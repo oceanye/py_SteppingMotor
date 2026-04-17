@@ -2,6 +2,7 @@
 #include "config.h"
 #include "stepper.h"
 #include "protocol.h"
+#include "foc_motor.h"
 
 // ====================================================================
 // 诊断固件 v1 —— 用于定位"指令OK但电机不转"的故障层
@@ -18,6 +19,8 @@ void setup() {
   Serial.print("PUL_PIN = GPIO"); Serial.println(PIN_STEP_PUL);
   Serial.print("DIR_PIN = GPIO"); Serial.println(PIN_STEP_DIR);
   Serial.println("发送 MOVE,steps,dir,delay_ms  或  DIAG");
+
+  foc_init();
 }
 
 void loop() {
