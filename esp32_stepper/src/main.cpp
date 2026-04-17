@@ -23,10 +23,24 @@ void setup() {
   foc_init();
 }
 
+static uint32_t s_last_fault_check = 0;
+
 void loop() {
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
     if (cmd.length() > 0) protocol_handle_line(cmd);
+  }
+
+  // 周期性检查 DRV8313 nFAULT 引脚（INPUT_PULLUP，正常 HIGH）
+  uint32_t now = millis();
+  if (now - s_last_fault_check >= FAULT_POLL_MS) {
+    s_last_fault_check = now;
+    if (digitalRead(PIN_FOC_NFAULT) == LOW &&
+        foc_get_state() != FOC_STATE_DISABLED &&
+        foc_get_state() != FOC_STATE_FAULT) {
+      foc_latch_fault();
+      Serial.println("FOC,FAULT");
+    }
   }
 }
