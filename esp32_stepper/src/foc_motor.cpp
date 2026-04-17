@@ -3,6 +3,7 @@
 #include "config.h"
 #include <Arduino.h>
 #include <SimpleFOC.h>
+#include <Preferences.h>
 #include <atomic>
 
 // ── SimpleFOC 对象（文件级静态）──
@@ -12,6 +13,7 @@ static BLDCDriver3PWM    driver(PIN_FOC_M1, PIN_FOC_M2, PIN_FOC_M3, PIN_FOC_EN);
 
 static TaskHandle_t s_foc_task_handle = nullptr;
 static float        s_home_offset_rad = 0.0f;
+static Preferences  s_prefs;
 
 // ── 跨核 atomic 镜像变量 ──
 static std::atomic<float>   g_target_deg    {0.0f};
@@ -26,6 +28,14 @@ static void foc_task(void* param);
 
 // ── 初始化 ──
 void foc_init() {
+  // 从 NVS 读极对数覆盖默认值。motor.pole_pairs 是 public 成员，
+  // 在 motor.init() 之前赋值即生效。
+  s_prefs.begin("foc", /*readOnly=*/true);
+  int pp = s_prefs.getInt("pp", FOC_POLE_PAIRS_DEFAULT);
+  s_prefs.end();
+  motor.pole_pairs = pp;
+  Serial.print("[FOC] pole_pairs from NVS = "); Serial.println(pp);
+
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   sensor.init();
   Serial.println("[FOC] AS5600 sensor init done");
@@ -140,7 +150,10 @@ void foc_home() {
 
 bool foc_set_pole_pairs_and_store(int n) {
   if (n < 1 || n > 50) return false;
-  // TODO(C3): 存 NVS
+  s_prefs.begin("foc", /*readOnly=*/false);
+  s_prefs.putInt("pp", n);
+  s_prefs.end();
+  // 下次启动生效（foc_init 读 NVS 时写 motor.pole_pairs）
   return true;
 }
 
