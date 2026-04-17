@@ -99,6 +99,8 @@ void stepper_run_diagnostics();
 
 将现有 `main.cpp` 中的 `moveMotor()` 改名为 `stepper_move()`，`runDiagnostics()` 改名为 `stepper_run_diagnostics()`；`stepper_init()` 负责 `pinMode` + `digitalWrite(LOW, LOW)`。引用 `config.h` 的引脚宏。
 
+⚠️ **契约**：`stepper_move()` 完成后必须打印 `Serial.println("OK");`（保留现有行为；Task C2 的 protocol 分发**依赖**此契约，不再额外打印 OK）。
+
 - [ ] **Step 3：修改 `main.cpp`，删除步进实现，调用 `stepper_*`**
 
 在 `setup()` 调 `stepper_init()`。在 `loop()` 的 `MOVE,...` 分支调 `stepper_move(...)`；`DIAG` 分支调 `stepper_run_diagnostics()`。
@@ -184,13 +186,16 @@ git commit -m "refactor(esp32): extract serial protocol dispatching into protoco
 
 **目的**：协议解析是纯字符串逻辑，可以在 PC 上用 unity 跑 native 测试（不需要硬件）。后续阶段 C 扩展 FOC 命令时能 TDD。
 
-- [ ] **Step 1：在 `platformio.ini` 增加 native 测试环境**
+- [ ] **Step 1：在 `platformio.ini` 末尾追加 native 测试环境**
+
+⚠️ **注意**：此处的 `build_src_filter` 行将在 Task C1 被**替换**（不是追加）。写入时先用空白 filter，后续 C1 再改。
 
 ```ini
 [env:native_test]
 platform = native
 test_framework = unity
 build_flags = -std=gnu++17
+; C1 会把下面这行替换为 +<protocol_parser.cpp>
 build_src_filter = -<*>
 ```
 
@@ -441,7 +446,7 @@ void foc_init() {
 
 ```cpp
 static void foc_task(void* /*param*/) {
-    bool was_aligned = false;
+    static bool s_aligned_once = false;   // 防止重复 initFOC()
 
     for (;;) {
         // 1. 读镜像 → SimpleFOC
@@ -457,8 +462,10 @@ static void foc_task(void* /*param*/) {
             state = FOC_STATE_ALIGNING;
         }
         if (state == FOC_STATE_ALIGNING) {
-            motor.initFOC();  // 阻塞 1-3 秒，电机缓转
-            was_aligned = true;
+            if (!s_aligned_once) {
+                motor.initFOC();      // 首次才跑对齐（阻塞 1-3 秒，电机缓转）
+                s_aligned_once = true;
+            }
             motor.enable();
             g_state.store(FOC_STATE_RUNNING);
             state = FOC_STATE_RUNNING;
@@ -630,15 +637,13 @@ int main(int, char**) {
 }
 ```
 
-- [ ] **Step 3：改 `platformio.ini` 让 native_test 能看到 src 文件**
+- [ ] **Step 3：修改 `platformio.ini` 的 `[env:native_test]` 区段**
 
+将 A4 Step 1 写入的 `build_src_filter = -<*>` 行**替换**为：
 ```ini
-[env:native_test]
-platform = native
-test_framework = unity
-build_flags = -std=gnu++17
 build_src_filter = +<protocol_parser.cpp>
 ```
+（只改这一行，其他行保留不动。用 Edit 工具定位旧 `-<*>` 做替换。）
 
 - [ ] **Step 4：运行测试确认全部失败（因为 parser 还没写）**
 
@@ -841,49 +846,58 @@ git commit -m "feat(protocol): wire FOC commands to foc_motor dispatch"
 **Files:**
 - Modify: `esp32_stepper/src/foc_motor.cpp`
 
-- [ ] **Step 1：加 Preferences 读写**
+⚠️ **关键**：`BLDCMotor motor(N)` 是文件级静态对象，构造时已锁定 N=7。但 SimpleFOC 的 `BLDCMotor::pole_pairs` 是 **public int 成员**，在 `motor.init()` 之前赋值即可生效（已验证）。因此步骤如下：
+
+- [ ] **Step 1：在 `foc_motor.cpp` 顶部加 Preferences**
 
 ```cpp
 #include <Preferences.h>
 static Preferences s_prefs;
-static int s_pole_pairs = FOC_POLE_PAIRS_DEFAULT;
 ```
 
-在 `foc_init()` 开头（Wire.begin 之前）读 NVS：
+- [ ] **Step 2：在 `foc_init()` **最开头**（在 Wire.begin 之前、任何 SimpleFOC 调用之前）插入：**
+
 ```cpp
-s_prefs.begin("foc", /*readonly=*/true);
-s_pole_pairs = s_prefs.getInt("pp", FOC_POLE_PAIRS_DEFAULT);
+// 从 NVS 读极对数覆盖默认值
+s_prefs.begin("foc", /*readOnly=*/true);
+int pp = s_prefs.getInt("pp", FOC_POLE_PAIRS_DEFAULT);
 s_prefs.end();
+motor.pole_pairs = pp;                // public 成员，init() 前赋值即生效
+Serial.print("[FOC] pole_pairs from NVS = "); Serial.println(pp);
 ```
-然后 `BLDCMotor motor(s_pole_pairs);` → 改为可变构造，或者初始化时 `motor.pole_pairs = s_pole_pairs;`（SimpleFOC 允许）。
 
-- [ ] **Step 2：实现 `foc_set_pole_pairs_and_store`**
+保留 `BLDCMotor motor(FOC_POLE_PAIRS_DEFAULT);` 不变（文件级）。
+
+- [ ] **Step 3：实现 `foc_set_pole_pairs_and_store`（替换 Task B2 写的 TODO stub）**
 
 ```cpp
 bool foc_set_pole_pairs_and_store(int n) {
     if (n < 1 || n > 50) return false;
-    s_prefs.begin("foc", false);
+    s_prefs.begin("foc", /*readOnly=*/false);
     s_prefs.putInt("pp", n);
     s_prefs.end();
-    // 不立即生效，提示用户重启
+    // 下次启动生效（motor.pole_pairs 在 foc_init 读 NVS 时设置）
     return true;
 }
 ```
 
-- [ ] **Step 3：编译 + 烧录，验证 `FOC,PP,9` 然后重启读 `FOC,S` 看打印**
+- [ ] **Step 4：编译 + 烧录**
 
-在 `foc_init` 里加一行调试：
-```cpp
-Serial.print("[FOC] pole_pairs from NVS = "); Serial.println(s_pole_pairs);
+```bash
+cd esp32_stepper && pio run -t upload
+pio device monitor --port COM4 --baud 115200
 ```
 
-烧录后发 `FOC,PP,9` → 重启 → 串口应显示 `[FOC] pole_pairs from NVS = 9`。
+- [ ] **Step 5：验证启动读 NVS**
 
-- [ ] **Step 4：恢复极对数 7**
+串口应看到 `[FOC] pole_pairs from NVS = 7`（或之前存的值）。
 
-发 `FOC,PP,7` → 重启 → 验证读回 7。
+- [ ] **Step 6：验证写 NVS + 重启生效**
 
-- [ ] **Step 5：提交**
+发 `FOC,PP,9` → 按复位键 → 应看到 `[FOC] pole_pairs from NVS = 9`。
+发 `FOC,PP,7` → 复位 → 回到 7。
+
+- [ ] **Step 7：提交**
 
 ```bash
 git add esp32_stepper/src/foc_motor.cpp
@@ -893,14 +907,34 @@ git commit -m "feat(foc): persist pole pairs to NVS via FOC,PP command"
 ## Task C4：nFAULT 监测
 
 **Files:**
-- Modify: `esp32_stepper/src/main.cpp` (or foc_motor.cpp)
+- Modify: `esp32_stepper/src/foc_motor.h`
+- Modify: `esp32_stepper/src/foc_motor.cpp`
+- Modify: `esp32_stepper/src/main.cpp`
 
-- [ ] **Step 1：在 main.cpp loop() 里加周期性 FAULT 轮询**
+- [ ] **Step 1：在 `foc_motor.h` 加 `foc_latch_fault()` 声明**
+
+在其他 API 声明旁加一行：
+```cpp
+// 由 Core 1 的 nFAULT 轮询调用，把状态机打到 FAULT
+void foc_latch_fault();
+```
+
+- [ ] **Step 2：在 `foc_motor.cpp` 实现**
 
 ```cpp
-#include "foc_motor.h"
-#include "config.h"
+void foc_latch_fault() {
+    g_fault_latched.store(true);
+    g_state.store(FOC_STATE_FAULT);
+    g_enable_req.store(false);
+    motor.disable();
+}
+```
 
+- [ ] **Step 3：在 main.cpp loop() 里加周期性 FAULT 轮询**
+
+在 `main.cpp` 顶部确保已 `#include "foc_motor.h"` 和 `#include "config.h"`。然后：
+
+```cpp
 static uint32_t s_last_fault_check = 0;
 
 void loop() {
@@ -914,26 +948,14 @@ void loop() {
     if (now - s_last_fault_check >= FAULT_POLL_MS) {
         s_last_fault_check = now;
         if (digitalRead(PIN_FOC_NFAULT) == LOW && foc_get_state() != FOC_STATE_DISABLED) {
-            // 拉低 + 非失能态 → latch 故障
-            extern void foc_latch_fault();  // 在 foc_motor.cpp 里加
-            foc_latch_fault();
+            foc_latch_fault();            // 通过正规 API，不用 extern
             Serial.println("FOC,FAULT");
         }
     }
 }
 ```
 
-- [ ] **Step 2：在 foc_motor.cpp 加 `foc_latch_fault`**
-
-```cpp
-void foc_latch_fault() {
-    g_fault_latched.store(true);
-    g_state.store(FOC_STATE_FAULT);
-    g_enable_req.store(false);
-    motor.disable();
-}
-```
-在 `foc_motor.h` 里声明。
+（不再使用局部 `extern` 声明；完全依赖 foc_motor.h 的公开 API。）
 
 - [ ] **Step 3：编译，硬件还没接所以 nFAULT 悬空读到 HIGH（因 INPUT_PULLUP），不会触发**
 
@@ -1084,32 +1106,76 @@ git commit --allow-empty -m "milestone: 关卡 3 通过 (FOC 闭环工作)"
 ## Task D4：关卡 3B（仅当 D3 PP 校验失败）
 
 **Files:**
-- Create: `esp32_stepper/sketches/find_pp.cpp` (独立项目，临时)
+- Create: `esp32_stepper/src_find_pp/find_pp.cpp`
+- Modify: `esp32_stepper/platformio.ini`（新增独立 env）
 
-- [ ] **Step 1：在 PlatformIO 里复制 SimpleFOC 的 `find_pole_pair_number.ino` 示例，改成本项目引脚**
+**策略**：使用**独立的 PlatformIO env**，不污染主 env 的 src_filter。
 
-（SimpleFOC 库目录下 `examples/utils/calibration/find_pole_pair_number/`）
+- [ ] **Step 1：创建 `esp32_stepper/src_find_pp/find_pp.cpp`**
 
-替换 I2C 和 PWM 引脚为：
+从 SimpleFOC 库的 `examples/utils/calibration/find_pole_pair_number/find_pole_pair_number.ino` 复制内容，修改引脚：
+
 ```cpp
-MagneticSensorI2C sensor(AS5600_I2C);
-BLDCDriver3PWM driver(11, 12, 13, 14);
-// Wire.begin(8, 9);
+#include <SimpleFOC.h>
+
+MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
+BLDCDriver3PWM driver = BLDCDriver3PWM(11, 12, 13, 14);
+BLDCMotor motor = BLDCMotor(11);  // 起始猜测，脚本会改
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(8, 9);
+  sensor.init();
+  driver.voltage_power_supply = 12;
+  driver.voltage_limit = 3;
+  driver.init();
+  motor.linkDriver(&driver);
+  motor.voltage_sensor_align = 3;
+  motor.linkSensor(&sensor);
+  motor.init();
+  // 其余按 SimpleFOC 示例原样
+}
+
+void loop() {
+  // 示例的极对数搜索循环（原样复制）
+}
 ```
 
-- [ ] **Step 2：临时把 `platformio.ini` 的 `src_dir` 改成 `sketches/` 或注释掉主 src 改挂这一个文件**
+- [ ] **Step 2：在 `platformio.ini` 追加新 env**
 
-或者用 `build_src_filter = +<find_pp.cpp> -<main.cpp> ...`
+```ini
+[env:esp32s3_find_pp]
+extends = env:esp32s3
+src_dir = src_find_pp
+```
 
-- [ ] **Step 3：烧录，串口按提示输入**
+（`extends` 继承主 env 的所有配置，只覆盖 `src_dir`；主 env 不受影响。）
 
-脚本会提示 "Press any key" 和 "Enter pole pairs number to try"。逐步试 2, 7, 11, 14，看哪个读数误差最小。
+- [ ] **Step 3：烧录校准固件**
 
-- [ ] **Step 4：把确认的值写入 NVS**
+```bash
+cd esp32_stepper
+pio run -e esp32s3_find_pp -t upload
+pio device monitor --port COM4 --baud 115200
+```
 
-还原主 src_filter，烧回主固件，启动后发 `FOC,PP,<n>`，重启生效。
+- [ ] **Step 4：按提示交互操作**
 
-- [ ] **Step 5：回关卡 3 重试**
+脚本会提示 "Press any key to start" 等。跑完记下真实极对数 `N`（例如 11 或 14）。
+
+- [ ] **Step 5：烧回主固件并写 NVS**
+
+```bash
+pio run -t upload       # 默认 env:esp32s3
+```
+
+连接后串口发 `FOC,PP,<N>`，然后按 ESP32 复位键，应看到 `[FOC] pole_pairs from NVS = <N>`。
+
+- [ ] **Step 6：回关卡 3（Task D3）重试**
+
+- [ ] **Step 7：（可选）删除或保留 `src_find_pp/`**
+
+保留可作后续调试工具；删除可精简仓库。
 
 ## Task D5：关卡 4 — 参数精修
 
@@ -1353,6 +1419,7 @@ git commit -m "feat(gui): bind FOC tab controls to serial commands"
 def toggle_connect(self):
     ...  # 现有连接逻辑
     if self.ser and self.ser.is_open:
+        self.ser.timeout = 0.2          # ← 关键：避免 readline 无限阻塞轮询线程
         self.foc_poll_running = True
         threading.Thread(target=self._foc_poll_loop, daemon=True).start()
 ```
@@ -1434,11 +1501,16 @@ git commit -m "feat(gui): add 100ms FOC status polling thread and state gating"
 
 - [ ] **Step 1：在 `_send_pulses` 包裹 `self.stepper_in_progress = True/False`**
 
-- [ ] **Step 2：在 `_update_foc_display` 末尾检查此旗**
+- [ ] **Step 2：`_update_foc_display` 基于原始值设置，避免图标累积**
 
 ```python
-if getattr(self, 'stepper_in_progress', False):
-    self.foc_current_var.set(self.foc_current_var.get() + " ⏸")  # 附加图标
+def _update_foc_display(self, state, cur, tgt, fault):
+    ...
+    cur_text = f"{float(cur):.1f}°"
+    if getattr(self, 'stepper_in_progress', False):
+        cur_text += " ⏸"          # 仅在本帧加，下帧重新生成不会累积
+    self.foc_current_var.set(cur_text)
+    ...
 ```
 
 - [ ] **Step 3：测试**
@@ -1488,11 +1560,17 @@ git commit --allow-empty -m "milestone: 阶段 F 整合测试通过"
 **Files:**
 - Modify: `MD422_20K-2M.md`
 
-- [ ] **Step 1：在文档末尾追加"SimpleFOC 无刷电机"章节**
+- [ ] **Step 1：先 Read 现有文件确认章节结构**
 
-包含：接线表（复用 spec §4）、FOC 协议命令列表（复用 spec §6.2）、4 关卡简述（复用 spec §8 摘要）、故障排查小表。
+```bash
+# 先通读 MD422_20K-2M.md 确认 §7 文件结构段、§6 故障排查段的位置和格式
+```
 
-- [ ] **Step 2：更新文件结构树（§7），增加 foc_motor.* / protocol_parser.* / config.h / test/**
+- [ ] **Step 2：在文档末尾追加"SimpleFOC 无刷电机"章节**
+
+包含：接线表（复用 spec §4）、FOC 协议命令列表（复用 spec §6.2）、4 关卡简述（复用 spec §8 摘要）、故障排查小表。保持与现有段落相同的 markdown 风格（###、表格格式、代码块语言标记）。
+
+- [ ] **Step 3：更新文件结构树（§7），增加 foc_motor.* / protocol_parser.* / config.h / test/**
 
 - [ ] **Step 3：提交**
 
@@ -1534,7 +1612,7 @@ git tag v1.0-foc-integrated
 |---|---|
 | 阶段 A 破坏步进 | `git reset --hard HEAD~N`（N = A 内 commit 数）|
 | FOC 不能闭环 | 保留 C 代码但不使能 FOC，单独用步进（GUI 切 Tab 即可）|
-| 整体失败 | `git checkout d5971dc`（本 plan 之前的最后稳定 commit，如实情况下由 task 前查看 HEAD）|
+| 整体失败 | 执行前先 `git log --oneline -1` 记下当前 HEAD；出问题 `git checkout <那个 hash>`。或直接丢弃：`git reset --hard origin/master` |
 
 ## 开发环境检查清单
 
