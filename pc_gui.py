@@ -4,6 +4,7 @@ import serial
 import serial.tools.list_ports
 import threading
 import time
+import queue
 
 # ============== 步进标定常数 ==============
 PULSES_PER_MM = 50       # 根据实测修正：GUI 设 50mm 实际走 5mm → 需 10× 脉冲数
@@ -31,6 +32,10 @@ class StepperGUI:
         self._foc_enabled_ui = False
         self.foc_poll_running = False
         self.foc_trace_buf = []  # [(t, target_deg, cur_deg)]，示波器数据
+        # 异步通讯：reader 线程读所有行，同步响应塞队列，异步事件走回调
+        self._resp_queue = queue.Queue()
+        self._reader_running = False
+        self._pending_step = None   # (dist_mm, direction) 等待 STEP,DONE 事件更新位置
         self._build_ui()
 
     # ═════════════ 顶层 UI ═════════════
@@ -334,14 +339,14 @@ class StepperGUI:
 
     def toggle_connect(self):
         if self.ser and self.ser.is_open:
-            # 先停轮询
+            # 先停轮询和 reader
             self.foc_poll_running = False
-            time.sleep(0.15)
-            with self.serial_lock:
-                try:
-                    self.ser.close()
-                except Exception:
-                    pass
+            self._reader_running = False
+            time.sleep(0.3)
+            try:
+                self.ser.close()
+            except Exception:
+                pass
             self.ser = None
             self.conn_status.config(text="● 未连接", foreground="red")
             self.conn_btn.config(text="连接")
@@ -356,52 +361,107 @@ class StepperGUI:
         try:
             self.ser = serial.Serial(self.port_var.get(), int(self.baud_var.get()), timeout=0.2)
             time.sleep(1.0)
-            # 清空启动 banner
-            with self.serial_lock:
-                while self.ser.in_waiting:
-                    self.ser.readline()
+            # 清空启动 banner（reader 启动前直接读）
+            while self.ser.in_waiting:
+                self.ser.readline()
+            # 清响应队列
+            while not self._resp_queue.empty():
+                try: self._resp_queue.get_nowait()
+                except queue.Empty: break
             self.conn_status.config(text="● 已连接", foreground="green")
             self.conn_btn.config(text="断开")
             self._set_stepper_buttons_state("normal")
             self.stop_btn.config(state="disabled")  # 仅连续运动时启用
             self.log(f"已连接 {self.port_var.get()} @ {self.baud_var.get()}")
-            # 启动 FOC 状态轮询
+            # 启动 reader + FOC 轮询
+            self._reader_running = True
+            threading.Thread(target=self._reader_loop, daemon=True).start()
             self.foc_poll_running = True
             threading.Thread(target=self._foc_poll_loop, daemon=True).start()
         except Exception as e:
             messagebox.showerror("连接失败", str(e))
 
     # ═════════════ 共享底层 I/O ═════════════
-    def _send_and_read(self, cmd: str) -> str:
-        """所有串口访问的统一入口，带锁。返回单行响应（已 strip）。"""
+    def _reader_loop(self):
+        """单一 reader 线程，持续读串口。异步事件分发到回调；同步响应塞队列。"""
+        while self._reader_running and self.ser and self.ser.is_open:
+            try:
+                raw = self.ser.readline()
+            except Exception:
+                break
+            if not raw:
+                continue  # timeout，继续
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            # 异步事件（不对应任何 pending 请求）
+            if line.startswith("STEP,DONE"):
+                self.root.after(0, self._on_step_done)
+                continue
+            if line.startswith("FOC,FAULT"):
+                self.root.after(0, lambda l=line: self.log(f"⚠️ {l}"))
+                continue
+            # 忽略 SimpleFOC 的 MOT: 诊断（不走命令响应通道）
+            if line.startswith("MOT:"):
+                self.root.after(0, lambda l=line: self.log(l))
+                continue
+            # 启动 banner / 未命中的未知行：视同调试输出
+            if line.startswith("ESP32") or line.startswith("[FOC]") or line.startswith("PUL_PIN") or line.startswith("DIR_PIN") or line.startswith("发送"):
+                self.root.after(0, lambda l=line: self.log(l))
+                continue
+            # 其他 → 同步响应
+            try:
+                self._resp_queue.put_nowait(line)
+            except queue.Full:
+                pass
+
+    def _send_and_read(self, cmd: str, timeout: float = 1.0) -> str:
+        """发送命令，等待一行同步响应。持锁期间 reader 仍在读，响应通过 queue 传回。"""
         if not self.ser or not self.ser.is_open:
             return ""
         with self.serial_lock:
+            # 清掉残留（不应有，防万一）
+            while not self._resp_queue.empty():
+                try: self._resp_queue.get_nowait()
+                except queue.Empty: break
             try:
                 self.ser.write((cmd + "\n").encode())
-                return self.ser.readline().decode(errors="replace").strip()
             except Exception as e:
-                self.log(f"串口异常: {e}")
+                self.log(f"串口写异常: {e}")
+                return ""
+            try:
+                return self._resp_queue.get(timeout=timeout)
+            except queue.Empty:
                 return ""
 
-    # ═════════════ 步进：脉冲发送 ═════════════
+    # ═════════════ 步进：脉冲发送（异步 ACK + STEP,DONE 事件）═════════════
     def _send_pulses(self, steps, direction, delay_ms):
         if steps <= 0 or not self.ser or not self.ser.is_open:
             return False
-        self.stepper_in_progress = True
-        try:
-            resp = self._send_and_read(f"MOVE,{steps},{direction},{delay_ms}")
-            dist_mm = steps / PULSES_PER_MM
-            dir_txt = "向外" if direction == DIR_OUTWARD else "向内"
-            self.log(f"发送 {dist_mm:.1f}mm {dir_txt} @ {delay_ms}ms/脉冲 → {resp}")
-            if resp == "OK":
-                sign = +1.0 if direction == DIR_OUTWARD else -1.0
-                self.position_mm += sign * dist_mm
-                self.root.after(0, self._update_pos_label)
-                return True
-            return False
-        finally:
-            self.stepper_in_progress = False
+        # 若上次 STEP,DONE 还没回来，先等完（与并发 MOVE 有关）
+        while self.stepper_in_progress and self.running is False:
+            # running==False 表示非连续模式；连续模式下上层 worker 自己管
+            time.sleep(0.02)
+        resp = self._send_and_read(f"MOVE,{steps},{direction},{delay_ms}")
+        dist_mm = steps / PULSES_PER_MM
+        dir_txt = "向外" if direction == DIR_OUTWARD else "向内"
+        self.log(f"发送 {dist_mm:.1f}mm {dir_txt} @ {delay_ms}ms → {resp}")
+        if resp == "ACK":
+            # 记下待定脉冲参数；STEP,DONE 回来时 _on_step_done 会更新位置
+            sign = +1.0 if direction == DIR_OUTWARD else -1.0
+            self._pending_step = sign * dist_mm
+            self.stepper_in_progress = True
+            return True
+        return False
+
+    def _on_step_done(self):
+        """reader 线程收到 STEP,DONE 后（已 after 到主线程）。"""
+        if self._pending_step is not None:
+            self.position_mm += self._pending_step
+            self._pending_step = None
+            self._update_pos_label()
+        self.stepper_in_progress = False
+        self.log("步进完成")
 
     def _send_mm(self, distance_mm, direction, delay_ms):
         steps = int(round(distance_mm * PULSES_PER_MM))
@@ -431,6 +491,11 @@ class StepperGUI:
 
         def worker():
             while self.running:
+                # 发下一批前先等上一批 STEP,DONE 回来，避免 ERR:busy
+                while self.stepper_in_progress and self.running:
+                    time.sleep(0.02)
+                if not self.running:
+                    break
                 if not self._send_mm(CONTINUOUS_BURST_MM, direction, self.delay_var.get()):
                     break
             self.log("连续运动已停止")
