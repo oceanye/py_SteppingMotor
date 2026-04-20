@@ -105,7 +105,9 @@ static void foc_task(void* /*param*/) {
     }
 
     // 5. 更新输出镜像
-    float shaft = motor.shaft_angle - s_home_offset_rad;
+    // 注意：motor.shaft_angle 只在 loopFOC() 调用时更新，所以 DISABLED 态不刷新。
+    // 直接用 sensor.getAngle() 读 AS5600 连续累计角（rad），与使能态无关。
+    float shaft = sensor.getAngle() - s_home_offset_rad;
     g_current_deg.store(shaft * 180.0f / PI);
 
     vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -145,7 +147,8 @@ bool foc_set_voltage_limit(float v) {
 }
 
 void foc_home() {
-  s_home_offset_rad = motor.shaft_angle;  // Core 1 读 motor 成员，32-bit float OK
+  sensor.update();                        // 保证读到最新
+  s_home_offset_rad = sensor.getAngle();  // 直接从传感器取，不依赖 motor.shaft_angle
 }
 
 bool foc_set_pole_pairs_and_store(int n) {
