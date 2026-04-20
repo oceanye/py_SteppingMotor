@@ -29,6 +29,8 @@ bool foc_set_voltage_limit(float v);
 void foc_home();
 // 设极对数（1-50）并存 NVS，下次启动生效。
 bool foc_set_pole_pairs_and_store(int n);
+// 在线调位置环比例增益（刚度）。范围 0.1-50。
+bool foc_set_p_angle(float p);
 
 // ── 状态查询（从 Core 0 镜像读取）──
 FocState foc_get_state();

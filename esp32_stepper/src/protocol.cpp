@@ -70,6 +70,12 @@ static void handle_foc(const String& cmd) {
     else reply_err("out of range");
     return;
   }
+  if (sub == "PA" && arg.length() > 0) {
+    float p = arg.toFloat();
+    if (foc_set_p_angle(p)) reply_ok();
+    else reply_err("out of range");
+    return;
+  }
   reply_err("bad format");
 }
 

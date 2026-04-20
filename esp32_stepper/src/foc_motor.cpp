@@ -52,13 +52,13 @@ void foc_init() {
   motor.velocity_limit = FOC_VELOCITY_LIMIT;
   motor.controller     = MotionControlType::angle;
 
-  // 位置环 PID 调参（2208 gimbal 专用，保守稳定版）
-  motor.P_angle.P        = 5.0f;   // 位置环 P，2208 小扭矩下 20 会振荡，5 稳
+  // 位置环 PID 调参（2208 gimbal 专用，经硬件调试确认 P=45 刚度合适）
+  motor.P_angle.P        = 45.0f;  // 位置环 P，实测 45 刚度好且无振荡
   motor.PID_velocity.P   = 0.2f;   // 速度环 P，默认 0.5 偏高
   motor.PID_velocity.I   = 2.0f;   // 速度环 I，默认 10 偏高（容易积分振荡）
   motor.PID_velocity.D   = 0.0f;
   motor.PID_velocity.output_ramp = 1000.0f;
-  motor.LPF_velocity.Tf  = 0.02f;  // 速度低通滤波，默认 0.01 加倍
+  motor.LPF_velocity.Tf  = 0.02f;  // 速度低通滤波
 
   motor.init();
   // 不调 motor.initFOC()，等 foc_request_enable(true) 触发
@@ -175,6 +175,12 @@ bool foc_set_pole_pairs_and_store(int n) {
   s_prefs.putInt("pp", n);
   s_prefs.end();
   // 下次启动生效（foc_init 读 NVS 时写 motor.pole_pairs）
+  return true;
+}
+
+bool foc_set_p_angle(float p) {
+  if (p < 0.1f || p > 50.0f) return false;
+  motor.P_angle.P = p;  // 立即生效，Core 0 的 motor.move() 下个循环就用
   return true;
 }
 

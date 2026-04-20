@@ -17,7 +17,7 @@
 // ── FOC 常数 ──
 #define FOC_POLE_PAIRS_DEFAULT   7      // 2208 典型
 #define FOC_PSU_VOLTAGE          12.0f
-#define FOC_INITIAL_V_LIMIT      3.0f
+#define FOC_INITIAL_V_LIMIT      5.0f
 #define FOC_MAX_V_LIMIT          10.0f
 #define FOC_MAX_ANGLE_ABS        3600.0f
 #define FOC_VELOCITY_LIMIT       20.0f  // rad/s
