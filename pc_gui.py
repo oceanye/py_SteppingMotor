@@ -30,6 +30,7 @@ class StepperGUI:
         self.stepper_in_progress = False
         self._foc_enabled_ui = False
         self.foc_poll_running = False
+        self.foc_trace_buf = []  # [(t, target_deg, cur_deg)]，示波器数据
         self._build_ui()
 
     # ═════════════ 顶层 UI ═════════════
@@ -292,6 +293,13 @@ class StepperGUI:
                                         command=self._foc_clear_fault, state="disabled")
         self.foc_clear_btn.grid(row=5, column=0, columnspan=2, **pad, ipadx=10)
 
+        # 示波器区
+        scope_frame = ttk.LabelFrame(parent, text="响应曲线 (最近 10s · 蓝=目标 红=实测)")
+        scope_frame.grid(row=4, column=0, sticky="ew", **pad)
+        self.foc_scope = tk.Canvas(scope_frame, width=560, height=180,
+                                   bg="white", highlightthickness=1, highlightbackground="#999")
+        self.foc_scope.pack(padx=5, pady=5)
+
         # 聚合按钮组（E5 状态门控使用）
         self._foc_motion_btns = [self.foc_goto_btn] + self._foc_quick_btns + self._foc_inc_btns
         self._foc_cfg_btns    = [self.foc_home_btn, self.foc_vlimit_slider,
@@ -538,9 +546,11 @@ class StepperGUI:
         name = FOC_STATE_NAMES.get(state, "?")
         self.foc_state_var.set(name)
         try:
-            cur_text = f"{float(cur):.1f}°"
+            cur_f = float(cur)
+            tgt_f = float(tgt)
         except ValueError:
-            cur_text = "--"
+            cur_f = tgt_f = None
+        cur_text = f"{cur_f:.1f}°" if cur_f is not None else "--"
         if self.stepper_in_progress:
             cur_text += " ⏸"
         self.foc_current_var.set(cur_text)
@@ -548,6 +558,62 @@ class StepperGUI:
         self.foc_fault_var.set(fault_text)
         self.foc_fault_label.config(foreground="red" if fault == "1" else "green")
         self._apply_foc_gating(state, fault)
+
+        # 示波器：追加采样并重绘（只有 RUNNING 且数据合法时）
+        if cur_f is not None and state == "2":
+            now = time.time()
+            self.foc_trace_buf.append((now, tgt_f, cur_f))
+            cutoff = now - 10.0
+            self.foc_trace_buf = [x for x in self.foc_trace_buf if x[0] >= cutoff]
+            self._redraw_foc_scope()
+
+    def _redraw_foc_scope(self):
+        W, H = 560, 180
+        cv = self.foc_scope
+        cv.delete("all")
+        buf = self.foc_trace_buf
+        if len(buf) < 2:
+            cv.create_text(W/2, H/2, text="(等待数据，先使能 FOC)", fill="#888")
+            return
+        t0 = buf[0][0]
+        t_span = max(0.1, buf[-1][0] - t0)
+
+        ys = [p[1] for p in buf] + [p[2] for p in buf]
+        y_min, y_max = min(ys), max(ys)
+        if y_max - y_min < 10:
+            c = (y_min + y_max) / 2
+            y_min, y_max = c - 5, c + 5
+        y_pad = (y_max - y_min) * 0.1
+        y_min -= y_pad
+        y_max += y_pad
+
+        # 浅色网格
+        for frac in (0.25, 0.5, 0.75):
+            y = H * frac
+            cv.create_line(0, y, W, y, fill="#e5e5e5")
+
+        # 零度线
+        if y_min < 0 < y_max:
+            y0 = H * (y_max - 0) / (y_max - y_min)
+            cv.create_line(0, y0, W, y0, fill="#aaa", dash=(3, 3))
+
+        # 轴标签
+        cv.create_text(3, 3, text=f"{y_max:.0f}°", anchor="nw", fill="#555", font=("Arial", 8))
+        cv.create_text(3, H-3, text=f"{y_min:.0f}°", anchor="sw", fill="#555", font=("Arial", 8))
+        cv.create_text(W-3, H-3, text=f"now", anchor="se", fill="#555", font=("Arial", 8))
+
+        # 构造两条折线
+        pts_t, pts_c = [], []
+        for t, tgt, cur in buf:
+            x = W * (t - t0) / t_span
+            yt = H * (y_max - tgt) / (y_max - y_min)
+            yc = H * (y_max - cur) / (y_max - y_min)
+            pts_t.extend([x, yt])
+            pts_c.extend([x, yc])
+        if len(pts_t) >= 4:
+            cv.create_line(*pts_t, fill="#1565c0", width=1)  # 目标 蓝
+        if len(pts_c) >= 4:
+            cv.create_line(*pts_c, fill="#d32f2f", width=2)  # 实测 红
 
     def _apply_foc_gating(self, state, fault):
         """状态门控 per spec §7.5"""
