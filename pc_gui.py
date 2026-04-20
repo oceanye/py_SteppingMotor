@@ -249,17 +249,28 @@ class StepperGUI:
         ttk.Label(en_frame, text="电压限幅:").grid(row=1, column=0, sticky="w", **pad)
         vf = ttk.Frame(en_frame)
         vf.grid(row=1, column=1, sticky="w", pady=5)
-        self.foc_vlimit_var = tk.DoubleVar(value=3.0)
-        self.foc_vlimit_slider = ttk.Scale(vf, from_=0.5, to=10.0, orient="horizontal",
+        self.foc_vlimit_var = tk.DoubleVar(value=8.0)
+        self.foc_vlimit_slider = ttk.Scale(vf, from_=0.5, to=12.0, orient="horizontal",
                                            variable=self.foc_vlimit_var, length=180,
                                            command=self._foc_on_vlimit_change, state="disabled")
         self.foc_vlimit_slider.pack(side="left")
-        self.foc_vlimit_label = ttk.Label(vf, text="3.0 V", width=8)
+        self.foc_vlimit_label = ttk.Label(vf, text="8.0 V (扭矩)", width=14)
         self.foc_vlimit_label.pack(side="left", padx=6)
 
-        ttk.Label(en_frame, text="极对数:").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Label(en_frame, text="位置环 P:").grid(row=2, column=0, sticky="w", **pad)
+        pg_frame = ttk.Frame(en_frame)
+        pg_frame.grid(row=2, column=1, sticky="w", pady=5)
+        self.foc_pangle_var = tk.DoubleVar(value=40.0)
+        self.foc_pangle_slider = ttk.Scale(pg_frame, from_=1.0, to=50.0, orient="horizontal",
+                                           variable=self.foc_pangle_var, length=180,
+                                           command=self._foc_on_pangle_change, state="disabled")
+        self.foc_pangle_slider.pack(side="left")
+        self.foc_pangle_label = ttk.Label(pg_frame, text="40.0 (刚度)", width=14)
+        self.foc_pangle_label.pack(side="left", padx=6)
+
+        ttk.Label(en_frame, text="极对数:").grid(row=3, column=0, sticky="w", **pad)
         pp_frame = ttk.Frame(en_frame)
-        pp_frame.grid(row=2, column=1, sticky="w", pady=5)
+        pp_frame.grid(row=3, column=1, sticky="w", pady=5)
         self.foc_pp_var = tk.IntVar(value=7)
         ttk.Spinbox(pp_frame, from_=1, to=50, textvariable=self.foc_pp_var, width=6).pack(side="left")
         self.foc_pp_save_btn = ttk.Button(pp_frame, text="保存到 NVS（重启生效）",
@@ -268,12 +279,12 @@ class StepperGUI:
 
         self.foc_clear_btn = ttk.Button(en_frame, text="🧹 清除故障",
                                         command=self._foc_clear_fault, state="disabled")
-        self.foc_clear_btn.grid(row=3, column=0, columnspan=2, **pad, ipadx=10)
+        self.foc_clear_btn.grid(row=4, column=0, columnspan=2, **pad, ipadx=10)
 
         # 聚合按钮组（E5 状态门控使用）
         self._foc_motion_btns = [self.foc_goto_btn] + self._foc_quick_btns + self._foc_inc_btns
         self._foc_cfg_btns    = [self.foc_home_btn, self.foc_vlimit_slider,
-                                 self.foc_pp_save_btn]
+                                 self.foc_pangle_slider, self.foc_pp_save_btn]
 
     # ═════════════ 公共辅助 ═════════════
     def _update_speed_label(self, *_):
@@ -477,12 +488,14 @@ class StepperGUI:
         self._send_foc(f"FOC,EN,{val}")
 
     def _foc_on_vlimit_change(self, _value):
-        # Scale 回调频繁触发，加去抖（这里简单：调用时直接发送，OK 接受重复）
         v = self.foc_vlimit_var.get()
-        self.foc_vlimit_label.config(text=f"{v:.1f} V")
-        # 不用 _send_foc 避免 log 刷屏；只在松开时发完整命令
-        # 这里我们接受每次 change 都发，频率不高（拖动时约 10-20Hz）
+        self.foc_vlimit_label.config(text=f"{v:.1f} V (扭矩)")
         self._send_foc(f"FOC,V,{v:.1f}")
+
+    def _foc_on_pangle_change(self, _value):
+        p = self.foc_pangle_var.get()
+        self.foc_pangle_label.config(text=f"{p:.1f} (刚度)")
+        self._send_foc(f"FOC,PA,{p:.1f}")
 
     def _foc_save_pp(self):
         n = int(self.foc_pp_var.get())
