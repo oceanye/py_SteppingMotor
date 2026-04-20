@@ -1,14 +1,47 @@
 #include <Arduino.h>
 #include "config.h"
 #include "stepper.h"
+#include <atomic>
+
+// ── 异步步进任务（Core 1）──
+static TaskHandle_t      s_task        = nullptr;
+static SemaphoreHandle_t s_start_sem   = nullptr;
+static std::atomic<bool> s_busy        {false};
+static int               s_steps, s_dir, s_delay_ms;   // 任务参数，仅在 busy=false 时由 async 写
+
+static void stepper_task(void* /*arg*/) {
+  for (;;) {
+    xSemaphoreTake(s_start_sem, portMAX_DELAY);
+    int steps = s_steps;
+    int dir   = s_dir;
+    int dms   = s_delay_ms;
+
+    digitalWrite(PIN_STEP_DIR, dir);
+    delayMicroseconds(100);
+    for (int i = 0; i < steps; i++) {
+      digitalWrite(PIN_STEP_PUL, HIGH);
+      delayMicroseconds(50);
+      digitalWrite(PIN_STEP_PUL, LOW);
+      // 用 vTaskDelay（而不是 delay）让其他任务尽早调度
+      vTaskDelay(dms / portTICK_PERIOD_MS);
+    }
+    s_busy.store(false);
+    Serial.println("STEP,DONE");
+  }
+}
 
 void stepper_init() {
   pinMode(PIN_STEP_PUL, OUTPUT);
   pinMode(PIN_STEP_DIR, OUTPUT);
   digitalWrite(PIN_STEP_PUL, LOW);
   digitalWrite(PIN_STEP_DIR, LOW);
+
+  s_start_sem = xSemaphoreCreateBinary();
+  // Core 1，优先级 1 低于主 loop 但高于 idle
+  xTaskCreatePinnedToCore(stepper_task, "stepper", 4096, nullptr, 1, &s_task, 1);
 }
 
+// 同步版本（保留，DIAG 可能直接调用）
 void stepper_move(int steps, int direction, int delay_ms) {
   digitalWrite(PIN_STEP_DIR, direction);
   delayMicroseconds(100);
@@ -19,6 +52,21 @@ void stepper_move(int steps, int direction, int delay_ms) {
     delay(delay_ms);
   }
   Serial.println("OK");
+}
+
+bool stepper_is_busy() {
+  return s_busy.load();
+}
+
+bool stepper_move_async(int steps, int direction, int delay_ms) {
+  // 调用方都在 Core 1 的 loop()（串口单线程），无竞态。
+  if (s_busy.load()) return false;
+  s_steps    = steps;
+  s_dir      = direction;
+  s_delay_ms = delay_ms;
+  s_busy.store(true);
+  xSemaphoreGive(s_start_sem);
+  return true;
 }
 
 void stepper_run_diagnostics() {
