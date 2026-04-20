@@ -17,10 +17,10 @@
 // ── FOC 常数 ──
 #define FOC_POLE_PAIRS_DEFAULT   7      // 2208 典型
 #define FOC_PSU_VOLTAGE          12.0f
-#define FOC_INITIAL_V_LIMIT      5.0f
-#define FOC_MAX_V_LIMIT          10.0f
+#define FOC_INITIAL_V_LIMIT      8.0f    // 启动默认，2208@12V下有明显扭矩
+#define FOC_MAX_V_LIMIT          12.0f   // 与 PSU 匹配；SVM 调制会自动用尽
 #define FOC_MAX_ANGLE_ABS        3600.0f
-#define FOC_VELOCITY_LIMIT       20.0f  // rad/s
+#define FOC_VELOCITY_LIMIT       10.0f  // rad/s，配 V=8V 防过冲
 #define FOC_TASK_STACK           4096
 #define FOC_TASK_PRIORITY        2
 #define FOC_TASK_CORE            0
