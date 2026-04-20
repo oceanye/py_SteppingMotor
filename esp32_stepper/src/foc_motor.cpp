@@ -54,7 +54,7 @@ void foc_init() {
 
   // 位置环 PID 调参（2208 gimbal 专用，硬件实测 45 有振荡、40 稳定）
   motor.P_angle.P        = 40.0f;  // 位置环 P，实测 40 是稳定上限
-  motor.PID_velocity.P   = 0.2f;   // 速度环 P，默认 0.5 偏高
+  motor.PID_velocity.P   = 0.4f;   // 速度环 P（= 阻尼感），默认 0.5；0.4 是扭矩大 + 阻尼的甜点
   motor.PID_velocity.I   = 2.0f;   // 速度环 I，默认 10 偏高（容易积分振荡）
   motor.PID_velocity.D   = 0.0f;
   motor.PID_velocity.output_ramp = 1000.0f;
@@ -181,6 +181,12 @@ bool foc_set_pole_pairs_and_store(int n) {
 bool foc_set_p_angle(float p) {
   if (p < 0.1f || p > 50.0f) return false;
   motor.P_angle.P = p;  // 立即生效，Core 0 的 motor.move() 下个循环就用
+  return true;
+}
+
+bool foc_set_p_velocity(float p) {
+  if (p < 0.01f || p > 2.0f) return false;
+  motor.PID_velocity.P = p;  // 立即生效
   return true;
 }
 

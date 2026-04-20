@@ -31,6 +31,8 @@ void foc_home();
 bool foc_set_pole_pairs_and_store(int n);
 // 在线调位置环比例增益（刚度）。范围 0.1-50。
 bool foc_set_p_angle(float p);
+// 在线调速度环比例增益（阻尼感）。范围 0.01-2.0。
+bool foc_set_p_velocity(float p);
 
 // ── 状态查询（从 Core 0 镜像读取）──
 FocState foc_get_state();

@@ -76,6 +76,12 @@ static void handle_foc(const String& cmd) {
     else reply_err("out of range");
     return;
   }
+  if (sub == "VP" && arg.length() > 0) {
+    float p = arg.toFloat();
+    if (foc_set_p_velocity(p)) reply_ok();
+    else reply_err("out of range");
+    return;
+  }
   reply_err("bad format");
 }
 
