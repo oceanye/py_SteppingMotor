@@ -293,6 +293,10 @@ class StepperGUI:
                                         command=self._foc_clear_fault, state="disabled")
         self.foc_clear_btn.grid(row=5, column=0, columnspan=2, **pad, ipadx=10)
 
+        self.foc_autotune_btn = ttk.Button(en_frame, text="🤖 自动优化 PID (约 60 秒)",
+                                           command=self._foc_autotune, state="disabled")
+        self.foc_autotune_btn.grid(row=6, column=0, columnspan=2, **pad, ipadx=10)
+
         # 示波器区
         scope_frame = ttk.LabelFrame(parent, text="响应曲线 (最近 10s · 蓝=目标 红=实测)")
         scope_frame.grid(row=4, column=0, sticky="ew", **pad)
@@ -304,7 +308,7 @@ class StepperGUI:
         self._foc_motion_btns = [self.foc_goto_btn] + self._foc_quick_btns + self._foc_inc_btns
         self._foc_cfg_btns    = [self.foc_home_btn, self.foc_vlimit_slider,
                                  self.foc_pangle_slider, self.foc_vp_slider,
-                                 self.foc_pp_save_btn]
+                                 self.foc_pp_save_btn, self.foc_autotune_btn]
 
     # ═════════════ 公共辅助 ═════════════
     def _update_speed_label(self, *_):
@@ -529,6 +533,113 @@ class StepperGUI:
     def _foc_clear_fault(self):
         self._send_foc("FOC,CLR")
         self._foc_enabled_ui = False  # 清故障后需要用户手动再使能
+
+    # ═════════════ FOC：自动调参 ═════════════
+    def _foc_autotune(self):
+        if not self.ser or not self.ser.is_open:
+            messagebox.showerror("未连接", "请先连接 COM 口并使能 FOC")
+            return
+        if not messagebox.askokcancel(
+            "自动调参确认",
+            "将依次测试不同 P_angle（阶跃 0°→90°→0°），\n"
+            "电机会来回转动约 60 秒。\n\n"
+            "开始吗？"):
+            return
+        self.foc_autotune_btn.config(state="disabled")
+        threading.Thread(target=self._foc_autotune_worker, daemon=True).start()
+
+    def _foc_autotune_worker(self):
+        try:
+            self.log("=" * 40)
+            self.log("🤖 自动调参开始")
+            self.log("=" * 40)
+
+            # 确保使能 + 归零
+            self._send_and_read("FOC,EN,1")
+            time.sleep(5.5)  # 给首次对齐时间
+            self._send_and_read("FOC,H")
+            time.sleep(0.5)
+            # VP 固定低值，只扫 PA
+            self._send_and_read("FOC,VP,0.15")
+            self.log("固定 VP=0.15，扫描 PA...")
+
+            results = []  # (pa, overshoot, ss_error, rise_time)
+
+            for pa in [5, 10, 15, 20, 25, 30, 35, 40]:
+                self.log(f"  测试 PA={pa} ...")
+                self._send_and_read(f"FOC,PA,{pa}")
+                time.sleep(0.3)
+
+                # 先回 0 稳定
+                self._send_and_read("FOC,A,0")
+                time.sleep(2.0)
+
+                # 记录阶跃响应
+                t0 = time.time()
+                self._send_and_read("FOC,A,90")
+                time.sleep(2.5)  # 2.5s 足够 2208 完成阶跃
+
+                # 从 trace_buf 取这段数据分析
+                data = [(t - t0, cur) for t, tgt, cur in self.foc_trace_buf
+                        if t >= t0 and abs(tgt - 90) < 0.5]
+                if len(data) < 5:
+                    self.log(f"    数据不足，跳过")
+                    continue
+                curs = [c for _, c in data]
+                max_cur = max(curs)
+                final_cur = curs[-1]
+                overshoot = max(0.0, max_cur - 90.0)
+                ss_error = abs(final_cur - 90.0)
+
+                # 粗略上升时间：首次到 81° (90% of 90)
+                rise_time = None
+                for t, c in data:
+                    if c >= 81:
+                        rise_time = t
+                        break
+
+                rt_str = f"{rise_time:.2f}s" if rise_time else ">2.5s"
+                self.log(f"    overshoot={overshoot:.1f}° ss_err={ss_error:.1f}° rise={rt_str}")
+                results.append((pa, overshoot, ss_error, rise_time or 99.0))
+
+                # 过冲太大提前停止
+                if overshoot > 30:
+                    self.log(f"    过冲 >30°，停止继续增大 PA")
+                    break
+
+            # 评分：small overshoot + fast rise + small ss_err
+            # 权重：过冲最重要（防振荡），上升时间次之
+            def score(r):
+                pa, ov, sse, rt = r
+                penalty_overshoot = ov * 2
+                penalty_rise = rt * 3
+                penalty_sserr = sse * 2
+                return penalty_overshoot + penalty_rise + penalty_sserr
+
+            if not results:
+                self.log("❌ 没有有效数据")
+                return
+            # 过滤过冲 >15 的
+            good = [r for r in results if r[1] <= 15]
+            pool = good if good else results
+            best = min(pool, key=score)
+            best_pa, best_ov, best_sse, best_rt = best
+
+            self.log("=" * 40)
+            self.log(f"✅ 推荐 PA={best_pa}")
+            self.log(f"   overshoot={best_ov:.1f}°  ss_err={best_sse:.1f}°  rise={best_rt:.2f}s")
+            self.log("   已自动应用此值")
+            self.log("=" * 40)
+
+            # 应用并回零
+            self._send_and_read(f"FOC,PA,{best_pa}")
+            time.sleep(0.2)
+            self._send_and_read("FOC,A,0")
+            # 同步 GUI 滑条显示
+            self.root.after(0, lambda: self.foc_pangle_var.set(float(best_pa)))
+            self.root.after(0, lambda: self.foc_pangle_label.config(text=f"{best_pa:.1f} (刚度)"))
+        finally:
+            self.root.after(0, lambda: self.foc_autotune_btn.config(state="normal"))
 
     # ═════════════ FOC：状态轮询 ═════════════
     def _foc_poll_loop(self):
