@@ -16,9 +16,9 @@
 
 // ── FOC 常数 ──
 #define FOC_POLE_PAIRS_DEFAULT   7      // 2208 典型
-#define FOC_PSU_VOLTAGE          12.0f
-#define FOC_INITIAL_V_LIMIT      10.0f   // 启动默认，扭矩上调留 2V 余量给 SVM
-#define FOC_MAX_V_LIMIT          12.0f   // 与 PSU 匹配；SVM 调制会自动用尽
+#define FOC_PSU_VOLTAGE          24.0f   // 与 DM422 共用单 24V 电源
+#define FOC_INITIAL_V_LIMIT      10.0f   // 启动默认，喂给 2208 电机的最大电压
+#define FOC_MAX_V_LIMIT          12.0f   // ⚠️ 电机额定上限 12V，不能超（即使 PSU=24V）
 #define FOC_MAX_ANGLE_ABS        3600.0f
 #define FOC_VELOCITY_LIMIT       5.0f   // rad/s，配 V=10V+VP=0.4 防过冲
 #define FOC_TASK_STACK           4096
