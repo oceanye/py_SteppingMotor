@@ -52,8 +52,8 @@ void foc_init() {
   motor.velocity_limit = FOC_VELOCITY_LIMIT;
   motor.controller     = MotionControlType::angle;
 
-  // 位置环 PID 调参（2208 gimbal 专用，经硬件调试确认 P=45 刚度合适）
-  motor.P_angle.P        = 45.0f;  // 位置环 P，实测 45 刚度好且无振荡
+  // 位置环 PID 调参（2208 gimbal 专用，硬件实测 45 有振荡、40 稳定）
+  motor.P_angle.P        = 40.0f;  // 位置环 P，实测 40 是稳定上限
   motor.PID_velocity.P   = 0.2f;   // 速度环 P，默认 0.5 偏高
   motor.PID_velocity.I   = 2.0f;   // 速度环 I，默认 10 偏高（容易积分振荡）
   motor.PID_velocity.D   = 0.0f;
