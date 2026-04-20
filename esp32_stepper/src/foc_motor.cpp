@@ -14,6 +14,7 @@ static BLDCDriver3PWM    driver(PIN_FOC_M1, PIN_FOC_M2, PIN_FOC_M3, PIN_FOC_EN);
 static TaskHandle_t s_foc_task_handle = nullptr;
 static float        s_home_offset_rad = 0.0f;
 static Preferences  s_prefs;
+static bool         s_aligned_once    = false;  // 文件级，允许 foc_clear_fault() 复位
 
 // ── 跨核 atomic 镜像变量 ──
 static std::atomic<float>   g_target_deg    {0.0f};
@@ -46,6 +47,7 @@ void foc_init() {
 
   motor.linkSensor(&sensor);
   motor.linkDriver(&driver);
+  motor.useMonitoring(Serial);  // 让 SimpleFOC 的 MOT: 诊断信息打印到串口
   motor.voltage_limit  = FOC_INITIAL_V_LIMIT;
   motor.velocity_limit = FOC_VELOCITY_LIMIT;
   motor.controller     = MotionControlType::angle;
@@ -61,11 +63,10 @@ void foc_init() {
 
 // ── Core 0 FOC 任务：状态机 + 闭环 ──
 static void foc_task(void* /*param*/) {
-  static bool s_aligned_once = false;  // 防止重复 initFOC()
-
   for (;;) {
     // 1. 读镜像 → SimpleFOC
-    motor.target        = g_target_deg.load() * PI / 180.0f;
+    // target 用户坐标（以 home 为 0）转 sensor 原生坐标：加 home_offset
+    motor.target        = g_target_deg.load() * PI / 180.0f + s_home_offset_rad;
     motor.voltage_limit = g_voltage_limit.load();
 
     // 2. 状态转换
@@ -81,6 +82,12 @@ static void foc_task(void* /*param*/) {
         motor.initFOC();  // 首次才跑对齐（阻塞 1-3 秒，电机缓转）
         s_aligned_once = true;
       }
+      // 使能前把 target 设为当前角度（用户坐标），避免大角度瞬间跳跃
+      sensor.update();
+      float cur_user_rad = sensor.getAngle() - s_home_offset_rad;
+      g_target_deg.store(cur_user_rad * 180.0f / PI);
+      motor.target = sensor.getAngle();  // sensor 原生坐标，直接保持当前位置
+
       motor.enable();
       g_state.store(FOC_STATE_RUNNING);
       state = FOC_STATE_RUNNING;
@@ -131,6 +138,7 @@ bool foc_clear_fault() {
   if (g_state.load() != FOC_STATE_FAULT) return false;
   g_fault_latched.store(false);
   g_state.store(FOC_STATE_DISABLED);
+  s_aligned_once = false;  // 故障可能让 motor 内部状态失效，强制下次 EN,1 重新对齐
   return true;
 }
 
@@ -147,8 +155,9 @@ bool foc_set_voltage_limit(float v) {
 }
 
 void foc_home() {
-  sensor.update();                        // 保证读到最新
-  s_home_offset_rad = sensor.getAngle();  // 直接从传感器取，不依赖 motor.shaft_angle
+  sensor.update();
+  s_home_offset_rad = sensor.getAngle();  // 当前 sensor 位置即新的 0°
+  g_target_deg.store(0.0f);               // 同时把目标归零，motor 保持原地不动
 }
 
 bool foc_set_pole_pairs_and_store(int n) {
