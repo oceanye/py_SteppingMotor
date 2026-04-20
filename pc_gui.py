@@ -268,9 +268,20 @@ class StepperGUI:
         self.foc_pangle_label = ttk.Label(pg_frame, text="40.0 (刚度)", width=14)
         self.foc_pangle_label.pack(side="left", padx=6)
 
-        ttk.Label(en_frame, text="极对数:").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Label(en_frame, text="速度环 P:").grid(row=3, column=0, sticky="w", **pad)
+        vp_frame = ttk.Frame(en_frame)
+        vp_frame.grid(row=3, column=1, sticky="w", pady=5)
+        self.foc_vp_var = tk.DoubleVar(value=0.4)
+        self.foc_vp_slider = ttk.Scale(vp_frame, from_=0.05, to=1.0, orient="horizontal",
+                                       variable=self.foc_vp_var, length=180,
+                                       command=self._foc_on_vp_change, state="disabled")
+        self.foc_vp_slider.pack(side="left")
+        self.foc_vp_label = ttk.Label(vp_frame, text="0.40 (阻尼)", width=14)
+        self.foc_vp_label.pack(side="left", padx=6)
+
+        ttk.Label(en_frame, text="极对数:").grid(row=4, column=0, sticky="w", **pad)
         pp_frame = ttk.Frame(en_frame)
-        pp_frame.grid(row=3, column=1, sticky="w", pady=5)
+        pp_frame.grid(row=4, column=1, sticky="w", pady=5)
         self.foc_pp_var = tk.IntVar(value=7)
         ttk.Spinbox(pp_frame, from_=1, to=50, textvariable=self.foc_pp_var, width=6).pack(side="left")
         self.foc_pp_save_btn = ttk.Button(pp_frame, text="保存到 NVS（重启生效）",
@@ -279,12 +290,13 @@ class StepperGUI:
 
         self.foc_clear_btn = ttk.Button(en_frame, text="🧹 清除故障",
                                         command=self._foc_clear_fault, state="disabled")
-        self.foc_clear_btn.grid(row=4, column=0, columnspan=2, **pad, ipadx=10)
+        self.foc_clear_btn.grid(row=5, column=0, columnspan=2, **pad, ipadx=10)
 
         # 聚合按钮组（E5 状态门控使用）
         self._foc_motion_btns = [self.foc_goto_btn] + self._foc_quick_btns + self._foc_inc_btns
         self._foc_cfg_btns    = [self.foc_home_btn, self.foc_vlimit_slider,
-                                 self.foc_pangle_slider, self.foc_pp_save_btn]
+                                 self.foc_pangle_slider, self.foc_vp_slider,
+                                 self.foc_pp_save_btn]
 
     # ═════════════ 公共辅助 ═════════════
     def _update_speed_label(self, *_):
@@ -496,6 +508,11 @@ class StepperGUI:
         p = self.foc_pangle_var.get()
         self.foc_pangle_label.config(text=f"{p:.1f} (刚度)")
         self._send_foc(f"FOC,PA,{p:.1f}")
+
+    def _foc_on_vp_change(self, _value):
+        p = self.foc_vp_var.get()
+        self.foc_vp_label.config(text=f"{p:.2f} (阻尼)")
+        self._send_foc(f"FOC,VP,{p:.2f}")
 
     def _foc_save_pp(self):
         n = int(self.foc_pp_var.get())
