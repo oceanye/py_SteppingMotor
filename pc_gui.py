@@ -297,10 +297,10 @@ class StepperGUI:
                                            command=self._foc_autotune, state="disabled")
         self.foc_autotune_btn.grid(row=6, column=0, columnspan=2, **pad, ipadx=10)
 
-        # 示波器区
-        scope_frame = ttk.LabelFrame(parent, text="响应曲线 (最近 10s · 蓝=目标 红=实测)")
-        scope_frame.grid(row=4, column=0, sticky="ew", **pad)
-        self.foc_scope = tk.Canvas(scope_frame, width=560, height=180,
+        # 示波器区（放右边，rowspan 占满左列所有行）
+        scope_frame = ttk.LabelFrame(parent, text="响应曲线 (10s · 蓝=目标 红=实测)")
+        scope_frame.grid(row=0, column=1, rowspan=4, sticky="nsew", **pad)
+        self.foc_scope = tk.Canvas(scope_frame, width=480, height=480,
                                    bg="white", highlightthickness=1, highlightbackground="#999")
         self.foc_scope.pack(padx=5, pady=5)
 
@@ -541,103 +541,138 @@ class StepperGUI:
             return
         if not messagebox.askokcancel(
             "自动调参确认",
-            "将依次测试不同 P_angle（阶跃 0°→90°→0°），\n"
-            "电机会来回转动约 60 秒。\n\n"
+            "两阶段扫描 PA（刚度）和 VP（阻尼），约 2 分钟。\n"
+            "电机会来回转动，请先固定好。\n\n"
             "开始吗？"):
             return
         self.foc_autotune_btn.config(state="disabled")
         threading.Thread(target=self._foc_autotune_worker, daemon=True).start()
 
+    def _step_response_test(self, target, pre_settle=2.0, duration=2.5):
+        """单次阶跃响应测试。返回 (overshoot, ss_error, rise_time, jitter)。"""
+        self._send_and_read("FOC,A,0")
+        time.sleep(pre_settle)
+        t0 = time.time()
+        self._send_and_read(f"FOC,A,{target}")
+        time.sleep(duration)
+        # 截取阶跃后的数据
+        data = [(t - t0, cur) for t, tgt, cur in self.foc_trace_buf
+                if t >= t0 and abs(tgt - target) < 0.5]
+        if len(data) < 5:
+            return None
+        curs = [c for _, c in data]
+        max_cur = max(curs)
+        final_cur = curs[-1]
+        overshoot = max(0.0, max_cur - target) if target > 0 else max(0.0, target - min(curs))
+        ss_error = abs(final_cur - target)
+        # 上升时间：首次到 90% 目标
+        rise_time = None
+        threshold = target * 0.9
+        for t, c in data:
+            if c >= threshold:
+                rise_time = t
+                break
+        # 稳态抖动：最后 0.8s 的标准差
+        tail = [c for t, c in data if t >= duration - 0.8]
+        if len(tail) >= 3:
+            m = sum(tail) / len(tail)
+            jitter = (sum((x-m)**2 for x in tail) / len(tail)) ** 0.5
+        else:
+            jitter = 0.0
+        return (overshoot, ss_error, rise_time or 99.0, jitter)
+
     def _foc_autotune_worker(self):
         try:
             self.log("=" * 40)
-            self.log("🤖 自动调参开始")
+            self.log("🤖 自动调参开始（两阶段：PA → VP）")
             self.log("=" * 40)
 
             # 确保使能 + 归零
             self._send_and_read("FOC,EN,1")
-            time.sleep(5.5)  # 给首次对齐时间
+            time.sleep(5.5)
             self._send_and_read("FOC,H")
             time.sleep(0.5)
-            # VP 固定低值，只扫 PA
+
+            # ─── 阶段 1：固定 VP=0.15，扫 PA ───
             self._send_and_read("FOC,VP,0.15")
-            self.log("固定 VP=0.15，扫描 PA...")
-
-            results = []  # (pa, overshoot, ss_error, rise_time)
-
+            self.log("【阶段 1】固定 VP=0.15，扫描 PA ...")
+            pa_results = []
             for pa in [5, 10, 15, 20, 25, 30, 35, 40]:
-                self.log(f"  测试 PA={pa} ...")
                 self._send_and_read(f"FOC,PA,{pa}")
                 time.sleep(0.3)
-
-                # 先回 0 稳定
-                self._send_and_read("FOC,A,0")
-                time.sleep(2.0)
-
-                # 记录阶跃响应
-                t0 = time.time()
-                self._send_and_read("FOC,A,90")
-                time.sleep(2.5)  # 2.5s 足够 2208 完成阶跃
-
-                # 从 trace_buf 取这段数据分析
-                data = [(t - t0, cur) for t, tgt, cur in self.foc_trace_buf
-                        if t >= t0 and abs(tgt - 90) < 0.5]
-                if len(data) < 5:
-                    self.log(f"    数据不足，跳过")
+                m = self._step_response_test(90.0)
+                if m is None:
+                    self.log(f"  PA={pa}: 数据不足，跳过")
                     continue
-                curs = [c for _, c in data]
-                max_cur = max(curs)
-                final_cur = curs[-1]
-                overshoot = max(0.0, max_cur - 90.0)
-                ss_error = abs(final_cur - 90.0)
-
-                # 粗略上升时间：首次到 81° (90% of 90)
-                rise_time = None
-                for t, c in data:
-                    if c >= 81:
-                        rise_time = t
-                        break
-
-                rt_str = f"{rise_time:.2f}s" if rise_time else ">2.5s"
-                self.log(f"    overshoot={overshoot:.1f}° ss_err={ss_error:.1f}° rise={rt_str}")
-                results.append((pa, overshoot, ss_error, rise_time or 99.0))
-
-                # 过冲太大提前停止
-                if overshoot > 30:
-                    self.log(f"    过冲 >30°，停止继续增大 PA")
+                ov, sse, rt, jt = m
+                rt_str = f"{rt:.2f}s" if rt < 99 else ">2.5s"
+                self.log(f"  PA={pa}: 过冲={ov:.1f}° 稳态误差={sse:.1f}° 上升={rt_str} 抖动={jt:.2f}°")
+                pa_results.append((pa, ov, sse, rt, jt))
+                if ov > 30:
+                    self.log(f"  过冲超 30°，停止 PA 扫描")
                     break
 
-            # 评分：small overshoot + fast rise + small ss_err
-            # 权重：过冲最重要（防振荡），上升时间次之
-            def score(r):
-                pa, ov, sse, rt = r
-                penalty_overshoot = ov * 2
-                penalty_rise = rt * 3
-                penalty_sserr = sse * 2
-                return penalty_overshoot + penalty_rise + penalty_sserr
-
-            if not results:
-                self.log("❌ 没有有效数据")
+            if not pa_results:
+                self.log("❌ PA 扫描无数据，终止")
                 return
-            # 过滤过冲 >15 的
-            good = [r for r in results if r[1] <= 15]
-            pool = good if good else results
-            best = min(pool, key=score)
-            best_pa, best_ov, best_sse, best_rt = best
 
-            self.log("=" * 40)
-            self.log(f"✅ 推荐 PA={best_pa}")
-            self.log(f"   overshoot={best_ov:.1f}°  ss_err={best_sse:.1f}°  rise={best_rt:.2f}s")
-            self.log("   已自动应用此值")
-            self.log("=" * 40)
+            def pa_score(r):
+                _, ov, sse, rt, jt = r
+                return ov*2 + rt*3 + sse*2 + jt*5
+            good = [r for r in pa_results if r[1] <= 15]
+            pool = good if good else pa_results
+            best_pa_row = min(pool, key=pa_score)
+            best_pa = best_pa_row[0]
+            self.log(f"阶段 1 完成：选定 PA={best_pa}")
 
-            # 应用并回零
+            # ─── 阶段 2：固定 best_pa，扫 VP ───
+            self._send_and_read(f"FOC,PA,{best_pa}")
+            time.sleep(0.3)
+            self.log(f"【阶段 2】固定 PA={best_pa}，扫描 VP（阻尼）...")
+            vp_results = []
+            for vp in [0.10, 0.15, 0.20, 0.30, 0.40, 0.55, 0.70]:
+                self._send_and_read(f"FOC,VP,{vp}")
+                time.sleep(0.3)
+                m = self._step_response_test(90.0)
+                if m is None:
+                    continue
+                ov, sse, rt, jt = m
+                self.log(f"  VP={vp:.2f}: 过冲={ov:.1f}° 上升={rt:.2f}s 抖动={jt:.2f}°")
+                vp_results.append((vp, ov, sse, rt, jt))
+                # 稳态抖动 >3° 认为振荡，停止
+                if jt > 3.0:
+                    self.log(f"  抖动 >3°（振荡），停止 VP 扫描")
+                    break
+
+            if not vp_results:
+                self.log("VP 扫描无数据，保留默认")
+                best_vp = 0.15
+            else:
+                def vp_score(r):
+                    _, ov, sse, rt, jt = r
+                    return ov*2 + rt*2 + jt*10  # 抖动权重最高
+                # 过滤抖动 >2° 的
+                good = [r for r in vp_results if r[4] <= 2.0]
+                pool = good if good else vp_results
+                best_vp_row = min(pool, key=vp_score)
+                best_vp = best_vp_row[0]
+
+            # ─── 应用 + 回零 + 同步 GUI ───
             self._send_and_read(f"FOC,PA,{best_pa}")
             time.sleep(0.2)
+            self._send_and_read(f"FOC,VP,{best_vp}")
+            time.sleep(0.2)
             self._send_and_read("FOC,A,0")
-            # 同步 GUI 滑条显示
+
+            self.log("=" * 40)
+            self.log(f"✅ 最终推荐：PA={best_pa}  VP={best_vp:.2f}")
+            self.log("   已自动应用并同步 GUI 滑条")
+            self.log("=" * 40)
+
             self.root.after(0, lambda: self.foc_pangle_var.set(float(best_pa)))
             self.root.after(0, lambda: self.foc_pangle_label.config(text=f"{best_pa:.1f} (刚度)"))
+            self.root.after(0, lambda: self.foc_vp_var.set(float(best_vp)))
+            self.root.after(0, lambda: self.foc_vp_label.config(text=f"{best_vp:.2f} (阻尼)"))
         finally:
             self.root.after(0, lambda: self.foc_autotune_btn.config(state="normal"))
 
@@ -679,7 +714,7 @@ class StepperGUI:
             self._redraw_foc_scope()
 
     def _redraw_foc_scope(self):
-        W, H = 560, 180
+        W, H = 480, 480
         cv = self.foc_scope
         cv.delete("all")
         buf = self.foc_trace_buf
