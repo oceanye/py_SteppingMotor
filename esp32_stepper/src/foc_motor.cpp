@@ -51,6 +51,15 @@ void foc_init() {
   motor.voltage_limit  = FOC_INITIAL_V_LIMIT;
   motor.velocity_limit = FOC_VELOCITY_LIMIT;
   motor.controller     = MotionControlType::angle;
+
+  // 位置环 PID 调参（2208 gimbal 专用，保守稳定版）
+  motor.P_angle.P        = 5.0f;   // 位置环 P，2208 小扭矩下 20 会振荡，5 稳
+  motor.PID_velocity.P   = 0.2f;   // 速度环 P，默认 0.5 偏高
+  motor.PID_velocity.I   = 2.0f;   // 速度环 I，默认 10 偏高（容易积分振荡）
+  motor.PID_velocity.D   = 0.0f;
+  motor.PID_velocity.output_ramp = 1000.0f;
+  motor.LPF_velocity.Tf  = 0.02f;  // 速度低通滤波，默认 0.01 加倍
+
   motor.init();
   // 不调 motor.initFOC()，等 foc_request_enable(true) 触发
 
