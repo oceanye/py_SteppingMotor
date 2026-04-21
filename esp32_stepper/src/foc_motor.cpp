@@ -48,9 +48,10 @@ void foc_init() {
   motor.linkSensor(&sensor);
   motor.linkDriver(&driver);
   motor.useMonitoring(Serial);  // 让 SimpleFOC 的 MOT: 诊断信息打印到串口
-  motor.voltage_limit  = FOC_INITIAL_V_LIMIT;
-  motor.velocity_limit = FOC_VELOCITY_LIMIT;
-  motor.controller     = MotionControlType::angle;
+  motor.voltage_limit         = FOC_INITIAL_V_LIMIT;
+  motor.voltage_sensor_align  = 6.0f;   // 24V PSU 下对齐需要更大扭矩，默认 3V 推不动
+  motor.velocity_limit        = FOC_VELOCITY_LIMIT;
+  motor.controller            = MotionControlType::angle;
 
   // 位置环 PID 调参（2208 gimbal 专用，硬件实测 45 有振荡、40 稳定）
   motor.P_angle.P        = 40.0f;  // 位置环 P，实测 40 是稳定上限
@@ -88,14 +89,23 @@ static void foc_task(void* /*param*/) {
     }
     if (state == FOC_STATE_ALIGNING) {
       if (!s_aligned_once) {
-        motor.initFOC();  // 首次才跑对齐（阻塞 1-3 秒，电机缓转）
+        int ok = motor.initFOC();  // 返回 1 成功 / 0 失败
+        if (!ok) {
+          Serial.println("FOC,FAULT");
+          g_fault_latched.store(true);
+          g_state.store(FOC_STATE_FAULT);
+          g_enable_req.store(false);
+          state = FOC_STATE_FAULT;
+          vTaskDelay(1 / portTICK_PERIOD_MS);
+          continue;  // 下一轮循环处理 FAULT
+        }
         s_aligned_once = true;
       }
       // 使能前把 target 设为当前角度（用户坐标），避免大角度瞬间跳跃
       sensor.update();
       float cur_user_rad = sensor.getAngle() - s_home_offset_rad;
       g_target_deg.store(cur_user_rad * 180.0f / PI);
-      motor.target = sensor.getAngle();  // sensor 原生坐标，直接保持当前位置
+      motor.target = sensor.getAngle();
 
       motor.enable();
       g_state.store(FOC_STATE_RUNNING);
