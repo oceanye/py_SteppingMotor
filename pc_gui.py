@@ -28,6 +28,8 @@ class StepperGUI:
         self.serial_lock = threading.Lock()
         self.running = False
         self.position_mm = 0.0
+        self.travel_min_mm = None   # 软件限位最小（None=未校准）
+        self.travel_max_mm = None   # 软件限位最大
         self.stepper_in_progress = False
         self._foc_enabled_ui = False
         self.foc_poll_running = False
@@ -182,6 +184,23 @@ class StepperGUI:
                                     command=self.calibrate_position, state="disabled")
         self.calib_btn.grid(row=1, column=3, **pad)
 
+        # 行程范围校准（软件限位）
+        ttk.Label(pos_frame, text="行程范围:").grid(row=2, column=0, sticky="w", **pad)
+        range_frame = ttk.Frame(pos_frame)
+        range_frame.grid(row=2, column=1, columnspan=3, sticky="w", **pad)
+        self.range_label = ttk.Label(range_frame, text="未校准（无软件限位）",
+                                     foreground="gray", font=("Consolas", 10))
+        self.range_label.pack(side="left")
+        self.set_min_btn = ttk.Button(range_frame, text="⊖ 标记当前为最小",
+                                      command=self._mark_min, state="disabled")
+        self.set_min_btn.pack(side="left", padx=10)
+        self.set_max_btn = ttk.Button(range_frame, text="⊕ 标记当前为最大",
+                                      command=self._mark_max, state="disabled")
+        self.set_max_btn.pack(side="left", padx=2)
+        self.clear_range_btn = ttk.Button(range_frame, text="清除", width=6,
+                                          command=self._clear_range, state="disabled")
+        self.clear_range_btn.pack(side="left", padx=10)
+
     # ═════════════ FOC Tab ═════════════
     def _build_foc_tab(self, parent):
         pad = dict(padx=10, pady=5)
@@ -324,12 +343,61 @@ class StepperGUI:
     def _update_pos_label(self):
         self.pos_label.config(text=f"{self.position_mm:.1f} mm")
 
+    # ── 行程范围校准 ───────────────────────────
+    def _mark_min(self):
+        # 检查最小不能大于已设的最大
+        if self.travel_max_mm is not None and self.position_mm >= self.travel_max_mm:
+            messagebox.showerror("范围无效",
+                                 f"当前位置 {self.position_mm:.1f}mm 不能 ≥ 已设最大 {self.travel_max_mm:.1f}mm")
+            return
+        self.travel_min_mm = self.position_mm
+        self._update_range_display()
+        self.log(f"⊖ 标记最小行程: {self.travel_min_mm:.1f} mm")
+
+    def _mark_max(self):
+        if self.travel_min_mm is not None and self.position_mm <= self.travel_min_mm:
+            messagebox.showerror("范围无效",
+                                 f"当前位置 {self.position_mm:.1f}mm 不能 ≤ 已设最小 {self.travel_min_mm:.1f}mm")
+            return
+        self.travel_max_mm = self.position_mm
+        self._update_range_display()
+        self.log(f"⊕ 标记最大行程: {self.travel_max_mm:.1f} mm")
+
+    def _clear_range(self):
+        self.travel_min_mm = None
+        self.travel_max_mm = None
+        self._update_range_display()
+        self.log("行程限位已清除")
+
+    def _update_range_display(self):
+        if self.travel_min_mm is None and self.travel_max_mm is None:
+            self.range_label.config(text="未校准（无软件限位）", foreground="gray")
+        else:
+            mn = f"{self.travel_min_mm:.1f}" if self.travel_min_mm is not None else "?"
+            mx = f"{self.travel_max_mm:.1f}" if self.travel_max_mm is not None else "?"
+            travel = ""
+            if self.travel_min_mm is not None and self.travel_max_mm is not None:
+                travel = f"  (行程 {self.travel_max_mm - self.travel_min_mm:.1f} mm)"
+            self.range_label.config(text=f"min={mn} mm  max={mx} mm{travel}",
+                                    foreground="black")
+
+    def _check_range(self, target_mm):
+        """目标位置是否在校准范围内。范围未设则不限制。"""
+        if self.travel_min_mm is not None and target_mm < self.travel_min_mm - 0.05:
+            self.log(f"⛔ 拒绝：目标 {target_mm:.1f}mm 超下限 {self.travel_min_mm:.1f}mm")
+            return False
+        if self.travel_max_mm is not None and target_mm > self.travel_max_mm + 0.05:
+            self.log(f"⛔ 拒绝：目标 {target_mm:.1f}mm 超上限 {self.travel_max_mm:.1f}mm")
+            return False
+        return True
+
     def _set_stepper_buttons_state(self, state):
         # stop_btn 也一并启用（连接后始终可点，按下会停止任何运动）
         for b in (self.move_btn, self.jog_out_btn, self.jog_in_btn,
                   self.cont_out_btn, self.cont_in_btn,
                   self.set_home_btn, self.go_home_btn, self.goto_btn, self.calib_btn,
-                  self.stop_btn):
+                  self.stop_btn,
+                  self.set_min_btn, self.set_max_btn, self.clear_range_btn):
             b.config(state=state)
 
     # ═════════════ 串口连接 ═════════════
@@ -470,6 +538,11 @@ class StepperGUI:
         if steps <= 0:
             self.log(f"忽略：距离过小 ({distance_mm} mm)")
             return False
+        # 软件限位检查（提前预判终点位置）
+        sign = +1.0 if direction == DIR_OUTWARD else -1.0
+        target = self.position_mm + sign * (steps / PULSES_PER_MM)
+        if not self._check_range(target):
+            return False
         return self._send_pulses(steps, direction, delay_ms)
 
     # ═════════════ 步进：运动指令 ═════════════
@@ -546,6 +619,8 @@ class StepperGUI:
         self._goto(target)
 
     def _goto(self, target_mm):
+        if not self._check_range(target_mm):
+            return
         delta = target_mm - self.position_mm
         if abs(delta) < 1.0 / PULSES_PER_MM:
             self.log(f"已在目标位置附近 ({self.position_mm:.1f} mm)")
