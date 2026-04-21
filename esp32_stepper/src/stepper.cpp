@@ -3,162 +3,122 @@
 #include "stepper.h"
 #include <atomic>
 
-// ── 异步步进任务（Core 1）──
-static TaskHandle_t      s_task        = nullptr;
-static SemaphoreHandle_t s_start_sem   = nullptr;
-static std::atomic<bool> s_busy        {false};
-// s_delay_us: 每脉冲 LOW 段持续时间，单位**微秒**（之前是毫秒）
-static int               s_steps, s_dir, s_delay_us;
+// 每轴引脚（编译期常量数组）
+static const int PIN_PUL[NUM_AXES] = { PIN_STEP_PUL_0, PIN_STEP_PUL_1 };
+static const int PIN_DIR[NUM_AXES] = { PIN_STEP_DIR_0, PIN_STEP_DIR_1 };
 
-static void stepper_task(void* /*arg*/) {
+// 每轴异步任务状态
+static TaskHandle_t      s_task[NUM_AXES]      = {nullptr, nullptr};
+static SemaphoreHandle_t s_start_sem[NUM_AXES] = {nullptr, nullptr};
+static std::atomic<bool> s_busy[NUM_AXES];
+static int               s_steps[NUM_AXES], s_dir[NUM_AXES], s_delay_us[NUM_AXES];
+
+static bool valid_axis(int axis) { return axis >= 0 && axis < NUM_AXES; }
+
+static void stepper_task(void* arg) {
+  int axis = (int)(intptr_t)arg;
   for (;;) {
-    xSemaphoreTake(s_start_sem, portMAX_DELAY);
-    int steps = s_steps;
-    int dir   = s_dir;
-    int dus   = s_delay_us;
+    xSemaphoreTake(s_start_sem[axis], portMAX_DELAY);
+    int steps = s_steps[axis];
+    int dir   = s_dir[axis];
+    int dus   = s_delay_us[axis];
+    int pul   = PIN_PUL[axis];
+    int dpin  = PIN_DIR[axis];
 
-    digitalWrite(PIN_STEP_DIR, dir);
+    digitalWrite(dpin, dir);
     delayMicroseconds(100);
     for (int i = 0; i < steps; i++) {
-      digitalWrite(PIN_STEP_PUL, HIGH);
+      digitalWrite(pul, HIGH);
       delayMicroseconds(50);
-      digitalWrite(PIN_STEP_PUL, LOW);
-      // ≥1ms 用 vTaskDelay 让步；<1ms busy-wait，但每 50 步强制让一次喂狗
+      digitalWrite(pul, LOW);
       if (dus >= 1000) {
         vTaskDelay(dus / 1000 / portTICK_PERIOD_MS);
       } else if (dus > 0) {
         delayMicroseconds(dus);
-        if ((i % 50) == 49) vTaskDelay(1);  // ~1ms 让步给 USB CDC / watchdog
+        if ((i % 50) == 49) vTaskDelay(1);
       }
     }
-    s_busy.store(false);
-    Serial.println("STEP,DONE");
+    s_busy[axis].store(false);
+    Serial.print("STEP,");
+    Serial.print(axis);
+    Serial.println(",DONE");
   }
 }
 
 void stepper_init() {
-  pinMode(PIN_STEP_PUL, OUTPUT);
-  pinMode(PIN_STEP_DIR, OUTPUT);
-  digitalWrite(PIN_STEP_PUL, LOW);
-  digitalWrite(PIN_STEP_DIR, LOW);
-
-  s_start_sem = xSemaphoreCreateBinary();
-  // Core 1，优先级 1 低于主 loop 但高于 idle
-  xTaskCreatePinnedToCore(stepper_task, "stepper", 4096, nullptr, 1, &s_task, 1);
+  for (int axis = 0; axis < NUM_AXES; axis++) {
+    pinMode(PIN_PUL[axis], OUTPUT);
+    pinMode(PIN_DIR[axis], OUTPUT);
+    digitalWrite(PIN_PUL[axis], LOW);
+    digitalWrite(PIN_DIR[axis], LOW);
+    s_start_sem[axis] = xSemaphoreCreateBinary();
+    s_busy[axis].store(false);
+    char name[16]; snprintf(name, sizeof(name), "stepper%d", axis);
+    xTaskCreatePinnedToCore(stepper_task, name, 4096,
+                            (void*)(intptr_t)axis, 1, &s_task[axis], 1);
+  }
 }
 
-// 同步版本（保留供 DIAG 等直接调用；参数改为微秒）
-void stepper_move(int steps, int direction, int delay_us) {
-  digitalWrite(PIN_STEP_DIR, direction);
+void stepper_move(int axis, int steps, int direction, int delay_us) {
+  if (!valid_axis(axis)) { Serial.print("ERR:bad axis "); Serial.println(axis); return; }
+  int pul = PIN_PUL[axis], dpin = PIN_DIR[axis];
+  digitalWrite(dpin, direction);
   delayMicroseconds(100);
   for (int i = 0; i < steps; i++) {
-    digitalWrite(PIN_STEP_PUL, HIGH);
+    digitalWrite(pul, HIGH);
     delayMicroseconds(50);
-    digitalWrite(PIN_STEP_PUL, LOW);
+    digitalWrite(pul, LOW);
     if (delay_us >= 2000) delay(delay_us / 1000);
     else if (delay_us > 0) delayMicroseconds(delay_us);
   }
-  Serial.println("OK");
+  Serial.print("OK,"); Serial.println(axis);
 }
 
-bool stepper_is_busy() {
-  return s_busy.load();
+bool stepper_is_busy(int axis) {
+  if (!valid_axis(axis)) return false;
+  return s_busy[axis].load();
 }
 
-bool stepper_move_async(int steps, int direction, int delay_us) {
-  // 调用方都在 Core 1 的 loop()（串口单线程），无竞态。
-  if (s_busy.load()) return false;
-  s_steps    = steps;
-  s_dir      = direction;
-  s_delay_us = delay_us;
-  s_busy.store(true);
-  xSemaphoreGive(s_start_sem);
+bool stepper_move_async(int axis, int steps, int direction, int delay_us) {
+  if (!valid_axis(axis)) return false;
+  if (s_busy[axis].load()) return false;
+  s_steps[axis]    = steps;
+  s_dir[axis]      = direction;
+  s_delay_us[axis] = delay_us;
+  s_busy[axis].store(true);
+  xSemaphoreGive(s_start_sem[axis]);
   return true;
 }
 
-void stepper_run_diagnostics() {
-  // ---- DIAG 1: 静态电平测试 ----
+void stepper_run_diagnostics(int axis) {
+  if (!valid_axis(axis)) { Serial.println("ERR:bad axis"); return; }
+  int pul = PIN_PUL[axis], dpin = PIN_DIR[axis];
   Serial.println();
-  Serial.println("===== DIAG 1: 静态电平测试 =====");
-  Serial.println(">>> PUL+ 即将置 HIGH 持续 10 秒");
-  Serial.println(">>> 请用万用表直流电压档 (20V) 黑笔夹 ESP32 GND，红笔依次测:");
-  Serial.println("    a) ESP32 GPIO5 焊盘        期望 ~3.3V");
-  Serial.println("    b) DM422 PUL+ 端子         期望 ~3.3V");
-  Serial.println("    c) DM422 PUL+ 对 PUL-      期望 ~3.3V");
-  delay(2000);
-  digitalWrite(PIN_STEP_PUL, HIGH);
-  Serial.println(">>> [PUL=HIGH] 开始测量 ...");
-  delay(10000);
-
-  Serial.println(">>> PUL+ 置 LOW 持续 3 秒 (应读到 ~0V)");
-  digitalWrite(PIN_STEP_PUL, LOW);
-  delay(3000);
-
-  // ---- DIAG 2: DIR 引脚电平测试 ----
-  Serial.println();
-  Serial.println("===== DIAG 2: DIR 静态电平测试 =====");
-  Serial.println(">>> DIR+ 即将置 HIGH 持续 5 秒，请测 DM422 DIR+ 对 GND 期望 ~3.3V");
+  Serial.print("===== DIAG axis="); Serial.print(axis); Serial.println(" =====");
+  Serial.print(">>> PUL(GPIO"); Serial.print(pul); Serial.println(") 将置 HIGH 5 秒");
   delay(1000);
-  digitalWrite(PIN_STEP_DIR, HIGH);
+  digitalWrite(pul, HIGH);
   delay(5000);
-  digitalWrite(PIN_STEP_DIR, LOW);
-
-  // ---- DIAG 3: 超慢速大宽度脉冲（正反对称，净位移=0） ----
-  Serial.println();
-  Serial.println("===== DIAG 3: 慢速大脉冲测试 (正转5 + 反转5) =====");
-  Serial.println(">>> 每脉冲 HIGH 20ms + LOW 80ms，应能听到咔声");
-  delay(2000);
-
-  Serial.println("  [正转 5 步]");
-  digitalWrite(PIN_STEP_DIR, HIGH);
-  delay(1);
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(PIN_STEP_PUL, HIGH);
-    delay(20);
-    digitalWrite(PIN_STEP_PUL, LOW);
-    delay(80);
-  }
-
+  digitalWrite(pul, LOW);
   delay(500);
-  Serial.println("  [反转 5 步]");
-  digitalWrite(PIN_STEP_DIR, LOW);
-  delay(1);
+  Serial.print(">>> DIR(GPIO"); Serial.print(dpin); Serial.println(") 将置 HIGH 3 秒");
+  delay(500);
+  digitalWrite(dpin, HIGH);
+  delay(3000);
+  digitalWrite(dpin, LOW);
+  Serial.println(">>> 5 + 5 脉冲测试");
+  digitalWrite(dpin, HIGH);
+  delayMicroseconds(100);
   for (int i = 0; i < 5; i++) {
-    digitalWrite(PIN_STEP_PUL, HIGH);
-    delay(20);
-    digitalWrite(PIN_STEP_PUL, LOW);
-    delay(80);
+    digitalWrite(pul, HIGH); delay(20);
+    digitalWrite(pul, LOW);  delay(80);
   }
-
-  // ---- DIAG 4: 中速脉冲（正反对称，幅度 1/10，净位移=0） ----
-  Serial.println();
-  Serial.println("===== DIAG 4: 中速脉冲测试 (正转500 + 反转500) =====");
-  Serial.println(">>> 每步 2ms，单向总时长约 1 秒，观察转动是否明显");
-  delay(1000);
-
-  Serial.println("  [正转 500 步]");
-  digitalWrite(PIN_STEP_DIR, HIGH);
-  delay(1);
-  for (int i = 0; i < 500; i++) {
-    digitalWrite(PIN_STEP_PUL, HIGH);
-    delayMicroseconds(50);
-    digitalWrite(PIN_STEP_PUL, LOW);
-    delay(2);
+  delay(500);
+  digitalWrite(dpin, LOW);
+  delayMicroseconds(100);
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(pul, HIGH); delay(20);
+    digitalWrite(pul, LOW);  delay(80);
   }
-
-  delay(800);
-  Serial.println("  [反转 500 步，回到起点]");
-  digitalWrite(PIN_STEP_DIR, LOW);
-  delay(1);
-  for (int i = 0; i < 500; i++) {
-    digitalWrite(PIN_STEP_PUL, HIGH);
-    delayMicroseconds(50);
-    digitalWrite(PIN_STEP_PUL, LOW);
-    delay(2);
-  }
-
-  Serial.println();
-  Serial.println("===== 诊断结束，进入正常 MOVE 指令循环 =====");
-  Serial.println("可发送: MOVE,steps,dir,delay_ms  例如 MOVE,400,1,20");
-  Serial.println();
+  Serial.println("===== DIAG 结束 =====");
 }

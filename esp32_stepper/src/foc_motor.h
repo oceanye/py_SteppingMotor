@@ -2,7 +2,6 @@
 #pragma once
 #include <stdint.h>
 
-// FSM state enumeration. Matches protocol FOC,S 第二字段数值。
 enum FocState : uint8_t {
     FOC_STATE_DISABLED = 0,
     FOC_STATE_ALIGNING = 1,
@@ -10,32 +9,22 @@ enum FocState : uint8_t {
     FOC_STATE_FAULT    = 3,
 };
 
-// 初始化 sensor/driver/motor；注册 Core 0 FOC 任务。
-// 必须在 Serial.begin 之后调用。
+// 初始化所有轴：sensors / drivers / motors + 每轴 Core 0 任务。
 void foc_init();
 
-// ── Core 1 API（线程安全，从串口/主循环调用）──
-// 设目标角度，单位：度。超范围返回 false。
-bool foc_set_target_deg(float deg);
-// 请求切换使能；若从 FAULT 请求 enable=true，返回 false（拒绝）。
-bool foc_request_enable(bool en);
-// 清除故障 latch。仅 FAULT 态返回 true。
-bool foc_clear_fault();
-// 由 Core 1 nFAULT 轮询调用，把状态机打到 FAULT
-void foc_latch_fault();
-// 在线设 voltage_limit。范围外返回 false。
-bool foc_set_voltage_limit(float v);
-// 把当前角度设为 0°。
-void foc_home();
-// 设极对数（1-50）并存 NVS，下次启动生效。
-bool foc_set_pole_pairs_and_store(int n);
-// 在线调位置环比例增益（刚度）。范围 0.1-50。
-bool foc_set_p_angle(float p);
-// 在线调速度环比例增益（阻尼感）。范围 0.01-2.0。
-bool foc_set_p_velocity(float p);
+// 多轴 API：第一参数都是 axis（0=L, 1=R）。非法 axis 返回 false。
+bool foc_set_target_deg(int axis, float deg);
+bool foc_request_enable(int axis, bool en);
+bool foc_clear_fault(int axis);
+void foc_latch_fault(int axis);
+bool foc_set_voltage_limit(int axis, float v);
+void foc_home(int axis);
+bool foc_set_pole_pairs_and_store(int axis, int n);
+bool foc_set_p_angle(int axis, float p);
+bool foc_set_p_velocity(int axis, float p);
 
-// ── 状态查询（从 Core 0 镜像读取）──
-FocState foc_get_state();
-float    foc_get_current_deg();
-float    foc_get_target_deg();
-bool     foc_is_fault_latched();
+// 状态查询（按轴）
+FocState foc_get_state(int axis);
+float    foc_get_current_deg(int axis);
+float    foc_get_target_deg(int axis);
+bool     foc_is_fault_latched(int axis);
