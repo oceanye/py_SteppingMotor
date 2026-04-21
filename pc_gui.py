@@ -8,84 +8,106 @@ import queue
 import json
 import os
 
-# 校准文件：保存在脚本同目录
-CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stepper_calib.json")
+# ============== 轴配置 ==============
+NUM_AXES = 2
+AXIS_LABEL = ["L", "R"]   # 左腿 / 右腿
 
-# ============== 步进标定常数 ==============
-PULSES_PER_MM = 50       # 根据实测修正：GUI 设 50mm 实际走 5mm → 需 10× 脉冲数
+# ============== 步进标定 ==============
+PULSES_PER_MM = 50
+DIR_OUTWARD = 0
+DIR_INWARD  = 1
+CONTINUOUS_BURST_MM = 0.2
 
-DIR_OUTWARD = 0          # direction=0 对应物理"向外"
-DIR_INWARD  = 1          # direction=1 对应物理"向内/回退"
-
-CONTINUOUS_BURST_MM = 0.2  # 按住连续运动的每次脉冲包
-
-# ============== FOC 常数 ==============
+# ============== FOC ==============
 FOC_STATE_NAMES = {"0": "失能", "1": "对齐中", "2": "运行", "3": "故障"}
 FOC_POLL_INTERVAL_S = 0.1
+
+CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stepper_calib.json")
+
+
+def _empty_axis_dict():
+    return {i: None for i in range(NUM_AXES)}
 
 
 class StepperGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("步进 + FOC 电机控制器")
+        self.root.title("双轴步进 + FOC 控制器")
         self.root.resizable(False, False)
+
+        # ── 共享：串口 ──
         self.ser = None
         self.serial_lock = threading.Lock()
-        self.running = False
-        self.position_mm = 0.0
-        self.travel_min_mm = None   # 软件限位最小（None=未校准）
-        self.travel_max_mm = None   # 软件限位最大
-        self.stepper_in_progress = False
-        self._foc_enabled_ui = False
-        self.foc_poll_running = False
-        self.foc_trace_buf = []  # [(t, target_deg, cur_deg)]，示波器数据
-        # 异步通讯：reader 线程读所有行，同步响应塞队列，异步事件走回调
         self._resp_queue = queue.Queue()
         self._reader_running = False
-        self._pending_step = None   # (dist_mm, direction) 等待 STEP,DONE 事件更新位置
+        self.foc_poll_running = False
+
+        # ── 每轴状态（list 按 axis 索引）──
+        self.running            = [False] * NUM_AXES          # 连续运动 flag
+        self.position_mm        = [0.0]   * NUM_AXES
+        self.travel_min_mm      = [None]  * NUM_AXES
+        self.travel_max_mm      = [None]  * NUM_AXES
+        self.stepper_in_progress= [False] * NUM_AXES
+        self._pending_step      = [None]  * NUM_AXES
+        self._foc_enabled_ui    = [False] * NUM_AXES
+        self.foc_trace_buf      = [[] for _ in range(NUM_AXES)]
+
+        # ── 每轴 Tk 变量 ──
+        self.v_dist   = [tk.DoubleVar(value=10.0) for _ in range(NUM_AXES)]
+        self.v_dir    = [tk.IntVar   (value=DIR_OUTWARD) for _ in range(NUM_AXES)]
+        self.v_delay  = [tk.DoubleVar(value=20.0) for _ in range(NUM_AXES)]
+        self.v_goto   = [tk.DoubleVar(value=0.0)  for _ in range(NUM_AXES)]
+        self.v_foctgt = [tk.DoubleVar(value=0.0)  for _ in range(NUM_AXES)]
+        self.v_focstate   = [tk.StringVar(value="未连接") for _ in range(NUM_AXES)]
+        self.v_focfault   = [tk.StringVar(value="--")    for _ in range(NUM_AXES)]
+        self.v_foccur     = [tk.StringVar(value="--")    for _ in range(NUM_AXES)]
+        self.v_focvlimit  = [tk.DoubleVar(value=10.0)    for _ in range(NUM_AXES)]
+        self.v_focpangle  = [tk.DoubleVar(value=25.0)    for _ in range(NUM_AXES)]
+        self.v_focvp      = [tk.DoubleVar(value=0.2)     for _ in range(NUM_AXES)]
+        self.v_focpp      = [tk.IntVar   (value=7)       for _ in range(NUM_AXES)]
+
+        # ── 每轴 widget refs（dict-per-axis）──
+        self.sw = [dict() for _ in range(NUM_AXES)]  # stepper widgets
+        self.fw = [dict() for _ in range(NUM_AXES)]  # FOC widgets
+
         self._build_ui()
-        self._load_calib()   # 启动时载入持久化的行程范围
+        self._load_calib()
 
     # ═════════════ 顶层 UI ═════════════
     def _build_ui(self):
         pad = dict(padx=10, pady=5)
 
-        # ── 串口连接（共用）──
         conn_frame = ttk.LabelFrame(self.root, text="串口连接")
         conn_frame.grid(row=0, column=0, sticky="ew", **pad)
-
         ttk.Label(conn_frame, text="串口:").grid(row=0, column=0, **pad)
         self.port_var = tk.StringVar()
         self.port_cb = ttk.Combobox(conn_frame, textvariable=self.port_var, width=12, state="readonly")
         self.port_cb.grid(row=0, column=1, **pad)
         ttk.Button(conn_frame, text="刷新", command=self.refresh_ports).grid(row=0, column=2, **pad)
-
         ttk.Label(conn_frame, text="波特率:").grid(row=0, column=3, **pad)
         self.baud_var = tk.StringVar(value="115200")
         ttk.Combobox(conn_frame, textvariable=self.baud_var, values=["9600", "115200"],
                      width=8, state="readonly").grid(row=0, column=4, **pad)
-
         self.conn_btn = ttk.Button(conn_frame, text="连接", command=self.toggle_connect)
         self.conn_btn.grid(row=0, column=5, **pad)
         self.conn_status = ttk.Label(conn_frame, text="● 未连接", foreground="red")
         self.conn_status.grid(row=0, column=6, **pad)
 
-        # ── Notebook 标签页 ──
+        # Notebook: 4 tabs
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        for axis in range(NUM_AXES):
+            tab = ttk.Frame(self.notebook)
+            self.notebook.add(tab, text=f"🔩 步进 {AXIS_LABEL[axis]}")
+            self._build_stepper_tab(tab, axis)
+        for axis in range(NUM_AXES):
+            tab = ttk.Frame(self.notebook)
+            self.notebook.add(tab, text=f"🧲 FOC {AXIS_LABEL[axis]}")
+            self._build_foc_tab(tab, axis)
 
-        self.stepper_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.stepper_tab, text="🔩 步进")
-        self._build_stepper_tab(self.stepper_tab)
-
-        self.foc_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.foc_tab, text="🧲 FOC 无刷")
-        self._build_foc_tab(self.foc_tab)
-
-        # ── 日志（共用，置底）──
         log_frame = ttk.LabelFrame(self.root, text="日志")
         log_frame.grid(row=2, column=0, sticky="ew", **pad)
-        self.log_text = tk.Text(log_frame, height=8, width=80, state="disabled", font=("Consolas", 9))
+        self.log_text = tk.Text(log_frame, height=8, width=96, state="disabled", font=("Consolas", 9))
         self.log_text.pack(side="left", fill="both", padx=5, pady=5)
         scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         scroll.pack(side="right", fill="y")
@@ -95,346 +117,221 @@ class StepperGUI:
 
         self.refresh_ports()
 
-    # ═════════════ 步进 Tab ═════════════
-    def _build_stepper_tab(self, parent):
+    # ═════════════ 步进 Tab（参数化）═════════════
+    def _build_stepper_tab(self, parent, axis):
         pad = dict(padx=10, pady=5)
+        sw = self.sw[axis]
 
-        # 运动参数
-        param_frame = ttk.LabelFrame(parent, text="运动参数")
-        param_frame.grid(row=0, column=0, sticky="nsew", **pad)
-
-        ttk.Label(param_frame, text="距离 (mm):").grid(row=0, column=0, sticky="w", **pad)
-        self.distance_var = tk.DoubleVar(value=10.0)
-        ttk.Spinbox(param_frame, from_=0.2, to=500.0, increment=1.0,
-                    textvariable=self.distance_var, width=10, format="%.1f").grid(row=0, column=1, **pad)
-
-        ttk.Label(param_frame, text="快捷:").grid(row=1, column=0, sticky="w", **pad)
-        qbtn_frame = ttk.Frame(param_frame)
-        qbtn_frame.grid(row=1, column=1, sticky="w", pady=5)
+        pf = ttk.LabelFrame(parent, text=f"运动参数 — 轴 {AXIS_LABEL[axis]}")
+        pf.grid(row=0, column=0, sticky="nsew", **pad)
+        ttk.Label(pf, text="距离 (mm):").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Spinbox(pf, from_=0.2, to=500.0, increment=1.0,
+                    textvariable=self.v_dist[axis], width=10, format="%.1f").grid(row=0, column=1, **pad)
+        ttk.Label(pf, text="快捷:").grid(row=1, column=0, sticky="w", **pad)
+        qbf = ttk.Frame(pf); qbf.grid(row=1, column=1, sticky="w", pady=5)
         for label, mm in [("1mm", 1), ("10mm", 10), ("50mm", 50), ("100mm", 100)]:
-            ttk.Button(qbtn_frame, text=label, width=6,
-                       command=lambda d=mm: self.distance_var.set(d)).pack(side="left", padx=2)
+            ttk.Button(qbf, text=label, width=6,
+                       command=lambda d=mm, a=axis: self.v_dist[a].set(d)).pack(side="left", padx=2)
+        ttk.Label(pf, text="方向:").grid(row=2, column=0, sticky="w", **pad)
+        df = ttk.Frame(pf); df.grid(row=2, column=1, sticky="w")
+        ttk.Radiobutton(df, text="向外 ▶", variable=self.v_dir[axis], value=DIR_OUTWARD).pack(side="left", padx=4)
+        ttk.Radiobutton(df, text="◀ 向内", variable=self.v_dir[axis], value=DIR_INWARD).pack(side="left", padx=4)
+        ttk.Label(pf, text="速度:").grid(row=3, column=0, sticky="w", **pad)
+        sf = ttk.Frame(pf); sf.grid(row=3, column=1, sticky="w", pady=5)
+        sw['speed_slider'] = ttk.Scale(sf, from_=0.1, to=50.0, orient="horizontal",
+                                       variable=self.v_delay[axis], length=160)
+        sw['speed_slider'].pack(side="left")
+        sw['delay_label'] = ttk.Label(sf, text="", width=24)
+        sw['delay_label'].pack(side="left", padx=6)
+        self.v_delay[axis].trace_add("write", lambda *_, a=axis: self._update_speed_label(a))
+        self._update_speed_label(axis)
 
-        ttk.Label(param_frame, text="方向:").grid(row=2, column=0, sticky="w", **pad)
-        self.dir_var = tk.IntVar(value=DIR_OUTWARD)
-        dir_frame = ttk.Frame(param_frame)
-        dir_frame.grid(row=2, column=1, sticky="w")
-        ttk.Radiobutton(dir_frame, text="向外 ▶", variable=self.dir_var, value=DIR_OUTWARD).pack(side="left", padx=4)
-        ttk.Radiobutton(dir_frame, text="◀ 向内", variable=self.dir_var, value=DIR_INWARD).pack(side="left", padx=4)
+        cf = ttk.LabelFrame(parent, text="控制")
+        cf.grid(row=0, column=1, sticky="nsew", **pad)
+        sw['move_btn'] = ttk.Button(cf, text="执行运动",
+                                    command=lambda a=axis: self.send_move(a), state="disabled")
+        sw['move_btn'].grid(row=0, column=0, columnspan=2, padx=10, pady=10, ipadx=10, ipady=8)
+        sw['jog_out_btn'] = ttk.Button(cf, text="向外 1mm ▶",
+                                       command=lambda a=axis: self._quick_move(a, 1.0, DIR_OUTWARD),
+                                       state="disabled")
+        sw['jog_out_btn'].grid(row=1, column=0, **pad)
+        sw['jog_in_btn'] = ttk.Button(cf, text="◀ 向内 1mm",
+                                      command=lambda a=axis: self._quick_move(a, 1.0, DIR_INWARD),
+                                      state="disabled")
+        sw['jog_in_btn'].grid(row=1, column=1, **pad)
+        sw['cont_out_btn'] = ttk.Button(cf, text="向外 (按住) ▶▶", state="disabled")
+        sw['cont_out_btn'].grid(row=2, column=0, **pad)
+        sw['cont_out_btn'].bind("<ButtonPress-1>",   lambda e, a=axis: self._press_continuous(a, DIR_OUTWARD))
+        sw['cont_out_btn'].bind("<ButtonRelease-1>", lambda e, a=axis: self._release_continuous(a))
+        sw['cont_out_btn'].bind("<Leave>",           lambda e, a=axis: self._release_continuous(a))
+        sw['cont_in_btn'] = ttk.Button(cf, text="◀◀ 向内 (按住)", state="disabled")
+        sw['cont_in_btn'].grid(row=2, column=1, **pad)
+        sw['cont_in_btn'].bind("<ButtonPress-1>",   lambda e, a=axis: self._press_continuous(a, DIR_INWARD))
+        sw['cont_in_btn'].bind("<ButtonRelease-1>", lambda e, a=axis: self._release_continuous(a))
+        sw['cont_in_btn'].bind("<Leave>",           lambda e, a=axis: self._release_continuous(a))
+        sw['stop_btn'] = ttk.Button(cf, text="■ 紧急停止",
+                                    command=lambda a=axis: self.stop_continuous(a), state="disabled")
+        sw['stop_btn'].grid(row=3, column=0, columnspan=2, **pad, ipadx=10)
 
-        ttk.Label(param_frame, text="速度:").grid(row=3, column=0, sticky="w", **pad)
-        speed_frame = ttk.Frame(param_frame)
-        speed_frame.grid(row=3, column=1, sticky="w", pady=5)
-        # delay 现在是 float ms（最小 0.1ms = 100µs，最大 50ms）
-        self.delay_var = tk.DoubleVar(value=20.0)
-        self.speed_slider = ttk.Scale(speed_frame, from_=0.1, to=50.0, orient="horizontal",
-                                      variable=self.delay_var, length=160)
-        self.speed_slider.pack(side="left")
-        self.delay_label = ttk.Label(speed_frame, text="", width=24)
-        self.delay_label.pack(side="left", padx=6)
-        self.delay_var.trace_add("write", self._update_speed_label)
-        self._update_speed_label()
+        rf = ttk.LabelFrame(parent, text="位置与原点（软件跟踪）")
+        rf.grid(row=1, column=0, columnspan=2, sticky="ew", **pad)
+        ttk.Label(rf, text="当前位置:").grid(row=0, column=0, sticky="w", **pad)
+        sw['pos_label'] = ttk.Label(rf, text="0.0 mm", font=("Consolas", 14, "bold"), foreground="blue")
+        sw['pos_label'].grid(row=0, column=1, sticky="w", **pad)
+        sw['set_home_btn'] = ttk.Button(rf, text="⌂ 设为原点 (0 mm)",
+                                        command=lambda a=axis: self.set_home(a), state="disabled")
+        sw['set_home_btn'].grid(row=0, column=2, **pad)
+        sw['go_home_btn'] = ttk.Button(rf, text="⟲ 回到原点",
+                                       command=lambda a=axis: self.go_home(a), state="disabled")
+        sw['go_home_btn'].grid(row=0, column=3, **pad)
+        ttk.Label(rf, text="前往位置 (mm):").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Spinbox(rf, from_=-1000.0, to=1000.0, increment=1.0,
+                    textvariable=self.v_goto[axis], width=10, format="%.1f").grid(row=1, column=1, **pad)
+        sw['goto_btn'] = ttk.Button(rf, text="前往",
+                                    command=lambda a=axis: self.goto_target_position(a), state="disabled")
+        sw['goto_btn'].grid(row=1, column=2, **pad)
+        sw['calib_btn'] = ttk.Button(rf, text="把当前位置校准为此值",
+                                     command=lambda a=axis: self.calibrate_position(a), state="disabled")
+        sw['calib_btn'].grid(row=1, column=3, **pad)
 
-        # 控制按钮
-        ctrl_frame = ttk.LabelFrame(parent, text="控制")
-        ctrl_frame.grid(row=0, column=1, sticky="nsew", **pad)
+        ttk.Label(rf, text="行程范围:").grid(row=2, column=0, sticky="w", **pad)
+        rgf = ttk.Frame(rf); rgf.grid(row=2, column=1, columnspan=3, sticky="w", **pad)
+        sw['range_label'] = ttk.Label(rgf, text="未校准", foreground="gray", font=("Consolas", 10))
+        sw['range_label'].pack(side="left")
+        sw['set_min_btn'] = ttk.Button(rgf, text="⊖ 标记当前为最小",
+                                       command=lambda a=axis: self._mark_min(a), state="disabled")
+        sw['set_min_btn'].pack(side="left", padx=10)
+        sw['set_max_btn'] = ttk.Button(rgf, text="⊕ 标记当前为最大",
+                                       command=lambda a=axis: self._mark_max(a), state="disabled")
+        sw['set_max_btn'].pack(side="left", padx=2)
+        sw['clear_range_btn'] = ttk.Button(rgf, text="清除", width=6,
+                                           command=lambda a=axis: self._clear_range(a), state="disabled")
+        sw['clear_range_btn'].pack(side="left", padx=10)
 
-        self.move_btn = ttk.Button(ctrl_frame, text="执行运动", command=self.send_move, state="disabled")
-        self.move_btn.grid(row=0, column=0, columnspan=2, padx=10, pady=10, ipadx=10, ipady=8)
-
-        self.jog_out_btn = ttk.Button(ctrl_frame, text="向外 1mm ▶",
-                                      command=lambda: self._quick_move(1.0, DIR_OUTWARD), state="disabled")
-        self.jog_out_btn.grid(row=1, column=0, **pad)
-        self.jog_in_btn = ttk.Button(ctrl_frame, text="◀ 向内 1mm",
-                                     command=lambda: self._quick_move(1.0, DIR_INWARD), state="disabled")
-        self.jog_in_btn.grid(row=1, column=1, **pad)
-
-        self.cont_out_btn = ttk.Button(ctrl_frame, text="向外 (按住) ▶▶", state="disabled")
-        self.cont_out_btn.grid(row=2, column=0, **pad)
-        self.cont_out_btn.bind("<ButtonPress-1>",   lambda e: self._press_continuous(DIR_OUTWARD))
-        self.cont_out_btn.bind("<ButtonRelease-1>", lambda e: self._release_continuous())
-        self.cont_out_btn.bind("<Leave>",           lambda e: self._release_continuous())
-
-        self.cont_in_btn = ttk.Button(ctrl_frame, text="◀◀ 向内 (按住)", state="disabled")
-        self.cont_in_btn.grid(row=2, column=1, **pad)
-        self.cont_in_btn.bind("<ButtonPress-1>",   lambda e: self._press_continuous(DIR_INWARD))
-        self.cont_in_btn.bind("<ButtonRelease-1>", lambda e: self._release_continuous())
-        self.cont_in_btn.bind("<Leave>",           lambda e: self._release_continuous())
-
-        self.stop_btn = ttk.Button(ctrl_frame, text="■ 紧急停止", command=self.stop_continuous, state="disabled")
-        self.stop_btn.grid(row=3, column=0, columnspan=2, **pad, ipadx=10)
-
-        # 位置与原点
-        pos_frame = ttk.LabelFrame(parent, text="位置与原点（软件跟踪）")
-        pos_frame.grid(row=1, column=0, columnspan=2, sticky="ew", **pad)
-
-        ttk.Label(pos_frame, text="当前位置:").grid(row=0, column=0, sticky="w", **pad)
-        self.pos_label = ttk.Label(pos_frame, text="0.0 mm",
-                                   font=("Consolas", 14, "bold"), foreground="blue")
-        self.pos_label.grid(row=0, column=1, sticky="w", **pad)
-
-        self.set_home_btn = ttk.Button(pos_frame, text="⌂ 设为原点 (0 mm)",
-                                       command=self.set_home, state="disabled")
-        self.set_home_btn.grid(row=0, column=2, **pad)
-        self.go_home_btn = ttk.Button(pos_frame, text="⟲ 回到原点",
-                                      command=self.go_home, state="disabled")
-        self.go_home_btn.grid(row=0, column=3, **pad)
-
-        ttk.Label(pos_frame, text="前往位置 (mm):").grid(row=1, column=0, sticky="w", **pad)
-        self.target_var = tk.DoubleVar(value=0.0)
-        ttk.Spinbox(pos_frame, from_=-1000.0, to=1000.0, increment=1.0,
-                    textvariable=self.target_var, width=10, format="%.1f").grid(row=1, column=1, **pad)
-        self.goto_btn = ttk.Button(pos_frame, text="前往", command=self.goto_target_position, state="disabled")
-        self.goto_btn.grid(row=1, column=2, **pad)
-        self.calib_btn = ttk.Button(pos_frame, text="把当前位置校准为此值",
-                                    command=self.calibrate_position, state="disabled")
-        self.calib_btn.grid(row=1, column=3, **pad)
-
-        # 行程范围校准（软件限位）
-        ttk.Label(pos_frame, text="行程范围:").grid(row=2, column=0, sticky="w", **pad)
-        range_frame = ttk.Frame(pos_frame)
-        range_frame.grid(row=2, column=1, columnspan=3, sticky="w", **pad)
-        self.range_label = ttk.Label(range_frame, text="未校准（无软件限位）",
-                                     foreground="gray", font=("Consolas", 10))
-        self.range_label.pack(side="left")
-        self.set_min_btn = ttk.Button(range_frame, text="⊖ 标记当前为最小",
-                                      command=self._mark_min, state="disabled")
-        self.set_min_btn.pack(side="left", padx=10)
-        self.set_max_btn = ttk.Button(range_frame, text="⊕ 标记当前为最大",
-                                      command=self._mark_max, state="disabled")
-        self.set_max_btn.pack(side="left", padx=2)
-        self.clear_range_btn = ttk.Button(range_frame, text="清除", width=6,
-                                          command=self._clear_range, state="disabled")
-        self.clear_range_btn.pack(side="left", padx=10)
-
-    # ═════════════ FOC Tab ═════════════
-    def _build_foc_tab(self, parent):
+    # ═════════════ FOC Tab（参数化）═════════════
+    def _build_foc_tab(self, parent, axis):
         pad = dict(padx=10, pady=5)
+        fw = self.fw[axis]
 
-        # 状态区
-        state_frame = ttk.LabelFrame(parent, text="状态（实时轮询 100ms）")
-        state_frame.grid(row=0, column=0, sticky="ew", **pad)
-
-        ttk.Label(state_frame, text="状态:").grid(row=0, column=0, sticky="w", **pad)
-        self.foc_state_var = tk.StringVar(value="未连接")
-        ttk.Label(state_frame, textvariable=self.foc_state_var, width=10,
+        sf = ttk.LabelFrame(parent, text=f"状态 — 轴 {AXIS_LABEL[axis]} (100ms 轮询)")
+        sf.grid(row=0, column=0, sticky="ew", **pad)
+        ttk.Label(sf, text="状态:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Label(sf, textvariable=self.v_focstate[axis], width=10,
                   font=("Consolas", 11, "bold"), foreground="gray").grid(row=0, column=1, sticky="w", **pad)
-
-        ttk.Label(state_frame, text="故障:").grid(row=0, column=2, sticky="w", **pad)
-        self.foc_fault_var = tk.StringVar(value="--")
-        self.foc_fault_label = ttk.Label(state_frame, textvariable=self.foc_fault_var, width=6,
-                                         font=("Consolas", 11, "bold"), foreground="gray")
-        self.foc_fault_label.grid(row=0, column=3, sticky="w", **pad)
-
-        ttk.Label(state_frame, text="当前角度:").grid(row=1, column=0, sticky="w", **pad)
-        self.foc_current_var = tk.StringVar(value="--")
-        ttk.Label(state_frame, textvariable=self.foc_current_var, width=16,
+        ttk.Label(sf, text="故障:").grid(row=0, column=2, sticky="w", **pad)
+        fw['fault_label'] = ttk.Label(sf, textvariable=self.v_focfault[axis], width=6,
+                                      font=("Consolas", 11, "bold"), foreground="gray")
+        fw['fault_label'].grid(row=0, column=3, sticky="w", **pad)
+        ttk.Label(sf, text="当前角度:").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Label(sf, textvariable=self.v_foccur[axis], width=16,
                   font=("Consolas", 14, "bold"), foreground="blue").grid(row=1, column=1, columnspan=3, sticky="w", **pad)
 
-        # 目标控制
-        tgt_frame = ttk.LabelFrame(parent, text="目标控制")
-        tgt_frame.grid(row=1, column=0, sticky="ew", **pad)
-
-        ttk.Label(tgt_frame, text="目标角度 (°):").grid(row=0, column=0, sticky="w", **pad)
-        self.foc_target_var = tk.DoubleVar(value=0.0)
-        ttk.Spinbox(tgt_frame, from_=-3600.0, to=3600.0, increment=1.0,
-                    textvariable=self.foc_target_var, width=10, format="%.1f").grid(row=0, column=1, **pad)
-        self.foc_goto_btn = ttk.Button(tgt_frame, text="前往", command=self._foc_goto, state="disabled")
-        self.foc_goto_btn.grid(row=0, column=2, **pad)
-
-        ttk.Label(tgt_frame, text="快捷:").grid(row=1, column=0, sticky="w", **pad)
-        quick_frame = ttk.Frame(tgt_frame)
-        quick_frame.grid(row=1, column=1, columnspan=2, sticky="w", pady=5)
-        self._foc_quick_btns = []
+        tf = ttk.LabelFrame(parent, text="目标控制")
+        tf.grid(row=1, column=0, sticky="ew", **pad)
+        ttk.Label(tf, text="目标角度 (°):").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Spinbox(tf, from_=-3600.0, to=3600.0, increment=1.0,
+                    textvariable=self.v_foctgt[axis], width=10, format="%.1f").grid(row=0, column=1, **pad)
+        fw['goto_btn'] = ttk.Button(tf, text="前往",
+                                    command=lambda a=axis: self._foc_goto(a), state="disabled")
+        fw['goto_btn'].grid(row=0, column=2, **pad)
+        ttk.Label(tf, text="快捷:").grid(row=1, column=0, sticky="w", **pad)
+        qf = ttk.Frame(tf); qf.grid(row=1, column=1, columnspan=2, sticky="w", pady=5)
+        fw['quick_btns'] = []
         for deg in (0, 45, 90, 180, 270):
-            b = ttk.Button(quick_frame, text=f"{deg}°", width=5,
-                           command=lambda d=deg: self._foc_quick(float(d)), state="disabled")
+            b = ttk.Button(qf, text=f"{deg}°", width=5,
+                           command=lambda d=deg, a=axis: self._foc_quick(a, float(d)), state="disabled")
             b.pack(side="left", padx=2)
-            self._foc_quick_btns.append(b)
-
-        ttk.Label(tgt_frame, text="增量:").grid(row=2, column=0, sticky="w", **pad)
-        inc_frame = ttk.Frame(tgt_frame)
-        inc_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=5)
-        self._foc_inc_btns = []
+            fw['quick_btns'].append(b)
+        ttk.Label(tf, text="增量:").grid(row=2, column=0, sticky="w", **pad)
+        incf = ttk.Frame(tf); incf.grid(row=2, column=1, columnspan=2, sticky="w", pady=5)
+        fw['inc_btns'] = []
         for delta in (-10, -1, +1, +10):
-            b = ttk.Button(inc_frame, text=f"{delta:+d}°", width=5,
-                           command=lambda d=float(delta): self._foc_increment(d), state="disabled")
+            b = ttk.Button(incf, text=f"{delta:+d}°", width=5,
+                           command=lambda d=float(delta), a=axis: self._foc_increment(a, d), state="disabled")
             b.pack(side="left", padx=2)
-            self._foc_inc_btns.append(b)
+            fw['inc_btns'].append(b)
 
-        # 原点
-        home_frame = ttk.LabelFrame(parent, text="原点")
-        home_frame.grid(row=2, column=0, sticky="ew", **pad)
-        self.foc_home_btn = ttk.Button(home_frame, text="⌂ 把当前位置设为 0°",
-                                       command=self._foc_home, state="disabled")
-        self.foc_home_btn.grid(row=0, column=0, **pad)
+        hf = ttk.LabelFrame(parent, text="原点")
+        hf.grid(row=2, column=0, sticky="ew", **pad)
+        fw['home_btn'] = ttk.Button(hf, text="⌂ 把当前位置设为 0°",
+                                    command=lambda a=axis: self._foc_home(a), state="disabled")
+        fw['home_btn'].grid(row=0, column=0, **pad)
 
-        # 使能 / 调试
-        en_frame = ttk.LabelFrame(parent, text="使能 / 调试")
-        en_frame.grid(row=3, column=0, sticky="ew", **pad)
+        ef = ttk.LabelFrame(parent, text="使能 / 调试")
+        ef.grid(row=3, column=0, sticky="ew", **pad)
+        fw['enable_btn'] = ttk.Button(ef, text="▶ 使能 FOC",
+                                      command=lambda a=axis: self._foc_toggle_enable(a), state="disabled")
+        fw['enable_btn'].grid(row=0, column=0, columnspan=2, padx=10, pady=10, ipadx=10, ipady=6)
 
-        self.foc_enable_btn = ttk.Button(en_frame, text="▶ 使能 FOC",
-                                         command=self._foc_toggle_enable, state="disabled")
-        self.foc_enable_btn.grid(row=0, column=0, columnspan=2, padx=10, pady=10, ipadx=10, ipady=6)
+        ttk.Label(ef, text="电压限幅:").grid(row=1, column=0, sticky="w", **pad)
+        vf = ttk.Frame(ef); vf.grid(row=1, column=1, sticky="w", pady=5)
+        fw['vlimit_slider'] = ttk.Scale(vf, from_=0.5, to=12.0, orient="horizontal",
+                                        variable=self.v_focvlimit[axis], length=180,
+                                        command=lambda v, a=axis: self._foc_on_vlimit(a, v), state="disabled")
+        fw['vlimit_slider'].pack(side="left")
+        fw['vlimit_label'] = ttk.Label(vf, text="10.0 V (扭矩)", width=14)
+        fw['vlimit_label'].pack(side="left", padx=6)
 
-        ttk.Label(en_frame, text="电压限幅:").grid(row=1, column=0, sticky="w", **pad)
-        vf = ttk.Frame(en_frame)
-        vf.grid(row=1, column=1, sticky="w", pady=5)
-        self.foc_vlimit_var = tk.DoubleVar(value=8.0)
-        self.foc_vlimit_slider = ttk.Scale(vf, from_=0.5, to=12.0, orient="horizontal",
-                                           variable=self.foc_vlimit_var, length=180,
-                                           command=self._foc_on_vlimit_change, state="disabled")
-        self.foc_vlimit_slider.pack(side="left")
-        self.foc_vlimit_label = ttk.Label(vf, text="8.0 V (扭矩)", width=14)
-        self.foc_vlimit_label.pack(side="left", padx=6)
+        ttk.Label(ef, text="位置环 P:").grid(row=2, column=0, sticky="w", **pad)
+        pgf = ttk.Frame(ef); pgf.grid(row=2, column=1, sticky="w", pady=5)
+        fw['pangle_slider'] = ttk.Scale(pgf, from_=1.0, to=50.0, orient="horizontal",
+                                        variable=self.v_focpangle[axis], length=180,
+                                        command=lambda v, a=axis: self._foc_on_pangle(a, v), state="disabled")
+        fw['pangle_slider'].pack(side="left")
+        fw['pangle_label'] = ttk.Label(pgf, text="25.0 (刚度)", width=14)
+        fw['pangle_label'].pack(side="left", padx=6)
 
-        ttk.Label(en_frame, text="位置环 P:").grid(row=2, column=0, sticky="w", **pad)
-        pg_frame = ttk.Frame(en_frame)
-        pg_frame.grid(row=2, column=1, sticky="w", pady=5)
-        self.foc_pangle_var = tk.DoubleVar(value=40.0)
-        self.foc_pangle_slider = ttk.Scale(pg_frame, from_=1.0, to=50.0, orient="horizontal",
-                                           variable=self.foc_pangle_var, length=180,
-                                           command=self._foc_on_pangle_change, state="disabled")
-        self.foc_pangle_slider.pack(side="left")
-        self.foc_pangle_label = ttk.Label(pg_frame, text="40.0 (刚度)", width=14)
-        self.foc_pangle_label.pack(side="left", padx=6)
+        ttk.Label(ef, text="速度环 P:").grid(row=3, column=0, sticky="w", **pad)
+        vpf = ttk.Frame(ef); vpf.grid(row=3, column=1, sticky="w", pady=5)
+        fw['vp_slider'] = ttk.Scale(vpf, from_=0.05, to=1.0, orient="horizontal",
+                                    variable=self.v_focvp[axis], length=180,
+                                    command=lambda v, a=axis: self._foc_on_vp(a, v), state="disabled")
+        fw['vp_slider'].pack(side="left")
+        fw['vp_label'] = ttk.Label(vpf, text="0.20 (阻尼)", width=14)
+        fw['vp_label'].pack(side="left", padx=6)
 
-        ttk.Label(en_frame, text="速度环 P:").grid(row=3, column=0, sticky="w", **pad)
-        vp_frame = ttk.Frame(en_frame)
-        vp_frame.grid(row=3, column=1, sticky="w", pady=5)
-        self.foc_vp_var = tk.DoubleVar(value=0.4)
-        self.foc_vp_slider = ttk.Scale(vp_frame, from_=0.05, to=1.0, orient="horizontal",
-                                       variable=self.foc_vp_var, length=180,
-                                       command=self._foc_on_vp_change, state="disabled")
-        self.foc_vp_slider.pack(side="left")
-        self.foc_vp_label = ttk.Label(vp_frame, text="0.40 (阻尼)", width=14)
-        self.foc_vp_label.pack(side="left", padx=6)
+        ttk.Label(ef, text="极对数:").grid(row=4, column=0, sticky="w", **pad)
+        ppf = ttk.Frame(ef); ppf.grid(row=4, column=1, sticky="w", pady=5)
+        ttk.Spinbox(ppf, from_=1, to=50, textvariable=self.v_focpp[axis], width=6).pack(side="left")
+        fw['pp_save_btn'] = ttk.Button(ppf, text="保存到 NVS（重启生效）",
+                                       command=lambda a=axis: self._foc_save_pp(a), state="disabled")
+        fw['pp_save_btn'].pack(side="left", padx=6)
+        fw['clear_btn'] = ttk.Button(ef, text="🧹 清除故障",
+                                     command=lambda a=axis: self._foc_clear_fault(a), state="disabled")
+        fw['clear_btn'].grid(row=5, column=0, columnspan=2, **pad, ipadx=10)
+        fw['autotune_btn'] = ttk.Button(ef, text="🤖 自动优化 PID",
+                                        command=lambda a=axis: self._foc_autotune(a), state="disabled")
+        fw['autotune_btn'].grid(row=6, column=0, columnspan=2, **pad, ipadx=10)
 
-        ttk.Label(en_frame, text="极对数:").grid(row=4, column=0, sticky="w", **pad)
-        pp_frame = ttk.Frame(en_frame)
-        pp_frame.grid(row=4, column=1, sticky="w", pady=5)
-        self.foc_pp_var = tk.IntVar(value=7)
-        ttk.Spinbox(pp_frame, from_=1, to=50, textvariable=self.foc_pp_var, width=6).pack(side="left")
-        self.foc_pp_save_btn = ttk.Button(pp_frame, text="保存到 NVS（重启生效）",
-                                          command=self._foc_save_pp, state="disabled")
-        self.foc_pp_save_btn.pack(side="left", padx=6)
+        scf = ttk.LabelFrame(parent, text="响应曲线 (10s · 蓝=目标 红=实测)")
+        scf.grid(row=0, column=1, rowspan=4, sticky="nsew", **pad)
+        fw['scope'] = tk.Canvas(scf, width=420, height=420, bg="white",
+                                highlightthickness=1, highlightbackground="#999")
+        fw['scope'].pack(padx=5, pady=5)
 
-        self.foc_clear_btn = ttk.Button(en_frame, text="🧹 清除故障",
-                                        command=self._foc_clear_fault, state="disabled")
-        self.foc_clear_btn.grid(row=5, column=0, columnspan=2, **pad, ipadx=10)
+        # 聚合：状态门控用
+        fw['motion_btns'] = [fw['goto_btn']] + fw['quick_btns'] + fw['inc_btns']
+        fw['cfg_btns']    = [fw['home_btn'], fw['vlimit_slider'], fw['pangle_slider'],
+                             fw['vp_slider'], fw['pp_save_btn'], fw['autotune_btn']]
 
-        self.foc_autotune_btn = ttk.Button(en_frame, text="🤖 自动优化 PID (约 60 秒)",
-                                           command=self._foc_autotune, state="disabled")
-        self.foc_autotune_btn.grid(row=6, column=0, columnspan=2, **pad, ipadx=10)
+    # ═════════════ 共享辅助 ═════════════
+    def _update_speed_label(self, axis):
+        d = max(0.1, self.v_delay[axis].get())
+        mm_s = 1000.0 / (PULSES_PER_MM * d)
+        self.sw[axis]['delay_label'].config(text=f"{d:.1f} ms ≈ {mm_s:.0f} mm/s")
 
-        # 示波器区（放右边，rowspan 占满左列所有行）
-        scope_frame = ttk.LabelFrame(parent, text="响应曲线 (10s · 蓝=目标 红=实测)")
-        scope_frame.grid(row=0, column=1, rowspan=4, sticky="nsew", **pad)
-        self.foc_scope = tk.Canvas(scope_frame, width=480, height=480,
-                                   bg="white", highlightthickness=1, highlightbackground="#999")
-        self.foc_scope.pack(padx=5, pady=5)
+    def _update_pos_label(self, axis):
+        self.sw[axis]['pos_label'].config(text=f"{self.position_mm[axis]:.1f} mm")
 
-        # 聚合按钮组（E5 状态门控使用）
-        self._foc_motion_btns = [self.foc_goto_btn] + self._foc_quick_btns + self._foc_inc_btns
-        self._foc_cfg_btns    = [self.foc_home_btn, self.foc_vlimit_slider,
-                                 self.foc_pangle_slider, self.foc_vp_slider,
-                                 self.foc_pp_save_btn, self.foc_autotune_btn]
+    def _enable_stepper_buttons(self, axis, state):
+        sw = self.sw[axis]
+        keys = ['move_btn', 'jog_out_btn', 'jog_in_btn', 'cont_out_btn', 'cont_in_btn',
+                'stop_btn', 'set_home_btn', 'go_home_btn', 'goto_btn', 'calib_btn',
+                'set_min_btn', 'set_max_btn', 'clear_range_btn']
+        for k in keys:
+            sw[k].config(state=state)
 
-    # ═════════════ 公共辅助 ═════════════
-    def _update_speed_label(self, *_):
-        d = max(0.1, self.delay_var.get())
-        speed_mm_s = 1000.0 / (PULSES_PER_MM * d)
-        self.delay_label.config(text=f"{d:.1f} ms/脉冲 ≈ {speed_mm_s:.0f} mm/s")
-
-    def _update_pos_label(self):
-        self.pos_label.config(text=f"{self.position_mm:.1f} mm")
-
-    # ── 行程范围校准 ───────────────────────────
-    def _mark_min(self):
-        if self.travel_max_mm is not None and self.position_mm >= self.travel_max_mm:
-            messagebox.showerror("范围无效",
-                                 f"当前位置 {self.position_mm:.1f}mm 不能 ≥ 已设最大 {self.travel_max_mm:.1f}mm")
-            return
-        self.travel_min_mm = self.position_mm
-        self._update_range_display()
-        self._save_calib()
-        self.log(f"⊖ 标记最小行程: {self.travel_min_mm:.1f} mm (已保存)")
-
-    def _mark_max(self):
-        if self.travel_min_mm is not None and self.position_mm <= self.travel_min_mm:
-            messagebox.showerror("范围无效",
-                                 f"当前位置 {self.position_mm:.1f}mm 不能 ≤ 已设最小 {self.travel_min_mm:.1f}mm")
-            return
-        self.travel_max_mm = self.position_mm
-        self._update_range_display()
-        self._save_calib()
-        self.log(f"⊕ 标记最大行程: {self.travel_max_mm:.1f} mm (已保存)")
-
-    def _clear_range(self):
-        self.travel_min_mm = None
-        self.travel_max_mm = None
-        self._update_range_display()
-        self._save_calib()
-        self.log("行程限位已清除 (已保存)")
-
-    def _save_calib(self):
-        """把当前校准持久化到 .stepper_calib.json。"""
-        try:
-            with open(CALIB_FILE, "w", encoding="utf-8") as f:
-                json.dump({
-                    "travel_min_mm": self.travel_min_mm,
-                    "travel_max_mm": self.travel_max_mm,
-                }, f, indent=2)
-        except Exception as e:
-            self.log(f"⚠️ 校准保存失败: {e}")
-
-    def _load_calib(self):
-        """启动时读取校准。"""
-        if not os.path.exists(CALIB_FILE):
-            return
-        try:
-            with open(CALIB_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.travel_min_mm = data.get("travel_min_mm")
-            self.travel_max_mm = data.get("travel_max_mm")
-            self._update_range_display()
-            if self.travel_min_mm is not None or self.travel_max_mm is not None:
-                self.log(f"已加载校准: min={self.travel_min_mm} max={self.travel_max_mm}")
-        except Exception as e:
-            self.log(f"⚠️ 校准读取失败: {e}")
-
-    def _update_range_display(self):
-        if self.travel_min_mm is None and self.travel_max_mm is None:
-            self.range_label.config(text="未校准（无软件限位）", foreground="gray")
-        else:
-            mn = f"{self.travel_min_mm:.1f}" if self.travel_min_mm is not None else "?"
-            mx = f"{self.travel_max_mm:.1f}" if self.travel_max_mm is not None else "?"
-            travel = ""
-            if self.travel_min_mm is not None and self.travel_max_mm is not None:
-                travel = f"  (行程 {self.travel_max_mm - self.travel_min_mm:.1f} mm)"
-            self.range_label.config(text=f"min={mn} mm  max={mx} mm{travel}",
-                                    foreground="black")
-
-    def _check_range(self, target_mm):
-        """目标位置是否在校准范围内。范围未设则不限制。"""
-        if self.travel_min_mm is not None and target_mm < self.travel_min_mm - 0.05:
-            self.log(f"⛔ 拒绝：目标 {target_mm:.1f}mm 超下限 {self.travel_min_mm:.1f}mm")
-            return False
-        if self.travel_max_mm is not None and target_mm > self.travel_max_mm + 0.05:
-            self.log(f"⛔ 拒绝：目标 {target_mm:.1f}mm 超上限 {self.travel_max_mm:.1f}mm")
-            return False
-        return True
-
-    def _set_stepper_buttons_state(self, state):
-        # stop_btn 也一并启用（连接后始终可点，按下会停止任何运动）
-        for b in (self.move_btn, self.jog_out_btn, self.jog_in_btn,
-                  self.cont_out_btn, self.cont_in_btn,
-                  self.set_home_btn, self.go_home_btn, self.goto_btn, self.calib_btn,
-                  self.stop_btn,
-                  self.set_min_btn, self.set_max_btn, self.clear_range_btn):
-            b.config(state=state)
-
-    # ═════════════ 串口连接 ═════════════
+    # ═════════════ 串口 ═════════════
     def refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
         self.port_cb["values"] = ports
@@ -443,40 +340,35 @@ class StepperGUI:
 
     def toggle_connect(self):
         if self.ser and self.ser.is_open:
-            # 先停轮询和 reader
             self.foc_poll_running = False
             self._reader_running = False
             time.sleep(0.3)
-            try:
-                self.ser.close()
-            except Exception:
-                pass
+            try: self.ser.close()
+            except Exception: pass
             self.ser = None
             self.conn_status.config(text="● 未连接", foreground="red")
             self.conn_btn.config(text="连接")
-            self._set_stepper_buttons_state("disabled")
-            self._apply_foc_gating(state="?", fault="?")
-            self.foc_state_var.set("未连接")
-            self.foc_current_var.set("--")
-            self.foc_fault_var.set("--")
+            for a in range(NUM_AXES):
+                self._enable_stepper_buttons(a, "disabled")
+                self._apply_foc_gating(a, state="?", fault="?")
+                self.v_focstate[a].set("未连接")
+                self.v_foccur[a].set("--")
+                self.v_focfault[a].set("--")
             self.log("串口已断开")
             return
-
         try:
             self.ser = serial.Serial(self.port_var.get(), int(self.baud_var.get()), timeout=0.2)
             time.sleep(1.0)
-            # 清空启动 banner（reader 启动前直接读）
             while self.ser.in_waiting:
                 self.ser.readline()
-            # 清响应队列
             while not self._resp_queue.empty():
                 try: self._resp_queue.get_nowait()
                 except queue.Empty: break
             self.conn_status.config(text="● 已连接", foreground="green")
             self.conn_btn.config(text="断开")
-            self._set_stepper_buttons_state("normal")  # 含 stop_btn
+            for a in range(NUM_AXES):
+                self._enable_stepper_buttons(a, "normal")
             self.log(f"已连接 {self.port_var.get()} @ {self.baud_var.get()}")
-            # 启动 reader + FOC 轮询
             self._reader_running = True
             threading.Thread(target=self._reader_loop, daemon=True).start()
             self.foc_poll_running = True
@@ -484,46 +376,45 @@ class StepperGUI:
         except Exception as e:
             messagebox.showerror("连接失败", str(e))
 
-    # ═════════════ 共享底层 I/O ═════════════
     def _reader_loop(self):
-        """单一 reader 线程，持续读串口。异步事件分发到回调；同步响应塞队列。"""
         while self._reader_running and self.ser and self.ser.is_open:
             try:
                 raw = self.ser.readline()
             except Exception:
                 break
-            if not raw:
-                continue  # timeout，继续
+            if not raw: continue
             line = raw.decode(errors="replace").strip()
-            if not line:
-                continue
-            # 异步事件（不对应任何 pending 请求）
-            if line.startswith("STEP,DONE"):
-                self.root.after(0, self._on_step_done)
-                continue
-            if line.startswith("FOC,FAULT"):
-                self.root.after(0, lambda l=line: self.log(f"⚠️ {l}"))
-                continue
-            # 忽略 SimpleFOC 的 MOT: 诊断（不走命令响应通道）
-            if line.startswith("MOT:"):
+            if not line: continue
+            # 解析轴号异步事件
+            if line.startswith("STEP,") and line.endswith(",DONE"):
+                # STEP,<axis>,DONE
+                parts = line.split(",")
+                if len(parts) == 3:
+                    try:
+                        axis = int(parts[1])
+                        self.root.after(0, lambda a=axis: self._on_step_done(a))
+                        continue
+                    except ValueError: pass
+            if line.startswith("FOC,") and ",FAULT" in line:
+                parts = line.split(",")
+                if len(parts) >= 3 and parts[2] == "FAULT":
+                    try:
+                        axis = int(parts[1])
+                        self.root.after(0, lambda a=axis, l=line: self.log(f"⚠️ 轴{AXIS_LABEL[a]}: {l}"))
+                        continue
+                    except ValueError: pass
+            if line.startswith("MOT:") or line.startswith("[FOC") or \
+               line.startswith("ESP32") or line.startswith("Protocol:") or \
+               line.startswith("NUM_AXES") or line.startswith("  "):
                 self.root.after(0, lambda l=line: self.log(l))
                 continue
-            # 启动 banner / 未命中的未知行：视同调试输出
-            if line.startswith("ESP32") or line.startswith("[FOC]") or line.startswith("PUL_PIN") or line.startswith("DIR_PIN") or line.startswith("发送"):
-                self.root.after(0, lambda l=line: self.log(l))
-                continue
-            # 其他 → 同步响应
             try:
                 self._resp_queue.put_nowait(line)
-            except queue.Full:
-                pass
+            except queue.Full: pass
 
-    def _send_and_read(self, cmd: str, timeout: float = 1.0) -> str:
-        """发送命令，等待一行同步响应。持锁期间 reader 仍在读，响应通过 queue 传回。"""
-        if not self.ser or not self.ser.is_open:
-            return ""
+    def _send_and_read(self, cmd, timeout=1.0):
+        if not self.ser or not self.ser.is_open: return ""
         with self.serial_lock:
-            # 清掉残留（不应有，防万一）
             while not self._resp_queue.empty():
                 try: self._resp_queue.get_nowait()
                 except queue.Empty: break
@@ -537,452 +428,396 @@ class StepperGUI:
             except queue.Empty:
                 return ""
 
-    # ═════════════ 步进：脉冲发送（异步 ACK + STEP,DONE 事件）═════════════
-    def _send_pulses(self, steps, direction, delay_ms):
-        if steps <= 0 or not self.ser or not self.ser.is_open:
-            return False
-        # 若上次 STEP,DONE 还没回来，先等完（与并发 MOVE 有关）
-        while self.stepper_in_progress and self.running is False:
+    # ═════════════ 步进：发送 ═════════════
+    def _send_pulses(self, axis, steps, direction, delay_ms):
+        if steps <= 0 or not self.ser or not self.ser.is_open: return False
+        while self.stepper_in_progress[axis] and not self.running[axis]:
             time.sleep(0.02)
-        # 协议第三参为微秒（v2.2+），ms × 1000
         delay_us = max(1, int(round(delay_ms * 1000)))
-        resp = self._send_and_read(f"MOVE,{steps},{direction},{delay_us}")
+        resp = self._send_and_read(f"MOVE,{axis},{steps},{direction},{delay_us}")
         dist_mm = steps / PULSES_PER_MM
         dir_txt = "向外" if direction == DIR_OUTWARD else "向内"
-        speed_mm_s = 1000.0 / (PULSES_PER_MM * max(0.001, delay_ms))
-        self.log(f"发送 {dist_mm:.1f}mm {dir_txt} @ {delay_ms:.1f}ms ({speed_mm_s:.0f}mm/s) → {resp}")
-        if resp == "ACK":
+        mm_s = 1000.0 / (PULSES_PER_MM * max(0.001, delay_ms))
+        self.log(f"轴{AXIS_LABEL[axis]} {dist_mm:.1f}mm {dir_txt} @ {delay_ms:.1f}ms ({mm_s:.0f}mm/s) → {resp}")
+        if resp.startswith("ACK,"):
             sign = +1.0 if direction == DIR_OUTWARD else -1.0
-            self._pending_step = sign * dist_mm
-            self.stepper_in_progress = True
+            self._pending_step[axis] = sign * dist_mm
+            self.stepper_in_progress[axis] = True
             return True
         return False
 
-    def _on_step_done(self):
-        """reader 线程收到 STEP,DONE 后（已 after 到主线程）。"""
-        if self._pending_step is not None:
-            self.position_mm += self._pending_step
-            self._pending_step = None
-            self._update_pos_label()
-        self.stepper_in_progress = False
-        self.log("步进完成")
-
-    def _send_mm(self, distance_mm, direction, delay_ms):
+    def _send_mm(self, axis, distance_mm, direction, delay_ms):
         steps = int(round(distance_mm * PULSES_PER_MM))
         if steps <= 0:
-            self.log(f"忽略：距离过小 ({distance_mm} mm)")
+            self.log(f"轴{AXIS_LABEL[axis]}: 忽略距离过小 ({distance_mm})")
             return False
-        # 软件限位检查（提前预判终点位置）
         sign = +1.0 if direction == DIR_OUTWARD else -1.0
-        target = self.position_mm + sign * (steps / PULSES_PER_MM)
-        if not self._check_range(target):
-            return False
-        return self._send_pulses(steps, direction, delay_ms)
+        target = self.position_mm[axis] + sign * (steps / PULSES_PER_MM)
+        if not self._check_range(axis, target): return False
+        return self._send_pulses(axis, steps, direction, delay_ms)
 
-    # ═════════════ 步进：运动指令 ═════════════
-    def send_move(self):
+    def _on_step_done(self, axis):
+        if self._pending_step[axis] is not None:
+            self.position_mm[axis] += self._pending_step[axis]
+            self._pending_step[axis] = None
+            self._update_pos_label(axis)
+        self.stepper_in_progress[axis] = False
+        self.log(f"轴{AXIS_LABEL[axis]} 步进完成")
+
+    # ═════════════ 步进：命令 ═════════════
+    def send_move(self, axis):
         threading.Thread(target=self._send_mm,
-                         args=(self.distance_var.get(), self.dir_var.get(), self.delay_var.get()),
+                         args=(axis, self.v_dist[axis].get(), self.v_dir[axis].get(),
+                               self.v_delay[axis].get()), daemon=True).start()
+
+    def _quick_move(self, axis, distance_mm, direction):
+        threading.Thread(target=self._send_mm,
+                         args=(axis, distance_mm, direction, self.v_delay[axis].get()),
                          daemon=True).start()
 
-    def _quick_move(self, distance_mm, direction):
-        threading.Thread(target=self._send_mm,
-                         args=(distance_mm, direction, self.delay_var.get()),
-                         daemon=True).start()
-
-    def _press_continuous(self, direction):
-        if self.running or not self.ser or not self.ser.is_open:
-            return
-        self.running = True
-        self.stop_btn.config(state="normal")
+    def _press_continuous(self, axis, direction):
+        if self.running[axis] or not self.ser or not self.ser.is_open: return
+        self.running[axis] = True
         dir_txt = "向外" if direction == DIR_OUTWARD else "向内"
-        self.log(f"按住连续{dir_txt} (burst={CONTINUOUS_BURST_MM}mm)")
-
+        self.log(f"轴{AXIS_LABEL[axis]} 按住连续{dir_txt}")
         def worker():
-            while self.running:
-                # 发下一批前先等上一批 STEP,DONE 回来，避免 ERR:busy
-                while self.stepper_in_progress and self.running:
+            while self.running[axis]:
+                while self.stepper_in_progress[axis] and self.running[axis]:
                     time.sleep(0.02)
-                if not self.running:
+                if not self.running[axis]: break
+                if not self._send_mm(axis, CONTINUOUS_BURST_MM, direction, self.v_delay[axis].get()):
                     break
-                if not self._send_mm(CONTINUOUS_BURST_MM, direction, self.delay_var.get()):
-                    break
-            self.log("连续运动已停止")
-            # stop_btn 不再禁用——常驻可点
-
+            self.log(f"轴{AXIS_LABEL[axis]} 连续运动停止")
         threading.Thread(target=worker, daemon=True).start()
 
-    def _release_continuous(self):
-        if self.running:
-            self.running = False
+    def _release_continuous(self, axis):
+        if self.running[axis]: self.running[axis] = False
 
-    def stop_continuous(self):
-        """紧急停止：停步进连续 worker，同时把 FOC 失能 + 当前位置作为新 target（防漂）。"""
-        self.running = False  # 步进 worker 自然结束
-        # 失能 FOC 并把目标锁在当前角度
+    def stop_continuous(self, axis):
+        self.running[axis] = False
         if self.ser and self.ser.is_open:
-            threading.Thread(target=lambda: self._send_and_read("FOC,EN,0"),
+            threading.Thread(target=lambda: self._send_and_read(f"FOC,{axis},EN,0"),
                              daemon=True).start()
-        self.log("⛔ 紧急停止")
+        self.log(f"⛔ 轴{AXIS_LABEL[axis]} 紧急停止")
 
-    # ═════════════ 步进：原点/定位 ═════════════
-    def set_home(self):
-        self.position_mm = 0.0
-        self._update_pos_label()
-        self.log("✓ 当前位置已设为原点 (0.0 mm)")
+    # ═════════════ 步进：位置/原点 ═════════════
+    def set_home(self, axis):
+        self.position_mm[axis] = 0.0
+        self._update_pos_label(axis)
+        self.log(f"✓ 轴{AXIS_LABEL[axis]} 当前位置设为原点")
 
-    def calibrate_position(self):
-        try:
-            val = float(self.target_var.get())
+    def calibrate_position(self, axis):
+        try: val = float(self.v_goto[axis].get())
         except (tk.TclError, ValueError):
-            messagebox.showerror("输入无效", "请先在前往位置框内输入数值")
-            return
-        self.position_mm = val
-        self._update_pos_label()
-        self.log(f"✓ 当前位置已校准为 {val:.1f} mm")
+            messagebox.showerror("输入无效", "请先填目标位置"); return
+        self.position_mm[axis] = val
+        self._update_pos_label(axis)
+        self.log(f"✓ 轴{AXIS_LABEL[axis]} 位置校准为 {val:.1f} mm")
 
-    def go_home(self):
-        self._goto(0.0)
+    def go_home(self, axis):
+        self._goto(axis, 0.0)
 
-    def goto_target_position(self):
-        try:
-            target = float(self.target_var.get())
+    def goto_target_position(self, axis):
+        try: target = float(self.v_goto[axis].get())
         except (tk.TclError, ValueError):
-            messagebox.showerror("输入无效", "请输入有效的目标位置")
-            return
-        self._goto(target)
+            messagebox.showerror("输入无效", "请输入有效目标位置"); return
+        self._goto(axis, target)
 
-    def _goto(self, target_mm):
-        if not self._check_range(target_mm):
-            return
-        delta = target_mm - self.position_mm
+    def _goto(self, axis, target_mm):
+        if not self._check_range(axis, target_mm): return
+        delta = target_mm - self.position_mm[axis]
         if abs(delta) < 1.0 / PULSES_PER_MM:
-            self.log(f"已在目标位置附近 ({self.position_mm:.1f} mm)")
-            return
+            self.log(f"轴{AXIS_LABEL[axis]} 已在目标附近"); return
         direction = DIR_OUTWARD if delta > 0 else DIR_INWARD
         distance = abs(delta)
-        self.log(f"前往 {target_mm:.1f} mm  (当前 {self.position_mm:.1f} mm, 需移动 {distance:.1f} mm)")
+        self.log(f"轴{AXIS_LABEL[axis]} 前往 {target_mm:.1f}mm (移动 {distance:.1f}mm)")
         threading.Thread(target=self._send_mm,
-                         args=(distance, direction, self.delay_var.get()),
+                         args=(axis, distance, direction, self.v_delay[axis].get()),
                          daemon=True).start()
 
-    # ═════════════ FOC：命令绑定 ═════════════
-    def _send_foc(self, cmd: str):
-        """异步发 FOC 命令，日志记录。"""
+    # ═════════════ 行程校准 ═════════════
+    def _mark_min(self, axis):
+        if self.travel_max_mm[axis] is not None and self.position_mm[axis] >= self.travel_max_mm[axis]:
+            messagebox.showerror("范围无效", "最小不能 ≥ 最大"); return
+        self.travel_min_mm[axis] = self.position_mm[axis]
+        self._update_range_display(axis); self._save_calib()
+        self.log(f"⊖ 轴{AXIS_LABEL[axis]} 最小 = {self.travel_min_mm[axis]:.1f}mm")
+
+    def _mark_max(self, axis):
+        if self.travel_min_mm[axis] is not None and self.position_mm[axis] <= self.travel_min_mm[axis]:
+            messagebox.showerror("范围无效", "最大不能 ≤ 最小"); return
+        self.travel_max_mm[axis] = self.position_mm[axis]
+        self._update_range_display(axis); self._save_calib()
+        self.log(f"⊕ 轴{AXIS_LABEL[axis]} 最大 = {self.travel_max_mm[axis]:.1f}mm")
+
+    def _clear_range(self, axis):
+        self.travel_min_mm[axis] = None
+        self.travel_max_mm[axis] = None
+        self._update_range_display(axis); self._save_calib()
+        self.log(f"轴{AXIS_LABEL[axis]} 行程限位已清除")
+
+    def _update_range_display(self, axis):
+        mn, mx = self.travel_min_mm[axis], self.travel_max_mm[axis]
+        label = self.sw[axis]['range_label']
+        if mn is None and mx is None:
+            label.config(text="未校准（无软件限位）", foreground="gray")
+        else:
+            mn_s = f"{mn:.1f}" if mn is not None else "?"
+            mx_s = f"{mx:.1f}" if mx is not None else "?"
+            travel = f"  (行程 {mx-mn:.1f}mm)" if (mn is not None and mx is not None) else ""
+            label.config(text=f"min={mn_s} max={mx_s}{travel}", foreground="black")
+
+    def _check_range(self, axis, target_mm):
+        mn, mx = self.travel_min_mm[axis], self.travel_max_mm[axis]
+        if mn is not None and target_mm < mn - 0.05:
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_mm:.1f}<下限{mn:.1f}"); return False
+        if mx is not None and target_mm > mx + 0.05:
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_mm:.1f}>上限{mx:.1f}"); return False
+        return True
+
+    def _save_calib(self):
+        data = {str(a): {"min": self.travel_min_mm[a], "max": self.travel_max_mm[a]}
+                for a in range(NUM_AXES)}
+        try:
+            with open(CALIB_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.log(f"⚠️ 校准保存失败: {e}")
+
+    def _load_calib(self):
+        if not os.path.exists(CALIB_FILE): return
+        try:
+            with open(CALIB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for a in range(NUM_AXES):
+                d = data.get(str(a), {})
+                self.travel_min_mm[a] = d.get("min")
+                self.travel_max_mm[a] = d.get("max")
+                self._update_range_display(a)
+            any_set = any(self.travel_min_mm[a] is not None or self.travel_max_mm[a] is not None
+                          for a in range(NUM_AXES))
+            if any_set:
+                self.log("已加载行程校准")
+        except Exception as e:
+            self.log(f"⚠️ 校准读取失败: {e}")
+
+    # ═════════════ FOC：命令 ═════════════
+    def _send_foc(self, axis, sub_and_arg):
+        """例：_send_foc(0, 'EN,1') → 发 FOC,0,EN,1 → 日志记响应"""
+        cmd = f"FOC,{axis},{sub_and_arg}"
         def worker():
             resp = self._send_and_read(cmd)
-            self.log(f"发送 {cmd} → {resp}")
+            self.log(f"{cmd} → {resp}")
         threading.Thread(target=worker, daemon=True).start()
 
-    def _foc_goto(self):
-        self._send_foc(f"FOC,A,{self.foc_target_var.get():.1f}")
+    def _foc_goto(self, axis):
+        self._send_foc(axis, f"A,{self.v_foctgt[axis].get():.1f}")
 
-    def _foc_quick(self, deg):
-        self.foc_target_var.set(deg)
-        self._foc_goto()
+    def _foc_quick(self, axis, deg):
+        self.v_foctgt[axis].set(deg); self._foc_goto(axis)
 
-    def _foc_increment(self, delta):
-        self.foc_target_var.set(self.foc_target_var.get() + delta)
-        self._foc_goto()
+    def _foc_increment(self, axis, delta):
+        self.v_foctgt[axis].set(self.v_foctgt[axis].get() + delta); self._foc_goto(axis)
 
-    def _foc_home(self):
-        self._send_foc("FOC,H")
+    def _foc_home(self, axis):
+        self._send_foc(axis, "H")
 
-    def _foc_toggle_enable(self):
-        self._foc_enabled_ui = not self._foc_enabled_ui
-        val = 1 if self._foc_enabled_ui else 0
-        self._send_foc(f"FOC,EN,{val}")
+    def _foc_toggle_enable(self, axis):
+        self._foc_enabled_ui[axis] = not self._foc_enabled_ui[axis]
+        v = 1 if self._foc_enabled_ui[axis] else 0
+        self._send_foc(axis, f"EN,{v}")
 
-    def _foc_on_vlimit_change(self, _value):
-        v = self.foc_vlimit_var.get()
-        self.foc_vlimit_label.config(text=f"{v:.1f} V (扭矩)")
-        self._send_foc(f"FOC,V,{v:.1f}")
+    def _foc_on_vlimit(self, axis, _):
+        v = self.v_focvlimit[axis].get()
+        self.fw[axis]['vlimit_label'].config(text=f"{v:.1f} V (扭矩)")
+        self._send_foc(axis, f"V,{v:.1f}")
 
-    def _foc_on_pangle_change(self, _value):
-        p = self.foc_pangle_var.get()
-        self.foc_pangle_label.config(text=f"{p:.1f} (刚度)")
-        self._send_foc(f"FOC,PA,{p:.1f}")
+    def _foc_on_pangle(self, axis, _):
+        p = self.v_focpangle[axis].get()
+        self.fw[axis]['pangle_label'].config(text=f"{p:.1f} (刚度)")
+        self._send_foc(axis, f"PA,{p:.1f}")
 
-    def _foc_on_vp_change(self, _value):
-        p = self.foc_vp_var.get()
-        self.foc_vp_label.config(text=f"{p:.2f} (阻尼)")
-        self._send_foc(f"FOC,VP,{p:.2f}")
+    def _foc_on_vp(self, axis, _):
+        p = self.v_focvp[axis].get()
+        self.fw[axis]['vp_label'].config(text=f"{p:.2f} (阻尼)")
+        self._send_foc(axis, f"VP,{p:.2f}")
 
-    def _foc_save_pp(self):
-        n = int(self.foc_pp_var.get())
-        self._send_foc(f"FOC,PP,{n}")
+    def _foc_save_pp(self, axis):
+        n = int(self.v_focpp[axis].get())
+        self._send_foc(axis, f"PP,{n}")
 
-    def _foc_clear_fault(self):
-        self._send_foc("FOC,CLR")
-        self._foc_enabled_ui = False  # 清故障后需要用户手动再使能
+    def _foc_clear_fault(self, axis):
+        self._send_foc(axis, "CLR")
+        self._foc_enabled_ui[axis] = False
 
-    # ═════════════ FOC：自动调参 ═════════════
-    def _foc_autotune(self):
-        if not self.ser or not self.ser.is_open:
-            messagebox.showerror("未连接", "请先连接 COM 口并使能 FOC")
-            return
-        if not messagebox.askokcancel(
-            "自动调参确认",
-            "两阶段扫描 PA（刚度）和 VP（阻尼），约 2 分钟。\n"
-            "电机会来回转动，请先固定好。\n\n"
-            "开始吗？"):
-            return
-        self.foc_autotune_btn.config(state="disabled")
-        threading.Thread(target=self._foc_autotune_worker, daemon=True).start()
-
-    def _step_response_test(self, target, pre_settle=2.0, duration=2.5):
-        """单次阶跃响应测试。返回 (overshoot, ss_error, rise_time, jitter)。"""
-        self._send_and_read("FOC,A,0")
-        time.sleep(pre_settle)
-        t0 = time.time()
-        self._send_and_read(f"FOC,A,{target}")
-        time.sleep(duration)
-        # 截取阶跃后的数据
-        data = [(t - t0, cur) for t, tgt, cur in self.foc_trace_buf
-                if t >= t0 and abs(tgt - target) < 0.5]
-        if len(data) < 5:
-            return None
-        curs = [c for _, c in data]
-        max_cur = max(curs)
-        final_cur = curs[-1]
-        overshoot = max(0.0, max_cur - target) if target > 0 else max(0.0, target - min(curs))
-        ss_error = abs(final_cur - target)
-        # 上升时间：首次到 90% 目标
-        rise_time = None
-        threshold = target * 0.9
-        for t, c in data:
-            if c >= threshold:
-                rise_time = t
-                break
-        # 稳态抖动：最后 0.8s 的标准差
-        tail = [c for t, c in data if t >= duration - 0.8]
-        if len(tail) >= 3:
-            m = sum(tail) / len(tail)
-            jitter = (sum((x-m)**2 for x in tail) / len(tail)) ** 0.5
-        else:
-            jitter = 0.0
-        return (overshoot, ss_error, rise_time or 99.0, jitter)
-
-    def _foc_autotune_worker(self):
-        try:
-            self.log("=" * 40)
-            self.log("🤖 自动调参开始（两阶段：PA → VP）")
-            self.log("=" * 40)
-
-            # 确保使能 + 归零
-            self._send_and_read("FOC,EN,1")
-            time.sleep(5.5)
-            self._send_and_read("FOC,H")
-            time.sleep(0.5)
-
-            # ─── 阶段 1：固定 VP=0.15，扫 PA ───
-            self._send_and_read("FOC,VP,0.15")
-            self.log("【阶段 1】固定 VP=0.15，扫描 PA ...")
-            pa_results = []
-            for pa in [5, 10, 15, 20, 25, 30, 35, 40]:
-                self._send_and_read(f"FOC,PA,{pa}")
-                time.sleep(0.3)
-                m = self._step_response_test(90.0)
-                if m is None:
-                    self.log(f"  PA={pa}: 数据不足，跳过")
-                    continue
-                ov, sse, rt, jt = m
-                rt_str = f"{rt:.2f}s" if rt < 99 else ">2.5s"
-                self.log(f"  PA={pa}: 过冲={ov:.1f}° 稳态误差={sse:.1f}° 上升={rt_str} 抖动={jt:.2f}°")
-                pa_results.append((pa, ov, sse, rt, jt))
-                if ov > 30:
-                    self.log(f"  过冲超 30°，停止 PA 扫描")
-                    break
-
-            if not pa_results:
-                self.log("❌ PA 扫描无数据，终止")
-                return
-
-            def pa_score(r):
-                _, ov, sse, rt, jt = r
-                return ov*2 + rt*3 + sse*2 + jt*5
-            good = [r for r in pa_results if r[1] <= 15]
-            pool = good if good else pa_results
-            best_pa_row = min(pool, key=pa_score)
-            best_pa = best_pa_row[0]
-            self.log(f"阶段 1 完成：选定 PA={best_pa}")
-
-            # ─── 阶段 2：固定 best_pa，扫 VP ───
-            self._send_and_read(f"FOC,PA,{best_pa}")
-            time.sleep(0.3)
-            self.log(f"【阶段 2】固定 PA={best_pa}，扫描 VP（阻尼）...")
-            vp_results = []
-            for vp in [0.10, 0.15, 0.20, 0.30, 0.40, 0.55, 0.70]:
-                self._send_and_read(f"FOC,VP,{vp}")
-                time.sleep(0.3)
-                m = self._step_response_test(90.0)
-                if m is None:
-                    continue
-                ov, sse, rt, jt = m
-                self.log(f"  VP={vp:.2f}: 过冲={ov:.1f}° 上升={rt:.2f}s 抖动={jt:.2f}°")
-                vp_results.append((vp, ov, sse, rt, jt))
-                # 稳态抖动 >3° 认为振荡，停止
-                if jt > 3.0:
-                    self.log(f"  抖动 >3°（振荡），停止 VP 扫描")
-                    break
-
-            if not vp_results:
-                self.log("VP 扫描无数据，保留默认")
-                best_vp = 0.15
-            else:
-                def vp_score(r):
-                    _, ov, sse, rt, jt = r
-                    return ov*2 + rt*2 + jt*10  # 抖动权重最高
-                # 过滤抖动 >2° 的
-                good = [r for r in vp_results if r[4] <= 2.0]
-                pool = good if good else vp_results
-                best_vp_row = min(pool, key=vp_score)
-                best_vp = best_vp_row[0]
-
-            # ─── 应用 + 回零 + 同步 GUI ───
-            self._send_and_read(f"FOC,PA,{best_pa}")
-            time.sleep(0.2)
-            self._send_and_read(f"FOC,VP,{best_vp}")
-            time.sleep(0.2)
-            self._send_and_read("FOC,A,0")
-
-            self.log("=" * 40)
-            self.log(f"✅ 最终推荐：PA={best_pa}  VP={best_vp:.2f}")
-            self.log("   已自动应用并同步 GUI 滑条")
-            self.log("=" * 40)
-
-            self.root.after(0, lambda: self.foc_pangle_var.set(float(best_pa)))
-            self.root.after(0, lambda: self.foc_pangle_label.config(text=f"{best_pa:.1f} (刚度)"))
-            self.root.after(0, lambda: self.foc_vp_var.set(float(best_vp)))
-            self.root.after(0, lambda: self.foc_vp_label.config(text=f"{best_vp:.2f} (阻尼)"))
-        finally:
-            self.root.after(0, lambda: self.foc_autotune_btn.config(state="normal"))
-
-    # ═════════════ FOC：状态轮询 ═════════════
+    # ═════════════ FOC：轮询 + 显示 ═════════════
     def _foc_poll_loop(self):
         while self.foc_poll_running and self.ser and self.ser.is_open:
-            resp = self._send_and_read("FOC,S")
-            if resp.startswith("FOC,S,"):
-                parts = resp.split(",")
-                if len(parts) == 6:
-                    state, cur, tgt, fault = parts[2], parts[3], parts[4], parts[5]
-                    self.root.after(0, lambda s=state, c=cur, t=tgt, f=fault:
-                                    self._update_foc_display(s, c, t, f))
-            time.sleep(FOC_POLL_INTERVAL_S)
+            for axis in range(NUM_AXES):
+                if not (self.foc_poll_running and self.ser and self.ser.is_open): break
+                resp = self._send_and_read(f"FOC,{axis},S")
+                prefix = f"FOC,{axis},S,"
+                if resp.startswith(prefix):
+                    parts = resp.split(",")
+                    # 格式: FOC,<axis>,S,<state>,<cur>,<tgt>,<fault>
+                    if len(parts) == 7:
+                        s, c, t, f = parts[3], parts[4], parts[5], parts[6]
+                        self.root.after(0, lambda a=axis, s=s, c=c, t=t, f=f:
+                                        self._update_foc_display(a, s, c, t, f))
+                time.sleep(FOC_POLL_INTERVAL_S / NUM_AXES)  # 总周期仍 ~100ms
 
-    def _update_foc_display(self, state, cur, tgt, fault):
-        name = FOC_STATE_NAMES.get(state, "?")
-        self.foc_state_var.set(name)
+    def _update_foc_display(self, axis, state, cur, tgt, fault):
+        self.v_focstate[axis].set(FOC_STATE_NAMES.get(state, "?"))
         try:
-            cur_f = float(cur)
-            tgt_f = float(tgt)
+            cur_f = float(cur); tgt_f = float(tgt)
         except ValueError:
             cur_f = tgt_f = None
         cur_text = f"{cur_f:.1f}°" if cur_f is not None else "--"
-        if self.stepper_in_progress:
-            cur_text += " ⏸"
-        self.foc_current_var.set(cur_text)
-        fault_text = "报警" if fault == "1" else "正常"
-        self.foc_fault_var.set(fault_text)
-        self.foc_fault_label.config(foreground="red" if fault == "1" else "green")
-        self._apply_foc_gating(state, fault)
+        if self.stepper_in_progress[axis]: cur_text += " ⏸"
+        self.v_foccur[axis].set(cur_text)
+        self.v_focfault[axis].set("报警" if fault == "1" else "正常")
+        self.fw[axis]['fault_label'].config(foreground="red" if fault == "1" else "green")
+        self._apply_foc_gating(axis, state, fault)
 
-        # 示波器：追加采样并重绘（只有 RUNNING 且数据合法时）
         if cur_f is not None and state == "2":
             now = time.time()
-            self.foc_trace_buf.append((now, tgt_f, cur_f))
+            self.foc_trace_buf[axis].append((now, tgt_f, cur_f))
             cutoff = now - 10.0
-            self.foc_trace_buf = [x for x in self.foc_trace_buf if x[0] >= cutoff]
-            self._redraw_foc_scope()
+            self.foc_trace_buf[axis] = [x for x in self.foc_trace_buf[axis] if x[0] >= cutoff]
+            self._redraw_scope(axis)
 
-    def _redraw_foc_scope(self):
-        W, H = 480, 480
-        cv = self.foc_scope
-        cv.delete("all")
-        buf = self.foc_trace_buf
-        if len(buf) < 2:
-            cv.create_text(W/2, H/2, text="(等待数据，先使能 FOC)", fill="#888")
+    def _apply_foc_gating(self, axis, state, fault):
+        fw = self.fw[axis]
+        if not self.ser or not self.ser.is_open:
+            for w in fw['motion_btns'] + fw['cfg_btns']:
+                w.config(state="disabled")
+            fw['enable_btn'].config(state="disabled")
+            fw['clear_btn'].config(state="disabled")
             return
-        t0 = buf[0][0]
-        t_span = max(0.1, buf[-1][0] - t0)
+        is_fault    = (fault == "1" or state == "3")
+        is_disabled = (state == "0")
+        is_running  = (state == "2")
+        is_aligning = (state == "1")
+        motion_state = "normal" if is_running else "disabled"
+        for b in fw['motion_btns']: b.config(state=motion_state)
+        cfg_state = "normal" if (is_disabled or is_running) else "disabled"
+        for w in fw['cfg_btns']: w.config(state=cfg_state)
+        en_state = "normal" if (is_disabled or is_running) else "disabled"
+        fw['enable_btn'].config(state=en_state)
+        if is_running:    fw['enable_btn'].config(text="■ 失能 FOC")
+        elif is_aligning: fw['enable_btn'].config(text="… 对齐中")
+        elif is_fault:    fw['enable_btn'].config(text="(故障，先清除)")
+        else:             fw['enable_btn'].config(text="▶ 使能 FOC")
+        fw['clear_btn'].config(state="normal" if is_fault else "disabled")
 
+    def _redraw_scope(self, axis):
+        W, H = 420, 420
+        cv = self.fw[axis]['scope']
+        cv.delete("all")
+        buf = self.foc_trace_buf[axis]
+        if len(buf) < 2:
+            cv.create_text(W/2, H/2, text="(等待数据)", fill="#888")
+            return
+        t0 = buf[0][0]; t_span = max(0.1, buf[-1][0] - t0)
         ys = [p[1] for p in buf] + [p[2] for p in buf]
         y_min, y_max = min(ys), max(ys)
         if y_max - y_min < 10:
-            c = (y_min + y_max) / 2
-            y_min, y_max = c - 5, c + 5
+            c = (y_min + y_max) / 2; y_min, y_max = c - 5, c + 5
         y_pad = (y_max - y_min) * 0.1
-        y_min -= y_pad
-        y_max += y_pad
-
-        # 浅色网格
+        y_min -= y_pad; y_max += y_pad
         for frac in (0.25, 0.5, 0.75):
-            y = H * frac
-            cv.create_line(0, y, W, y, fill="#e5e5e5")
-
-        # 零度线
+            y = H * frac; cv.create_line(0, y, W, y, fill="#e5e5e5")
         if y_min < 0 < y_max:
             y0 = H * (y_max - 0) / (y_max - y_min)
             cv.create_line(0, y0, W, y0, fill="#aaa", dash=(3, 3))
-
-        # 轴标签
         cv.create_text(3, 3, text=f"{y_max:.0f}°", anchor="nw", fill="#555", font=("Arial", 8))
         cv.create_text(3, H-3, text=f"{y_min:.0f}°", anchor="sw", fill="#555", font=("Arial", 8))
-        cv.create_text(W-3, H-3, text=f"now", anchor="se", fill="#555", font=("Arial", 8))
-
-        # 构造两条折线
         pts_t, pts_c = [], []
         for t, tgt, cur in buf:
             x = W * (t - t0) / t_span
             yt = H * (y_max - tgt) / (y_max - y_min)
             yc = H * (y_max - cur) / (y_max - y_min)
-            pts_t.extend([x, yt])
-            pts_c.extend([x, yc])
-        if len(pts_t) >= 4:
-            cv.create_line(*pts_t, fill="#1565c0", width=1)  # 目标 蓝
-        if len(pts_c) >= 4:
-            cv.create_line(*pts_c, fill="#d32f2f", width=2)  # 实测 红
+            pts_t.extend([x, yt]); pts_c.extend([x, yc])
+        if len(pts_t) >= 4: cv.create_line(*pts_t, fill="#1565c0", width=1)
+        if len(pts_c) >= 4: cv.create_line(*pts_c, fill="#d32f2f", width=2)
 
-    def _apply_foc_gating(self, state, fault):
-        """状态门控 per spec §7.5"""
+    # ═════════════ FOC：自动调参（单轴）═════════════
+    def _foc_autotune(self, axis):
         if not self.ser or not self.ser.is_open:
-            # 全部灰
-            for w in self._foc_motion_btns + self._foc_cfg_btns:
-                w.config(state="disabled")
-            self.foc_enable_btn.config(state="disabled")
-            self.foc_clear_btn.config(state="disabled")
+            messagebox.showerror("未连接", "请先连接串口"); return
+        if not messagebox.askokcancel(
+            "自动调参确认",
+            f"轴 {AXIS_LABEL[axis]} 两阶段扫描 PA + VP，约 2 分钟。\n电机会来回转动，请先固定好。"):
             return
+        self.fw[axis]['autotune_btn'].config(state="disabled")
+        threading.Thread(target=lambda: self._foc_autotune_worker(axis), daemon=True).start()
 
-        is_fault    = (fault == "1" or state == "3")
-        is_disabled = (state == "0")
-        is_running  = (state == "2")
-        is_aligning = (state == "1")
+    def _step_response_test(self, axis, target, pre_settle=2.0, duration=2.5):
+        self._send_and_read(f"FOC,{axis},A,0"); time.sleep(pre_settle)
+        t0 = time.time()
+        self._send_and_read(f"FOC,{axis},A,{target}"); time.sleep(duration)
+        data = [(t - t0, cur) for t, tgt, cur in self.foc_trace_buf[axis]
+                if t >= t0 and abs(tgt - target) < 0.5]
+        if len(data) < 5: return None
+        curs = [c for _, c in data]
+        overshoot = max(0.0, max(curs) - target) if target > 0 else max(0.0, target - min(curs))
+        ss_error = abs(curs[-1] - target)
+        rt = None
+        thr = target * 0.9
+        for t, c in data:
+            if c >= thr: rt = t; break
+        tail = [c for t, c in data if t >= duration - 0.8]
+        if len(tail) >= 3:
+            m = sum(tail)/len(tail)
+            jit = (sum((x-m)**2 for x in tail)/len(tail))**0.5
+        else: jit = 0.0
+        return (overshoot, ss_error, rt or 99.0, jit)
 
-        # 运动按钮：仅 RUNNING
-        motion_state = "normal" if is_running else "disabled"
-        for b in self._foc_motion_btns:
-            b.config(state=motion_state)
-
-        # 配置类（归零、电压限幅、极对数保存）：DISABLED 或 RUNNING
-        cfg_state = "normal" if (is_disabled or is_running) else "disabled"
-        for w in self._foc_cfg_btns:
-            w.config(state=cfg_state)
-
-        # 使能切换按钮：DISABLED 或 RUNNING 可切
-        en_state = "normal" if (is_disabled or is_running) else "disabled"
-        self.foc_enable_btn.config(state=en_state)
-        # 标签更新
-        if is_running:
-            self.foc_enable_btn.config(text="■ 失能 FOC")
-        elif is_aligning:
-            self.foc_enable_btn.config(text="… 对齐中")
-        elif is_fault:
-            self.foc_enable_btn.config(text="(故障，先清除)")
-        else:
-            self.foc_enable_btn.config(text="▶ 使能 FOC")
-
-        # 清故障：仅 FAULT
-        self.foc_clear_btn.config(state="normal" if is_fault else "disabled")
+    def _foc_autotune_worker(self, axis):
+        try:
+            self.log(f"🤖 轴{AXIS_LABEL[axis]} 自动调参开始")
+            self._send_and_read(f"FOC,{axis},EN,1"); time.sleep(5.5)
+            self._send_and_read(f"FOC,{axis},H"); time.sleep(0.5)
+            self._send_and_read(f"FOC,{axis},VP,0.15")
+            pa_results = []
+            for pa in [5, 10, 15, 20, 25, 30]:
+                self._send_and_read(f"FOC,{axis},PA,{pa}"); time.sleep(0.3)
+                m = self._step_response_test(axis, 90.0)
+                if m is None: continue
+                ov, sse, rt, jt = m
+                self.log(f"  PA={pa}: 过冲={ov:.1f}° 误差={sse:.1f}° 上升={rt:.2f}s 抖={jt:.2f}°")
+                pa_results.append((pa, ov, sse, rt, jt))
+                if ov > 30: break
+            if not pa_results:
+                self.log("❌ 无数据"); return
+            good = [r for r in pa_results if r[1] <= 15]
+            pool = good if good else pa_results
+            best_pa = min(pool, key=lambda r: r[1]*2 + r[3]*3 + r[2]*2 + r[4]*5)[0]
+            self._send_and_read(f"FOC,{axis},PA,{best_pa}"); time.sleep(0.3)
+            vp_results = []
+            for vp in [0.10, 0.15, 0.20, 0.30, 0.40, 0.55, 0.70]:
+                self._send_and_read(f"FOC,{axis},VP,{vp}"); time.sleep(0.3)
+                m = self._step_response_test(axis, 90.0)
+                if m is None: continue
+                ov, sse, rt, jt = m
+                self.log(f"  VP={vp:.2f}: 过冲={ov:.1f}° 上升={rt:.2f}s 抖={jt:.2f}°")
+                vp_results.append((vp, ov, sse, rt, jt))
+                if jt > 3.0: break
+            best_vp = 0.15
+            if vp_results:
+                good = [r for r in vp_results if r[4] <= 2.0]
+                pool = good if good else vp_results
+                best_vp = min(pool, key=lambda r: r[1]*2 + r[3]*2 + r[4]*10)[0]
+            self._send_and_read(f"FOC,{axis},PA,{best_pa}"); time.sleep(0.2)
+            self._send_and_read(f"FOC,{axis},VP,{best_vp}"); time.sleep(0.2)
+            self._send_and_read(f"FOC,{axis},A,0")
+            self.log(f"✅ 轴{AXIS_LABEL[axis]} 推荐：PA={best_pa}  VP={best_vp:.2f}")
+            self.root.after(0, lambda: self.v_focpangle[axis].set(float(best_pa)))
+            self.root.after(0, lambda: self.fw[axis]['pangle_label'].config(text=f"{best_pa:.1f} (刚度)"))
+            self.root.after(0, lambda: self.v_focvp[axis].set(float(best_vp)))
+            self.root.after(0, lambda: self.fw[axis]['vp_label'].config(text=f"{best_vp:.2f} (阻尼)"))
+        finally:
+            self.root.after(0, lambda: self.fw[axis]['autotune_btn'].config(state="normal"))
 
     # ═════════════ 日志 ═════════════
     def log(self, msg):
