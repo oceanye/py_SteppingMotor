@@ -7,14 +7,15 @@
 static TaskHandle_t      s_task        = nullptr;
 static SemaphoreHandle_t s_start_sem   = nullptr;
 static std::atomic<bool> s_busy        {false};
-static int               s_steps, s_dir, s_delay_ms;   // 任务参数，仅在 busy=false 时由 async 写
+// s_delay_us: 每脉冲 LOW 段持续时间，单位**微秒**（之前是毫秒）
+static int               s_steps, s_dir, s_delay_us;
 
 static void stepper_task(void* /*arg*/) {
   for (;;) {
     xSemaphoreTake(s_start_sem, portMAX_DELAY);
     int steps = s_steps;
     int dir   = s_dir;
-    int dms   = s_delay_ms;
+    int dus   = s_delay_us;
 
     digitalWrite(PIN_STEP_DIR, dir);
     delayMicroseconds(100);
@@ -22,8 +23,13 @@ static void stepper_task(void* /*arg*/) {
       digitalWrite(PIN_STEP_PUL, HIGH);
       delayMicroseconds(50);
       digitalWrite(PIN_STEP_PUL, LOW);
-      // 用 vTaskDelay（而不是 delay）让其他任务尽早调度
-      vTaskDelay(dms / portTICK_PERIOD_MS);
+      // ≥1ms 用 vTaskDelay 让步；<1ms busy-wait，但每 50 步强制让一次喂狗
+      if (dus >= 1000) {
+        vTaskDelay(dus / 1000 / portTICK_PERIOD_MS);
+      } else if (dus > 0) {
+        delayMicroseconds(dus);
+        if ((i % 50) == 49) vTaskDelay(1);  // ~1ms 让步给 USB CDC / watchdog
+      }
     }
     s_busy.store(false);
     Serial.println("STEP,DONE");
@@ -41,15 +47,16 @@ void stepper_init() {
   xTaskCreatePinnedToCore(stepper_task, "stepper", 4096, nullptr, 1, &s_task, 1);
 }
 
-// 同步版本（保留，DIAG 可能直接调用）
-void stepper_move(int steps, int direction, int delay_ms) {
+// 同步版本（保留供 DIAG 等直接调用；参数改为微秒）
+void stepper_move(int steps, int direction, int delay_us) {
   digitalWrite(PIN_STEP_DIR, direction);
   delayMicroseconds(100);
   for (int i = 0; i < steps; i++) {
     digitalWrite(PIN_STEP_PUL, HIGH);
     delayMicroseconds(50);
     digitalWrite(PIN_STEP_PUL, LOW);
-    delay(delay_ms);
+    if (delay_us >= 2000) delay(delay_us / 1000);
+    else if (delay_us > 0) delayMicroseconds(delay_us);
   }
   Serial.println("OK");
 }
@@ -58,12 +65,12 @@ bool stepper_is_busy() {
   return s_busy.load();
 }
 
-bool stepper_move_async(int steps, int direction, int delay_ms) {
+bool stepper_move_async(int steps, int direction, int delay_us) {
   // 调用方都在 Core 1 的 loop()（串口单线程），无竞态。
   if (s_busy.load()) return false;
   s_steps    = steps;
   s_dir      = direction;
-  s_delay_ms = delay_ms;
+  s_delay_us = delay_us;
   s_busy.store(true);
   xSemaphoreGive(s_start_sem);
   return true;

@@ -117,12 +117,12 @@ class StepperGUI:
         ttk.Label(param_frame, text="速度:").grid(row=3, column=0, sticky="w", **pad)
         speed_frame = ttk.Frame(param_frame)
         speed_frame.grid(row=3, column=1, sticky="w", pady=5)
-        self.delay_var = tk.IntVar(value=20)
-        self.speed_slider = ttk.Scale(speed_frame, from_=2, to=100, orient="horizontal",
-                                      variable=self.delay_var, length=160,
-                                      command=lambda v: self.delay_var.set(int(float(v))))
+        # delay 现在是 float ms（最小 0.1ms = 100µs，最大 50ms）
+        self.delay_var = tk.DoubleVar(value=20.0)
+        self.speed_slider = ttk.Scale(speed_frame, from_=0.1, to=50.0, orient="horizontal",
+                                      variable=self.delay_var, length=160)
         self.speed_slider.pack(side="left")
-        self.delay_label = ttk.Label(speed_frame, text="", width=22)
+        self.delay_label = ttk.Label(speed_frame, text="", width=24)
         self.delay_label.pack(side="left", padx=6)
         self.delay_var.trace_add("write", self._update_speed_label)
         self._update_speed_label()
@@ -317,9 +317,9 @@ class StepperGUI:
 
     # ═════════════ 公共辅助 ═════════════
     def _update_speed_label(self, *_):
-        d = max(1, self.delay_var.get())
+        d = max(0.1, self.delay_var.get())
         speed_mm_s = 1000.0 / (PULSES_PER_MM * d)
-        self.delay_label.config(text=f"{d} ms/脉冲 ≈ {speed_mm_s:.1f} mm/s")
+        self.delay_label.config(text=f"{d:.1f} ms/脉冲 ≈ {speed_mm_s:.0f} mm/s")
 
     def _update_pos_label(self):
         self.pos_label.config(text=f"{self.position_mm:.1f} mm")
@@ -440,14 +440,15 @@ class StepperGUI:
             return False
         # 若上次 STEP,DONE 还没回来，先等完（与并发 MOVE 有关）
         while self.stepper_in_progress and self.running is False:
-            # running==False 表示非连续模式；连续模式下上层 worker 自己管
             time.sleep(0.02)
-        resp = self._send_and_read(f"MOVE,{steps},{direction},{delay_ms}")
+        # 协议第三参为微秒（v2.2+），ms × 1000
+        delay_us = max(1, int(round(delay_ms * 1000)))
+        resp = self._send_and_read(f"MOVE,{steps},{direction},{delay_us}")
         dist_mm = steps / PULSES_PER_MM
         dir_txt = "向外" if direction == DIR_OUTWARD else "向内"
-        self.log(f"发送 {dist_mm:.1f}mm {dir_txt} @ {delay_ms}ms → {resp}")
+        speed_mm_s = 1000.0 / (PULSES_PER_MM * max(0.001, delay_ms))
+        self.log(f"发送 {dist_mm:.1f}mm {dir_txt} @ {delay_ms:.1f}ms ({speed_mm_s:.0f}mm/s) → {resp}")
         if resp == "ACK":
-            # 记下待定脉冲参数；STEP,DONE 回来时 _on_step_done 会更新位置
             sign = +1.0 if direction == DIR_OUTWARD else -1.0
             self._pending_step = sign * dist_mm
             self.stepper_in_progress = True

@@ -6,7 +6,8 @@
 static void reply_ok()                 { Serial.println("OK"); }
 static void reply_err(const char* why) { Serial.print("ERR:"); Serial.println(why); }
 
-// ── MOVE,steps,dir,delay_ms ──
+// ── MOVE,steps,dir,delay_us ──
+// 第 3 参数从 v2.2 起改为**微秒**（之前是毫秒，单位提升允许更高速度）。
 // 异步：立即回 "ACK" 或 "ERR:busy"；完成时 stepper_task 会发 "STEP,DONE"。
 static void handle_move(const String& cmd) {
   int p1 = cmd.indexOf(',');
@@ -16,8 +17,8 @@ static void handle_move(const String& cmd) {
 
   int steps     = cmd.substring(p1 + 1, p2).toInt();
   int direction = cmd.substring(p2 + 1, p3).toInt();
-  int delay_ms  = cmd.substring(p3 + 1).toInt();
-  if (stepper_move_async(steps, direction, delay_ms)) {
+  int delay_us  = cmd.substring(p3 + 1).toInt();
+  if (stepper_move_async(steps, direction, delay_us)) {
     Serial.println("ACK");
   } else {
     reply_err("busy");
