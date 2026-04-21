@@ -53,13 +53,13 @@ void foc_init() {
   motor.velocity_limit        = FOC_VELOCITY_LIMIT;
   motor.controller            = MotionControlType::angle;
 
-  // 位置环 PID 调参（2208 gimbal 专用，硬件实测 45 有振荡、40 稳定）
-  motor.P_angle.P        = 40.0f;  // 位置环 P，实测 40 是稳定上限
-  motor.PID_velocity.P   = 0.4f;   // 速度环 P（= 阻尼感），默认 0.5；0.4 是扭矩大 + 阻尼的甜点
-  motor.PID_velocity.I   = 2.0f;   // 速度环 I，默认 10 偏高（容易积分振荡）
+  // 位置环 PID 调参（24V PSU 实测稳定值，2208 gimbal）
+  motor.P_angle.P        = 25.0f;  // PSU 升到 24V 后 PA=40 会振荡，降到 25 稳
+  motor.PID_velocity.P   = 0.2f;   // 速度环 P，PSU=24 下 0.4 过激进
+  motor.PID_velocity.I   = 2.0f;
   motor.PID_velocity.D   = 0.0f;
   motor.PID_velocity.output_ramp = 1000.0f;
-  motor.LPF_velocity.Tf  = 0.02f;  // 速度低通滤波
+  motor.LPF_velocity.Tf  = 0.02f;
 
   motor.init();
   // 不调 motor.initFOC()，等 foc_request_enable(true) 触发
