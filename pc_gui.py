@@ -5,6 +5,11 @@ import serial.tools.list_ports
 import threading
 import time
 import queue
+import json
+import os
+
+# 校准文件：保存在脚本同目录
+CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stepper_calib.json")
 
 # ============== 步进标定常数 ==============
 PULSES_PER_MM = 50       # 根据实测修正：GUI 设 50mm 实际走 5mm → 需 10× 脉冲数
@@ -39,6 +44,7 @@ class StepperGUI:
         self._reader_running = False
         self._pending_step = None   # (dist_mm, direction) 等待 STEP,DONE 事件更新位置
         self._build_ui()
+        self._load_calib()   # 启动时载入持久化的行程范围
 
     # ═════════════ 顶层 UI ═════════════
     def _build_ui(self):
@@ -345,14 +351,14 @@ class StepperGUI:
 
     # ── 行程范围校准 ───────────────────────────
     def _mark_min(self):
-        # 检查最小不能大于已设的最大
         if self.travel_max_mm is not None and self.position_mm >= self.travel_max_mm:
             messagebox.showerror("范围无效",
                                  f"当前位置 {self.position_mm:.1f}mm 不能 ≥ 已设最大 {self.travel_max_mm:.1f}mm")
             return
         self.travel_min_mm = self.position_mm
         self._update_range_display()
-        self.log(f"⊖ 标记最小行程: {self.travel_min_mm:.1f} mm")
+        self._save_calib()
+        self.log(f"⊖ 标记最小行程: {self.travel_min_mm:.1f} mm (已保存)")
 
     def _mark_max(self):
         if self.travel_min_mm is not None and self.position_mm <= self.travel_min_mm:
@@ -361,13 +367,41 @@ class StepperGUI:
             return
         self.travel_max_mm = self.position_mm
         self._update_range_display()
-        self.log(f"⊕ 标记最大行程: {self.travel_max_mm:.1f} mm")
+        self._save_calib()
+        self.log(f"⊕ 标记最大行程: {self.travel_max_mm:.1f} mm (已保存)")
 
     def _clear_range(self):
         self.travel_min_mm = None
         self.travel_max_mm = None
         self._update_range_display()
-        self.log("行程限位已清除")
+        self._save_calib()
+        self.log("行程限位已清除 (已保存)")
+
+    def _save_calib(self):
+        """把当前校准持久化到 .stepper_calib.json。"""
+        try:
+            with open(CALIB_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "travel_min_mm": self.travel_min_mm,
+                    "travel_max_mm": self.travel_max_mm,
+                }, f, indent=2)
+        except Exception as e:
+            self.log(f"⚠️ 校准保存失败: {e}")
+
+    def _load_calib(self):
+        """启动时读取校准。"""
+        if not os.path.exists(CALIB_FILE):
+            return
+        try:
+            with open(CALIB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.travel_min_mm = data.get("travel_min_mm")
+            self.travel_max_mm = data.get("travel_max_mm")
+            self._update_range_display()
+            if self.travel_min_mm is not None or self.travel_max_mm is not None:
+                self.log(f"已加载校准: min={self.travel_min_mm} max={self.travel_max_mm}")
+        except Exception as e:
+            self.log(f"⚠️ 校准读取失败: {e}")
 
     def _update_range_display(self):
         if self.travel_min_mm is None and self.travel_max_mm is None:
