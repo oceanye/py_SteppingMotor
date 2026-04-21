@@ -325,9 +325,11 @@ class StepperGUI:
         self.pos_label.config(text=f"{self.position_mm:.1f} mm")
 
     def _set_stepper_buttons_state(self, state):
+        # stop_btn 也一并启用（连接后始终可点，按下会停止任何运动）
         for b in (self.move_btn, self.jog_out_btn, self.jog_in_btn,
                   self.cont_out_btn, self.cont_in_btn,
-                  self.set_home_btn, self.go_home_btn, self.goto_btn, self.calib_btn):
+                  self.set_home_btn, self.go_home_btn, self.goto_btn, self.calib_btn,
+                  self.stop_btn):
             b.config(state=state)
 
     # ═════════════ 串口连接 ═════════════
@@ -370,8 +372,7 @@ class StepperGUI:
                 except queue.Empty: break
             self.conn_status.config(text="● 已连接", foreground="green")
             self.conn_btn.config(text="断开")
-            self._set_stepper_buttons_state("normal")
-            self.stop_btn.config(state="disabled")  # 仅连续运动时启用
+            self._set_stepper_buttons_state("normal")  # 含 stop_btn
             self.log(f"已连接 {self.port_var.get()} @ {self.baud_var.get()}")
             # 启动 reader + FOC 轮询
             self._reader_running = True
@@ -500,7 +501,7 @@ class StepperGUI:
                 if not self._send_mm(CONTINUOUS_BURST_MM, direction, self.delay_var.get()):
                     break
             self.log("连续运动已停止")
-            self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
+            # stop_btn 不再禁用——常驻可点
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -509,7 +510,13 @@ class StepperGUI:
             self.running = False
 
     def stop_continuous(self):
-        self.running = False
+        """紧急停止：停步进连续 worker，同时把 FOC 失能 + 当前位置作为新 target（防漂）。"""
+        self.running = False  # 步进 worker 自然结束
+        # 失能 FOC 并把目标锁在当前角度
+        if self.ser and self.ser.is_open:
+            threading.Thread(target=lambda: self._send_and_read("FOC,EN,0"),
+                             daemon=True).start()
+        self.log("⛔ 紧急停止")
 
     # ═════════════ 步进：原点/定位 ═════════════
     def set_home(self):
