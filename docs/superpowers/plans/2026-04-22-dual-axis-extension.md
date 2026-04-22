@@ -285,18 +285,16 @@ git merge --no-ff feat/foc-integration
 
 ## Phase D：可选增强（视需求）
 
-这些是未实现的后续需求，按用户需要选做。
+### ✅ Task D1：广播命令（已实施，commit `39425f3`）
 
-### Task D1：广播命令
+固件协议支持 `*` 作为 axis，遍历所有轴分发：
+- `MOVE,*,500,0,20000` → 两轴步进同时启动，各自 `ACK,<axis>`
+- `FOC,*,EN,1` / `FOC,*,A,90` / `FOC,*,S` → 两轴并发执行
+- 单轴语法完全向后兼容
 
-**新语法**：`MOVE,*,500,0,20000` / `FOC,*,A,90` —— 对所有轴并发
+GUI 未加专用按钮；用户用 Monitor 或后续扩展 GUI 时可用。
 
-- 协议解析器识别 `*`，对 `[0..NUM_AXES)` 分别派发
-- GUI 增加"同步控制"面板
-
-**工时**：约 2 小时。
-
-### Task D2：硬件限位开关
+### Task D2：硬件限位开关（待实施）
 
 - 每轴加 2 限位（min/max），共 4 个数字输入 GPIO
 - 固件中断 or 轮询读状态，触发时立即失能
@@ -304,19 +302,21 @@ git merge --no-ff feat/foc-integration
 
 **工时**：约 3 小时 + 硬件采购。
 
-### Task D3：位置/PID 全持久化
+### ✅ Task D3：PID 参数持久化（已实施，commit `84dc0cb`）
 
-- `position_mm`、`P_angle.P`、`PID_velocity.P`、`voltage_limit` 全部进 NVS
-- 重启后恢复（带用户确认对话框）
+GUI 端 `.foc_tune.json` 保存 V/PA/VP/PP 每轴一份：
+- 启动时读 json → 填 Tk 变量 + 更新滑条标签
+- 连接成功后 `_apply_foc_tune_to_firmware` 推到 ESP32
+- 滑条松手（ButtonRelease）/ autotune 完成 / PP 保存时触发写回
 
-**工时**：约 1.5 小时。
+**不持久化**：`position_mm`（跨会话电机可能被移动，不可信）。
 
-### Task D4：加减速曲线
+### Task D4：加减速曲线（TODO — 硬件验证后再做）
 
 - 步进加梯形/S 曲线，高速启停无冲击
-- FOC 加 velocity trajectory planner
+- FOC 加 velocity trajectory planner（SimpleFOC 自带 MotionControlType::trajectory）
 
-**工时**：约 3-4 小时。
+**工时**：约 3-4 小时，需要硬件联调定参数。
 
 ---
 
