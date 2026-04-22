@@ -22,7 +22,8 @@ CONTINUOUS_BURST_MM = 0.2
 FOC_STATE_NAMES = {"0": "失能", "1": "对齐中", "2": "运行", "3": "故障"}
 FOC_POLL_INTERVAL_S = 0.1
 
-CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stepper_calib.json")
+CALIB_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stepper_calib.json")
+FOC_TUNE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".foc_tune.json")
 
 
 def _empty_axis_dict():
@@ -72,6 +73,7 @@ class StepperGUI:
 
         self._build_ui()
         self._load_calib()
+        self._load_foc_tune()
 
     # ═════════════ 顶层 UI ═════════════
     def _build_ui(self):
@@ -269,6 +271,7 @@ class StepperGUI:
                                         variable=self.v_focvlimit[axis], length=180,
                                         command=lambda v, a=axis: self._foc_on_vlimit(a, v), state="disabled")
         fw['vlimit_slider'].pack(side="left")
+        fw['vlimit_slider'].bind("<ButtonRelease-1>", lambda e: self._save_foc_tune())
         fw['vlimit_label'] = ttk.Label(vf, text="10.0 V (扭矩)", width=14)
         fw['vlimit_label'].pack(side="left", padx=6)
 
@@ -278,6 +281,7 @@ class StepperGUI:
                                         variable=self.v_focpangle[axis], length=180,
                                         command=lambda v, a=axis: self._foc_on_pangle(a, v), state="disabled")
         fw['pangle_slider'].pack(side="left")
+        fw['pangle_slider'].bind("<ButtonRelease-1>", lambda e: self._save_foc_tune())
         fw['pangle_label'] = ttk.Label(pgf, text="25.0 (刚度)", width=14)
         fw['pangle_label'].pack(side="left", padx=6)
 
@@ -287,6 +291,7 @@ class StepperGUI:
                                     variable=self.v_focvp[axis], length=180,
                                     command=lambda v, a=axis: self._foc_on_vp(a, v), state="disabled")
         fw['vp_slider'].pack(side="left")
+        fw['vp_slider'].bind("<ButtonRelease-1>", lambda e: self._save_foc_tune())
         fw['vp_label'] = ttk.Label(vpf, text="0.20 (阻尼)", width=14)
         fw['vp_label'].pack(side="left", padx=6)
 
@@ -373,6 +378,8 @@ class StepperGUI:
             threading.Thread(target=self._reader_loop, daemon=True).start()
             self.foc_poll_running = True
             threading.Thread(target=self._foc_poll_loop, daemon=True).start()
+            # 连接成功后把持久化的 FOC 调参推到固件
+            self._apply_foc_tune_to_firmware()
         except Exception as e:
             messagebox.showerror("连接失败", str(e))
 
@@ -601,6 +608,56 @@ class StepperGUI:
         except Exception as e:
             self.log(f"⚠️ 校准读取失败: {e}")
 
+    # ═════════════ FOC 调参持久化 ═════════════
+    def _save_foc_tune(self):
+        """把每轴 V/PA/VP/PP 当前值写到 .foc_tune.json。"""
+        try:
+            data = {str(a): {
+                "V":  round(self.v_focvlimit[a].get(), 2),
+                "PA": round(self.v_focpangle[a].get(), 2),
+                "VP": round(self.v_focvp[a].get(),     3),
+                "PP": int(self.v_focpp[a].get()),
+            } for a in range(NUM_AXES)}
+            with open(FOC_TUNE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.log(f"⚠️ FOC 调参保存失败: {e}")
+
+    def _load_foc_tune(self):
+        """启动时从 json 读回 Tk 变量 + 更新滑条标签。不自动下发到固件，
+        要等 toggle_connect 成功后 _apply_foc_tune_to_firmware 再推。"""
+        if not os.path.exists(FOC_TUNE_FILE): return
+        try:
+            with open(FOC_TUNE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for a in range(NUM_AXES):
+                d = data.get(str(a), {})
+                if "V"  in d: self.v_focvlimit[a].set(float(d["V"]))
+                if "PA" in d: self.v_focpangle[a].set(float(d["PA"]))
+                if "VP" in d: self.v_focvp[a].set(float(d["VP"]))
+                if "PP" in d: self.v_focpp[a].set(int(d["PP"]))
+                # 同步标签
+                self.fw[a]['vlimit_label'].config(text=f"{self.v_focvlimit[a].get():.1f} V (扭矩)")
+                self.fw[a]['pangle_label'].config(text=f"{self.v_focpangle[a].get():.1f} (刚度)")
+                self.fw[a]['vp_label'].config(text=f"{self.v_focvp[a].get():.2f} (阻尼)")
+            self.log("已加载 FOC 调参")
+        except Exception as e:
+            self.log(f"⚠️ FOC 调参读取失败: {e}")
+
+    def _apply_foc_tune_to_firmware(self):
+        """连接成功后将已加载的 V/PA/VP 下发给固件；PP 在固件 NVS 里，不需要重发。"""
+        def worker():
+            time.sleep(0.3)
+            for axis in range(NUM_AXES):
+                v  = self.v_focvlimit[axis].get()
+                pa = self.v_focpangle[axis].get()
+                vp = self.v_focvp[axis].get()
+                self._send_and_read(f"FOC,{axis},V,{v:.1f}")
+                self._send_and_read(f"FOC,{axis},PA,{pa:.1f}")
+                self._send_and_read(f"FOC,{axis},VP,{vp:.2f}")
+            self.log("FOC 调参已下发固件")
+        threading.Thread(target=worker, daemon=True).start()
+
     # ═════════════ FOC：命令 ═════════════
     def _send_foc(self, axis, sub_and_arg):
         """例：_send_foc(0, 'EN,1') → 发 FOC,0,EN,1 → 日志记响应"""
@@ -645,6 +702,7 @@ class StepperGUI:
     def _foc_save_pp(self, axis):
         n = int(self.v_focpp[axis].get())
         self._send_foc(axis, f"PP,{n}")
+        self._save_foc_tune()
 
     def _foc_clear_fault(self, axis):
         self._send_foc(axis, "CLR")
@@ -816,6 +874,8 @@ class StepperGUI:
             self.root.after(0, lambda: self.fw[axis]['pangle_label'].config(text=f"{best_pa:.1f} (刚度)"))
             self.root.after(0, lambda: self.v_focvp[axis].set(float(best_vp)))
             self.root.after(0, lambda: self.fw[axis]['vp_label'].config(text=f"{best_vp:.2f} (阻尼)"))
+            # 持久化自动调参结果
+            self._save_foc_tune()
         finally:
             self.root.after(0, lambda: self.fw[axis]['autotune_btn'].config(state="normal"))
 
