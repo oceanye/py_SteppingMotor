@@ -16,6 +16,7 @@
 #include "protocol.h"
 #include "stepper.h"
 #include "foc_motor.h"
+#include "config.h"
 
 static void reply_ok_axis(int axis) { Serial.print("OK,"); Serial.println(axis); }
 static void reply_err(const char* why) { Serial.print("ERR:"); Serial.println(why); }
@@ -35,13 +36,24 @@ static int split_tokens(const String& s, String tokens[], int max_n) {
   return n;
 }
 
-// ── MOVE,<axis>,<steps>,<dir>,<delay_us> ──
+// ── MOVE,<axis|*>,<steps>,<dir>,<delay_us> ──
+// axis="*" 广播所有轴；每轴独立返回 ACK,<axis> 或 ERR。
 static void handle_move(const String tok[], int n) {
   if (n != 5) { reply_err("bad format"); return; }
-  int axis     = tok[1].toInt();
   int steps    = tok[2].toInt();
   int dir      = tok[3].toInt();
   int delay_us = tok[4].toInt();
+  if (tok[1] == "*") {
+    for (int axis = 0; axis < NUM_AXES; axis++) {
+      if (stepper_move_async(axis, steps, dir, delay_us)) {
+        Serial.print("ACK,"); Serial.println(axis);
+      } else {
+        Serial.print("ERR:busy "); Serial.println(axis);
+      }
+    }
+    return;
+  }
+  int axis = tok[1].toInt();
   if (stepper_move_async(axis, steps, dir, delay_us)) {
     Serial.print("ACK,"); Serial.println(axis);
   } else {
@@ -56,12 +68,8 @@ static void handle_diag(const String tok[], int n) {
   stepper_run_diagnostics(axis);
 }
 
-// ── FOC,<axis>,<sub>[,<arg>] ──
-static void handle_foc(const String tok[], int n) {
-  if (n < 3) { reply_err("bad format"); return; }
-  int axis = tok[1].toInt();
-  const String& sub = tok[2];
-  String arg = (n >= 4) ? tok[3] : String("");
+// 单轴 FOC 命令分发（从 handle_foc 提出来，广播可复用）
+static void dispatch_foc_single(int axis, const String& sub, const String& arg) {
 
   if (sub == "S" && arg.length() == 0) {
     Serial.print("FOC,"); Serial.print(axis); Serial.print(",S,");
@@ -112,6 +120,21 @@ static void handle_foc(const String tok[], int n) {
     return;
   }
   reply_err("bad format");
+}
+
+// ── FOC,<axis|*>,<sub>[,<arg>] ── 单轴或广播
+static void handle_foc(const String tok[], int n) {
+  if (n < 3) { reply_err("bad format"); return; }
+  const String& sub = tok[2];
+  String arg = (n >= 4) ? tok[3] : String("");
+  if (tok[1] == "*") {
+    for (int axis = 0; axis < NUM_AXES; axis++) {
+      dispatch_foc_single(axis, sub, arg);
+    }
+    return;
+  }
+  int axis = tok[1].toInt();
+  dispatch_foc_single(axis, sub, arg);
 }
 
 void protocol_handle_line(const String& cmd) {
