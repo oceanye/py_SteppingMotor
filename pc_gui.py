@@ -24,6 +24,8 @@ FOC_POLL_INTERVAL_S = 0.1
 
 CALIB_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stepper_calib.json")
 FOC_TUNE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".foc_tune.json")
+LOG_DIR       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
 
 def _empty_axis_dict():
@@ -107,15 +109,31 @@ class StepperGUI:
             self.notebook.add(tab, text=f"🧲 FOC {AXIS_LABEL[axis]}")
             self._build_foc_tab(tab, axis)
 
-        log_frame = ttk.LabelFrame(self.root, text="日志")
+        log_frame = ttk.LabelFrame(self.root,
+                                   text=f"日志（同时写到 {os.path.basename(LOG_DIR)}/gui_<日期>.log）")
         log_frame.grid(row=2, column=0, sticky="ew", **pad)
-        self.log_text = tk.Text(log_frame, height=8, width=96, state="disabled", font=("Consolas", 9))
+        self.log_text = tk.Text(log_frame, height=10, width=96, state="disabled", font=("Consolas", 9))
         self.log_text.pack(side="left", fill="both", padx=5, pady=5)
         scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         scroll.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=scroll.set)
-        ttk.Button(self.root, text="清空日志", command=self.clear_log).grid(
-            row=3, column=0, sticky="e", padx=10, pady=2)
+        # 颜色标注
+        self.log_text.tag_config("err",   foreground="#c00")
+        self.log_text.tag_config("warn",  foreground="#e65100")
+        self.log_text.tag_config("axisL", foreground="#1565c0")
+        self.log_text.tag_config("axisR", foreground="#7b1fa2")
+        self.log_text.tag_config("ok",    foreground="#2e7d32")
+        self.log_text.tag_config("rx",    foreground="#666")
+
+        log_btn_frame = ttk.Frame(self.root)
+        log_btn_frame.grid(row=3, column=0, sticky="e", padx=10, pady=2)
+        ttk.Button(log_btn_frame, text="清空", command=self.clear_log).pack(side="left", padx=2)
+        ttk.Button(log_btn_frame, text="打开日志目录", command=self._open_log_dir).pack(side="left", padx=2)
+        self.raw_log_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(log_btn_frame, text="串口原始流(新文件)", variable=self.raw_log_var,
+                        command=self._toggle_raw_log).pack(side="left", padx=8)
+
+        self._raw_log_fh = None  # 串口原始日志文件句柄（开关控制）
 
         self.refresh_ports()
 
@@ -392,6 +410,10 @@ class StepperGUI:
             if not raw: continue
             line = raw.decode(errors="replace").strip()
             if not line: continue
+            # 串口原始流可选记录
+            if self._raw_log_fh:
+                try: self._raw_log_fh.write(f"{time.time():.3f}  RX: {line}\n"); self._raw_log_fh.flush()
+                except Exception: pass
             # 解析轴号异步事件
             if line.startswith("STEP,") and line.endswith(",DONE"):
                 # STEP,<axis>,DONE
@@ -426,6 +448,9 @@ class StepperGUI:
                 try: self._resp_queue.get_nowait()
                 except queue.Empty: break
             try:
+                if self._raw_log_fh:
+                    try: self._raw_log_fh.write(f"{time.time():.3f}  TX: {cmd}\n"); self._raw_log_fh.flush()
+                    except Exception: pass
                 self.ser.write((cmd + "\n").encode())
             except Exception as e:
                 self.log(f"串口写异常: {e}")
@@ -880,10 +905,41 @@ class StepperGUI:
             self.root.after(0, lambda: self.fw[axis]['autotune_btn'].config(state="normal"))
 
     # ═════════════ 日志 ═════════════
+    def _classify_log(self, msg):
+        if any(k in msg for k in ("⛔", "ERR", "FAULT", "失败", "异常", "拒绝")):
+            return "err"
+        if any(k in msg for k in ("⚠️", "warn")):
+            return "warn"
+        if "轴L" in msg or "axis 0" in msg or "FOC,0," in msg or "MOVE,0" in msg:
+            return "axisL"
+        if "轴R" in msg or "axis 1" in msg or "FOC,1," in msg or "MOVE,1" in msg:
+            return "axisR"
+        if any(k in msg for k in ("✓", "OK", "DONE", "完成", "通过")):
+            return "ok"
+        if msg.startswith("MOT:") or msg.startswith("[FOC"):
+            return "rx"
+        return ""
+
+    def _log_file_path(self):
+        return os.path.join(LOG_DIR, f"gui_{time.strftime('%Y-%m-%d')}.log")
+
     def log(self, msg):
+        ts = time.strftime("%H:%M:%S")
+        full = f"{ts}  {msg}"
+        # 写日期分割的日志文件（追加）
+        try:
+            with open(self._log_file_path(), "a", encoding="utf-8") as f:
+                f.write(full + "\n")
+        except Exception:
+            pass
+        # UI 上色显示
+        tag = self._classify_log(msg)
         def _append():
             self.log_text.config(state="normal")
-            self.log_text.insert("end", f"{time.strftime('%H:%M:%S')}  {msg}\n")
+            if tag:
+                self.log_text.insert("end", full + "\n", tag)
+            else:
+                self.log_text.insert("end", full + "\n")
             self.log_text.see("end")
             self.log_text.config(state="disabled")
         self.root.after(0, _append)
@@ -892,6 +948,29 @@ class StepperGUI:
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
+
+    def _open_log_dir(self):
+        try:
+            os.startfile(LOG_DIR)  # Windows
+        except Exception:
+            messagebox.showinfo("日志目录", LOG_DIR)
+
+    def _toggle_raw_log(self):
+        """打开/关闭串口原始流文件记录（每条 RX 行写到独立 log）。"""
+        if self.raw_log_var.get():
+            try:
+                path = os.path.join(LOG_DIR, f"raw_{time.strftime('%Y%m%d_%H%M%S')}.log")
+                self._raw_log_fh = open(path, "w", encoding="utf-8")
+                self.log(f"串口原始流 → {os.path.basename(path)}")
+            except Exception as e:
+                self.log(f"⚠️ 原始流打开失败: {e}")
+                self.raw_log_var.set(False)
+        else:
+            if self._raw_log_fh:
+                try: self._raw_log_fh.close()
+                except Exception: pass
+                self._raw_log_fh = None
+                self.log("串口原始流已停止")
 
 
 if __name__ == "__main__":
