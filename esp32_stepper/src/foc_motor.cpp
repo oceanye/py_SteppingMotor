@@ -227,6 +227,16 @@ bool foc_set_p_velocity(int axis, float p) {
   return true;
 }
 
+bool foc_force_realign(int axis) {
+  if (!valid_axis(axis)) return false;
+  // 必须先 disable 才能安全修改对齐状态
+  motors[axis].disable();
+  s_aligned_once[axis] = false;
+  g_state[axis].store(FOC_STATE_DISABLED);
+  g_enable_req[axis].store(false);
+  return true;
+}
+
 FocState foc_get_state(int axis) {
   if (!valid_axis(axis)) return FOC_STATE_DISABLED;
   return (FocState)g_state[axis].load();

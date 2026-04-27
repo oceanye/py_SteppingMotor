@@ -22,6 +22,8 @@ void foc_home(int axis);
 bool foc_set_pole_pairs_and_store(int axis, int n);
 bool foc_set_p_angle(int axis, float p);
 bool foc_set_p_velocity(int axis, float p);
+// 强制下次 EN,1 重跑 initFOC()（换相线/磁铁后需要）
+bool foc_force_realign(int axis);
 
 // 状态查询（按轴）
 FocState foc_get_state(int axis);

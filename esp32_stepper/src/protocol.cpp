@@ -119,6 +119,9 @@ static void dispatch_foc_single(int axis, const String& sub, const String& arg) 
     else reply_err("out of range");
     return;
   }
+  if (sub == "REALIGN" && arg.length() == 0) {
+    foc_force_realign(axis); reply_ok_axis(axis); return;
+  }
   reply_err("bad format");
 }
 
