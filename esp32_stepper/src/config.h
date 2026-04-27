@@ -33,7 +33,7 @@
 #define FOC_POLE_PAIRS_DEFAULT   7      // 2208 典型
 #define FOC_PSU_VOLTAGE          24.0f  // 与 DM422 共用 24V 电源
 #define FOC_INITIAL_V_LIMIT      10.0f
-#define FOC_MAX_V_LIMIT          12.0f  // 电机额定上限
+#define FOC_MAX_V_LIMIT          24.0f  // PSU=24V 满载（注意：>12V 长时间会烧 2208 电机）
 #define FOC_MAX_ANGLE_ABS        3600.0f
 #define FOC_VELOCITY_LIMIT       5.0f
 #define FOC_TASK_STACK           4096

@@ -285,12 +285,12 @@ class StepperGUI:
 
         ttk.Label(ef, text="电压限幅:").grid(row=1, column=0, sticky="w", **pad)
         vf = ttk.Frame(ef); vf.grid(row=1, column=1, sticky="w", pady=5)
-        fw['vlimit_slider'] = ttk.Scale(vf, from_=0.5, to=12.0, orient="horizontal",
+        fw['vlimit_slider'] = ttk.Scale(vf, from_=0.5, to=24.0, orient="horizontal",
                                         variable=self.v_focvlimit[axis], length=180,
                                         command=lambda v, a=axis: self._foc_on_vlimit(a, v), state="disabled")
         fw['vlimit_slider'].pack(side="left")
         fw['vlimit_slider'].bind("<ButtonRelease-1>", lambda e: self._save_foc_tune())
-        fw['vlimit_label'] = ttk.Label(vf, text="10.0 V (扭矩)", width=14)
+        fw['vlimit_label'] = ttk.Label(vf, text="10.0 V (扭矩)", width=22)
         fw['vlimit_label'].pack(side="left", padx=6)
 
         ttk.Label(ef, text="位置环 P:").grid(row=2, column=0, sticky="w", **pad)
@@ -711,7 +711,11 @@ class StepperGUI:
 
     def _foc_on_vlimit(self, axis, _):
         v = self.v_focvlimit[axis].get()
-        self.fw[axis]['vlimit_label'].config(text=f"{v:.1f} V (扭矩)")
+        if v > 12.0:
+            txt = f"{v:.1f} V ⚠️ 超额定"
+            self.fw[axis]['vlimit_label'].config(text=txt, foreground="red")
+        else:
+            self.fw[axis]['vlimit_label'].config(text=f"{v:.1f} V (扭矩)", foreground="black")
         self._send_foc(axis, f"V,{v:.1f}")
 
     def _foc_on_pangle(self, axis, _):
