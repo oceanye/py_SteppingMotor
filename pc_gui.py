@@ -463,8 +463,16 @@ class StepperGUI:
     # ═════════════ 步进：发送 ═════════════
     def _send_pulses(self, axis, steps, direction, delay_ms):
         if steps <= 0 or not self.ser or not self.ser.is_open: return False
-        while self.stepper_in_progress[axis] and not self.running[axis]:
-            time.sleep(0.02)
+        # 等上次脉冲完成（避免 ESP32 ERR:busy）；显式提示+超时
+        if self.stepper_in_progress[axis] and not self.running[axis]:
+            self.log(f"轴{AXIS_LABEL[axis]} 等待上次步进完成...")
+            wait_deadline = time.time() + 30.0
+            while self.stepper_in_progress[axis] and not self.running[axis]:
+                if time.time() > wait_deadline:
+                    self.log(f"⚠️ 轴{AXIS_LABEL[axis]} 等待超时(30s)，强制清 in_progress 标志")
+                    self.stepper_in_progress[axis] = False
+                    break
+                time.sleep(0.02)
         delay_us = max(1, int(round(delay_ms * 1000)))
         resp = self._send_and_read(f"MOVE,{axis},{steps},{direction},{delay_us}")
         dist_mm = steps / PULSES_PER_MM
