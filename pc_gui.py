@@ -835,7 +835,8 @@ class StepperGUI:
         self.fw[axis]['autotune_btn'].config(state="disabled")
         threading.Thread(target=lambda: self._foc_autotune_worker(axis), daemon=True).start()
 
-    def _step_response_test(self, axis, target, pre_settle=2.0, duration=2.5):
+    def _step_response_test(self, axis, target, pre_settle=2.5, duration=5.0):
+        # duration 默认 5s（之前 2.5s 对扭矩不足的轴会超时占位 rt=99）
         self._send_and_read(f"FOC,{axis},A,0"); time.sleep(pre_settle)
         t0 = time.time()
         self._send_and_read(f"FOC,{axis},A,{target}"); time.sleep(duration)
@@ -865,7 +866,7 @@ class StepperGUI:
             pa_results = []
             for pa in [5, 10, 15, 20, 25, 30]:
                 self._send_and_read(f"FOC,{axis},PA,{pa}"); time.sleep(0.3)
-                m = self._step_response_test(axis, 90.0)
+                m = self._step_response_test(axis, 60.0)  # 60° + 默认 5s 窗口
                 if m is None: continue
                 ov, sse, rt, jt = m
                 self.log(f"  PA={pa}: 过冲={ov:.1f}° 误差={sse:.1f}° 上升={rt:.2f}s 抖={jt:.2f}°")
@@ -880,7 +881,7 @@ class StepperGUI:
             vp_results = []
             for vp in [0.10, 0.15, 0.20, 0.30, 0.40, 0.55, 0.70]:
                 self._send_and_read(f"FOC,{axis},VP,{vp}"); time.sleep(0.3)
-                m = self._step_response_test(axis, 90.0)
+                m = self._step_response_test(axis, 60.0)  # 60° + 默认 5s 窗口
                 if m is None: continue
                 ov, sse, rt, jt = m
                 self.log(f"  VP={vp:.2f}: 过冲={ov:.1f}° 上升={rt:.2f}s 抖={jt:.2f}°")
