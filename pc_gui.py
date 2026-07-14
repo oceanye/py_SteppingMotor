@@ -20,11 +20,17 @@ CONTINUOUS_BURST_MM = 0.2
 
 # ============== FOC ==============
 FOC_STATE_NAMES = {"0": "失能", "1": "对齐中", "2": "运行", "3": "故障"}
+GEAR_STATE_NAMES = {"0": "失能", "1": "—", "2": "运行", "3": "故障"}  # GEAR 没有"对齐"阶段
 FOC_POLL_INTERVAL_S = 0.1
 
-CALIB_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stepper_calib.json")
-FOC_TUNE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".foc_tune.json")
-LOG_DIR       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+# ============== 模式 ==============
+MODE_FOC  = "FOC"
+MODE_GEAR = "GEAR"
+
+CALIB_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stepper_calib.json")
+FOC_TUNE_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".foc_tune.json")
+GEAR_TUNE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".gear_tune.json")
+LOG_DIR        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
@@ -35,7 +41,7 @@ def _empty_axis_dict():
 class StepperGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("双轴步进 + FOC 控制器")
+        self.root.title("双轴步进 + FOC/GEAR 控制器")
         self.root.resizable(False, False)
 
         # ── 共享：串口 ──
@@ -54,6 +60,8 @@ class StepperGUI:
         self._pending_step      = [None]  * NUM_AXES
         self._foc_enabled_ui    = [False] * NUM_AXES
         self.foc_trace_buf      = [[] for _ in range(NUM_AXES)]
+        # goto watcher 代数：每次新 goto +1，旧 watcher 检测到 gen 变了就退出
+        self._goto_watcher_gen  = [0] * NUM_AXES
 
         # ── 每轴 Tk 变量 ──
         self.v_dist   = [tk.DoubleVar(value=10.0) for _ in range(NUM_AXES)]
@@ -69,13 +77,28 @@ class StepperGUI:
         self.v_focvp      = [tk.DoubleVar(value=0.2)     for _ in range(NUM_AXES)]
         self.v_focpp      = [tk.IntVar   (value=7)       for _ in range(NUM_AXES)]
 
+        # ── GEAR 模式调参变量（和 FOC 共享 v_foctgt / v_focstate / v_foccur / v_focfault）──
+        self.v_gearpwm = [tk.DoubleVar(value=100.0)  for _ in range(NUM_AXES)]   # PWM duty cap %（0-100）
+        self.v_gearkp  = [tk.DoubleVar(value=1.0)    for _ in range(NUM_AXES)]
+        self.v_gearki  = [tk.DoubleVar(value=0.0)    for _ in range(NUM_AXES)]
+        self.v_gearkd  = [tk.DoubleVar(value=0.05)   for _ in range(NUM_AXES)]
+        self.v_geargr  = [tk.DoubleVar(value=1000.0) for _ in range(NUM_AXES)]   # 齿轮比（NVS）
+
+        # ── 模式：
+        #    mode_select_var: 用户选择 (Auto/FOC/GEAR)；Auto 时从固件 MODE 命令读
+        #    fw_mode_var:      当前实际生效的模式显示 (FOC/GEAR/?)
+        self.mode_select_var = tk.StringVar(value="Auto")
+        self.fw_mode_var = tk.StringVar(value="?")
+
         # ── 每轴 widget refs（dict-per-axis）──
         self.sw = [dict() for _ in range(NUM_AXES)]  # stepper widgets
         self.fw = [dict() for _ in range(NUM_AXES)]  # FOC widgets
+        self.gw = [dict() for _ in range(NUM_AXES)]  # GEAR widgets
 
         self._build_ui()
         self._load_calib()
         self._load_foc_tune()
+        self._load_gear_tune()
 
     # ═════════════ 顶层 UI ═════════════
     def _build_ui(self):
@@ -97,17 +120,46 @@ class StepperGUI:
         self.conn_status = ttk.Label(conn_frame, text="● 未连接", foreground="red")
         self.conn_status.grid(row=0, column=6, **pad)
 
-        # Notebook: 4 tabs
+        # 实际生效的固件模式显示
+        ttk.Label(conn_frame, text="生效模式:").grid(row=0, column=7, **pad)
+        self.mode_label = ttk.Label(conn_frame, textvariable=self.fw_mode_var,
+                                    width=8, font=("Consolas", 11, "bold"),
+                                    foreground="gray")
+        self.mode_label.grid(row=0, column=8, **pad)
+
+        # 用户模式选择（Auto/FOC/GEAR）—— 第二行
+        ttk.Label(conn_frame, text="模式选择:").grid(row=1, column=0, sticky="e", **pad)
+        mode_inner = ttk.Frame(conn_frame)
+        mode_inner.grid(row=1, column=1, columnspan=8, sticky="w", **pad)
+        ttk.Radiobutton(mode_inner, text="Auto (固件自报)", variable=self.mode_select_var,
+                        value="Auto", command=self._on_mode_select_change).pack(side="left", padx=6)
+        ttk.Radiobutton(mode_inner, text="强制 FOC", variable=self.mode_select_var,
+                        value="FOC", command=self._on_mode_select_change).pack(side="left", padx=6)
+        ttk.Radiobutton(mode_inner, text="强制 GEAR", variable=self.mode_select_var,
+                        value="GEAR", command=self._on_mode_select_change).pack(side="left", padx=6)
+
+        # Notebook: 步进 ×2 + FOC ×2 + GEAR ×2 = 6 tabs。
+        # FOC/GEAR 互斥：连接后根据固件 MODE 灰掉另一组。
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        self.tab_index_step = [None] * NUM_AXES
+        self.tab_index_foc  = [None] * NUM_AXES
+        self.tab_index_gear = [None] * NUM_AXES
         for axis in range(NUM_AXES):
             tab = ttk.Frame(self.notebook)
+            self.tab_index_step[axis] = self.notebook.index("end")
             self.notebook.add(tab, text=f"🔩 步进 {AXIS_LABEL[axis]}")
             self._build_stepper_tab(tab, axis)
         for axis in range(NUM_AXES):
             tab = ttk.Frame(self.notebook)
+            self.tab_index_foc[axis] = self.notebook.index("end")
             self.notebook.add(tab, text=f"🧲 FOC {AXIS_LABEL[axis]}")
             self._build_foc_tab(tab, axis)
+        for axis in range(NUM_AXES):
+            tab = ttk.Frame(self.notebook)
+            self.tab_index_gear[axis] = self.notebook.index("end")
+            self.notebook.add(tab, text=f"⚙ 减速 {AXIS_LABEL[axis]}")
+            self._build_gear_tab(tab, axis)
 
         log_frame = ttk.LabelFrame(self.root,
                                    text=f"日志（同时写到 {os.path.basename(LOG_DIR)}/gui_<日期>.log）")
@@ -371,12 +423,18 @@ class StepperGUI:
             self.ser = None
             self.conn_status.config(text="● 未连接", foreground="red")
             self.conn_btn.config(text="连接")
+            self.fw_mode_var.set("?")
+            self.mode_label.config(foreground="gray")
             for a in range(NUM_AXES):
                 self._enable_stepper_buttons(a, "disabled")
                 self._apply_foc_gating(a, state="?", fault="?")
+                self._apply_gear_gating(a, state="?", fault="?")
                 self.v_focstate[a].set("未连接")
                 self.v_foccur[a].set("--")
                 self.v_focfault[a].set("--")
+                # 断开后两组 motor tabs 都重新可见可选，等下次连接重新决定
+                self.notebook.tab(self.tab_index_foc[a],  state="normal")
+                self.notebook.tab(self.tab_index_gear[a], state="normal")
             self.log("串口已断开")
             return
         try:
@@ -396,8 +454,8 @@ class StepperGUI:
             threading.Thread(target=self._reader_loop, daemon=True).start()
             self.foc_poll_running = True
             threading.Thread(target=self._foc_poll_loop, daemon=True).start()
-            # 连接成功后把持久化的 FOC 调参推到固件
-            self._apply_foc_tune_to_firmware()
+            # 自动查固件模式，并根据模式灰掉另一组 tab + 下发对应模式的 tune
+            self._query_mode_and_apply()
         except Exception as e:
             messagebox.showerror("连接失败", str(e))
 
@@ -772,7 +830,10 @@ class StepperGUI:
         self.v_foccur[axis].set(cur_text)
         self.v_focfault[axis].set("报警" if fault == "1" else "正常")
         self.fw[axis]['fault_label'].config(foreground="red" if fault == "1" else "green")
+        self.gw[axis]['fault_label'].config(foreground="red" if fault == "1" else "green")
+        # 两个模式都按响应门控（只激活当前模式的会真正生效）
         self._apply_foc_gating(axis, state, fault)
+        self._apply_gear_gating(axis, state, fault)
 
         if cur_f is not None and state == "2":
             now = time.time()
@@ -780,6 +841,28 @@ class StepperGUI:
             cutoff = now - 10.0
             self.foc_trace_buf[axis] = [x for x in self.foc_trace_buf[axis] if x[0] >= cutoff]
             self._redraw_scope(axis)
+
+    def _apply_gear_gating(self, axis, state, fault):
+        gw = self.gw[axis]
+        if not self.ser or not self.ser.is_open:
+            for w in gw['motion_btns'] + gw['cfg_widgets']:
+                w.config(state="disabled")
+            gw['enable_btn'].config(state="disabled")
+            gw['clear_btn'].config(state="disabled")
+            return
+        is_fault    = (fault == "1" or state == "3")
+        is_disabled = (state == "0")
+        is_running  = (state == "2")
+        motion_state = "normal" if is_running else "disabled"
+        for b in gw['motion_btns']: b.config(state=motion_state)
+        cfg_state = "normal" if (is_disabled or is_running) else "disabled"
+        for w in gw['cfg_widgets']: w.config(state=cfg_state)
+        en_state = "normal" if (is_disabled or is_running) else "disabled"
+        gw['enable_btn'].config(state=en_state)
+        if is_running:    gw['enable_btn'].config(text="■ 失能 PID")
+        elif is_fault:    gw['enable_btn'].config(text="(故障，先清除)")
+        else:             gw['enable_btn'].config(text="▶ 使能 PID")
+        gw['clear_btn'].config(state="normal" if is_fault else "disabled")
 
     def _apply_foc_gating(self, axis, state, fault):
         fw = self.fw[axis]
@@ -806,12 +889,19 @@ class StepperGUI:
         fw['clear_btn'].config(state="normal" if is_fault else "disabled")
 
     def _redraw_scope(self, axis):
+        # 在 FOC tab 和 GEAR tab 的画布上都画（共用同一份 trace 缓冲）
+        canvases = []
+        if axis < len(self.fw) and 'scope' in self.fw[axis]: canvases.append(self.fw[axis]['scope'])
+        if axis < len(self.gw) and 'scope' in self.gw[axis]: canvases.append(self.gw[axis]['scope'])
+        for cv in canvases:
+            self._draw_scope_on(cv, axis)
+
+    def _draw_scope_on(self, cv, axis):
         W, H = 420, 420
-        cv = self.fw[axis]['scope']
         cv.delete("all")
         buf = self.foc_trace_buf[axis]
         if len(buf) < 2:
-            cv.create_text(W/2, H/2, text="(等待数据)", fill="#888")
+            cv.create_text(W/2, H/2, text="(等待数据，使能 + 设目标后开始)", fill="#888")
             return
         t0 = buf[0][0]; t_span = max(0.1, buf[-1][0] - t0)
         ys = [p[1] for p in buf] + [p[2] for p in buf]
@@ -835,6 +925,328 @@ class StepperGUI:
             pts_t.extend([x, yt]); pts_c.extend([x, yc])
         if len(pts_t) >= 4: cv.create_line(*pts_t, fill="#1565c0", width=1)
         if len(pts_c) >= 4: cv.create_line(*pts_c, fill="#d32f2f", width=2)
+
+    # ═════════════ GEAR Tab（参数化）═════════════
+    def _build_gear_tab(self, parent, axis):
+        pad = dict(padx=10, pady=5)
+        gw = self.gw[axis]
+
+        sf = ttk.LabelFrame(parent, text=f"状态 — 减速 {AXIS_LABEL[axis]} (100ms 轮询)")
+        sf.grid(row=0, column=0, sticky="ew", **pad)
+        ttk.Label(sf, text="状态:").grid(row=0, column=0, sticky="w", **pad)
+        # 复用 v_focstate / v_foccur / v_focfault（FOC 和 GEAR 协议响应一样格式）
+        ttk.Label(sf, textvariable=self.v_focstate[axis], width=10,
+                  font=("Consolas", 11, "bold"), foreground="gray").grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(sf, text="故障:").grid(row=0, column=2, sticky="w", **pad)
+        gw['fault_label'] = ttk.Label(sf, textvariable=self.v_focfault[axis], width=6,
+                                      font=("Consolas", 11, "bold"), foreground="gray")
+        gw['fault_label'].grid(row=0, column=3, sticky="w", **pad)
+        ttk.Label(sf, text="当前角度:").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Label(sf, textvariable=self.v_foccur[axis], width=16,
+                  font=("Consolas", 14, "bold"), foreground="blue").grid(row=1, column=1, columnspan=3, sticky="w", **pad)
+
+        tf = ttk.LabelFrame(parent, text="目标控制")
+        tf.grid(row=1, column=0, sticky="ew", **pad)
+        ttk.Label(tf, text="目标角度 (°):").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Spinbox(tf, from_=-3600.0, to=3600.0, increment=1.0,
+                    textvariable=self.v_foctgt[axis], width=10, format="%.1f").grid(row=0, column=1, **pad)
+        gw['goto_btn'] = ttk.Button(tf, text="前往",
+                                    command=lambda a=axis: self._gear_goto(a), state="disabled")
+        gw['goto_btn'].grid(row=0, column=2, **pad)
+        ttk.Label(tf, text="快捷:").grid(row=1, column=0, sticky="w", **pad)
+        qf = ttk.Frame(tf); qf.grid(row=1, column=1, columnspan=2, sticky="w", pady=5)
+        gw['quick_btns'] = []
+        for deg in (0, 45, 90, 180, 270):
+            b = ttk.Button(qf, text=f"{deg}°", width=5,
+                           command=lambda d=deg, a=axis: self._gear_quick(a, float(d)), state="disabled")
+            b.pack(side="left", padx=2)
+            gw['quick_btns'].append(b)
+        ttk.Label(tf, text="增量:").grid(row=2, column=0, sticky="w", **pad)
+        incf = ttk.Frame(tf); incf.grid(row=2, column=1, columnspan=2, sticky="w", pady=5)
+        gw['inc_btns'] = []
+        for delta in (-10, -1, +1, +10):
+            b = ttk.Button(incf, text=f"{delta:+d}°", width=5,
+                           command=lambda d=float(delta), a=axis: self._gear_increment(a, d), state="disabled")
+            b.pack(side="left", padx=2)
+            gw['inc_btns'].append(b)
+
+        hf = ttk.LabelFrame(parent, text="原点")
+        hf.grid(row=2, column=0, sticky="ew", **pad)
+        gw['home_btn'] = ttk.Button(hf, text="⌂ 把当前位置设为 0°",
+                                    command=lambda a=axis: self._gear_home(a), state="disabled")
+        gw['home_btn'].grid(row=0, column=0, **pad)
+
+        ef = ttk.LabelFrame(parent, text="使能 / 调参")
+        ef.grid(row=3, column=0, sticky="ew", **pad)
+        gw['enable_btn'] = ttk.Button(ef, text="▶ 使能 PID",
+                                      command=lambda a=axis: self._gear_toggle_enable(a), state="disabled")
+        gw['enable_btn'].grid(row=0, column=0, columnspan=2, padx=10, pady=10, ipadx=10, ipady=6)
+
+        ttk.Label(ef, text="PWM 上限 %:").grid(row=1, column=0, sticky="w", **pad)
+        vf = ttk.Frame(ef); vf.grid(row=1, column=1, sticky="w", pady=5)
+        gw['pwm_slider'] = ttk.Scale(vf, from_=10.0, to=100.0, orient="horizontal",
+                                     variable=self.v_gearpwm[axis], length=180,
+                                     command=lambda v, a=axis: self._gear_on_pwm(a, v), state="disabled")
+        gw['pwm_slider'].pack(side="left")
+        gw['pwm_slider'].bind("<ButtonRelease-1>", lambda e: self._save_gear_tune())
+        gw['pwm_label'] = ttk.Label(vf, text="100.0 %", width=10)
+        gw['pwm_label'].pack(side="left", padx=6)
+
+        ttk.Label(ef, text="Kp (位置比例):").grid(row=2, column=0, sticky="w", **pad)
+        kpf = ttk.Frame(ef); kpf.grid(row=2, column=1, sticky="w", pady=5)
+        gw['kp_slider'] = ttk.Scale(kpf, from_=0.1, to=50.0, orient="horizontal",
+                                    variable=self.v_gearkp[axis], length=180,
+                                    command=lambda v, a=axis: self._gear_on_kp(a, v), state="disabled")
+        gw['kp_slider'].pack(side="left")
+        gw['kp_slider'].bind("<ButtonRelease-1>", lambda e: self._save_gear_tune())
+        gw['kp_label'] = ttk.Label(kpf, text="1.0", width=10)
+        gw['kp_label'].pack(side="left", padx=6)
+
+        ttk.Label(ef, text="Ki (积分):").grid(row=3, column=0, sticky="w", **pad)
+        kif = ttk.Frame(ef); kif.grid(row=3, column=1, sticky="w", pady=5)
+        gw['ki_slider'] = ttk.Scale(kif, from_=0.0, to=10.0, orient="horizontal",
+                                    variable=self.v_gearki[axis], length=180,
+                                    command=lambda v, a=axis: self._gear_on_ki(a, v), state="disabled")
+        gw['ki_slider'].pack(side="left")
+        gw['ki_slider'].bind("<ButtonRelease-1>", lambda e: self._save_gear_tune())
+        gw['ki_label'] = ttk.Label(kif, text="0.00", width=10)
+        gw['ki_label'].pack(side="left", padx=6)
+
+        ttk.Label(ef, text="Kd (微分):").grid(row=4, column=0, sticky="w", **pad)
+        kdf = ttk.Frame(ef); kdf.grid(row=4, column=1, sticky="w", pady=5)
+        gw['kd_slider'] = ttk.Scale(kdf, from_=0.0, to=2.0, orient="horizontal",
+                                    variable=self.v_gearkd[axis], length=180,
+                                    command=lambda v, a=axis: self._gear_on_kd(a, v), state="disabled")
+        gw['kd_slider'].pack(side="left")
+        gw['kd_slider'].bind("<ButtonRelease-1>", lambda e: self._save_gear_tune())
+        gw['kd_label'] = ttk.Label(kdf, text="0.050", width=10)
+        gw['kd_label'].pack(side="left", padx=6)
+
+        ttk.Label(ef, text="齿轮比 GR:").grid(row=5, column=0, sticky="w", **pad)
+        grf = ttk.Frame(ef); grf.grid(row=5, column=1, sticky="w", pady=5)
+        ttk.Spinbox(grf, from_=1.0, to=10000.0, increment=10.0,
+                    textvariable=self.v_geargr[axis], width=10, format="%.1f").pack(side="left")
+        gw['gr_save_btn'] = ttk.Button(grf, text="保存到 NVS（立即生效）",
+                                       command=lambda a=axis: self._gear_save_gr(a), state="disabled")
+        gw['gr_save_btn'].pack(side="left", padx=6)
+
+        gw['clear_btn'] = ttk.Button(ef, text="🧹 清除故障",
+                                     command=lambda a=axis: self._gear_clear_fault(a), state="disabled")
+        gw['clear_btn'].grid(row=6, column=0, columnspan=2, **pad, ipadx=10)
+        gw['autotune_btn'] = ttk.Button(ef, text="🤖 自动调 PID（约 3 分钟）",
+                                        command=lambda a=axis: self._gear_autotune(a), state="disabled")
+        gw['autotune_btn'].grid(row=7, column=0, columnspan=2, **pad, ipadx=10)
+
+        # 简单响应曲线（复用 foc_trace_buf）
+        scf = ttk.LabelFrame(parent, text="响应曲线 (10s · 蓝=目标 红=实测)")
+        scf.grid(row=0, column=1, rowspan=4, sticky="nsew", **pad)
+        gw['scope'] = tk.Canvas(scf, width=420, height=420, bg="white",
+                                highlightthickness=1, highlightbackground="#999")
+        gw['scope'].pack(padx=5, pady=5)
+
+        # 聚合：状态门控用
+        gw['motion_btns'] = [gw['goto_btn']] + gw['quick_btns'] + gw['inc_btns']
+        gw['cfg_widgets'] = [gw['home_btn'], gw['pwm_slider'], gw['kp_slider'],
+                             gw['ki_slider'], gw['kd_slider'], gw['gr_save_btn'],
+                             gw['autotune_btn']]
+
+    # ═════════════ GEAR：命令 ═════════════
+    def _send_gear(self, axis, sub_and_arg):
+        """和 _send_foc 一样格式，GEAR 固件也用 FOC,<axis>,... 命名空间。"""
+        cmd = f"FOC,{axis},{sub_and_arg}"
+        def worker():
+            resp = self._send_and_read(cmd)
+            self.log(f"{cmd} → {resp}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _gear_goto(self, axis):
+        target = self.v_foctgt[axis].get()
+        self._send_gear(axis, f"A,{target:.1f}")
+        self._start_goto_watcher(axis, target)
+
+    def _start_goto_watcher(self, axis, target_deg, tol_deg=2.0, timeout_s=15.0):
+        """后台监视 cur → tgt 的逼近，每 1.5s 打印进度。新 goto / 失能 自动取消旧 watcher。"""
+        self._goto_watcher_gen[axis] += 1
+        my_gen = self._goto_watcher_gen[axis]
+        def worker():
+            t0 = time.time()
+            last_log = 0.0
+            self.log(f"→ 轴{AXIS_LABEL[axis]} 前往 {target_deg:.1f}°")
+            while self.ser and self.ser.is_open:
+                # 1. 被新 goto 取代 → 退出（不打日志）
+                if self._goto_watcher_gen[axis] != my_gen:
+                    return
+                # 2. PID 已失能 → 退出（电机滑行，不可能到位）
+                state_txt = self.v_focstate[axis].get()
+                if state_txt != "运行":
+                    self.log(f"  轴{AXIS_LABEL[axis]} watcher 退出（PID 状态={state_txt}）")
+                    return
+                # 3. 读当前角度
+                raw = self.v_foccur[axis].get()
+                try:
+                    cur = float(raw.rstrip("°").rstrip(" ⏸").strip())
+                except (ValueError, AttributeError):
+                    time.sleep(0.3); continue
+                err = target_deg - cur
+                dt = time.time() - t0
+                # 4. 到位
+                if abs(err) < tol_deg:
+                    self.log(f"✓ 轴{AXIS_LABEL[axis]} 到位 cur={cur:.1f}° (用时 {dt:.1f}s)")
+                    return
+                # 5. 超时
+                if dt > timeout_s:
+                    self.log(f"⚠️ 轴{AXIS_LABEL[axis]} {timeout_s:.0f}s 未到位 "
+                             f"cur={cur:.1f}° 差 {err:+.1f}° (Kp 太小？发 DIAG,0 看 PWM)")
+                    return
+                # 6. 周期进度
+                if time.time() - last_log > 1.5:
+                    self.log(f"  轴{AXIS_LABEL[axis]} cur={cur:.1f}° 差 {err:+.1f}° (t={dt:.1f}s)")
+                    last_log = time.time()
+                time.sleep(0.3)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _gear_quick(self, axis, deg):
+        self.v_foctgt[axis].set(deg); self._gear_goto(axis)
+
+    def _gear_increment(self, axis, delta):
+        self.v_foctgt[axis].set(self.v_foctgt[axis].get() + delta); self._gear_goto(axis)
+
+    def _gear_home(self, axis):
+        self._send_gear(axis, "H")
+
+    def _gear_toggle_enable(self, axis):
+        self._foc_enabled_ui[axis] = not self._foc_enabled_ui[axis]
+        v = 1 if self._foc_enabled_ui[axis] else 0
+        self._send_gear(axis, f"EN,{v}")
+
+    def _gear_on_pwm(self, axis, _):
+        v = self.v_gearpwm[axis].get()
+        self.gw[axis]['pwm_label'].config(text=f"{v:.1f} %")
+        self._send_gear(axis, f"V,{v:.1f}")   # GEAR 固件 V 是 PWM 百分比
+
+    def _gear_on_kp(self, axis, _):
+        v = self.v_gearkp[axis].get()
+        self.gw[axis]['kp_label'].config(text=f"{v:.2f}")
+        self._send_gear(axis, f"PA,{v:.2f}")
+
+    def _gear_on_ki(self, axis, _):
+        v = self.v_gearki[axis].get()
+        self.gw[axis]['ki_label'].config(text=f"{v:.2f}")
+        self._send_gear(axis, f"PI,{v:.2f}")
+
+    def _gear_on_kd(self, axis, _):
+        v = self.v_gearkd[axis].get()
+        self.gw[axis]['kd_label'].config(text=f"{v:.3f}")
+        self._send_gear(axis, f"PD,{v:.3f}")
+
+    def _gear_save_gr(self, axis):
+        gr = float(self.v_geargr[axis].get())
+        self._send_gear(axis, f"GR,{gr:.1f}")
+        self._save_gear_tune()
+
+    def _gear_clear_fault(self, axis):
+        self._send_gear(axis, "CLR")
+        self._foc_enabled_ui[axis] = False
+
+    # ═════════════ GEAR 调参持久化 ═════════════
+    def _save_gear_tune(self):
+        try:
+            data = {str(a): {
+                "PWM": round(self.v_gearpwm[a].get(), 2),
+                "Kp":  round(self.v_gearkp[a].get(),  3),
+                "Ki":  round(self.v_gearki[a].get(),  3),
+                "Kd":  round(self.v_gearkd[a].get(),  4),
+                "GR":  round(self.v_geargr[a].get(),  1),
+            } for a in range(NUM_AXES)}
+            with open(GEAR_TUNE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            # 简短日志反馈 axis 0 当前值（最常用）
+            d = data["0"]
+            self.log(f"💾 GEAR 调参已保存到 {os.path.basename(GEAR_TUNE_FILE)} "
+                     f"(L: PWM={d['PWM']}% Kp={d['Kp']} Ki={d['Ki']} Kd={d['Kd']} GR={d['GR']})")
+        except Exception as e:
+            self.log(f"⚠️ GEAR 调参保存失败: {e}")
+
+    def _load_gear_tune(self):
+        if not os.path.exists(GEAR_TUNE_FILE): return
+        try:
+            with open(GEAR_TUNE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for a in range(NUM_AXES):
+                d = data.get(str(a), {})
+                if "PWM" in d: self.v_gearpwm[a].set(float(d["PWM"]))
+                if "Kp"  in d: self.v_gearkp[a].set(float(d["Kp"]))
+                if "Ki"  in d: self.v_gearki[a].set(float(d["Ki"]))
+                if "Kd"  in d: self.v_gearkd[a].set(float(d["Kd"]))
+                if "GR"  in d: self.v_geargr[a].set(float(d["GR"]))
+                self.gw[a]['pwm_label'].config(text=f"{self.v_gearpwm[a].get():.1f} %")
+                self.gw[a]['kp_label'].config(text=f"{self.v_gearkp[a].get():.2f}")
+                self.gw[a]['ki_label'].config(text=f"{self.v_gearki[a].get():.2f}")
+                self.gw[a]['kd_label'].config(text=f"{self.v_gearkd[a].get():.3f}")
+            self.log("已加载 GEAR 调参")
+        except Exception as e:
+            self.log(f"⚠️ GEAR 调参读取失败: {e}")
+
+    def _apply_gear_tune_to_firmware(self):
+        def worker():
+            time.sleep(0.3)
+            for axis in range(NUM_AXES):
+                self._send_and_read(f"FOC,{axis},V,{self.v_gearpwm[axis].get():.1f}")
+                self._send_and_read(f"FOC,{axis},PA,{self.v_gearkp[axis].get():.2f}")
+                self._send_and_read(f"FOC,{axis},PI,{self.v_gearki[axis].get():.2f}")
+                self._send_and_read(f"FOC,{axis},PD,{self.v_gearkd[axis].get():.3f}")
+            self.log("GEAR 调参已下发固件")
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ═════════════ 模式自动检测 + tab 灰显 ═════════════
+    def _query_mode_and_apply(self):
+        """连接成功后调一次。用户选 Auto 时发 MODE 命令自动检测；
+        用户选 FOC/GEAR 时直接强制应用，不查询固件。"""
+        sel = self.mode_select_var.get()
+        if sel in (MODE_FOC, MODE_GEAR):
+            self.log(f"模式选择 = 强制 {sel}（跳过固件 MODE 查询）")
+            self.root.after(0, lambda: self._apply_mode_to_tabs(sel))
+            return
+        # Auto
+        def worker():
+            time.sleep(0.4)
+            resp = self._send_and_read("MODE", timeout=1.5)
+            mode = MODE_FOC
+            if resp.startswith("MODE,"):
+                m = resp.split(",", 1)[1].strip().upper()
+                if m in (MODE_FOC, MODE_GEAR): mode = m
+            else:
+                self.log(f"⚠️ 固件未返回 MODE（响应={resp!r}）。请烧含 MODE 命令的固件，"
+                         f"或用'强制 FOC/GEAR'手动选。先按 FOC 处理。")
+            self.root.after(0, lambda: self._apply_mode_to_tabs(mode))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mode_select_change(self):
+        """用户切换 Auto/FOC/GEAR radio 时调用。如果已连接，立即重新应用模式。"""
+        sel = self.mode_select_var.get()
+        self.log(f"模式选择 → {sel}")
+        if self.ser and self.ser.is_open:
+            self._query_mode_and_apply()
+
+    def _apply_mode_to_tabs(self, mode):
+        """灰掉非当前模式的 tab，更新 mode 标签，下发对应模式的 tune。"""
+        self.fw_mode_var.set(mode)
+        if mode == MODE_FOC:
+            self.mode_label.config(foreground="#1565c0")
+            for a in range(NUM_AXES):
+                self.notebook.tab(self.tab_index_foc[a],  state="normal")
+                self.notebook.tab(self.tab_index_gear[a], state="disabled")
+            # 自动跳到第一个 FOC tab
+            self.notebook.select(self.tab_index_foc[0])
+            self._apply_foc_tune_to_firmware()
+        elif mode == MODE_GEAR:
+            self.mode_label.config(foreground="#2e7d32")
+            for a in range(NUM_AXES):
+                self.notebook.tab(self.tab_index_foc[a],  state="disabled")
+                self.notebook.tab(self.tab_index_gear[a], state="normal")
+            self.notebook.select(self.tab_index_gear[0])
+            self._apply_gear_tune_to_firmware()
+        self.log(f"固件模式 = {mode}")
 
     # ═════════════ FOC：自动调参（单轴）═════════════
     def _foc_autotune(self, axis):
@@ -916,6 +1328,109 @@ class StepperGUI:
             self._save_foc_tune()
         finally:
             self.root.after(0, lambda: self.fw[axis]['autotune_btn'].config(state="normal"))
+
+    # ═════════════ GEAR：自动调参（三阶段 Kp → Kd → Ki）═════════════
+    def _gear_autotune(self, axis):
+        if not self.ser or not self.ser.is_open:
+            messagebox.showerror("未连接", "请先连接串口"); return
+        if not messagebox.askokcancel(
+            "GEAR 自动调参",
+            f"轴 {AXIS_LABEL[axis]} 三阶段扫描 Kp → Kd → Ki，约 3 分钟。\n"
+            f"电机会反复在 0° ↔ 60° 之间走，请确认机械空间够。"):
+            return
+        self.gw[axis]['autotune_btn'].config(state="disabled")
+        threading.Thread(target=lambda: self._gear_autotune_worker(axis), daemon=True).start()
+
+    def _gear_autotune_worker(self, axis):
+        # 阶段评分权重（越小越好）：[overshoot, ss_error, rise_time, jitter]
+        TARGET = 60.0
+        try:
+            self.log(f"🤖 轴{AXIS_LABEL[axis]} GEAR 自动调参开始 (目标 ±{TARGET:.0f}°)")
+            # 重置到已知状态
+            self._send_and_read(f"FOC,{axis},V,100");  time.sleep(0.1)
+            self._send_and_read(f"FOC,{axis},PI,0");   time.sleep(0.1)
+            self._send_and_read(f"FOC,{axis},PD,0.05"); time.sleep(0.1)
+            self._send_and_read(f"FOC,{axis},PA,5");   time.sleep(0.1)
+            self._send_and_read(f"FOC,{axis},EN,1");   time.sleep(0.5)
+            self._send_and_read(f"FOC,{axis},H");      time.sleep(0.3)
+
+            # ── 阶段 1: Kp 扫描 ──
+            self.log(f"--- 阶段 1/3: Kp 扫描 ---")
+            kp_results = []
+            for kp in [5, 10, 15, 20, 25, 30, 35]:
+                self._send_and_read(f"FOC,{axis},PA,{kp}"); time.sleep(0.3)
+                m = self._step_response_test(axis, TARGET, pre_settle=2.0, duration=5.0)
+                if m is None:
+                    self.log(f"  Kp={kp}: 无数据"); continue
+                ov, sse, rt, jt = m
+                self.log(f"  Kp={kp}: 过冲={ov:.1f}° 稳态误差={sse:.1f}° "
+                         f"上升={rt:.2f}s 抖={jt:.2f}°")
+                kp_results.append((kp, ov, sse, rt, jt))
+                if ov > 40:  # 过冲太大，停止扫描避免机械冲击
+                    self.log(f"  ⚠️ Kp={kp} 过冲 {ov:.1f}° 太大，停止扫描"); break
+            if not kp_results:
+                self.log("❌ Kp 阶段无有效数据，autotune 中止"); return
+            # 选最佳 Kp：过冲适中 + 上升快 + 稳态误差小
+            good = [r for r in kp_results if r[1] <= 15.0]
+            pool = good if good else kp_results
+            best_kp = min(pool, key=lambda r: r[1]*2 + r[3]*3 + r[2]*2 + r[4]*4)[0]
+            self.log(f"→ 选 Kp = {best_kp}")
+            self._send_and_read(f"FOC,{axis},PA,{best_kp}"); time.sleep(0.3)
+
+            # ── 阶段 2: Kd 扫描（抑制过冲）──
+            self.log(f"--- 阶段 2/3: Kd 扫描 ---")
+            kd_results = []
+            for kd in [0.05, 0.1, 0.2, 0.3, 0.5, 0.8]:
+                self._send_and_read(f"FOC,{axis},PD,{kd}"); time.sleep(0.3)
+                m = self._step_response_test(axis, TARGET, pre_settle=2.0, duration=5.0)
+                if m is None: continue
+                ov, sse, rt, jt = m
+                self.log(f"  Kd={kd:.2f}: 过冲={ov:.1f}° 上升={rt:.2f}s 抖={jt:.2f}°")
+                kd_results.append((kd, ov, sse, rt, jt))
+                if jt > 4.0:  # 抖动太大，停止
+                    self.log(f"  ⚠️ Kd={kd} 抖动 {jt:.1f}° 太大，停止扫描"); break
+            best_kd = 0.1
+            if kd_results:
+                # 优先：过冲小 + 抖动小
+                good = [r for r in kd_results if r[4] <= 2.0]
+                pool = good if good else kd_results
+                best_kd = min(pool, key=lambda r: r[1]*3 + r[3]*1 + r[4]*5)[0]
+            self.log(f"→ 选 Kd = {best_kd:.2f}")
+            self._send_and_read(f"FOC,{axis},PD,{best_kd}"); time.sleep(0.3)
+
+            # ── 阶段 3: Ki 扫描（消稳态误差）──
+            self.log(f"--- 阶段 3/3: Ki 扫描 ---")
+            ki_results = []
+            for ki in [0.0, 0.3, 0.7, 1.5, 3.0]:
+                self._send_and_read(f"FOC,{axis},PI,{ki}"); time.sleep(0.3)
+                m = self._step_response_test(axis, TARGET, pre_settle=2.0, duration=5.0)
+                if m is None: continue
+                ov, sse, rt, jt = m
+                self.log(f"  Ki={ki:.2f}: 过冲={ov:.1f}° 稳态误差={sse:.1f}° 抖={jt:.2f}°")
+                ki_results.append((ki, ov, sse, rt, jt))
+                if jt > 5.0 or ov > 25:
+                    self.log(f"  ⚠️ Ki={ki} 失稳，停止扫描"); break
+            best_ki = 0.0
+            if ki_results:
+                # 优先：稳态误差小 + 抖动小，过冲控制
+                good = [r for r in ki_results if r[1] <= 12.0 and r[4] <= 3.0]
+                pool = good if good else ki_results
+                best_ki = min(pool, key=lambda r: r[2]*5 + r[1]*1 + r[4]*3)[0]
+            self.log(f"→ 选 Ki = {best_ki:.2f}")
+            self._send_and_read(f"FOC,{axis},PI,{best_ki}"); time.sleep(0.3)
+
+            # 收尾：回 0°、更新 GUI 滑块、写 .gear_tune.json
+            self._send_and_read(f"FOC,{axis},A,0"); time.sleep(2.0)
+            self.log(f"✅ 轴{AXIS_LABEL[axis]} 推荐：Kp={best_kp}  Kd={best_kd:.2f}  Ki={best_ki:.2f}")
+            self.root.after(0, lambda: self.v_gearkp[axis].set(float(best_kp)))
+            self.root.after(0, lambda: self.gw[axis]['kp_label'].config(text=f"{best_kp:.2f}"))
+            self.root.after(0, lambda: self.v_gearkd[axis].set(float(best_kd)))
+            self.root.after(0, lambda: self.gw[axis]['kd_label'].config(text=f"{best_kd:.3f}"))
+            self.root.after(0, lambda: self.v_gearki[axis].set(float(best_ki)))
+            self.root.after(0, lambda: self.gw[axis]['ki_label'].config(text=f"{best_ki:.2f}"))
+            self._save_gear_tune()
+        finally:
+            self.root.after(0, lambda: self.gw[axis]['autotune_btn'].config(state="normal"))
 
     # ═════════════ 日志 ═════════════
     def _classify_log(self, msg):

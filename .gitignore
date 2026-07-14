@@ -5,4 +5,5 @@ __pycache__/
 .idea/
 .stepper_calib.json
 .foc_tune.json
+.gear_tune.json
 logs/
