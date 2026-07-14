@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.stepper_calib.json
+.foc_tune.json
+.gear_tune.json
+logs/
