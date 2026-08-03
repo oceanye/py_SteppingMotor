@@ -290,9 +290,9 @@ bool foc_set_voltage_limit(int axis, float v) {
 
 void foc_home(int axis) {
   if (!valid_axis(axis)) return;
-  int16_t hw = 0;
-  pcnt_get_counter_value(axes[axis].pcnt_unit, &hw);
-  axes[axis].home_offset_counts = hw;
+  // 直接清零 PCNT 硬件计数器，避免长时间运行后计数器漂移到 ±32767 边缘导致溢出
+  pcnt_counter_clear(axes[axis].pcnt_unit);
+  axes[axis].home_offset_counts = 0;
   axes[axis].target_deg.store(0.0f);
 }
 

@@ -196,6 +196,7 @@ void protocol_handle_line(const String& cmd) {
     return;
   }
   if (tok[0] == "MOVE")        handle_move(tok, n);
+  else if (tok[0] == "STOP")   { int a = tok[1].toInt(); stepper_abort(a); reply_ok_axis(a); }
   else if (tok[0] == "STDIAG") handle_stdiag(tok, n);
   else if (tok[0] == "DIAG")   handle_diag(tok, n);    // 上下文敏感：见 handle_diag 内 #ifdef
   else if (tok[0] == "FOC")    handle_foc(tok, n);

@@ -13,9 +13,28 @@ NUM_AXES = 2
 AXIS_LABEL = ["L", "R"]   # 左腿 / 右腿
 
 # ============== 步进标定 ==============
-PULSES_PER_MM = 50
-DIR_OUTWARD = 0
-DIR_INWARD  = 1
+# 两轴统一: 28HD140GT81-200LR 贯通式步进, 200 微步/圈, 导程 1.0 mm/圈
+PULSES_PER_MM = [200.0 / 1.0, 200.0 / 1.0]
+# 速度档位 (mm/s) —— 根据 200 微步 + 0.6mm 导距 + 加减速曲线设定
+SPEED_PRESETS = [0.3, 0.5, 0.6, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 10]
+SPEED_DEFAULT = 3.0
+# 实测：delayMicroseconds 路径每步固定开销 ~200us（50us HIGH + yield + 调度）
+# 用于速度补偿：发送的 delay 比理论值少 200us，使实际速度逼近设定值
+DELAY_OVERHEAD_US = 200
+
+def _speed_to_delay_ms(speed, ppm):
+    """速度(mm/s) → 补偿后延迟(ms)。快速档减去固定开销，慢速档(vTaskDelay)不补偿。"""
+    target_us = 1000000.0 / (ppm * speed)
+    if target_us >= 2000:
+        return target_us / 1000.0
+    return max(0.05, (target_us - DELAY_OVERHEAD_US) / 1000.0)
+
+DELAY_DEFAULT_MS = [_speed_to_delay_ms(SPEED_DEFAULT, PULSES_PER_MM[a]) for a in range(NUM_AXES)]
+DIR_OUTWARD = 1
+DIR_INWARD  = 0
+# 每轴方向翻转标志（电机安装方向不同时用）
+# 0 = 不翻转, 1 = 翻转 DIR 信号。两轴原始方向均正确，不翻转。
+DIR_INVERT = [0, 0]
 CONTINUOUS_BURST_MM = 0.2
 
 # ============== FOC ==============
@@ -66,7 +85,8 @@ class StepperGUI:
         # ── 每轴 Tk 变量 ──
         self.v_dist   = [tk.DoubleVar(value=10.0) for _ in range(NUM_AXES)]
         self.v_dir    = [tk.IntVar   (value=DIR_OUTWARD) for _ in range(NUM_AXES)]
-        self.v_delay  = [tk.DoubleVar(value=20.0) for _ in range(NUM_AXES)]
+        self.v_delay  = [tk.DoubleVar(value=DELAY_DEFAULT_MS[a]) for a in range(NUM_AXES)]
+        self.v_speed_str = [tk.StringVar(value=str(SPEED_DEFAULT)) for _ in range(NUM_AXES)]
         self.v_goto   = [tk.DoubleVar(value=0.0)  for _ in range(NUM_AXES)]
         self.v_foctgt = [tk.DoubleVar(value=0.0)  for _ in range(NUM_AXES)]
         self.v_focstate   = [tk.StringVar(value="未连接") for _ in range(NUM_AXES)]
@@ -206,16 +226,18 @@ class StepperGUI:
                        command=lambda d=mm, a=axis: self.v_dist[a].set(d)).pack(side="left", padx=2)
         ttk.Label(pf, text="方向:").grid(row=2, column=0, sticky="w", **pad)
         df = ttk.Frame(pf); df.grid(row=2, column=1, sticky="w")
-        ttk.Radiobutton(df, text="向外 ▶", variable=self.v_dir[axis], value=DIR_OUTWARD).pack(side="left", padx=4)
-        ttk.Radiobutton(df, text="◀ 向内", variable=self.v_dir[axis], value=DIR_INWARD).pack(side="left", padx=4)
-        ttk.Label(pf, text="速度:").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Radiobutton(df, text="向上 ▶", variable=self.v_dir[axis], value=DIR_OUTWARD).pack(side="left", padx=4)
+        ttk.Radiobutton(df, text="◀ 向下", variable=self.v_dir[axis], value=DIR_INWARD).pack(side="left", padx=4)
+        ttk.Label(pf, text="速度档位:").grid(row=3, column=0, sticky="w", **pad)
         sf = ttk.Frame(pf); sf.grid(row=3, column=1, sticky="w", pady=5)
-        sw['speed_slider'] = ttk.Scale(sf, from_=0.1, to=50.0, orient="horizontal",
-                                       variable=self.v_delay[axis], length=160)
-        sw['speed_slider'].pack(side="left")
-        sw['delay_label'] = ttk.Label(sf, text="", width=24)
+        sw['speed_combo'] = ttk.Combobox(sf, textvariable=self.v_speed_str[axis],
+                                         values=[str(s) for s in SPEED_PRESETS],
+                                         width=6, state="readonly")
+        sw['speed_combo'].pack(side="left")
+        ttk.Label(sf, text="mm/s").pack(side="left", padx=2)
+        sw['delay_label'] = ttk.Label(sf, text="", width=16)
         sw['delay_label'].pack(side="left", padx=6)
-        self.v_delay[axis].trace_add("write", lambda *_, a=axis: self._update_speed_label(a))
+        sw['speed_combo'].bind("<<ComboboxSelected>>", lambda e, a=axis: self._on_speed_select(a))
         self._update_speed_label(axis)
 
         cf = ttk.LabelFrame(parent, text="控制")
@@ -223,20 +245,20 @@ class StepperGUI:
         sw['move_btn'] = ttk.Button(cf, text="执行运动",
                                     command=lambda a=axis: self.send_move(a), state="disabled")
         sw['move_btn'].grid(row=0, column=0, columnspan=2, padx=10, pady=10, ipadx=10, ipady=8)
-        sw['jog_out_btn'] = ttk.Button(cf, text="向外 1mm ▶",
+        sw['jog_out_btn'] = ttk.Button(cf, text="向上 1mm ▶",
                                        command=lambda a=axis: self._quick_move(a, 1.0, DIR_OUTWARD),
                                        state="disabled")
         sw['jog_out_btn'].grid(row=1, column=0, **pad)
-        sw['jog_in_btn'] = ttk.Button(cf, text="◀ 向内 1mm",
+        sw['jog_in_btn'] = ttk.Button(cf, text="◀ 向下 1mm",
                                       command=lambda a=axis: self._quick_move(a, 1.0, DIR_INWARD),
                                       state="disabled")
         sw['jog_in_btn'].grid(row=1, column=1, **pad)
-        sw['cont_out_btn'] = ttk.Button(cf, text="向外 (按住) ▶▶", state="disabled")
+        sw['cont_out_btn'] = ttk.Button(cf, text="向上 (按住) ▶▶", state="disabled")
         sw['cont_out_btn'].grid(row=2, column=0, **pad)
         sw['cont_out_btn'].bind("<ButtonPress-1>",   lambda e, a=axis: self._press_continuous(a, DIR_OUTWARD))
         sw['cont_out_btn'].bind("<ButtonRelease-1>", lambda e, a=axis: self._release_continuous(a))
         sw['cont_out_btn'].bind("<Leave>",           lambda e, a=axis: self._release_continuous(a))
-        sw['cont_in_btn'] = ttk.Button(cf, text="◀◀ 向内 (按住)", state="disabled")
+        sw['cont_in_btn'] = ttk.Button(cf, text="◀◀ 向下 (按住)", state="disabled")
         sw['cont_in_btn'].grid(row=2, column=1, **pad)
         sw['cont_in_btn'].bind("<ButtonPress-1>",   lambda e, a=axis: self._press_continuous(a, DIR_INWARD))
         sw['cont_in_btn'].bind("<ButtonRelease-1>", lambda e, a=axis: self._release_continuous(a))
@@ -244,6 +266,10 @@ class StepperGUI:
         sw['stop_btn'] = ttk.Button(cf, text="■ 紧急停止",
                                     command=lambda a=axis: self.stop_continuous(a), state="disabled")
         sw['stop_btn'].grid(row=3, column=0, columnspan=2, **pad, ipadx=10)
+        sw['progress'] = ttk.Progressbar(cf, orient="horizontal", length=200, mode="determinate")
+        sw['progress'].grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(8,0))
+        sw['progress_label'] = ttk.Label(cf, text="", font=("Consolas", 9))
+        sw['progress_label'].grid(row=5, column=0, columnspan=2, sticky="w", padx=10)
 
         rf = ttk.LabelFrame(parent, text="位置与原点（软件跟踪）")
         rf.grid(row=1, column=0, columnspan=2, sticky="ew", **pad)
@@ -390,10 +416,29 @@ class StepperGUI:
                              fw['vp_slider'], fw['pp_save_btn'], fw['autotune_btn']]
 
     # ═════════════ 共享辅助 ═════════════
+    def _on_speed_select(self, axis):
+        try:
+            speed = float(self.v_speed_str[axis].get())
+        except ValueError:
+            return
+        if speed <= 0: return
+        self.v_delay[axis].set(_speed_to_delay_ms(speed, PULSES_PER_MM[axis]))
+        self._update_speed_label(axis)
+
     def _update_speed_label(self, axis):
-        d = max(0.1, self.v_delay[axis].get())
-        mm_s = 1000.0 / (PULSES_PER_MM * d)
-        self.sw[axis]['delay_label'].config(text=f"{d:.1f} ms ≈ {mm_s:.0f} mm/s")
+        d = self.v_delay[axis].get()
+        self.sw[axis]['delay_label'].config(text=f"({d:.2f} ms/脉冲)")
+
+    def _on_step_progress(self, axis, done, total):
+        if axis < len(self.sw) and 'progress' in self.sw[axis]:
+            pct = int(done * 100 / total) if total > 0 else 0
+            self.sw[axis]['progress']['value'] = pct
+            self.sw[axis]['progress_label'].config(text=f"{pct}%  ({done}/{total} 步)")
+
+    def _reset_progress(self, axis):
+        if axis < len(self.sw) and 'progress' in self.sw[axis]:
+            self.sw[axis]['progress']['value'] = 0
+            self.sw[axis]['progress_label'].config(text="")
 
     def _update_pos_label(self, axis):
         self.sw[axis]['pos_label'].config(text=f"{self.position_mm[axis]:.1f} mm")
@@ -473,8 +518,19 @@ class StepperGUI:
                 try: self._raw_log_fh.write(f"{time.time():.3f}  RX: {line}\n"); self._raw_log_fh.flush()
                 except Exception: pass
             # 解析轴号异步事件
-            if line.startswith("STEP,") and line.endswith(",DONE"):
-                # STEP,<axis>,DONE
+            if line.startswith("STEP,") and ",P," in line:
+                # STEP,<axis>,P,<done>,<total>
+                parts = line.split(",")
+                if len(parts) == 5 and parts[2] == "P":
+                    try:
+                        axis = int(parts[1])
+                        done = int(parts[3])
+                        total = int(parts[4])
+                        self.root.after(0, lambda a=axis, d=done, t=total: self._on_step_progress(a, d, t))
+                        continue
+                    except ValueError: pass
+            if line.startswith("STEP,") and (line.endswith(",DONE") or line.endswith(",ABORT")):
+                # STEP,<axis>,DONE  或  STEP,<axis>,ABORT
                 parts = line.split(",")
                 if len(parts) == 3:
                     try:
@@ -524,33 +580,37 @@ class StepperGUI:
         # 等上次脉冲完成（避免 ESP32 ERR:busy）；显式提示+超时
         if self.stepper_in_progress[axis] and not self.running[axis]:
             self.log(f"轴{AXIS_LABEL[axis]} 等待上次步进完成...")
-            wait_deadline = time.time() + 30.0
+            wait_deadline = time.time() + 10.0
             while self.stepper_in_progress[axis] and not self.running[axis]:
                 if time.time() > wait_deadline:
-                    self.log(f"⚠️ 轴{AXIS_LABEL[axis]} 等待超时(30s)，强制清 in_progress 标志")
+                    self.log(f"⚠️ 轴{AXIS_LABEL[axis]} 等待超时(10s)，强制清 in_progress 标志")
                     self.stepper_in_progress[axis] = False
                     break
                 time.sleep(0.02)
         delay_us = max(1, int(round(delay_ms * 1000)))
-        resp = self._send_and_read(f"MOVE,{axis},{steps},{direction},{delay_us}")
-        dist_mm = steps / PULSES_PER_MM
-        dir_txt = "向外" if direction == DIR_OUTWARD else "向内"
-        mm_s = 1000.0 / (PULSES_PER_MM * max(0.001, delay_ms))
-        self.log(f"轴{AXIS_LABEL[axis]} {dist_mm:.1f}mm {dir_txt} @ {delay_ms:.1f}ms ({mm_s:.0f}mm/s) → {resp}")
+        actual_dir = direction ^ DIR_INVERT[axis]   # 按轴翻转DIR信号
+        resp = self._send_and_read(f"MOVE,{axis},{steps},{actual_dir},{delay_us}")
+        dist_mm = steps / PULSES_PER_MM[axis]
+        dir_txt = "向上" if direction == DIR_OUTWARD else "向下"
+        mm_s = 1000.0 / (PULSES_PER_MM[axis] * max(0.001, delay_ms))
+        self.log(f"轴{AXIS_LABEL[axis]} {dist_mm:.1f}mm {dir_txt} @ {delay_ms:.2f}ms ({mm_s:.1f}mm/s) → {resp}")
         if resp.startswith("ACK,"):
             sign = +1.0 if direction == DIR_OUTWARD else -1.0
             self._pending_step[axis] = sign * dist_mm
             self.stepper_in_progress[axis] = True
+            if 'progress' in self.sw[axis]:
+                self.sw[axis]['progress']['value'] = 0
+                self.sw[axis]['progress_label'].config(text="运动中...")
             return True
         return False
 
     def _send_mm(self, axis, distance_mm, direction, delay_ms):
-        steps = int(round(distance_mm * PULSES_PER_MM))
+        steps = int(round(distance_mm * PULSES_PER_MM[axis]))
         if steps <= 0:
             self.log(f"轴{AXIS_LABEL[axis]}: 忽略距离过小 ({distance_mm})")
             return False
         sign = +1.0 if direction == DIR_OUTWARD else -1.0
-        target = self.position_mm[axis] + sign * (steps / PULSES_PER_MM)
+        target = self.position_mm[axis] + sign * (steps / PULSES_PER_MM[axis])
         if not self._check_range(axis, target): return False
         return self._send_pulses(axis, steps, direction, delay_ms)
 
@@ -560,6 +620,10 @@ class StepperGUI:
             self._pending_step[axis] = None
             self._update_pos_label(axis)
         self.stepper_in_progress[axis] = False
+        if 'progress' in self.sw[axis]:
+            self.sw[axis]['progress']['value'] = 100
+            self.sw[axis]['progress_label'].config(text="✓ 完成")
+            self.root.after(2000, lambda a=axis: self._reset_progress(a))
         self.log(f"轴{AXIS_LABEL[axis]} 步进完成")
 
     # ═════════════ 步进：命令 ═════════════
@@ -576,7 +640,7 @@ class StepperGUI:
     def _press_continuous(self, axis, direction):
         if self.running[axis] or not self.ser or not self.ser.is_open: return
         self.running[axis] = True
-        dir_txt = "向外" if direction == DIR_OUTWARD else "向内"
+        dir_txt = "向上" if direction == DIR_OUTWARD else "向下"
         self.log(f"轴{AXIS_LABEL[axis]} 按住连续{dir_txt}")
         def worker():
             while self.running[axis]:
@@ -594,7 +658,7 @@ class StepperGUI:
     def stop_continuous(self, axis):
         self.running[axis] = False
         if self.ser and self.ser.is_open:
-            threading.Thread(target=lambda: self._send_and_read(f"FOC,{axis},EN,0"),
+            threading.Thread(target=lambda: self._send_and_read(f"STOP,{axis}"),
                              daemon=True).start()
         self.log(f"⛔ 轴{AXIS_LABEL[axis]} 紧急停止")
 
@@ -624,7 +688,7 @@ class StepperGUI:
     def _goto(self, axis, target_mm):
         if not self._check_range(axis, target_mm): return
         delta = target_mm - self.position_mm[axis]
-        if abs(delta) < 1.0 / PULSES_PER_MM:
+        if abs(delta) < 1.0 / PULSES_PER_MM[axis]:
             self.log(f"轴{AXIS_LABEL[axis]} 已在目标附近"); return
         direction = DIR_OUTWARD if delta > 0 else DIR_INWARD
         distance = abs(delta)
@@ -1260,7 +1324,6 @@ class StepperGUI:
         threading.Thread(target=lambda: self._foc_autotune_worker(axis), daemon=True).start()
 
     def _step_response_test(self, axis, target, pre_settle=2.5, duration=5.0):
-        # duration 默认 5s（之前 2.5s 对扭矩不足的轴会超时占位 rt=99）
         self._send_and_read(f"FOC,{axis},A,0"); time.sleep(pre_settle)
         t0 = time.time()
         self._send_and_read(f"FOC,{axis},A,{target}"); time.sleep(duration)
@@ -1269,16 +1332,19 @@ class StepperGUI:
         if len(data) < 5: return None
         curs = [c for _, c in data]
         overshoot = max(0.0, max(curs) - target) if target > 0 else max(0.0, target - min(curs))
-        ss_error = abs(curs[-1] - target)
         rt = None
         thr = target * 0.9
         for t, c in data:
             if c >= thr: rt = t; break
-        tail = [c for t, c in data if t >= duration - 0.8]
+        # 稳态误差：用最后 2 秒的平均值（比取末点更稳定）
+        tail = [c for t, c in data if t >= duration - 2.0]
         if len(tail) >= 3:
-            m = sum(tail)/len(tail)
-            jit = (sum((x-m)**2 for x in tail)/len(tail))**0.5
-        else: jit = 0.0
+            tail_avg = sum(tail) / len(tail)
+            ss_error = abs(tail_avg - target)
+            jit = (sum((x - tail_avg)**2 for x in tail) / len(tail)) ** 0.5
+        else:
+            ss_error = abs(curs[-1] - target)
+            jit = 0.0
         return (overshoot, ss_error, rt or 99.0, jit)
 
     def _foc_autotune_worker(self, axis):
@@ -1342,86 +1408,102 @@ class StepperGUI:
         threading.Thread(target=lambda: self._gear_autotune_worker(axis), daemon=True).start()
 
     def _gear_autotune_worker(self, axis):
-        # 阶段评分权重（越小越好）：[overshoot, ss_error, rise_time, jitter]
         TARGET = 60.0
+        DUR = 8.0   # 加长到 8 秒，确保含 Ki 时充分收敛
         try:
             self.log(f"🤖 轴{AXIS_LABEL[axis]} GEAR 自动调参开始 (目标 ±{TARGET:.0f}°)")
             # 重置到已知状态
             self._send_and_read(f"FOC,{axis},V,100");  time.sleep(0.1)
             self._send_and_read(f"FOC,{axis},PI,0");   time.sleep(0.1)
-            self._send_and_read(f"FOC,{axis},PD,0.05"); time.sleep(0.1)
+            self._send_and_read(f"FOC,{axis},PD,0.5"); time.sleep(0.1)
             self._send_and_read(f"FOC,{axis},PA,5");   time.sleep(0.1)
             self._send_and_read(f"FOC,{axis},EN,1");   time.sleep(0.5)
             self._send_and_read(f"FOC,{axis},H");      time.sleep(0.3)
 
             # ── 阶段 1: Kp 扫描 ──
-            self.log(f"--- 阶段 1/3: Kp 扫描 ---")
+            self.log(f"--- 阶段 1/4: Kp 扫描 ---")
             kp_results = []
-            for kp in [5, 10, 15, 20, 25, 30, 35]:
+            for kp in [5, 10, 15, 20, 25, 30]:
                 self._send_and_read(f"FOC,{axis},PA,{kp}"); time.sleep(0.3)
-                m = self._step_response_test(axis, TARGET, pre_settle=2.0, duration=5.0)
+                m = self._step_response_test(axis, TARGET, pre_settle=2.0, duration=DUR)
                 if m is None:
                     self.log(f"  Kp={kp}: 无数据"); continue
                 ov, sse, rt, jt = m
                 self.log(f"  Kp={kp}: 过冲={ov:.1f}° 稳态误差={sse:.1f}° "
                          f"上升={rt:.2f}s 抖={jt:.2f}°")
                 kp_results.append((kp, ov, sse, rt, jt))
-                if ov > 40:  # 过冲太大，停止扫描避免机械冲击
-                    self.log(f"  ⚠️ Kp={kp} 过冲 {ov:.1f}° 太大，停止扫描"); break
+                if ov > 40:
+                    self.log(f"  ⚠️ 过冲太大，停止"); break
             if not kp_results:
-                self.log("❌ Kp 阶段无有效数据，autotune 中止"); return
-            # 选最佳 Kp：过冲适中 + 上升快 + 稳态误差小
+                self.log("❌ Kp 阶段无有效数据，中止"); return
+            # 评分：稳态误差权重最高，其次过冲
             good = [r for r in kp_results if r[1] <= 15.0]
             pool = good if good else kp_results
-            best_kp = min(pool, key=lambda r: r[1]*2 + r[3]*3 + r[2]*2 + r[4]*4)[0]
+            best_kp = min(pool, key=lambda r: r[2]*5 + r[1]*3 + r[3]*2 + r[4]*2)[0]
             self.log(f"→ 选 Kp = {best_kp}")
             self._send_and_read(f"FOC,{axis},PA,{best_kp}"); time.sleep(0.3)
 
             # ── 阶段 2: Kd 扫描（抑制过冲）──
-            self.log(f"--- 阶段 2/3: Kd 扫描 ---")
+            self.log(f"--- 阶段 2/4: Kd 扫描 ---")
             kd_results = []
-            for kd in [0.05, 0.1, 0.2, 0.3, 0.5, 0.8]:
+            for kd in [0.3, 0.5, 0.8, 1.0, 1.5, 2.0]:
                 self._send_and_read(f"FOC,{axis},PD,{kd}"); time.sleep(0.3)
-                m = self._step_response_test(axis, TARGET, pre_settle=2.0, duration=5.0)
+                m = self._step_response_test(axis, TARGET, pre_settle=2.0, duration=DUR)
                 if m is None: continue
                 ov, sse, rt, jt = m
-                self.log(f"  Kd={kd:.2f}: 过冲={ov:.1f}° 上升={rt:.2f}s 抖={jt:.2f}°")
+                self.log(f"  Kd={kd:.1f}: 过冲={ov:.1f}° 稳态误差={sse:.1f}° 抖={jt:.2f}°")
                 kd_results.append((kd, ov, sse, rt, jt))
-                if jt > 4.0:  # 抖动太大，停止
-                    self.log(f"  ⚠️ Kd={kd} 抖动 {jt:.1f}° 太大，停止扫描"); break
-            best_kd = 0.1
+                if jt > 5.0:
+                    self.log(f"  ⚠️ 抖动太大，停止"); break
+            best_kd = 0.5
             if kd_results:
-                # 优先：过冲小 + 抖动小
-                good = [r for r in kd_results if r[4] <= 2.0]
+                good = [r for r in kd_results if r[1] <= 5.0 and r[4] <= 2.0]
                 pool = good if good else kd_results
-                best_kd = min(pool, key=lambda r: r[1]*3 + r[3]*1 + r[4]*5)[0]
-            self.log(f"→ 选 Kd = {best_kd:.2f}")
+                best_kd = min(pool, key=lambda r: r[1]*4 + r[4]*5 + r[2]*3)[0]
+            self.log(f"→ 选 Kd = {best_kd:.1f}")
             self._send_and_read(f"FOC,{axis},PD,{best_kd}"); time.sleep(0.3)
 
-            # ── 阶段 3: Ki 扫描（消稳态误差）──
-            self.log(f"--- 阶段 3/3: Ki 扫描 ---")
+            # ── 阶段 3: Ki 扫描（小值范围，消稳态误差到 ≤1°）──
+            self.log(f"--- 阶段 3/4: Ki 扫描 ---")
             ki_results = []
-            for ki in [0.0, 0.3, 0.7, 1.5, 3.0]:
+            for ki in [0.02, 0.05, 0.1, 0.15, 0.2, 0.3]:
                 self._send_and_read(f"FOC,{axis},PI,{ki}"); time.sleep(0.3)
-                m = self._step_response_test(axis, TARGET, pre_settle=2.0, duration=5.0)
+                m = self._step_response_test(axis, TARGET, pre_settle=2.5, duration=DUR)
                 if m is None: continue
                 ov, sse, rt, jt = m
                 self.log(f"  Ki={ki:.2f}: 过冲={ov:.1f}° 稳态误差={sse:.1f}° 抖={jt:.2f}°")
                 ki_results.append((ki, ov, sse, rt, jt))
-                if jt > 5.0 or ov > 25:
-                    self.log(f"  ⚠️ Ki={ki} 失稳，停止扫描"); break
+                if ov > 15 or jt > 3.0:
+                    self.log(f"  ⚠️ Ki={ki} 失稳，停止"); break
             best_ki = 0.0
             if ki_results:
-                # 优先：稳态误差小 + 抖动小，过冲控制
-                good = [r for r in ki_results if r[1] <= 12.0 and r[4] <= 3.0]
+                # 优先：稳态误差 ≤1°，同时过冲 ≤8°
+                good = [r for r in ki_results if r[2] <= 1.0 and r[1] <= 8.0]
                 pool = good if good else ki_results
-                best_ki = min(pool, key=lambda r: r[2]*5 + r[1]*1 + r[4]*3)[0]
+                best_ki = min(pool, key=lambda r: r[2]*10 + r[1]*3 + r[4]*3)[0]
             self.log(f"→ 选 Ki = {best_ki:.2f}")
             self._send_and_read(f"FOC,{axis},PI,{best_ki}"); time.sleep(0.3)
 
-            # 收尾：回 0°、更新 GUI 滑块、写 .gear_tune.json
+            # ── 阶段 4: 验证最终参数 ──
+            self.log(f"--- 阶段 4/4: 验证 ---")
+            self._send_and_read(f"FOC,{axis},PA,{best_kp}"); time.sleep(0.1)
+            self._send_and_read(f"FOC,{axis},PD,{best_kd}"); time.sleep(0.1)
+            self._send_and_read(f"FOC,{axis},PI,{best_ki}"); time.sleep(0.1)
+            self._send_and_read(f"FOC,{axis},H"); time.sleep(1.0)
+            m = self._step_response_test(axis, TARGET, pre_settle=3.0, duration=DUR)
+            if m:
+                ov, sse, rt, jt = m
+                self.log(f"  验证结果: 过冲={ov:.1f}° 稳态误差={sse:.1f}° 上升={rt:.2f}s 抖={jt:.2f}°")
+                if sse <= 1.0:
+                    self.log(f"✅ 稳态误差 ≤ 1°，达标！")
+                else:
+                    self.log(f"⚠️ 稳态误差 {sse:.1f}° > 1°，建议手动微调 Ki")
+            else:
+                self.log("  验证: 无数据")
+
+            # 收尾
             self._send_and_read(f"FOC,{axis},A,0"); time.sleep(2.0)
-            self.log(f"✅ 轴{AXIS_LABEL[axis]} 推荐：Kp={best_kp}  Kd={best_kd:.2f}  Ki={best_ki:.2f}")
+            self.log(f"✅ 轴{AXIS_LABEL[axis]} 推荐：Kp={best_kp}  Kd={best_kd:.1f}  Ki={best_ki:.2f}")
             self.root.after(0, lambda: self.v_gearkp[axis].set(float(best_kp)))
             self.root.after(0, lambda: self.gw[axis]['kp_label'].config(text=f"{best_kp:.2f}"))
             self.root.after(0, lambda: self.v_gearkd[axis].set(float(best_kd)))

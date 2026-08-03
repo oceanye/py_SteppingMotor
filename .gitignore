@@ -7,3 +7,4 @@ __pycache__/
 .foc_tune.json
 .gear_tune.json
 logs/
+build_upload*.log

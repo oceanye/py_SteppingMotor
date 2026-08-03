@@ -14,5 +14,8 @@ bool stepper_move_async(int axis, int steps, int direction, int delay_us);
 // 某轴后台任务是否在执行
 bool stepper_is_busy(int axis);
 
+// 中止某轴正在执行的脉冲运动（紧急停止用）
+void stepper_abort(int axis);
+
 // 完整自检序列（DIAG,<axis> 指令）
 void stepper_run_diagnostics(int axis);
