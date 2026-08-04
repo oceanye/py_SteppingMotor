@@ -135,6 +135,7 @@ DM 专用 24V 电源
   <tr><td>GEAR 1 实体 ENC A(C1) / B(C2)</td><td class="gpio">13 / 14</td><td>IN PCNT</td><td>J_ENC1 → A / B</td></tr>
   <tr><td>轨道 D IN1 / IN2</td><td class="gpio">40 / 41</td><td>OUT PWM</td><td>U_DRVD → 第 3 块 DRV8871 IN1 / IN2</td></tr>
   <tr><td>预留 AUX TX/SDA / RX/SCL / DE</td><td class="gpio">42 / 47 / 48</td><td>预留</td><td>J_AUX_UART；可选 I²C 或 U_RS485</td></tr>
+  <tr><td>硬件急停输入（可选，默认启用）</td><td class="gpio">35</td><td>IN PULLUP</td><td>常闭按钮 → GND（active-low），见 §11</td></tr>
   <tr><td>3V3 / GND</td><td class="gpio">3V3 / GND</td><td>PWR</td><td>编码器与 3.3V 逻辑模块 / 公共地</td></tr>
 </table>
 
@@ -325,6 +326,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
   <li>DM #0～#5 逐轴短距离前进/后退，方向与机械定义一致。</li>
   <li>任意步进运动中发送 STOP，实际停止位置不会被当作完整目标位置。</li>
   <li>发送 <code>ESTOP</code>，确认收到唯一响应 <code>OK,ESTOP</code>，全部步进/轨道停止且两路闭环失能。</li>
+  <li>硬件急停（GPIO35，默认启用）：用常闭按钮接 GPIO35↔GND；按下应上报 <code>HWESTOP,TRIGGERED</code> 并停止全部输出，松开后自动复位。该机制是软件急停，仍需独立的切断电机功率的硬件断电急停按钮。</li>
   <li>GEAR 0 低输出闭环点动，编码器 A/B 计数方向与目标方向一致。</li>
   <li>GEAR 1 重复相同步骤，不直接复制未经验证的 PID 参数。</li>
   <li>轨道 D 低占空比前进 → 停止 → 后退，GPIO40/41 对应正确。</li>
@@ -353,7 +355,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
 </table>
 
 <hr>
-<p class="small">当前目标：<code>NUM_AXES=6</code>、<code>NUM_GEAR_AXES=2</code>、独立 TRACK D · 模块尺寸状态：<strong>MOCK，未完成实物机械核验</strong> · 更新日期：2026-08-03</p>
+<p class="small">当前目标：<code>NUM_AXES=6</code>、<code>NUM_GEAR_AXES=2</code>、独立 TRACK D · 模块尺寸状态：<strong>MOCK，未完成实物机械核验</strong> · 更新日期：2026-08-04（补硬件急停 GPIO35）</p>
 
 </body>
 </html>

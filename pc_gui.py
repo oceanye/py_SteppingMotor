@@ -859,6 +859,16 @@ class StepperGUI:
                 self._post_ui(lambda: self.v_track_status.set("轨道租约到期，已停止"))
                 self._post_ui(lambda: self.log("轨道 D 固件租约到期，已自动停止"))
                 continue
+            if line == "HWESTOP,TRIGGERED":
+                # 固件硬件急停已执行 system_estop()；本地同步状态，不重发 ESTOP。
+                # 步进轴随后的 STEP ABORT 事件与 GEAR 轮询会各自更新对应状态。
+                self._track_lease_generation += 1
+                with self.state_lock:
+                    self._track_direction = "STOP"
+                    self._track_last_response = line
+                self._post_ui(lambda: self.v_track_status.set("硬件急停触发，已停止"))
+                self._post_ui(lambda: self.log("⚠️ 硬件急停触发（HWESTOP,TRIGGERED）：固件已停止全部步进/轨道并失能闭环轴；释放急停按钮后可重新操作"))
+                continue
             if line.startswith("FOC,") and ",FAULT" in line:
                 parts = line.split(",")
                 if len(parts) >= 3 and parts[2] == "FAULT":
