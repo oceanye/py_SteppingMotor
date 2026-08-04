@@ -1,6 +1,6 @@
 # py_SteppingMotor 项目记忆
 
-> 整理日期：2026-07-14；当前形态更新：2026-08-03
+> 整理日期：2026-07-14；当前形态更新：2026-08-04
 > 用途：供后续开发者或 AI 接手维护时快速恢复上下文。
 > 信息来源：`.claude/history.jsonl` 中本项目 285 条历史记录、Git 历史、当前代码、`docs/superpowers` 设计/计划、GUI 日志和当前调参文件。
 
@@ -193,22 +193,42 @@ GEAR 专用：`GR`、`PI`、`PD`，其中 `V` 表示 PWM duty cap 百分比而�
 
 ## 7. 维护验证基线
 
-当前这台电脑不是开发/验证环境，且项目内 `.venv` 指向已不存在的 Python；本轮按用户
-要求不修复环境、不执行测试。以下命令仅作为以后在完整开发环境中的验证基线：
+2026-08-04 起已迁移到正式开发机（Windows，`D:\py_SteppingMotor`），环境、基线构建、
+烧录与功能验收均已验证通过：
 
-每次修改公共固件或协议后至少执行：
+- 系统 Python 3.13.7；项目 `.venv` 可用，已装 `pyserial==3.5`。
+- PlatformIO Core 6.1.19 已装进项目 `.venv`（不污染系统 Python）。
+- `py_compile pc_gui.py web_control.py pc_control.py esp32_main.py` 全部通过。
+- 固件三环境编译通过（espressif32 6.12.0 / Arduino-ESP32 3.20017.241212）：
+  - `esp32s3_gear`（默认 GEAR）：SUCCESS，RAM 6.0%，Flash 24.2%。
+  - `esp32s3`（FOC，含 SimpleFOC 2.3.3）：SUCCESS，RAM 6.4%，Flash 25.7%。
+  - `esp32s3_minimal`：SUCCESS，RAM 5.8%，Flash 21.1%。
+- 默认 GEAR 构建与历史 FOC 构建条件编译隔离完好，互不破坏。
+- 已烧录 `esp32s3_gear` 到 ESP32-S3（COM9 / CH343），C 阶段无电机功率逻辑验收通过：`MODE`→`MODE,GEAR`、`MOVE`→`ACK`+`STEP,DONE,executed,requested`、`ESTOP`→`OK,ESTOP`、非法轴/格式→`ERR`。
+- C5 网页验收通过：`pc_gui.py` 独占串口，LAN 网页 `0.0.0.0:8765` 在线，手机经 `http://<台式机IP>:8765/` 控制；网页 `move`→位置更新、`estop`→confirmed、轨道 D 租约到期→`TRACK,D,TIMEOUT` 自动停车 均验证。
+- host gcc/g++（WinLibs MinGW-W64 UCRT POSIX 16.1.0，winget 安装）已就绪；`pio test -e native_test` 通过，6 个协议边界测试全部 PASSED。
+
+注意事项：
+
+- `.venv\Scripts\pio.exe` 这个 console shim 在本机间歇性“拒绝访问”；统一改用
+  `python -m platformio ...` 调用，例如
+  `.\.venv\Scripts\python.exe -m platformio run -e esp32s3_gear`。
+- 实物 ESP32-S3 为 DevKitC-1-N8（8 MB QD）；`platformio.ini` 三环境的 `board_build.flash_size`/`board_upload.flash_size` 已从 4MB 修正为 8MB（分区表仍为 `default.csv`，app 区 1.25 MB；若以后需要 OTA/LittleFS/更大 app 区，再换分区表）。
+
+每次修改公共固件或协议后的最小验证基线：
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile pc_gui.py pc_control.py esp32_main.py
+.\.venv\Scripts\python.exe -m py_compile pc_gui.py web_control.py pc_control.py esp32_main.py
 cd esp32_stepper
-pio run -e esp32s3
-pio run -e esp32s3_gear
+.\.venv\Scripts\python.exe -m platformio run -e esp32s3_gear
+.\.venv\Scripts\python.exe -m platformio run -e esp32s3
 ```
 
-有 host GCC 后再执行：
+协议回归测试（host GCC 已装，已验证通过）：
 
 ```powershell
-pio test -e native_test
+cd esp32_stepper
+.\.venv\Scripts\python.exe -m platformio test -e native_test
 ```
 
 烧录、通电、自动 PID、越限测试和故障注入属于硬件操作，不能仅凭“编译成功”视为验证通过。

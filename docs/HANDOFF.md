@@ -2,6 +2,11 @@
 
 交接日期：2026-08-03
 
+> 2026-08-04 更新：项目已迁移到正式开发机（`D:\py_SteppingMotor`，Windows，Python 3.13.7）。
+> `.venv`（pyserial 3.5）与 PlatformIO Core 6.1.19 已就绪，`py_compile` 与 `esp32s3_gear`
+> / `esp32s3` / `esp32s3_minimal` 三套固件均已编译通过；详见 `docs/PROJECT_MEMORY.md`
+> 第 7 节。下文 2026-08-03 正文作为历史交接基线保留。
+
 本文是后续迁移到开发机、真实控制柜和实物机构时的执行基线。当前这台电脑不是开发/硬件环境，本轮只完成代码、接口、PCB 模块占位和文档落位；**没有宣称编译、烧录、KiCad DRC 或电机实测通过**。
 
 ## 1. 当前交付状态

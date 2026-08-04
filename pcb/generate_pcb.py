@@ -167,8 +167,14 @@ NETS = list(dict.fromkeys(NETS))
 N = {name: index for index, name in enumerate(NETS)}
 
 
+_UID_SEQ = 0
+_UID_NS = uuid.UUID("00000000-0000-0000-0000-000000000000")
+
+
 def uid() -> str:
-    return str(uuid.uuid4())
+    global _UID_SEQ
+    _UID_SEQ += 1
+    return str(uuid.uuid5(_UID_NS, f"pcb-element-{_UID_SEQ}"))
 
 
 def fnum(value: float) -> str:
