@@ -1,5 +1,8 @@
 # FOC 无刷电机集成 —— 实施计划
 
+> 历史实施计划：本文保留用于追溯 2026-04-17 的 FOC 集成过程，其中复选框、
+> 协议示例和轴数不表示当前完成状态。当前系统说明以根目录操作手册和实际源码为准。
+
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在现有 ESP32-S3 上集成 SimpleFOC mini v1.0 + 2208 无刷电机 + AS5600 编码器，实现位置闭环控制，与现有 DM422 步进系统并存。

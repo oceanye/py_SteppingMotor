@@ -2,8 +2,8 @@
 #pragma once
 
 // 编译模式由 platformio.ini 的 build_flags 提供：
-//   -DDRIVE_MODE_FOC   → 默认，步进 + FOC 双轴
-//   -DDRIVE_MODE_GEAR  → Phase 1 新板，DRV8871 + N20 单轴（无步进、无 FOC）
+//   -DDRIVE_MODE_FOC   → 旧板：双路步进 + 双路 FOC
+//   -DDRIVE_MODE_GEAR  → 默认新板：六路步进 + 双路闭环减速电机 + 轨道 D
 #if !defined(DRIVE_MODE_FOC) && !defined(DRIVE_MODE_GEAR)
   #error "Build flag missing: define DRIVE_MODE_FOC or DRIVE_MODE_GEAR in platformio.ini"
 #endif
@@ -59,17 +59,26 @@
 #endif  // DRIVE_MODE_FOC
 
 // ============================================================
-// GEAR 模式（Phase 1：DRV8871 + N20 减速电机，单轴起步）
+// GEAR 模式（六路 DM422/DM442 + 两路闭环 DRV8871 + 一路轨道 D）
 // ============================================================
 #if defined(DRIVE_MODE_GEAR)
 
-#define NUM_AXES 2   // 步进 L/R 都用；GEAR 电机当前只接了 axis 0，axis 1 留占位 pin
+#define NUM_AXES 6          // 步进轴数（6 × DM422）
+#define NUM_GEAR_AXES 2     // GEAR 减速电机轴数（DRV8871，不变）
 
-// ── 步进（PUL/DIR 每轴一对，和 FOC 模式同 pin） ──
+// ── 步进（PUL/DIR 每轴一对）──
 #define PIN_STEP_PUL_0     5
 #define PIN_STEP_DIR_0     6
 #define PIN_STEP_PUL_1     7
 #define PIN_STEP_DIR_1    15
+#define PIN_STEP_PUL_2     1
+#define PIN_STEP_DIR_2     2
+#define PIN_STEP_PUL_3     4
+#define PIN_STEP_DIR_3     8
+#define PIN_STEP_PUL_4     9
+#define PIN_STEP_DIR_4    10
+#define PIN_STEP_PUL_5    38
+#define PIN_STEP_DIR_5    39
 
 // ── 减速电机 axis 0（已接好，2026-05-22 调通） ──
 // 物理上 ESP32 GPIO 11 → DRV8871 IN1，GPIO 16 → DRV8871 IN2。
@@ -83,8 +92,9 @@
 #define PIN_GEAR_ENCB_0   18   // ← 物理 C1 当作 B
 
 // ── 减速电机 axis 1（占位，未接硬件；将来装 R 侧 N20 时用） ──
-// 选 ESP32-S3 上确认空闲的 GPIO，不和步进 / axis 0 GEAR / USB / strapping 冲突。
-#define PIN_GEAR_IN1_1    17   // 备选
+// 载板实体接线为 IN1=GPIO12、IN2=GPIO17、C1/A=GPIO13、C2/B=GPIO14；
+// 和 axis 0 一样，这里的逻辑 IN1/IN2、ENCA/ENCB 为统一 PID 正方向而交换。
+#define PIN_GEAR_IN1_1    17   // → 实体 IN2
 #define PIN_GEAR_IN2_1    12
 #define PIN_GEAR_ENCA_1   14
 #define PIN_GEAR_ENCB_1   13
@@ -98,6 +108,47 @@
 #define GEAR_LEDC_CH_IN2_0      1
 #define GEAR_LEDC_CH_IN1_1      2
 #define GEAR_LEDC_CH_IN2_1      3
+
+// ── 轨道 D 开环直流电机（第三块 DRV8871，仅 GEAR 构建）──
+// 这是独立的租约式开环输出，不占用两路闭环 GEAR 轴。
+#define PIN_TRACK_D_IN1         40
+#define PIN_TRACK_D_IN2         41
+#define TRACK_D_LEDC_CH_IN1      4
+#define TRACK_D_LEDC_CH_IN2      5
+#define TRACK_PWM_FREQ_HZ       20000
+#define TRACK_PWM_RES_BITS       8
+#define TRACK_PWM_MAX           ((1 << TRACK_PWM_RES_BITS) - 1)
+#define TRACK_DEFAULT_LEASE_MS  1000
+#define TRACK_MIN_LEASE_MS       100
+#define TRACK_MAX_LEASE_MS      5000
+#define TRACK_SAFETY_TICK_MS      10
+
+// ── 可选六路步进轴绝对编码器诊断总线（不参与步进控制）──
+// GPIO42/47 与载板 AUX UART/RS485 共用，使用本功能时不得同时安装/启用 UART、
+// RS485 或其他占用这两个 GPIO 的模块。长线 I2C 易受电机噪声干扰，应使用短线、
+// 合理上拉、共地，必要时降低时钟或采用差分 I2C 延长器。
+#define STEPPER_ENCODER_DIAGNOSTICS_ENABLED  0  // 编码器尚未安装；安装后显式改为 1
+#define STEPPER_ENCODER_CLOSED_LOOP_ENABLED  0  // 预留；当前 DM442 始终原生 PUL/DIR 开环
+#define NUM_STEPPER_ENCODERS                  6
+#define PIN_STEPPER_ENCODER_I2C_SDA          42
+#define PIN_STEPPER_ENCODER_I2C_SCL          47
+#define STEPPER_ENCODER_I2C_HZ           100000
+#define TCA9548A_I2C_ADDR                   0x70
+#define AS5600_I2C_ADDR                     0x36
+#define AS5600_RAW_ANGLE_REG                0x0C
+#define AS5600_STATUS_REG                   0x0B
+#define STEPPER_ENCODER_POLL_MS               20
+#define STEPPER_ENCODER_OFFLINE_RETRY_MS    1000
+#define STEPPER_ENCODER_TASK_STACK          3072
+#define STEPPER_ENCODER_TASK_PRIORITY          1
+#define STEPPER_ENCODER_TASK_CORE              0
+
+// PCF8575 仅预留地址和未来诊断入口；当前 DIR/PUL 路径绝不经过 PCF8575。
+#define PCF8575_DIAGNOSTICS_ENABLED           0
+#define PCF8575_I2C_ADDR                    0x20
+#if STEPPER_ENCODER_CLOSED_LOOP_ENABLED
+  #error "Closed-loop DM442 control is not implemented; keep PUL/DIR open-loop"
+#endif
 
 // ── 编码器换算 ──
 #define GEAR_RATIO_DEFAULT      1000.0f                  // N20 1000:1

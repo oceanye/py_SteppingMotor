@@ -1,5 +1,8 @@
 # 双轴扩展（左/右腿）实施计划
 
+> 历史实施计划：本文描述 2026-04-22 的双轴阶段。当前默认 GEAR 构建已继续扩展
+> 为 6 路步进、2 路闭环减速电机以及独立轨道 D DRV8871；请勿直接按本文旧引脚表接线。
+
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development or executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把现有单轴系统（1× DM422 + 1× SimpleFOC mini + 2208 + AS5600）扩展为双轴，对应一台两腿机器人的左右旋转关节。左轴（L=axis 0）硬件不动，新增右轴（R=axis 1）。

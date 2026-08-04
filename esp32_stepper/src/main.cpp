@@ -3,13 +3,17 @@
 #include "protocol.h"
 #include "foc_motor.h"
 #include "stepper.h"     // 两个构建都需要步进
+#if defined(DRIVE_MODE_GEAR)
+#include "track_motor.h"
+#include "stepper_encoders.h"
+#endif
 #if defined(DRIVE_MODE_FOC)
   static const int PIN_NFAULT[NUM_AXES] = { PIN_FOC_NFAULT_0, PIN_FOC_NFAULT_1 };
 #endif
 
-// 协议 v2.3+：全显式轴号。命令带 axis（0=L, 1=R）
+// 协议 v2.3+：全显式轴号。
 //   FOC 构建：MOVE,<axis>,<steps>,<dir>,<delay_us> | FOC,<axis>,<sub>,<arg> | DIAG,<axis>
-//   GEAR 构建：FOC,<axis>,<sub>,<arg> | DIAG,<axis>（无 MOVE）
+//   GEAR 构建：六路 MOVE/STOP | 两路 FOC（闭环减速电机）| TRACK,D,... | DIAG
 
 void setup() {
   Serial.begin(115200);
@@ -34,23 +38,44 @@ void setup() {
   }
   stepper_init();
   foc_init();
-  Serial.println("Protocol: MOVE,<axis>,s,d,us | FOC,<axis>,... | DIAG,<axis> | STDIAG,<axis> | MODE");
+  Serial.println("Protocol: MOVE/STOP/ESTOP | FOC,<axis>,... | DIAG,<axis> | STDIAG,<axis> | MODE");
 #elif defined(DRIVE_MODE_GEAR)
   Serial.println("ESP32 Controller Ready (GEAR mode, stepper + DC gear motor)");
-  Serial.println("  fw: PCNT-quad-fix v2 + stepper");
-  Serial.print("NUM_AXES = "); Serial.println(NUM_AXES);
+  Serial.println("  fw: accel-ramp + 6-axis stepper + PCNT-clear");
+  Serial.print("NUM_AXES (stepper) = "); Serial.println(NUM_AXES);
+  Serial.print("NUM_GEAR_AXES = "); Serial.println(NUM_GEAR_AXES);
+  const int pul_pins[] = {PIN_STEP_PUL_0,PIN_STEP_PUL_1,PIN_STEP_PUL_2,PIN_STEP_PUL_3,PIN_STEP_PUL_4,PIN_STEP_PUL_5};
+  const int dir_pins[] = {PIN_STEP_DIR_0,PIN_STEP_DIR_1,PIN_STEP_DIR_2,PIN_STEP_DIR_3,PIN_STEP_DIR_4,PIN_STEP_DIR_5};
   for (int a = 0; a < NUM_AXES; a++) {
-    Serial.print("  axis "); Serial.print(a); Serial.println(":");
-    Serial.print("    stepper PUL="); Serial.print(a==0?PIN_STEP_PUL_0:PIN_STEP_PUL_1);
-    Serial.print(" DIR=");            Serial.println(a==0?PIN_STEP_DIR_0:PIN_STEP_DIR_1);
-    Serial.print("    gear IN1=");    Serial.print(a==0?PIN_GEAR_IN1_0:PIN_GEAR_IN1_1);
-    Serial.print(" IN2=");            Serial.print(a==0?PIN_GEAR_IN2_0:PIN_GEAR_IN2_1);
-    Serial.print(" ENC_A=");          Serial.print(a==0?PIN_GEAR_ENCA_0:PIN_GEAR_ENCA_1);
-    Serial.print(" ENC_B=");          Serial.println(a==0?PIN_GEAR_ENCB_0:PIN_GEAR_ENCB_1);
+    Serial.print("  stepper "); Serial.print(a);
+    Serial.print(": PUL="); Serial.print(pul_pins[a]);
+    Serial.print(" DIR="); Serial.println(dir_pins[a]);
+  }
+  const int gin1[] = {PIN_GEAR_IN1_0, PIN_GEAR_IN1_1};
+  const int gin2[] = {PIN_GEAR_IN2_0, PIN_GEAR_IN2_1};
+  const int gea[]  = {PIN_GEAR_ENCA_0, PIN_GEAR_ENCA_1};
+  const int geb[]  = {PIN_GEAR_ENCB_0, PIN_GEAR_ENCB_1};
+  for (int a = 0; a < NUM_GEAR_AXES; a++) {
+    Serial.print("  gear "); Serial.print(a);
+    Serial.print(": IN1="); Serial.print(gin1[a]);
+    Serial.print(" IN2="); Serial.print(gin2[a]);
+    Serial.print(" ENC_A="); Serial.print(gea[a]);
+    Serial.print(" ENC_B="); Serial.println(geb[a]);
   }
   stepper_init();
   foc_init();   // GEAR 构建里这个符号由 gear_motor.cpp 提供
-  Serial.println("Protocol: MOVE,<axis>,... | FOC,<axis>,... | DIAG,<axis> | STDIAG,<axis> | MODE");
+  track_motor_init();
+  stepper_encoders_init();
+  Serial.print("  track D: IN1="); Serial.print(PIN_TRACK_D_IN1);
+  Serial.print(" IN2="); Serial.println(PIN_TRACK_D_IN2);
+#if STEPPER_ENCODER_DIAGNOSTICS_ENABLED
+  Serial.print("  optional step encoders: ENABLED TCA9548A@0x70 SDA/SCL=");
+  Serial.print(PIN_STEPPER_ENCODER_I2C_SDA); Serial.print('/');
+  Serial.println(PIN_STEPPER_ENCODER_I2C_SCL);
+#else
+  Serial.println("  optional step encoders: DISABLED/reserved (set diagnostics flag after hardware install)");
+#endif
+  Serial.println("Protocol: MOVE/STOP/ESTOP | FOC | TRACK | ENC,<axis>,S | DIAG | STDIAG | MODE");
 #endif
 }
 

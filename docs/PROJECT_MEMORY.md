@@ -1,7 +1,7 @@
 # py_SteppingMotor 项目记忆
 
-> 整理日期：2026-07-14  
-> 用途：供后续开发者或 AI 接手维护时快速恢复上下文。  
+> 整理日期：2026-07-14；当前形态更新：2026-08-03
+> 用途：供后续开发者或 AI 接手维护时快速恢复上下文。
 > 信息来源：`.claude/history.jsonl` 中本项目 285 条历史记录、Git 历史、当前代码、`docs/superpowers` 设计/计划、GUI 日志和当前调参文件。
 
 ## 1. 信息可信度顺序
@@ -10,11 +10,10 @@
 
 1. 当前硬件实测和最新 GUI/raw 日志
 2. 当前工作区代码与 `platformio.ini`
-3. Git 提交历史
-4. 本文件
-5. `docs/wiring_check.html`
-6. `docs/superpowers` 设计和实施计划
-7. `MD422_20K-2M.md`（部分协议和单轴说明已经过时）
+3. `MD422_20K-2M.md` 与 `docs/wiring_check.html`
+4. Git 提交历史
+5. 本文件
+6. `docs/superpowers` 历史设计和实施计划
 
 Claude Code 没有为本项目生成独立的 `memory/MEMORY.md`。相关上下文保存在全局
 `.claude/history.jsonl`；原完整会话正文目前未在 `.claude/projects` 或 `.claude/sessions`
@@ -22,8 +21,14 @@ Claude Code 没有为本项目生成独立的 `memory/MEMORY.md`。相关上下�
 
 ## 2. 项目目标与当前形态
 
-系统使用 PC 端 Tkinter GUI，通过 115200 波特率串口控制 ESP32-S3 上的左右两轴。
-每轴包含一个 DM422 步进执行器，并可在以下两类闭环电机方案之间选择：
+系统使用 PC 端 Tkinter GUI，通过 115200 波特率串口控制 ESP32-S3。GUI 同时作为
+局域网 HTTP 服务器，手机网页只通过 GUI 间接控制串口。当前默认 GEAR 构建包含：
+
+- 6 路 DM422/DM442 步进轴，协议轴号 0–5；
+- 2 路 DRV8871 + N20 + AB 编码器位置闭环，协议轴号 0–1；
+- 1 路独立轨道 D DRV8871 开环电机，GPIO40/41，租约超时自动停止。
+
+闭环电机仍可在以下两类构建方案之间选择：
 
 - **FOC 模式**：2208 BLDC + SimpleFOC mini + AS5600。
 - **GEAR 模式**：12V N20 1000:1 有刷减速电机 + DRV8871 + AB 霍尔编码器。
@@ -33,7 +38,7 @@ Claude Code 没有为本项目生成独立的 `memory/MEMORY.md`。相关上下�
 | 环境 | 编译宏 | 当前端口 | 内容 |
 |---|---|---|---|
 | `esp32s3` | `DRIVE_MODE_FOC` | COM4 | 双 DM422 步进 + 双 SimpleFOC |
-| `esp32s3_gear` | `DRIVE_MODE_GEAR` | COM9 | 双 DM422 步进 + 双 DRV8871/N20 |
+| `esp32s3_gear` | `DRIVE_MODE_GEAR` | COM9 | 6 路步进 + 双闭环 DRV8871/N20 + 轨道 D |
 | `esp32s3_minimal` | `MINIMAL_TEST_BUILD` | COM9 | ESP32-S3 健康度/复位循环排查 |
 
 `esp32s3_gear` 是当前默认环境。GUI 可用 `MODE` 自动识别固件，也可强制选择 FOC
@@ -120,11 +125,13 @@ Claude Code 没有为本项目生成独立的 `memory/MEMORY.md`。相关上下�
 
 ## 4. 当前协议
 
-协议 v2.3+ 使用显式轴号，`0=L`、`1=R`，也支持 `*` 广播。
+协议使用显式轴号。GEAR 步进为 0–5，闭环为 0–1，也支持 `*` 广播。
 
 ```text
 MODE
+ESTOP
 MOVE,<axis|*>,<steps>,<dir>,<delay_us>
+STOP,<axis|*>
 STDIAG,<axis>
 DIAG,<axis>[,LIVE]
 FOC,<axis|*>,S
@@ -134,12 +141,16 @@ FOC,<axis|*>,H
 FOC,<axis|*>,CLR
 FOC,<axis|*>,V,<value>
 FOC,<axis|*>,PA,<value>
+TRACK,D,FWD|REV,<duty>[,<lease_ms>]
+TRACK,D,STOP
+TRACK,D,S
 ```
 
 FOC 专用：`PP`、`VP`、`REALIGN`。  
 GEAR 专用：`GR`、`PI`、`PD`，其中 `V` 表示 PWM duty cap 百分比而不是电压。
 
-不要再依据 `MD422_20K-2M.md` 中无轴号的旧协议发送正式命令。
+步进结束事件携带实际执行量：`STEP,<axis>,DONE|ABORT,<executed>,<requested>`。
+轨道 D 的 duty 为 1–100%，租约为 100–5000 ms，省略时默认 1000 ms。
 
 ## 5. 接线与安全经验
 
@@ -151,31 +162,39 @@ GEAR 专用：`GR`、`PI`、`PD`，其中 `V` 表示 PWM duty cap 百分比而�
 - 自动调参或首次闭环前确保机构有足够行程，并准备断开电机电源。
 - 当前没有硬件限位开关，GUI 软件限位不能替代物理保护。
 
-## 6. 已知技术债与下一步
+## 6. 已完成修复与下一步
 
-### 高优先级
+2026-08-03 已完成：
 
-1. **GEAR PCNT 溢出**：16 位计数器在 1000:1 下约 ±421°到边界，但 API 允许
-   ±3600°。需要加入 PCNT 高/低限事件和软件累计计数。
-2. **跨核数据竞争**：GEAR 的 `kp/ki/kd`、`gear_ratio`、`duty_cap_pct`、
-   `home_offset_counts` 不是 atomic，却由串口核和控制任务共同访问。
-3. **协议严格解析**：Arduino `toInt()/toFloat()` 会把非法文本转成 0，非法轴文本
-   可能误操作轴 0。需要完整数字校验和统一错误响应。
-4. **形成 Git 基线**：GEAR 相关约 771 行改动以及新文件尚未提交，修改前应先审查、
-   拆分并提交可回滚基线。
+- PCNT 改为 1 ms 增量读取/清零并使用任务私有 64 位软件累计；
+- PID、齿轮比、PWM 上限、home 请求等跨核状态改为 atomic 或请求式同步；
+- 协议改为严格数值、字段数和轴范围解析；
+- 步进 STOP 状态机消除启动竞争，并回报实际执行步数；
+- native 测试从 smoke 扩展为协议数字和字段边界测试；
+- GUI 区分 6 个步进轴和 2 个闭环轴，并处理 ABORT 位置不可信状态；
+- 增加轨道 D 和固定地址、无令牌的局域网网页控制；GUI 明示局域网地址与端口。
+- 为六路 DM442 增加 TCA9548A + 6×AS5600 的只读诊断代码和模块级 PCB 预留；编码器
+  尚未安装，因此诊断默认关闭、闭环受编译期保护，当前原生 PUL/DIR 开环不变。
+- 增加 PCF8575 模块级 DNP 预留，仅作为未来 DIR/ENA 等低速逻辑扩展；PUL 永远保留
+  在 ESP32 原生 GPIO，PCF 输出在实测并增加成品缓冲模块前不连接 DM 光耦输入。
+- 增加 `docs/HANDOFF.md`，作为迁移到真实开发/硬件环境后的构建、接线、验收和未来
+  闭环实现基线。
 
 ### 中优先级
 
 - 继续解决右 GEAR 轴的稳态误差和两轴 PID 差异。
 - 增加固件硬件限位、急停和真正的 GEAR 故障输入/检测。
-- 将串口解析抽成 host 可测试模块；当前 native 测试只有 smoke test。
 - 安装可用的 `gcc/g++` 后恢复 `pio test -e native_test`。
-- 更新 `MD422_20K-2M.md`、双轴设计附录和 GEAR 正式设计文档。
-- `.gear_tune.json` 当前未被 `.gitignore` 忽略；需决定它是机器本地参数还是受控基线。
-- 清理 `platformio.ini`、`main.cpp` 和 `gear_motor.cpp` 中“GEAR 不含步进”或
-  “只接一个 N20”等已经与现状冲突的注释。
+- PCB 当前使用模块 mock 尺寸；拿到 ESP32-S3 DevKit、DRV8871 模块和端子实测尺寸后
+  替换封装 courtyard 并复核孔距；TCA9548A、PCF8575、AS5600 的模块尺寸、针序、
+  地址跳线和 3.3V 上拉也必须逐项实测。
+- 超过 6 路步进时优先增加 Pico/RP2040 脉冲协处理模块；I²C GPIO 扩展只用于
+  DIR/ENA/限位等低速信号。
 
 ## 7. 维护验证基线
+
+当前这台电脑不是开发/验证环境，且项目内 `.venv` 指向已不存在的 Python；本轮按用户
+要求不修复环境、不执行测试。以下命令仅作为以后在完整开发环境中的验证基线：
 
 每次修改公共固件或协议后至少执行：
 

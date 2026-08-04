@@ -7,15 +7,22 @@ import time
 import queue
 import json
 import os
+import socket
+import webbrowser
 
 # ============== 轴配置 ==============
-NUM_AXES = 2
-AXIS_LABEL = ["L", "R"]   # 左腿 / 右腿
+# 步进轴和闭环电机是两套独立的轴集合。兼容常量仅供旧配置使用，
+# 新代码必须明确选择 NUM_STEPPER_AXES 或 NUM_MOTOR_AXES。
+NUM_STEPPER_AXES = 6
+NUM_MOTOR_AXES = 2
+NUM_AXES = NUM_STEPPER_AXES       # 向后兼容
+NUM_GEAR_AXES = NUM_MOTOR_AXES    # 向后兼容
+AXIS_LABEL = ["L", "R", "A", "B", "C", "D"]
 
 # ============== 步进标定 ==============
-# 两轴统一: 28HD140GT81-200LR 贯通式步进, 200 微步/圈, 导程 1.0 mm/圈
-PULSES_PER_MM = [200.0 / 1.0, 200.0 / 1.0]
-# 速度档位 (mm/s) —— 根据 200 微步 + 0.6mm 导距 + 加减速曲线设定
+# 六轴统一: 28HD140GT81-200LR 贯通式步进, 200 微步/圈, 导程 1.0 mm/圈
+PULSES_PER_MM = [200.0 / 1.0] * NUM_STEPPER_AXES
+# 速度档位 (mm/s) —— 根据 200 微步 + 1.0mm 导程 + 加减速曲线设定
 SPEED_PRESETS = [0.3, 0.5, 0.6, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 10]
 SPEED_DEFAULT = 3.0
 # 实测：delayMicroseconds 路径每步固定开销 ~200us（50us HIGH + yield + 调度）
@@ -29,12 +36,12 @@ def _speed_to_delay_ms(speed, ppm):
         return target_us / 1000.0
     return max(0.05, (target_us - DELAY_OVERHEAD_US) / 1000.0)
 
-DELAY_DEFAULT_MS = [_speed_to_delay_ms(SPEED_DEFAULT, PULSES_PER_MM[a]) for a in range(NUM_AXES)]
+DELAY_DEFAULT_MS = [_speed_to_delay_ms(SPEED_DEFAULT, PULSES_PER_MM[a]) for a in range(NUM_STEPPER_AXES)]
 DIR_OUTWARD = 1
 DIR_INWARD  = 0
 # 每轴方向翻转标志（电机安装方向不同时用）
 # 0 = 不翻转, 1 = 翻转 DIR 信号。两轴原始方向均正确，不翻转。
-DIR_INVERT = [0, 0]
+DIR_INVERT = [0] * NUM_STEPPER_AXES
 CONTINUOUS_BURST_MM = 0.2
 
 # ============== FOC ==============
@@ -54,71 +61,109 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 
 def _empty_axis_dict():
-    return {i: None for i in range(NUM_AXES)}
+    return {i: None for i in range(NUM_STEPPER_AXES)}
 
 
 class StepperGUI:
-    def __init__(self, root):
+    def __init__(self, root, web_server_factory=None):
         self.root = root
-        self.root.title("双轴步进 + FOC/GEAR 控制器")
+        self.root.title("六轴步进 + FOC/GEAR + 轨道 D 控制器")
         self.root.resizable(False, False)
 
         # ── 共享：串口 ──
         self.ser = None
         self.serial_lock = threading.Lock()
+        self.state_lock = threading.RLock()
+        self._disconnect_lock = threading.Lock()
+        self._estop_lock = threading.Lock()
+        self._control_context = threading.local()
         self._resp_queue = queue.Queue()
+        self._ui_actions = queue.Queue()
         self._reader_running = False
         self.foc_poll_running = False
+        self._last_serial_error_log = 0.0
+        self._serial_failure_handled = False
+        self._serial_generation = 0
+        self._control_generation = 0
+        self._closing = False
+        self._disconnecting = False
+        self._estop_in_progress = False
 
         # ── 每轴状态（list 按 axis 索引）──
-        self.running            = [False] * NUM_AXES          # 连续运动 flag
-        self.position_mm        = [0.0]   * NUM_AXES
-        self.travel_min_mm      = [None]  * NUM_AXES
-        self.travel_max_mm      = [None]  * NUM_AXES
-        self.stepper_in_progress= [False] * NUM_AXES
-        self._pending_step      = [None]  * NUM_AXES
-        self._foc_enabled_ui    = [False] * NUM_AXES
-        self.foc_trace_buf      = [[] for _ in range(NUM_AXES)]
+        self.running            = [False] * NUM_STEPPER_AXES  # 连续运动 flag
+        self.position_mm        = [0.0]   * NUM_STEPPER_AXES
+        self.position_trusted   = [True]  * NUM_STEPPER_AXES
+        self.travel_min_mm      = [None]  * NUM_STEPPER_AXES
+        self.travel_max_mm      = [None]  * NUM_STEPPER_AXES
+        self.stepper_in_progress= [False] * NUM_STEPPER_AXES
+        self._pending_step      = [None]  * NUM_STEPPER_AXES
+        self._move_dispatching  = [False] * NUM_STEPPER_AXES
+        self._web_step_pending  = [False] * NUM_STEPPER_AXES
+        self._foc_enabled_ui    = [False] * NUM_MOTOR_AXES
+        self.foc_trace_buf      = [[] for _ in range(NUM_MOTOR_AXES)]
+        self._motor_status      = [
+            {"state": "?", "current_deg": None, "target_deg": None, "fault": None}
+            for _ in range(NUM_MOTOR_AXES)
+        ]
         # goto watcher 代数：每次新 goto +1，旧 watcher 检测到 gen 变了就退出
-        self._goto_watcher_gen  = [0] * NUM_AXES
+        self._goto_watcher_gen  = [0] * NUM_MOTOR_AXES
 
         # ── 每轴 Tk 变量 ──
-        self.v_dist   = [tk.DoubleVar(value=10.0) for _ in range(NUM_AXES)]
-        self.v_dir    = [tk.IntVar   (value=DIR_OUTWARD) for _ in range(NUM_AXES)]
-        self.v_delay  = [tk.DoubleVar(value=DELAY_DEFAULT_MS[a]) for a in range(NUM_AXES)]
-        self.v_speed_str = [tk.StringVar(value=str(SPEED_DEFAULT)) for _ in range(NUM_AXES)]
-        self.v_goto   = [tk.DoubleVar(value=0.0)  for _ in range(NUM_AXES)]
-        self.v_foctgt = [tk.DoubleVar(value=0.0)  for _ in range(NUM_AXES)]
-        self.v_focstate   = [tk.StringVar(value="未连接") for _ in range(NUM_AXES)]
-        self.v_focfault   = [tk.StringVar(value="--")    for _ in range(NUM_AXES)]
-        self.v_foccur     = [tk.StringVar(value="--")    for _ in range(NUM_AXES)]
-        self.v_focvlimit  = [tk.DoubleVar(value=10.0)    for _ in range(NUM_AXES)]
-        self.v_focpangle  = [tk.DoubleVar(value=25.0)    for _ in range(NUM_AXES)]
-        self.v_focvp      = [tk.DoubleVar(value=0.2)     for _ in range(NUM_AXES)]
-        self.v_focpp      = [tk.IntVar   (value=7)       for _ in range(NUM_AXES)]
+        self.v_dist   = [tk.DoubleVar(value=10.0) for _ in range(NUM_STEPPER_AXES)]
+        self.v_dir    = [tk.IntVar   (value=DIR_OUTWARD) for _ in range(NUM_STEPPER_AXES)]
+        self.v_delay  = [tk.DoubleVar(value=DELAY_DEFAULT_MS[a]) for a in range(NUM_STEPPER_AXES)]
+        self.v_speed_str = [tk.StringVar(value=str(SPEED_DEFAULT)) for _ in range(NUM_STEPPER_AXES)]
+        self.v_goto   = [tk.DoubleVar(value=0.0)  for _ in range(NUM_STEPPER_AXES)]
+        self.v_foctgt = [tk.DoubleVar(value=0.0)  for _ in range(NUM_MOTOR_AXES)]
+        self.v_focstate   = [tk.StringVar(value="未连接") for _ in range(NUM_MOTOR_AXES)]
+        self.v_focfault   = [tk.StringVar(value="--")    for _ in range(NUM_MOTOR_AXES)]
+        self.v_foccur     = [tk.StringVar(value="--")    for _ in range(NUM_MOTOR_AXES)]
+        self.v_focvlimit  = [tk.DoubleVar(value=10.0)    for _ in range(NUM_MOTOR_AXES)]
+        self.v_focpangle  = [tk.DoubleVar(value=25.0)    for _ in range(NUM_MOTOR_AXES)]
+        self.v_focvp      = [tk.DoubleVar(value=0.2)     for _ in range(NUM_MOTOR_AXES)]
+        self.v_focpp      = [tk.IntVar   (value=7)       for _ in range(NUM_MOTOR_AXES)]
 
         # ── GEAR 模式调参变量（和 FOC 共享 v_foctgt / v_focstate / v_foccur / v_focfault）──
-        self.v_gearpwm = [tk.DoubleVar(value=100.0)  for _ in range(NUM_AXES)]   # PWM duty cap %（0-100）
-        self.v_gearkp  = [tk.DoubleVar(value=1.0)    for _ in range(NUM_AXES)]
-        self.v_gearki  = [tk.DoubleVar(value=0.0)    for _ in range(NUM_AXES)]
-        self.v_gearkd  = [tk.DoubleVar(value=0.05)   for _ in range(NUM_AXES)]
-        self.v_geargr  = [tk.DoubleVar(value=1000.0) for _ in range(NUM_AXES)]   # 齿轮比（NVS）
+        self.v_gearpwm = [tk.DoubleVar(value=100.0)  for _ in range(NUM_MOTOR_AXES)]   # PWM duty cap %（0-100）
+        self.v_gearkp  = [tk.DoubleVar(value=1.0)    for _ in range(NUM_MOTOR_AXES)]
+        self.v_gearki  = [tk.DoubleVar(value=0.0)    for _ in range(NUM_MOTOR_AXES)]
+        self.v_gearkd  = [tk.DoubleVar(value=0.05)   for _ in range(NUM_MOTOR_AXES)]
+        self.v_geargr  = [tk.DoubleVar(value=1000.0) for _ in range(NUM_MOTOR_AXES)]   # 齿轮比（NVS）
+
+        # 轨道 D（独立 DRV8871）状态。命令采用 800 ms 租约，GUI 按住时续租。
+        self.v_track_duty = tk.IntVar(value=60)
+        self.v_track_status = tk.StringVar(value="已停止")
+        self._track_direction = "STOP"
+        self._track_lease_ms = 800
+        self._track_lease_generation = 0
+        self._track_last_response = ""
 
         # ── 模式：
         #    mode_select_var: 用户选择 (Auto/FOC/GEAR)；Auto 时从固件 MODE 命令读
         #    fw_mode_var:      当前实际生效的模式显示 (FOC/GEAR/?)
         self.mode_select_var = tk.StringVar(value="Auto")
         self.fw_mode_var = tk.StringVar(value="?")
+        self._fw_mode_cache = "?"
 
         # ── 每轴 widget refs（dict-per-axis）──
-        self.sw = [dict() for _ in range(NUM_AXES)]  # stepper widgets
-        self.fw = [dict() for _ in range(NUM_AXES)]  # FOC widgets
-        self.gw = [dict() for _ in range(NUM_AXES)]  # GEAR widgets
+        self.sw = [dict() for _ in range(NUM_STEPPER_AXES)]  # stepper widgets
+        self.fw = [dict() for _ in range(NUM_MOTOR_AXES)]    # FOC widgets
+        self.gw = [dict() for _ in range(NUM_MOTOR_AXES)]    # GEAR widgets
+        self.tw = {}
+        self.web_server = None
+        self.web_status_var = tk.StringVar(value="● 服务未启动")
+        self.web_address_var = tk.StringVar(value="—")
+        self.web_port_var = tk.StringVar(value="—")
+        self.web_url_var = tk.StringVar(value="网页服务未启动")
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(25, self._drain_ui_actions)
         self._load_calib()
         self._load_foc_tune()
         self._load_gear_tune()
+        if web_server_factory is not None:
+            self._start_web_server(web_server_factory)
 
     # ═════════════ 顶层 UI ═════════════
     def _build_ui(self):
@@ -158,28 +203,60 @@ class StepperGUI:
         ttk.Radiobutton(mode_inner, text="强制 GEAR", variable=self.mode_select_var,
                         value="GEAR", command=self._on_mode_select_change).pack(side="left", padx=6)
 
-        # Notebook: 步进 ×2 + FOC ×2 + GEAR ×2 = 6 tabs。
+        ttk.Label(conn_frame, text="网页服务:").grid(row=2, column=0, sticky="e", **pad)
+        self.web_status_label = ttk.Label(
+            conn_frame, textvariable=self.web_status_var, foreground="gray")
+        self.web_status_label.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Label(conn_frame, text="手机访问地址:").grid(row=2, column=3, sticky="e", **pad)
+        ttk.Entry(conn_frame, textvariable=self.web_address_var, width=28,
+                  state="readonly").grid(row=2, column=4, columnspan=3, sticky="ew", **pad)
+        ttk.Label(conn_frame, text="端口:").grid(row=2, column=7, sticky="e", **pad)
+        ttk.Label(conn_frame, textvariable=self.web_port_var,
+                  font=("Consolas", 11, "bold")).grid(row=2, column=8, sticky="w", **pad)
+
+        ttk.Label(conn_frame, text="手机完整网址:").grid(row=3, column=0, sticky="e", **pad)
+        self.web_url_entry = ttk.Entry(conn_frame, textvariable=self.web_url_var,
+                                       width=69, state="readonly")
+        self.web_url_entry.grid(row=3, column=1, columnspan=6, sticky="ew", **pad)
+        ttk.Button(conn_frame, text="复制手机网址", command=self._copy_web_url).grid(
+            row=3, column=7, **pad)
+        ttk.Button(conn_frame, text="本机打开", command=self._open_web_url).grid(
+            row=3, column=8, **pad)
+
+        ttk.Label(
+            conn_frame,
+            text="流程：① 手机与台式机连接同一局域网  ② GUI 连接 ESP32 串口  "
+                 "③ 手机打开上方固定网址  ④ 页面显示“串口已连接”后控制电机",
+            foreground="#555",
+        ).grid(row=4, column=0, columnspan=9, sticky="w", padx=8, pady=(1, 5))
+
+        # Notebook: 步进 ×6 + FOC ×2 + GEAR ×2 + 轨道 D。
         # FOC/GEAR 互斥：连接后根据固件 MODE 灰掉另一组。
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
-        self.tab_index_step = [None] * NUM_AXES
-        self.tab_index_foc  = [None] * NUM_AXES
-        self.tab_index_gear = [None] * NUM_AXES
-        for axis in range(NUM_AXES):
+        self.tab_index_step = [None] * NUM_STEPPER_AXES
+        self.tab_index_foc  = [None] * NUM_MOTOR_AXES
+        self.tab_index_gear = [None] * NUM_MOTOR_AXES
+        for axis in range(NUM_STEPPER_AXES):
             tab = ttk.Frame(self.notebook)
             self.tab_index_step[axis] = self.notebook.index("end")
             self.notebook.add(tab, text=f"🔩 步进 {AXIS_LABEL[axis]}")
             self._build_stepper_tab(tab, axis)
-        for axis in range(NUM_AXES):
+        for axis in range(NUM_MOTOR_AXES):
             tab = ttk.Frame(self.notebook)
             self.tab_index_foc[axis] = self.notebook.index("end")
             self.notebook.add(tab, text=f"🧲 FOC {AXIS_LABEL[axis]}")
             self._build_foc_tab(tab, axis)
-        for axis in range(NUM_AXES):
+        for axis in range(NUM_MOTOR_AXES):
             tab = ttk.Frame(self.notebook)
             self.tab_index_gear[axis] = self.notebook.index("end")
             self.notebook.add(tab, text=f"⚙ 减速 {AXIS_LABEL[axis]}")
             self._build_gear_tab(tab, axis)
+
+        track_tab = ttk.Frame(self.notebook)
+        self.tab_index_track = self.notebook.index("end")
+        self.notebook.add(track_tab, text="↔ 轨道 D")
+        self._build_track_tab(track_tab)
 
         log_frame = ttk.LabelFrame(self.root,
                                    text=f"日志（同时写到 {os.path.basename(LOG_DIR)}/gui_<日期>.log）")
@@ -415,7 +492,160 @@ class StepperGUI:
         fw['cfg_btns']    = [fw['home_btn'], fw['vlimit_slider'], fw['pangle_slider'],
                              fw['vp_slider'], fw['pp_save_btn'], fw['autotune_btn']]
 
+    # ═════════════ 轨道 D（独立 DRV8871）═════════════
+    def _build_track_tab(self, parent):
+        pad = dict(padx=12, pady=8)
+        frame = ttk.LabelFrame(parent, text="轨道 D 直流电机（DRV8871）")
+        frame.grid(row=0, column=0, sticky="nsew", **pad)
+
+        ttk.Label(frame, text="PWM 占空比:").grid(row=0, column=0, sticky="w", **pad)
+        duty = ttk.Spinbox(frame, from_=1, to=100, increment=1,
+                           textvariable=self.v_track_duty, width=8, state="disabled")
+        duty.grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(frame, text="%（按住按钮期间有效）").grid(row=0, column=2, sticky="w", **pad)
+
+        fwd = ttk.Button(frame, text="▶ 按住前进", state="disabled")
+        fwd.grid(row=1, column=0, **pad, ipadx=18, ipady=12)
+        rev = ttk.Button(frame, text="◀ 按住后退", state="disabled")
+        rev.grid(row=1, column=1, **pad, ipadx=18, ipady=12)
+        stop = ttk.Button(frame, text="■ STOP", command=self._track_release,
+                          state="disabled")
+        stop.grid(row=1, column=2, **pad, ipadx=18, ipady=12)
+
+        for button, direction in ((fwd, "FWD"), (rev, "REV")):
+            button.bind("<ButtonPress-1>",
+                        lambda _event, d=direction: self._track_press(d))
+            button.bind("<ButtonRelease-1>", lambda _event: self._track_release())
+            button.bind("<Leave>", lambda _event: self._track_release())
+
+        ttk.Label(frame, text="状态:").grid(row=2, column=0, sticky="e", **pad)
+        status = ttk.Label(frame, textvariable=self.v_track_status,
+                           font=("Consolas", 12, "bold"), foreground="#555")
+        status.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Label(
+            frame,
+            text="安全机制：运行命令带 800 ms 租约；按住时约每 250~500 ms 续租，\n"
+                 "松开、鼠标移出、串口断开或网页停止时立即发送 STOP。",
+            foreground="#666",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+
+        self.tw.update(duty=duty, fwd_btn=fwd, rev_btn=rev,
+                       stop_btn=stop, status_label=status)
+
+    def _set_track_controls(self, state):
+        for key in ("duty", "fwd_btn", "rev_btn", "stop_btn"):
+            widget = self.tw.get(key)
+            if widget is not None:
+                widget.config(state=state)
+
+    def _track_press(self, direction):
+        try:
+            duty = max(1, min(100, int(self.v_track_duty.get())))
+        except (TypeError, ValueError, tk.TclError):
+            duty = 60
+            self.v_track_duty.set(duty)
+        self._start_track_lease(direction, duty)
+
+    def _start_track_lease(self, direction, duty):
+        if direction not in ("FWD", "REV"):
+            return False
+        if not self._is_serial_connected():
+            self.v_track_status.set("未连接")
+            return False
+        self._track_lease_generation += 1
+        generation = self._track_lease_generation
+        with self.state_lock:
+            self._track_direction = direction
+            self._track_lease_ms = 800
+        self.v_track_status.set(f"{direction} · PWM {duty}% · 租约续租中")
+        self.tw['status_label'].config(foreground="#1565c0")
+        self._track_lease_tick(generation, direction, duty)
+        return True
+
+    def _track_lease_tick(self, generation, direction, duty):
+        if generation != self._track_lease_generation or self._track_direction != direction:
+            return
+
+        def worker():
+            response = self._send_and_read(
+                f"TRACK,D,{direction},{duty},800",
+                timeout=0.25,
+                guard=lambda: (generation == self._track_lease_generation
+                               and self._track_direction == direction),
+            )
+            with self.state_lock:
+                self._track_last_response = response
+            if generation == self._track_lease_generation and self._track_direction == direction:
+                self._post_ui(lambda: self.root.after(
+                    250, lambda: self._track_lease_tick(generation, direction, duty)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _track_release(self):
+        self._track_lease_generation += 1
+        generation = self._track_lease_generation
+        with self.state_lock:
+            self._track_direction = "STOP"
+        self.v_track_status.set("已停止")
+        if self.tw.get('status_label'):
+            self.tw['status_label'].config(foreground="#555")
+        threading.Thread(target=self._send_track_stop,
+                         args=(generation,), daemon=True).start()
+
+    def _send_track_stop(self, generation=None, control_guard=None):
+        def guard():
+            track_ok = (generation is None or
+                        (generation == self._track_lease_generation
+                         and self._track_direction == "STOP"))
+            return track_ok and (control_guard is None or control_guard())
+        response = self._send_and_read("TRACK,D,STOP", timeout=0.6, guard=guard)
+        with self.state_lock:
+            self._track_last_response = response
+        return response
+
     # ═════════════ 共享辅助 ═════════════
+    def _post_ui(self, callback):
+        """从工作线程安全投递 Tk 操作；HTTP/串口线程不得直接调用 Tk。"""
+        self._ui_actions.put(callback)
+
+    def _start_control_worker(self, target, *args):
+        """启动绑定当前控制代数的写命令线程；ESTOP 后旧代数自动失效。"""
+        with self.state_lock:
+            if self._estop_in_progress:
+                self.log("软件急停正在执行，已拒绝新的 GUI 控制命令")
+                return None
+            generation = self._control_generation
+
+        def runner():
+            self._control_context.generation = generation
+            try:
+                target(*args)
+            finally:
+                try:
+                    del self._control_context.generation
+                except AttributeError:
+                    pass
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        return thread
+
+    def _drain_ui_actions(self):
+        for _ in range(100):
+            try:
+                callback = self._ui_actions.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                # UI 已销毁或单个刷新失败时不影响后续安全控制命令。
+                pass
+        try:
+            self.root.after(25, self._drain_ui_actions)
+        except tk.TclError:
+            pass
+
     def _on_speed_select(self, axis):
         try:
             speed = float(self.v_speed_str[axis].get())
@@ -430,7 +660,7 @@ class StepperGUI:
         self.sw[axis]['delay_label'].config(text=f"({d:.2f} ms/脉冲)")
 
     def _on_step_progress(self, axis, done, total):
-        if axis < len(self.sw) and 'progress' in self.sw[axis]:
+        if 0 <= axis < len(self.sw) and 'progress' in self.sw[axis]:
             pct = int(done * 100 / total) if total > 0 else 0
             self.sw[axis]['progress']['value'] = pct
             self.sw[axis]['progress_label'].config(text=f"{pct}%  ({done}/{total} 步)")
@@ -441,7 +671,10 @@ class StepperGUI:
             self.sw[axis]['progress_label'].config(text="")
 
     def _update_pos_label(self, axis):
-        self.sw[axis]['pos_label'].config(text=f"{self.position_mm[axis]:.1f} mm")
+        trusted = self.position_trusted[axis]
+        text = f"{self.position_mm[axis]:.1f} mm" if trusted else f"≈ {self.position_mm[axis]:.1f} mm（需校准）"
+        self.sw[axis]['pos_label'].config(
+            text=text, foreground="blue" if trusted else "#d84315")
 
     def _enable_stepper_buttons(self, axis, state):
         sw = self.sw[axis]
@@ -459,31 +692,20 @@ class StepperGUI:
             self.port_cb.set(ports[0])
 
     def toggle_connect(self):
-        if self.ser and self.ser.is_open:
-            self.foc_poll_running = False
-            self._reader_running = False
-            time.sleep(0.3)
-            try: self.ser.close()
-            except Exception: pass
-            self.ser = None
-            self.conn_status.config(text="● 未连接", foreground="red")
-            self.conn_btn.config(text="连接")
-            self.fw_mode_var.set("?")
-            self.mode_label.config(foreground="gray")
-            for a in range(NUM_AXES):
-                self._enable_stepper_buttons(a, "disabled")
-                self._apply_foc_gating(a, state="?", fault="?")
-                self._apply_gear_gating(a, state="?", fault="?")
-                self.v_focstate[a].set("未连接")
-                self.v_foccur[a].set("--")
-                self.v_focfault[a].set("--")
-                # 断开后两组 motor tabs 都重新可见可选，等下次连接重新决定
-                self.notebook.tab(self.tab_index_foc[a],  state="normal")
-                self.notebook.tab(self.tab_index_gear[a], state="normal")
-            self.log("串口已断开")
+        if self._is_serial_connected():
+            # 正常断开前停止所有输出；否则断开串口后电机仍可能继续执行或保持使能。
+            with self.state_lock:
+                self._disconnecting = True
+            self._stop_all_outputs(allow_closing=True)
+            self._disconnect_serial("用户断开串口", is_error=False)
             return
         try:
+            self._serial_failure_handled = False
+            with self.state_lock:
+                self._disconnecting = False
             self.ser = serial.Serial(self.port_var.get(), int(self.baud_var.get()), timeout=0.2)
+            self._serial_generation += 1
+            generation = self._serial_generation
             time.sleep(1.0)
             while self.ser.in_waiting:
                 self.ser.readline()
@@ -492,23 +714,102 @@ class StepperGUI:
                 except queue.Empty: break
             self.conn_status.config(text="● 已连接", foreground="green")
             self.conn_btn.config(text="断开")
-            for a in range(NUM_AXES):
+            for a in range(NUM_STEPPER_AXES):
                 self._enable_stepper_buttons(a, "normal")
+            self._set_track_controls("normal")
             self.log(f"已连接 {self.port_var.get()} @ {self.baud_var.get()}")
             self._reader_running = True
-            threading.Thread(target=self._reader_loop, daemon=True).start()
+            threading.Thread(target=self._reader_loop, args=(generation, self.ser), daemon=True).start()
             self.foc_poll_running = True
-            threading.Thread(target=self._foc_poll_loop, daemon=True).start()
+            threading.Thread(target=self._foc_poll_loop, args=(generation,), daemon=True).start()
             # 自动查固件模式，并根据模式灰掉另一组 tab + 下发对应模式的 tune
             self._query_mode_and_apply()
         except Exception as e:
+            self._disconnect_serial(str(e), is_error=True)
             messagebox.showerror("连接失败", str(e))
 
-    def _reader_loop(self):
-        while self._reader_running and self.ser and self.ser.is_open:
+    def _is_serial_connected(self):
+        ser = self.ser
+        return bool(ser and getattr(ser, "is_open", False))
+
+    def _disconnect_serial(self, reason="", is_error=False):
+        """统一停止读写/轮询并关闭串口；可安全地从任意线程重复调用。"""
+        with self._disconnect_lock:
+            if self._serial_failure_handled and is_error:
+                return
+            if is_error:
+                self._serial_failure_handled = True
+            self._reader_running = False
+            self.foc_poll_running = False
+            self._serial_generation += 1
+            ser, self.ser = self.ser, None
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+
+        def update_ui():
+            self._track_lease_generation += 1
+            with self.state_lock:
+                self._track_direction = "STOP"
+            self.v_track_status.set("连接中断，已停止")
+            self._set_track_controls("disabled")
+            if self._raw_log_fh:
+                try:
+                    self._raw_log_fh.close()
+                except Exception:
+                    pass
+                self._raw_log_fh = None
+                self.raw_log_var.set(False)
+            self.conn_status.config(text="● 未连接", foreground="red")
+            self.conn_btn.config(text="连接")
+            self.fw_mode_var.set("?")
+            with self.state_lock:
+                self._fw_mode_cache = "?"
+                self._motor_status = [
+                    {"state": "?", "current_deg": None, "target_deg": None, "fault": None}
+                    for _ in range(NUM_MOTOR_AXES)
+                ]
+            self.mode_label.config(foreground="gray")
+            for axis in range(NUM_STEPPER_AXES):
+                self.running[axis] = False
+                if (self.stepper_in_progress[axis] or self._move_dispatching[axis]
+                        or self._pending_step[axis] is not None):
+                    self.position_trusted[axis] = False
+                    self._pending_step[axis] = None
+                    self._move_dispatching[axis] = False
+                    self.stepper_in_progress[axis] = False
+                    self._update_pos_label(axis)
+                self._enable_stepper_buttons(axis, "disabled")
+            for axis in range(NUM_MOTOR_AXES):
+                self._apply_foc_gating(axis, state="?", fault="?")
+                self._apply_gear_gating(axis, state="?", fault="?")
+                self.v_focstate[axis].set("未连接")
+                self.v_foccur[axis].set("--")
+                self.v_focfault[axis].set("--")
+                self.notebook.tab(self.tab_index_foc[axis], state="normal")
+                self.notebook.tab(self.tab_index_gear[axis], state="normal")
+            self._save_calib()
+
+        self._post_ui(update_ui)
+        now = time.monotonic()
+        if not is_error or now - self._last_serial_error_log >= 5.0:
+            self._last_serial_error_log = now
+            prefix = "串口 I/O 异常，已停止轮询并断开" if is_error else "串口已断开"
+            self.log(f"{prefix}: {reason}" if reason else prefix)
+
+    def _handle_serial_failure(self, exc, source):
+        self._disconnect_serial(f"{source}: {exc}", is_error=True)
+
+    def _reader_loop(self, generation, ser):
+        while (self._reader_running and generation == self._serial_generation
+               and ser is self.ser and ser.is_open):
             try:
-                raw = self.ser.readline()
-            except Exception:
+                raw = ser.readline()
+            except Exception as exc:
+                if generation == self._serial_generation:
+                    self._handle_serial_failure(exc, "读取")
                 break
             if not raw: continue
             line = raw.decode(errors="replace").strip()
@@ -526,38 +827,76 @@ class StepperGUI:
                         axis = int(parts[1])
                         done = int(parts[3])
                         total = int(parts[4])
-                        self.root.after(0, lambda a=axis, d=done, t=total: self._on_step_progress(a, d, t))
+                        self._post_ui(lambda a=axis, d=done, t=total: self._on_step_progress(a, d, t))
                         continue
                     except ValueError: pass
-            if line.startswith("STEP,") and (line.endswith(",DONE") or line.endswith(",ABORT")):
-                # STEP,<axis>,DONE  或  STEP,<axis>,ABORT
+            if line.startswith("STEP,"):
+                # 新格式: STEP,<axis>,DONE|ABORT,<executed_steps>,<requested_steps>
+                # 兼容旧格式: STEP,<axis>,DONE|ABORT
                 parts = line.split(",")
-                if len(parts) == 3:
+                if len(parts) in (3, 5) and parts[2] in ("DONE", "ABORT"):
                     try:
                         axis = int(parts[1])
-                        self.root.after(0, lambda a=axis: self._on_step_done(a))
+                        result = parts[2]
+                        executed = requested = None
+                        if len(parts) == 5:
+                            executed = int(parts[3])
+                            requested = int(parts[4])
+                        if 0 <= axis < NUM_STEPPER_AXES:
+                            if result == "DONE":
+                                self._post_ui(lambda a=axis, e=executed, r=requested:
+                                              self._on_step_done(a, e, r))
+                            else:
+                                self._post_ui(lambda a=axis, e=executed, r=requested:
+                                              self._on_step_aborted(a, e, r))
                         continue
                     except ValueError: pass
+            if line == "TRACK,D,TIMEOUT":
+                self._track_lease_generation += 1
+                with self.state_lock:
+                    self._track_direction = "STOP"
+                    self._track_last_response = line
+                self._post_ui(lambda: self.v_track_status.set("轨道租约到期，已停止"))
+                self._post_ui(lambda: self.log("轨道 D 固件租约到期，已自动停止"))
+                continue
             if line.startswith("FOC,") and ",FAULT" in line:
                 parts = line.split(",")
                 if len(parts) >= 3 and parts[2] == "FAULT":
                     try:
                         axis = int(parts[1])
-                        self.root.after(0, lambda a=axis, l=line: self.log(f"⚠️ 轴{AXIS_LABEL[a]}: {l}"))
+                        if not 0 <= axis < NUM_MOTOR_AXES:
+                            continue
+                        self._post_ui(lambda a=axis, l=line: self.log(f"⚠️ 轴{AXIS_LABEL[a]}: {l}"))
                         continue
                     except ValueError: pass
             if line.startswith("MOT:") or line.startswith("[FOC") or \
                line.startswith("ESP32") or line.startswith("Protocol:") or \
                line.startswith("NUM_AXES") or line.startswith("  "):
-                self.root.after(0, lambda l=line: self.log(l))
+                self._post_ui(lambda l=line: self.log(l))
                 continue
             try:
                 self._resp_queue.put_nowait(line)
             except queue.Full: pass
 
-    def _send_and_read(self, cmd, timeout=1.0):
-        if not self.ser or not self.ser.is_open: return ""
+    def _send_and_read(self, cmd, timeout=1.0, guard=None, allow_closing=False):
+        blocked = self._closing or self._disconnecting
+        context_generation = getattr(self._control_context, "generation", None)
+        context_stale = (context_generation is not None and
+                         context_generation != self._control_generation)
+        if ((blocked and not allow_closing) or context_stale
+                or not self._is_serial_connected()):
+            return ""
         with self.serial_lock:
+            context_stale = (context_generation is not None and
+                             context_generation != self._control_generation)
+            if (((self._closing or self._disconnecting) and not allow_closing)
+                    or context_stale):
+                return ""
+            ser = self.ser
+            if not ser or not ser.is_open:
+                return ""
+            if guard is not None and not guard():
+                return ""
             while not self._resp_queue.empty():
                 try: self._resp_queue.get_nowait()
                 except queue.Empty: break
@@ -565,9 +904,9 @@ class StepperGUI:
                 if self._raw_log_fh:
                     try: self._raw_log_fh.write(f"{time.time():.3f}  TX: {cmd}\n"); self._raw_log_fh.flush()
                     except Exception: pass
-                self.ser.write((cmd + "\n").encode())
+                ser.write((cmd + "\n").encode())
             except Exception as e:
-                self.log(f"串口写异常: {e}")
+                self._handle_serial_failure(e, "写入")
                 return ""
             try:
                 return self._resp_queue.get(timeout=timeout)
@@ -575,8 +914,14 @@ class StepperGUI:
                 return ""
 
     # ═════════════ 步进：发送 ═════════════
-    def _send_pulses(self, axis, steps, direction, delay_ms):
-        if steps <= 0 or not self.ser or not self.ser.is_open: return False
+    def _send_pulses(self, axis, steps, direction, delay_ms, guard=None):
+        if not 0 <= axis < NUM_STEPPER_AXES:
+            return False
+        if steps <= 0 or not self._is_serial_connected():
+            return False
+        if not self.position_trusted[axis]:
+            self.log(f"⚠️ 轴 {AXIS_LABEL[axis]} 位置不可信；请先设置原点或校准位置")
+            return False
         # 等上次脉冲完成（避免 ESP32 ERR:busy）；显式提示+超时
         if self.stepper_in_progress[axis] and not self.running[axis]:
             self.log(f"轴{AXIS_LABEL[axis]} 等待上次步进完成...")
@@ -589,22 +934,32 @@ class StepperGUI:
                 time.sleep(0.02)
         delay_us = max(1, int(round(delay_ms * 1000)))
         actual_dir = direction ^ DIR_INVERT[axis]   # 按轴翻转DIR信号
-        resp = self._send_and_read(f"MOVE,{axis},{steps},{actual_dir},{delay_us}")
+        with self.state_lock:
+            self._move_dispatching[axis] = True
+        resp = self._send_and_read(
+            f"MOVE,{axis},{steps},{actual_dir},{delay_us}", guard=guard)
         dist_mm = steps / PULSES_PER_MM[axis]
         dir_txt = "向上" if direction == DIR_OUTWARD else "向下"
         mm_s = 1000.0 / (PULSES_PER_MM[axis] * max(0.001, delay_ms))
         self.log(f"轴{AXIS_LABEL[axis]} {dist_mm:.1f}mm {dir_txt} @ {delay_ms:.2f}ms ({mm_s:.1f}mm/s) → {resp}")
-        if resp.startswith("ACK,"):
-            sign = +1.0 if direction == DIR_OUTWARD else -1.0
-            self._pending_step[axis] = sign * dist_mm
-            self.stepper_in_progress[axis] = True
+        with self.state_lock:
+            self._move_dispatching[axis] = False
+            accepted = resp.startswith("ACK,")
+            if accepted:
+                sign = +1.0 if direction == DIR_OUTWARD else -1.0
+                self._pending_step[axis] = sign * dist_mm
+                self.stepper_in_progress[axis] = True
+        if accepted:
             if 'progress' in self.sw[axis]:
-                self.sw[axis]['progress']['value'] = 0
-                self.sw[axis]['progress_label'].config(text="运动中...")
+                self._post_ui(lambda a=axis: self._show_step_started(a))
             return True
         return False
 
-    def _send_mm(self, axis, distance_mm, direction, delay_ms):
+    def _show_step_started(self, axis):
+        self.sw[axis]['progress']['value'] = 0
+        self.sw[axis]['progress_label'].config(text="运动中...")
+
+    def _send_mm(self, axis, distance_mm, direction, delay_ms, guard=None):
         steps = int(round(distance_mm * PULSES_PER_MM[axis]))
         if steps <= 0:
             self.log(f"轴{AXIS_LABEL[axis]}: 忽略距离过小 ({distance_mm})")
@@ -612,11 +967,19 @@ class StepperGUI:
         sign = +1.0 if direction == DIR_OUTWARD else -1.0
         target = self.position_mm[axis] + sign * (steps / PULSES_PER_MM[axis])
         if not self._check_range(axis, target): return False
-        return self._send_pulses(axis, steps, direction, delay_ms)
+        return self._send_pulses(axis, steps, direction, delay_ms, guard=guard)
 
-    def _on_step_done(self, axis):
+    @staticmethod
+    def _executed_fraction(executed_steps, requested_steps, default):
+        if executed_steps is None or requested_steps is None or requested_steps <= 0:
+            return default
+        return max(0.0, min(1.0, float(executed_steps) / float(requested_steps)))
+
+    def _on_step_done(self, axis, executed_steps=None, requested_steps=None):
         if self._pending_step[axis] is not None:
-            self.position_mm[axis] += self._pending_step[axis]
+            fraction = self._executed_fraction(executed_steps, requested_steps, 1.0)
+            with self.state_lock:
+                self.position_mm[axis] += self._pending_step[axis] * fraction
             self._pending_step[axis] = None
             self._update_pos_label(axis)
         self.stepper_in_progress[axis] = False
@@ -624,22 +987,45 @@ class StepperGUI:
             self.sw[axis]['progress']['value'] = 100
             self.sw[axis]['progress_label'].config(text="✓ 完成")
             self.root.after(2000, lambda a=axis: self._reset_progress(a))
+        self._save_calib()
         self.log(f"轴{AXIS_LABEL[axis]} 步进完成")
+
+    def _on_step_aborted(self, axis, executed_steps=None, requested_steps=None):
+        """按固件回报记入部分位移；旧协议不回报脉冲时绝不记入整段位移。"""
+        fraction = self._executed_fraction(executed_steps, requested_steps, 0.0)
+        partial_mm = 0.0
+        if self._pending_step[axis] is not None:
+            partial_mm = self._pending_step[axis] * fraction
+            with self.state_lock:
+                self.position_mm[axis] += partial_mm
+        self._pending_step[axis] = None
+        self.stepper_in_progress[axis] = False
+        self.running[axis] = False
+        with self.state_lock:
+            self.position_trusted[axis] = False
+        self._update_pos_label(axis)
+        if 'progress' in self.sw[axis]:
+            self.sw[axis]['progress_label'].config(text="⚠ 已中止 · 位置需重新校准")
+        self._save_calib()
+        detail = (f"，已按固件回报记入 {partial_mm:+.3f} mm"
+                  if executed_steps is not None and requested_steps else
+                  "，旧固件未回报实际脉冲，未记入待执行位移")
+        self.log(f"⚠️ 轴{AXIS_LABEL[axis]} 运动已中止{detail}；软件位置已标记为不可信")
 
     # ═════════════ 步进：命令 ═════════════
     def send_move(self, axis):
-        threading.Thread(target=self._send_mm,
-                         args=(axis, self.v_dist[axis].get(), self.v_dir[axis].get(),
-                               self.v_delay[axis].get()), daemon=True).start()
+        self._start_control_worker(
+            self._send_mm, axis, self.v_dist[axis].get(), self.v_dir[axis].get(),
+            self.v_delay[axis].get())
 
     def _quick_move(self, axis, distance_mm, direction):
-        threading.Thread(target=self._send_mm,
-                         args=(axis, distance_mm, direction, self.v_delay[axis].get()),
-                         daemon=True).start()
+        self._start_control_worker(
+            self._send_mm, axis, distance_mm, direction, self.v_delay[axis].get())
 
     def _press_continuous(self, axis, direction):
         if self.running[axis] or not self.ser or not self.ser.is_open: return
         self.running[axis] = True
+        delay_ms = self.v_delay[axis].get()
         dir_txt = "向上" if direction == DIR_OUTWARD else "向下"
         self.log(f"轴{AXIS_LABEL[axis]} 按住连续{dir_txt}")
         def worker():
@@ -647,10 +1033,11 @@ class StepperGUI:
                 while self.stepper_in_progress[axis] and self.running[axis]:
                     time.sleep(0.02)
                 if not self.running[axis]: break
-                if not self._send_mm(axis, CONTINUOUS_BURST_MM, direction, self.v_delay[axis].get()):
+                if not self._send_mm(axis, CONTINUOUS_BURST_MM, direction, delay_ms):
                     break
             self.log(f"轴{AXIS_LABEL[axis]} 连续运动停止")
-        threading.Thread(target=worker, daemon=True).start()
+        if self._start_control_worker(worker) is None:
+            self.running[axis] = False
 
     def _release_continuous(self, axis):
         if self.running[axis]: self.running[axis] = False
@@ -664,16 +1051,22 @@ class StepperGUI:
 
     # ═════════════ 步进：位置/原点 ═════════════
     def set_home(self, axis):
-        self.position_mm[axis] = 0.0
+        with self.state_lock:
+            self.position_mm[axis] = 0.0
+            self.position_trusted[axis] = True
         self._update_pos_label(axis)
+        self._save_calib()
         self.log(f"✓ 轴{AXIS_LABEL[axis]} 当前位置设为原点")
 
     def calibrate_position(self, axis):
         try: val = float(self.v_goto[axis].get())
         except (tk.TclError, ValueError):
             messagebox.showerror("输入无效", "请先填目标位置"); return
-        self.position_mm[axis] = val
+        with self.state_lock:
+            self.position_mm[axis] = val
+            self.position_trusted[axis] = True
         self._update_pos_label(axis)
+        self._save_calib()
         self.log(f"✓ 轴{AXIS_LABEL[axis]} 位置校准为 {val:.1f} mm")
 
     def go_home(self, axis):
@@ -693,12 +1086,13 @@ class StepperGUI:
         direction = DIR_OUTWARD if delta > 0 else DIR_INWARD
         distance = abs(delta)
         self.log(f"轴{AXIS_LABEL[axis]} 前往 {target_mm:.1f}mm (移动 {distance:.1f}mm)")
-        threading.Thread(target=self._send_mm,
-                         args=(axis, distance, direction, self.v_delay[axis].get()),
-                         daemon=True).start()
+        self._start_control_worker(
+            self._send_mm, axis, distance, direction, self.v_delay[axis].get())
 
     # ═════════════ 行程校准 ═════════════
     def _mark_min(self, axis):
+        if not self.position_trusted[axis]:
+            messagebox.showerror("位置不可信", "请先设置原点或校准当前位置"); return
         if self.travel_max_mm[axis] is not None and self.position_mm[axis] >= self.travel_max_mm[axis]:
             messagebox.showerror("范围无效", "最小不能 ≥ 最大"); return
         self.travel_min_mm[axis] = self.position_mm[axis]
@@ -706,6 +1100,8 @@ class StepperGUI:
         self.log(f"⊖ 轴{AXIS_LABEL[axis]} 最小 = {self.travel_min_mm[axis]:.1f}mm")
 
     def _mark_max(self, axis):
+        if not self.position_trusted[axis]:
+            messagebox.showerror("位置不可信", "请先设置原点或校准当前位置"); return
         if self.travel_min_mm[axis] is not None and self.position_mm[axis] <= self.travel_min_mm[axis]:
             messagebox.showerror("范围无效", "最大不能 ≤ 最小"); return
         self.travel_max_mm[axis] = self.position_mm[axis]
@@ -730,6 +1126,9 @@ class StepperGUI:
             label.config(text=f"min={mn_s} max={mx_s}{travel}", foreground="black")
 
     def _check_range(self, axis, target_mm):
+        if not self.position_trusted[axis]:
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]} 位置不可信，禁止运动；请先重新校准")
+            return False
         mn, mx = self.travel_min_mm[axis], self.travel_max_mm[axis]
         if mn is not None and target_mm < mn - 0.05:
             self.log(f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_mm:.1f}<下限{mn:.1f}"); return False
@@ -738,8 +1137,12 @@ class StepperGUI:
         return True
 
     def _save_calib(self):
-        data = {str(a): {"min": self.travel_min_mm[a], "max": self.travel_max_mm[a]}
-                for a in range(NUM_AXES)}
+        data = {str(a): {
+                    "min": self.travel_min_mm[a],
+                    "max": self.travel_max_mm[a],
+                    "position": self.position_mm[a],
+                    "trusted": self.position_trusted[a],
+                } for a in range(NUM_STEPPER_AXES)}
         try:
             with open(CALIB_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -751,13 +1154,17 @@ class StepperGUI:
         try:
             with open(CALIB_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for a in range(NUM_AXES):
+            for a in range(NUM_STEPPER_AXES):
                 d = data.get(str(a), {})
                 self.travel_min_mm[a] = d.get("min")
                 self.travel_max_mm[a] = d.get("max")
+                if "position" in d:
+                    self.position_mm[a] = float(d["position"])
+                self.position_trusted[a] = bool(d.get("trusted", True))
+                self._update_pos_label(a)
                 self._update_range_display(a)
             any_set = any(self.travel_min_mm[a] is not None or self.travel_max_mm[a] is not None
-                          for a in range(NUM_AXES))
+                          for a in range(NUM_STEPPER_AXES))
             if any_set:
                 self.log("已加载行程校准")
         except Exception as e:
@@ -772,7 +1179,7 @@ class StepperGUI:
                 "PA": round(self.v_focpangle[a].get(), 2),
                 "VP": round(self.v_focvp[a].get(),     3),
                 "PP": int(self.v_focpp[a].get()),
-            } for a in range(NUM_AXES)}
+            } for a in range(NUM_MOTOR_AXES)}
             with open(FOC_TUNE_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
@@ -785,7 +1192,7 @@ class StepperGUI:
         try:
             with open(FOC_TUNE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for a in range(NUM_AXES):
+            for a in range(NUM_MOTOR_AXES):
                 d = data.get(str(a), {})
                 if "V"  in d: self.v_focvlimit[a].set(float(d["V"]))
                 if "PA" in d: self.v_focpangle[a].set(float(d["PA"]))
@@ -801,17 +1208,19 @@ class StepperGUI:
 
     def _apply_foc_tune_to_firmware(self):
         """连接成功后将已加载的 V/PA/VP 下发给固件；PP 在固件 NVS 里，不需要重发。"""
+        values = [
+            (self.v_focvlimit[axis].get(), self.v_focpangle[axis].get(),
+             self.v_focvp[axis].get())
+            for axis in range(NUM_MOTOR_AXES)
+        ]
         def worker():
             time.sleep(0.3)
-            for axis in range(NUM_AXES):
-                v  = self.v_focvlimit[axis].get()
-                pa = self.v_focpangle[axis].get()
-                vp = self.v_focvp[axis].get()
+            for axis, (v, pa, vp) in enumerate(values):
                 self._send_and_read(f"FOC,{axis},V,{v:.1f}")
                 self._send_and_read(f"FOC,{axis},PA,{pa:.1f}")
                 self._send_and_read(f"FOC,{axis},VP,{vp:.2f}")
             self.log("FOC 调参已下发固件")
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_control_worker(worker)
 
     # ═════════════ FOC：命令 ═════════════
     def _send_foc(self, axis, sub_and_arg):
@@ -820,7 +1229,7 @@ class StepperGUI:
         def worker():
             resp = self._send_and_read(cmd)
             self.log(f"{cmd} → {resp}")
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_control_worker(worker)
 
     def _foc_goto(self, axis):
         self._send_foc(axis, f"A,{self.v_foctgt[axis].get():.1f}")
@@ -868,10 +1277,13 @@ class StepperGUI:
         self._foc_enabled_ui[axis] = False
 
     # ═════════════ FOC：轮询 + 显示 ═════════════
-    def _foc_poll_loop(self):
-        while self.foc_poll_running and self.ser and self.ser.is_open:
-            for axis in range(NUM_AXES):
-                if not (self.foc_poll_running and self.ser and self.ser.is_open): break
+    def _foc_poll_loop(self, generation):
+        while (self.foc_poll_running and generation == self._serial_generation
+               and self._is_serial_connected()):
+            for axis in range(NUM_MOTOR_AXES):
+                if not (self.foc_poll_running and generation == self._serial_generation
+                        and self._is_serial_connected()):
+                    break
                 resp = self._send_and_read(f"FOC,{axis},S")
                 prefix = f"FOC,{axis},S,"
                 if resp.startswith(prefix):
@@ -879,9 +1291,9 @@ class StepperGUI:
                     # 格式: FOC,<axis>,S,<state>,<cur>,<tgt>,<fault>
                     if len(parts) == 7:
                         s, c, t, f = parts[3], parts[4], parts[5], parts[6]
-                        self.root.after(0, lambda a=axis, s=s, c=c, t=t, f=f:
-                                        self._update_foc_display(a, s, c, t, f))
-                time.sleep(FOC_POLL_INTERVAL_S / NUM_AXES)  # 总周期仍 ~100ms
+                        self._post_ui(lambda a=axis, s=s, c=c, t=t, f=f:
+                                      self._update_foc_display(a, s, c, t, f))
+                time.sleep(FOC_POLL_INTERVAL_S / NUM_MOTOR_AXES)  # 总周期仍 ~100ms
 
     def _update_foc_display(self, axis, state, cur, tgt, fault):
         self.v_focstate[axis].set(FOC_STATE_NAMES.get(state, "?"))
@@ -889,6 +1301,13 @@ class StepperGUI:
             cur_f = float(cur); tgt_f = float(tgt)
         except ValueError:
             cur_f = tgt_f = None
+        with self.state_lock:
+            self._motor_status[axis] = {
+                "state": state,
+                "current_deg": cur_f,
+                "target_deg": tgt_f,
+                "fault": fault == "1",
+            }
         cur_text = f"{cur_f:.1f}°" if cur_f is not None else "--"
         if self.stepper_in_progress[axis]: cur_text += " ⏸"
         self.v_foccur[axis].set(cur_text)
@@ -1121,7 +1540,7 @@ class StepperGUI:
         def worker():
             resp = self._send_and_read(cmd)
             self.log(f"{cmd} → {resp}")
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_control_worker(worker)
 
     def _gear_goto(self, axis):
         target = self.v_foctgt[axis].get()
@@ -1140,16 +1559,15 @@ class StepperGUI:
                 # 1. 被新 goto 取代 → 退出（不打日志）
                 if self._goto_watcher_gen[axis] != my_gen:
                     return
-                # 2. PID 已失能 → 退出（电机滑行，不可能到位）
-                state_txt = self.v_focstate[axis].get()
-                if state_txt != "运行":
-                    self.log(f"  轴{AXIS_LABEL[axis]} watcher 退出（PID 状态={state_txt}）")
+                # 2. 使用线程安全状态快照，不从后台线程读取 Tk 变量。
+                with self.state_lock:
+                    motor = dict(self._motor_status[axis])
+                if motor["state"] != "2":
+                    self.log(f"  轴{AXIS_LABEL[axis]} watcher 退出（PID 状态={motor['state']}）")
                     return
                 # 3. 读当前角度
-                raw = self.v_foccur[axis].get()
-                try:
-                    cur = float(raw.rstrip("°").rstrip(" ⏸").strip())
-                except (ValueError, AttributeError):
+                cur = motor["current_deg"]
+                if cur is None:
                     time.sleep(0.3); continue
                 err = target_deg - cur
                 dt = time.time() - t0
@@ -1221,7 +1639,7 @@ class StepperGUI:
                 "Ki":  round(self.v_gearki[a].get(),  3),
                 "Kd":  round(self.v_gearkd[a].get(),  4),
                 "GR":  round(self.v_geargr[a].get(),  1),
-            } for a in range(NUM_AXES)}
+            } for a in range(NUM_MOTOR_AXES)}
             with open(GEAR_TUNE_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             # 简短日志反馈 axis 0 当前值（最常用）
@@ -1236,7 +1654,7 @@ class StepperGUI:
         try:
             with open(GEAR_TUNE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for a in range(NUM_AXES):
+            for a in range(NUM_MOTOR_AXES):
                 d = data.get(str(a), {})
                 if "PWM" in d: self.v_gearpwm[a].set(float(d["PWM"]))
                 if "Kp"  in d: self.v_gearkp[a].set(float(d["Kp"]))
@@ -1252,15 +1670,20 @@ class StepperGUI:
             self.log(f"⚠️ GEAR 调参读取失败: {e}")
 
     def _apply_gear_tune_to_firmware(self):
+        values = [
+            (self.v_gearpwm[axis].get(), self.v_gearkp[axis].get(),
+             self.v_gearki[axis].get(), self.v_gearkd[axis].get())
+            for axis in range(NUM_MOTOR_AXES)
+        ]
         def worker():
             time.sleep(0.3)
-            for axis in range(NUM_AXES):
-                self._send_and_read(f"FOC,{axis},V,{self.v_gearpwm[axis].get():.1f}")
-                self._send_and_read(f"FOC,{axis},PA,{self.v_gearkp[axis].get():.2f}")
-                self._send_and_read(f"FOC,{axis},PI,{self.v_gearki[axis].get():.2f}")
-                self._send_and_read(f"FOC,{axis},PD,{self.v_gearkd[axis].get():.3f}")
+            for axis, (pwm, kp, ki, kd) in enumerate(values):
+                self._send_and_read(f"FOC,{axis},V,{pwm:.1f}")
+                self._send_and_read(f"FOC,{axis},PA,{kp:.2f}")
+                self._send_and_read(f"FOC,{axis},PI,{ki:.2f}")
+                self._send_and_read(f"FOC,{axis},PD,{kd:.3f}")
             self.log("GEAR 调参已下发固件")
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_control_worker(worker)
 
     # ═════════════ 模式自动检测 + tab 灰显 ═════════════
     def _query_mode_and_apply(self):
@@ -1269,7 +1692,7 @@ class StepperGUI:
         sel = self.mode_select_var.get()
         if sel in (MODE_FOC, MODE_GEAR):
             self.log(f"模式选择 = 强制 {sel}（跳过固件 MODE 查询）")
-            self.root.after(0, lambda: self._apply_mode_to_tabs(sel))
+            self._post_ui(lambda: self._apply_mode_to_tabs(sel))
             return
         # Auto
         def worker():
@@ -1282,7 +1705,7 @@ class StepperGUI:
             else:
                 self.log(f"⚠️ 固件未返回 MODE（响应={resp!r}）。请烧含 MODE 命令的固件，"
                          f"或用'强制 FOC/GEAR'手动选。先按 FOC 处理。")
-            self.root.after(0, lambda: self._apply_mode_to_tabs(mode))
+            self._post_ui(lambda: self._apply_mode_to_tabs(mode))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_mode_select_change(self):
@@ -1295,9 +1718,11 @@ class StepperGUI:
     def _apply_mode_to_tabs(self, mode):
         """灰掉非当前模式的 tab，更新 mode 标签，下发对应模式的 tune。"""
         self.fw_mode_var.set(mode)
+        with self.state_lock:
+            self._fw_mode_cache = mode
         if mode == MODE_FOC:
             self.mode_label.config(foreground="#1565c0")
-            for a in range(NUM_AXES):
+            for a in range(NUM_MOTOR_AXES):
                 self.notebook.tab(self.tab_index_foc[a],  state="normal")
                 self.notebook.tab(self.tab_index_gear[a], state="disabled")
             # 自动跳到第一个 FOC tab
@@ -1305,12 +1730,377 @@ class StepperGUI:
             self._apply_foc_tune_to_firmware()
         elif mode == MODE_GEAR:
             self.mode_label.config(foreground="#2e7d32")
-            for a in range(NUM_AXES):
+            for a in range(NUM_MOTOR_AXES):
                 self.notebook.tab(self.tab_index_foc[a],  state="disabled")
                 self.notebook.tab(self.tab_index_gear[a], state="normal")
             self.notebook.select(self.tab_index_gear[0])
             self._apply_gear_tune_to_firmware()
         self.log(f"固件模式 = {mode}")
+
+    # ═════════════ 网页服务公开接口（允许从非 Tk 线程调用）═════════════
+    @staticmethod
+    def _lan_ipv4():
+        """尽量取得手机可访问的局域网 IPv4；失败时安全回退到本机地址。"""
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            address = probe.getsockname()[0]
+            if address and not address.startswith("127."):
+                return address
+        except OSError:
+            pass
+        finally:
+            probe.close()
+        try:
+            address = socket.gethostbyname(socket.gethostname())
+            return address if address else "127.0.0.1"
+        except OSError:
+            return "127.0.0.1"
+
+    def _start_web_server(self, factory):
+        """启动随 GUI 生命周期运行的局域网网页服务。"""
+        try:
+            server = factory(self)
+            server.start()
+            self.attach_web_server(server)
+            port = server.bound_port
+            if port is None:
+                raise RuntimeError("网页服务未取得监听端口")
+            address = self._lan_ipv4()
+            url = f"http://{address}:{port}/"
+            self.web_address_var.set(address)
+            self.web_port_var.set(str(port))
+            self.web_url_var.set(url)
+            if address.startswith("127."):
+                self.web_status_var.set("● 已启动（仅检测到本机地址）")
+                self.web_status_label.configure(foreground="#b26a00")
+                self.log("⚠️ 网页服务已启动，但只检测到本机地址；请联网后重启 GUI")
+            else:
+                self.web_status_var.set("● 服务已启动")
+                self.web_status_label.configure(foreground="#16803a")
+                self.log(f"网页服务已启动：{url}（固定地址，无控制令牌）")
+        except Exception as exc:
+            self.web_server = None
+            self.web_status_var.set("● 服务启动失败")
+            self.web_address_var.set("—")
+            self.web_port_var.set("—")
+            self.web_url_var.set(f"网页服务启动失败：{exc}")
+            self.web_status_label.configure(foreground="#b42318")
+            self.log(f"⚠️ 网页服务启动失败：{exc}")
+
+    def _copy_web_url(self):
+        url = self.web_url_var.get()
+        if not url.startswith("http://"):
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self.root.update_idletasks()
+        self.log("手机控制固定网址已复制")
+
+    def _open_web_url(self):
+        url = self.web_url_var.get()
+        if url.startswith("http://"):
+            webbrowser.open(url)
+
+    def _on_close(self):
+        """尽力停车，然后回收串口和网页服务器。"""
+        with self.state_lock:
+            if self._closing:
+                return
+            self._closing = True
+            active_axes = [
+                axis for axis in range(NUM_STEPPER_AXES)
+                if (self.running[axis] or self.stepper_in_progress[axis]
+                    or self._move_dispatching[axis]
+                    or self._pending_step[axis] is not None)
+            ]
+        # 先关闭 HTTP 入口；_send_and_read 的 closing guard 同时封锁已排队的普通命令。
+        if self.web_server is not None:
+            try:
+                self.web_server.stop()
+            except Exception:
+                pass
+            self.web_server = None
+        if self._is_serial_connected():
+            self._stop_all_outputs(allow_closing=True)
+            self._disconnect_serial("GUI 已关闭", is_error=False)
+        # _disconnect_serial 的 UI 更新来不及在 destroy 前执行；关闭路径必须同步持久化失信状态。
+        with self.state_lock:
+            for axis in active_axes:
+                self.position_trusted[axis] = False
+                self.running[axis] = False
+                self.stepper_in_progress[axis] = False
+                self._move_dispatching[axis] = False
+                self._pending_step[axis] = None
+        self._save_calib()
+        self.root.destroy()
+
+    def _ensure_web_control_available(self):
+        with self.state_lock:
+            if self._closing:
+                raise RuntimeError("控制器正在关闭")
+            if self._disconnecting:
+                raise RuntimeError("串口正在断开")
+            if self._estop_in_progress:
+                raise RuntimeError("软件急停正在执行")
+            generation = self._control_generation
+        if not self._is_serial_connected():
+            raise RuntimeError("串口未连接")
+        return generation
+
+    def _stop_all_outputs(self, allow_closing=False):
+        """发送固件原子软件急停；返回是否收到精确确认。"""
+        self._track_lease_generation += 1
+        for axis in range(NUM_STEPPER_AXES):
+            self.running[axis] = False
+        with self.state_lock:
+            self._track_direction = "STOP"
+        response = self._send_and_read("ESTOP", timeout=0.8, allow_closing=allow_closing)
+        self._post_ui(lambda: self.v_track_status.set("已停止"))
+        return response == "OK,ESTOP"
+
+    def attach_web_server(self, server):
+        """保存 WebControlServer 实例，供外部启动/关闭流程统一管理。"""
+        self.web_server = server
+        return server
+
+    def web_get_status(self):
+        """返回只含 JSON 基础类型的线程安全快照，不读取任何 Tk 变量。"""
+        with self.state_lock:
+            steppers = [
+                {
+                    "axis": axis,
+                    "label": AXIS_LABEL[axis],
+                    "position_mm": self.position_mm[axis],
+                    "position_trusted": self.position_trusted[axis],
+                    "in_progress": (self.stepper_in_progress[axis]
+                                    or self._move_dispatching[axis]
+                                    or self._web_step_pending[axis]),
+                    "continuous": self.running[axis],
+                    "travel_min_mm": self.travel_min_mm[axis],
+                    "travel_max_mm": self.travel_max_mm[axis],
+                }
+                for axis in range(NUM_STEPPER_AXES)
+            ]
+            motors = [dict(axis=axis, label=AXIS_LABEL[axis], **self._motor_status[axis])
+                      for axis in range(NUM_MOTOR_AXES)]
+            track = {
+                "axis": "D",
+                "direction": self._track_direction,
+                "last_response": self._track_last_response,
+                "lease_ms": self._track_lease_ms,
+            }
+            mode = self._fw_mode_cache
+        return {
+            "connected": self._is_serial_connected(),
+            "mode": mode,
+            "steppers": [
+                (f"{item['position_mm']:.1f} mm"
+                 if item["position_trusted"] else "需重新校准")
+                + (" · 运行中" if item["in_progress"] else "")
+                for item in steppers
+            ],
+            "motors": [
+                (f"{item['current_deg']:.1f}°" if item["current_deg"] is not None else "--")
+                + (" · 故障" if item["fault"] else "")
+                for item in motors
+            ],
+            "track": track["direction"],
+            "stepper_axes": steppers,
+            "motor_axes": motors,
+            "track_detail": track,
+        }
+
+    @staticmethod
+    def _web_direction(direction):
+        if isinstance(direction, str):
+            value = direction.strip().upper()
+            if value in ("FWD", "FORWARD", "OUT", "OUTWARD", "UP", "+"):
+                return DIR_OUTWARD
+            if value in ("REV", "REVERSE", "IN", "INWARD", "DOWN", "-"):
+                return DIR_INWARD
+        elif direction in (DIR_OUTWARD, DIR_INWARD):
+            return int(direction)
+        raise ValueError("direction 必须是 FWD/REV（或 1/0）")
+
+    def web_stepper_move(self, axis, direction, distance_mm, speed_mm_s=SPEED_DEFAULT):
+        """异步移动步进轴；返回是否已接纳，不在 Web 请求线程中触碰 Tk。"""
+        generation = self._ensure_web_control_available()
+        try:
+            axis = int(axis)
+            distance_mm = float(distance_mm)
+            speed_mm_s = float(speed_mm_s)
+            direction = self._web_direction(direction)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
+        if not 0 <= axis < NUM_STEPPER_AXES:
+            raise ValueError("步进轴编号越界")
+        if distance_mm <= 0 or speed_mm_s <= 0:
+            raise ValueError("距离和速度必须大于 0")
+        with self.state_lock:
+            if not self.position_trusted[axis]:
+                raise RuntimeError("位置不可信，请在 GUI 中重新校准")
+            if (self.stepper_in_progress[axis] or self._move_dispatching[axis]
+                    or self._web_step_pending[axis]):
+                raise RuntimeError("该轴正在运动")
+            sign = 1.0 if direction == DIR_OUTWARD else -1.0
+            target = self.position_mm[axis] + sign * distance_mm
+            mn, mx = self.travel_min_mm[axis], self.travel_max_mm[axis]
+            if mn is not None and target < mn - 0.05:
+                raise RuntimeError("目标超出软件下限")
+            if mx is not None and target > mx + 0.05:
+                raise RuntimeError("目标超出软件上限")
+            self._web_step_pending[axis] = True
+        delay_ms = _speed_to_delay_ms(speed_mm_s, PULSES_PER_MM[axis])
+
+        def worker():
+            try:
+                self._send_mm(
+                    axis, distance_mm, direction, delay_ms,
+                    guard=lambda: generation == self._control_generation,
+                )
+            finally:
+                with self.state_lock:
+                    self._web_step_pending[axis] = False
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "accepted": True, "axis": axis}
+
+    def web_stepper_stop(self, axis):
+        generation = self._ensure_web_control_available()
+        try:
+            axis = int(axis)
+        except (TypeError, ValueError):
+            raise ValueError("无效步进轴编号")
+        if not 0 <= axis < NUM_STEPPER_AXES:
+            raise ValueError("步进轴编号越界")
+        self.running[axis] = False
+        response = self._send_and_read(
+            f"STOP,{axis}", timeout=0.6,
+            guard=lambda: generation == self._control_generation,
+        )
+        if not response:
+            raise RuntimeError("步进停止命令未获固件确认")
+        return {"ok": True, "confirmed": True, "axis": axis}
+
+    def web_motor_command(self, mode, axis, action, target_deg=None):
+        """控制两路闭环电机；签名与 WebControlServer 的 HTTP 路由一致。"""
+        generation = self._ensure_web_control_available()
+        mode = str(mode).strip().upper()
+        if mode not in (MODE_FOC, MODE_GEAR):
+            raise ValueError("模式必须是 FOC 或 GEAR")
+        action = str(action).strip().lower()
+        with self.state_lock:
+            active_mode = self._fw_mode_cache
+        # 失能属于安全动作，即使网页下拉框与当前固件模式不一致也允许发送。
+        if (action != "disable" and active_mode in (MODE_FOC, MODE_GEAR)
+                and mode != active_mode):
+            raise RuntimeError(f"当前固件模式是 {active_mode}，不能按 {mode} 控制")
+        try:
+            axis = int(axis)
+        except (TypeError, ValueError):
+            raise ValueError("无效电机轴编号")
+        if not 0 <= axis < NUM_MOTOR_AXES:
+            raise ValueError("电机轴编号越界")
+        if action == "enable":
+            subcommand = "EN,1"
+        elif action == "disable":
+            subcommand = "EN,0"
+        elif action == "zero":
+            subcommand = "H"
+        elif action == "target":
+            try:
+                amount = float(target_deg)
+            except (TypeError, ValueError):
+                raise ValueError("target 动作需要有效角度")
+            subcommand = f"A,{amount:.1f}"
+        else:
+            raise ValueError("动作必须是 enable/disable/zero/target")
+        cmd = f"FOC,{axis},{subcommand}"
+        response = self._send_and_read(
+            cmd, timeout=0.8,
+            guard=lambda: generation == self._control_generation,
+        )
+        if not response:
+            raise RuntimeError("闭环电机命令未获固件确认")
+        return {"ok": True, "confirmed": True, "mode": mode,
+                "axis": axis, "action": action}
+
+    def web_track_command(self, action, pwm=0, lease_ms=0):
+        """网页轨道 D 命令；运行命令始终带固件租约，客户端失联会自动停车。"""
+        control_generation = self._ensure_web_control_available()
+        action = str(action).strip().lower()
+        if action == "stop":
+            self._track_lease_generation += 1
+            generation = self._track_lease_generation
+            with self.state_lock:
+                self._track_direction = "STOP"
+            response = self._send_track_stop(
+                generation,
+                control_guard=lambda: control_generation == self._control_generation,
+            )
+            if not response:
+                raise RuntimeError("轨道停止命令未获固件确认")
+            self._post_ui(lambda: self.v_track_status.set("已停止（网页）"))
+            return {"ok": True, "confirmed": True, "action": "stop"}
+        if action not in ("forward", "reverse"):
+            raise ValueError("动作必须是 forward/reverse/stop")
+        direction = "FWD" if action == "forward" else "REV"
+        try:
+            pwm = max(1, min(100, int(pwm)))
+            lease_ms = int(lease_ms) if int(lease_ms) > 0 else 1000
+            lease_ms = max(100, min(5000, lease_ms))
+        except (TypeError, ValueError):
+            raise ValueError("PWM/租约参数无效")
+        self._track_lease_generation += 1
+        generation = self._track_lease_generation
+        with self.state_lock:
+            self._track_direction = direction
+            self._track_lease_ms = lease_ms
+
+        def worker():
+            response = self._send_and_read(
+                f"TRACK,D,{direction},{pwm},{lease_ms}",
+                timeout=0.25,
+                guard=lambda: (generation == self._track_lease_generation
+                               and self._track_direction == direction
+                               and control_generation == self._control_generation),
+            )
+            with self.state_lock:
+                self._track_last_response = response
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._post_ui(lambda: self.v_track_status.set(
+            f"{direction} · PWM {pwm}% · 网页租约 {lease_ms}ms"))
+
+        def expire_cached_state():
+            if generation != self._track_lease_generation:
+                return
+            with self.state_lock:
+                if self._track_direction == direction:
+                    self._track_direction = "STOP"
+            self._post_ui(lambda: self.v_track_status.set("网页租约到期，已停止"))
+
+        timer = threading.Timer(lease_ms / 1000.0 + 0.1, expire_cached_state)
+        timer.daemon = True
+        timer.start()
+        return {"ok": True, "accepted": True, "action": action,
+                "pwm": pwm, "lease_ms": lease_ms}
+
+    def web_emergency_stop(self):
+        """单个 HTTP 请求触发固件 ESTOP，并等待精确确认。"""
+        with self._estop_lock:
+            self._ensure_web_control_available()
+            with self.state_lock:
+                self._estop_in_progress = True
+                self._control_generation += 1
+            try:
+                if not self._stop_all_outputs(allow_closing=True):
+                    raise RuntimeError("急停命令未获得固件确认；请立即使用物理断电急停")
+                return {"ok": True, "confirmed": True}
+            finally:
+                with self.state_lock:
+                    self._estop_in_progress = False
 
     # ═════════════ FOC：自动调参（单轴）═════════════
     def _foc_autotune(self, axis):
@@ -1321,7 +2111,8 @@ class StepperGUI:
             f"轴 {AXIS_LABEL[axis]} 两阶段扫描 PA + VP，约 2 分钟。\n电机会来回转动，请先固定好。"):
             return
         self.fw[axis]['autotune_btn'].config(state="disabled")
-        threading.Thread(target=lambda: self._foc_autotune_worker(axis), daemon=True).start()
+        if self._start_control_worker(self._foc_autotune_worker, axis) is None:
+            self.fw[axis]['autotune_btn'].config(state="normal")
 
     def _step_response_test(self, axis, target, pre_settle=2.5, duration=5.0):
         self._send_and_read(f"FOC,{axis},A,0"); time.sleep(pre_settle)
@@ -1386,14 +2177,15 @@ class StepperGUI:
             self._send_and_read(f"FOC,{axis},VP,{best_vp}"); time.sleep(0.2)
             self._send_and_read(f"FOC,{axis},A,0")
             self.log(f"✅ 轴{AXIS_LABEL[axis]} 推荐：PA={best_pa}  VP={best_vp:.2f}")
-            self.root.after(0, lambda: self.v_focpangle[axis].set(float(best_pa)))
-            self.root.after(0, lambda: self.fw[axis]['pangle_label'].config(text=f"{best_pa:.1f} (刚度)"))
-            self.root.after(0, lambda: self.v_focvp[axis].set(float(best_vp)))
-            self.root.after(0, lambda: self.fw[axis]['vp_label'].config(text=f"{best_vp:.2f} (阻尼)"))
-            # 持久化自动调参结果
-            self._save_foc_tune()
+            def apply_result():
+                self.v_focpangle[axis].set(float(best_pa))
+                self.fw[axis]['pangle_label'].config(text=f"{best_pa:.1f} (刚度)")
+                self.v_focvp[axis].set(float(best_vp))
+                self.fw[axis]['vp_label'].config(text=f"{best_vp:.2f} (阻尼)")
+                self._save_foc_tune()
+            self._post_ui(apply_result)
         finally:
-            self.root.after(0, lambda: self.fw[axis]['autotune_btn'].config(state="normal"))
+            self._post_ui(lambda: self.fw[axis]['autotune_btn'].config(state="normal"))
 
     # ═════════════ GEAR：自动调参（三阶段 Kp → Kd → Ki）═════════════
     def _gear_autotune(self, axis):
@@ -1405,7 +2197,8 @@ class StepperGUI:
             f"电机会反复在 0° ↔ 60° 之间走，请确认机械空间够。"):
             return
         self.gw[axis]['autotune_btn'].config(state="disabled")
-        threading.Thread(target=lambda: self._gear_autotune_worker(axis), daemon=True).start()
+        if self._start_control_worker(self._gear_autotune_worker, axis) is None:
+            self.gw[axis]['autotune_btn'].config(state="normal")
 
     def _gear_autotune_worker(self, axis):
         TARGET = 60.0
@@ -1504,15 +2297,17 @@ class StepperGUI:
             # 收尾
             self._send_and_read(f"FOC,{axis},A,0"); time.sleep(2.0)
             self.log(f"✅ 轴{AXIS_LABEL[axis]} 推荐：Kp={best_kp}  Kd={best_kd:.1f}  Ki={best_ki:.2f}")
-            self.root.after(0, lambda: self.v_gearkp[axis].set(float(best_kp)))
-            self.root.after(0, lambda: self.gw[axis]['kp_label'].config(text=f"{best_kp:.2f}"))
-            self.root.after(0, lambda: self.v_gearkd[axis].set(float(best_kd)))
-            self.root.after(0, lambda: self.gw[axis]['kd_label'].config(text=f"{best_kd:.3f}"))
-            self.root.after(0, lambda: self.v_gearki[axis].set(float(best_ki)))
-            self.root.after(0, lambda: self.gw[axis]['ki_label'].config(text=f"{best_ki:.2f}"))
-            self._save_gear_tune()
+            def apply_result():
+                self.v_gearkp[axis].set(float(best_kp))
+                self.gw[axis]['kp_label'].config(text=f"{best_kp:.2f}")
+                self.v_gearkd[axis].set(float(best_kd))
+                self.gw[axis]['kd_label'].config(text=f"{best_kd:.3f}")
+                self.v_gearki[axis].set(float(best_ki))
+                self.gw[axis]['ki_label'].config(text=f"{best_ki:.2f}")
+                self._save_gear_tune()
+            self._post_ui(apply_result)
         finally:
-            self.root.after(0, lambda: self.gw[axis]['autotune_btn'].config(state="normal"))
+            self._post_ui(lambda: self.gw[axis]['autotune_btn'].config(state="normal"))
 
     # ═════════════ 日志 ═════════════
     def _classify_log(self, msg):
@@ -1552,7 +2347,7 @@ class StepperGUI:
                 self.log_text.insert("end", full + "\n")
             self.log_text.see("end")
             self.log_text.config(state="disabled")
-        self.root.after(0, _append)
+        self._post_ui(_append)
 
     def clear_log(self):
         self.log_text.config(state="normal")
@@ -1584,6 +2379,8 @@ class StepperGUI:
 
 
 if __name__ == "__main__":
+    from web_control import WebControlServer
+
     root = tk.Tk()
-    app = StepperGUI(root)
+    app = StepperGUI(root, lambda controller: WebControlServer(controller))
     root.mainloop()

@@ -2,301 +2,358 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>接线检查表 · ESP32-S3 双轴步进 + 双 GEAR 减速电机</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>接线检查表 · 6×DM422/DM442 + 2×GEAR + 轨道 D</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
-         max-width: 1100px; margin: 24px auto; padding: 0 24px; color: #222; line-height: 1.55; }
-  h1 { font-size: 26px; border-bottom: 3px solid #1565c0; padding-bottom: 8px; }
-  h2 { font-size: 20px; color: #1565c0; margin-top: 32px; border-left: 4px solid #1565c0; padding-left: 12px; }
-  h3 { font-size: 16px; color: #2e7d32; margin-top: 20px; }
-  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
-  th, td { border: 1px solid #ccc; padding: 7px 10px; text-align: left; }
-  th { background: #f0f0f0; }
-  td.gpio { font-family: Consolas, monospace; font-weight: bold; color: #1565c0; text-align: center; }
-  td.danger { background: #ffebee; color: #c62828; font-weight: bold; }
-  td.power24 { background: #fff3e0; }
-  td.power12 { background: #e3f2fd; }
-  td.power3v3 { background: #e8f5e9; }
-  td.gnd { background: #eeeeee; }
-  ul.checklist { list-style: none; padding-left: 4px; }
-  ul.checklist li { margin: 6px 0; padding-left: 28px; position: relative; }
-  ul.checklist li::before {
-    content: ""; position: absolute; left: 0; top: 4px;
-    width: 16px; height: 16px; border: 2px solid #888;
-    border-radius: 3px; background: white;
+  :root {
+    --blue: #1565c0; --green: #2e7d32; --orange: #ef6c00;
+    --red: #c62828; --gray: #616161; --border: #cfd8dc;
   }
-  .legend { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; font-size: 13px; }
-  .legend span { padding: 3px 10px; border-radius: 3px; }
-  .legend .p24 { background: #fff3e0; }
-  .legend .p12 { background: #e3f2fd; }
-  .legend .p33 { background: #e8f5e9; }
-  .legend .pgnd { background: #eeeeee; }
-  .legend .pdng { background: #ffebee; color: #c62828; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+         max-width: 1220px; margin: 24px auto; padding: 0 24px; color: #263238; line-height: 1.58; }
+  h1 { font-size: 27px; border-bottom: 3px solid var(--blue); padding-bottom: 9px; }
+  h2 { font-size: 20px; color: var(--blue); margin-top: 34px; border-left: 4px solid var(--blue); padding-left: 12px; }
+  h3 { font-size: 16px; color: var(--green); margin-top: 22px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--border); padding: 7px 9px; text-align: left; vertical-align: top; }
+  th { background: #eceff1; }
+  tr:nth-child(even) td { background-color: #fafafa; }
+  td.gpio { font-family: Consolas, monospace; font-weight: bold; color: var(--blue); text-align: center; }
+  td.power24 { background: #fff3e0 !important; }
+  td.powervm { background: #e3f2fd !important; }
+  td.power3v3 { background: #e8f5e9 !important; }
+  td.gnd { background: #eeeeee !important; }
+  td.danger-cell { background: #ffebee !important; color: var(--red); font-weight: bold; }
+  ul.checklist { list-style: none; padding-left: 4px; }
+  ul.checklist li { margin: 7px 0; padding-left: 29px; position: relative; }
+  ul.checklist li::before { content: ""; position: absolute; left: 0; top: 4px;
+    width: 16px; height: 16px; border: 2px solid #78909c; border-radius: 3px; background: white; }
+  .legend { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; font-size: 13px; }
+  .legend span { padding: 4px 10px; border-radius: 3px; }
+  .p24 { background: #fff3e0; } .pvm { background: #e3f2fd; }
+  .p33 { background: #e8f5e9; } .pgnd { background: #eeeeee; }
+  .pdng { background: #ffebee; color: var(--red); }
   pre.diagram { background: #fafafa; padding: 14px; border: 1px solid #ddd;
                 font-family: Consolas, monospace; font-size: 13px;
-                overflow-x: auto; white-space: pre; line-height: 1.4; }
-  .warn { background: #fff8e1; border-left: 4px solid #ffa000; padding: 10px 14px; margin: 12px 0; }
+                overflow-x: auto; white-space: pre; line-height: 1.42; }
+  .warn, .info, .danger, .mock { padding: 11px 14px; margin: 13px 0; }
+  .warn { background: #fff8e1; border-left: 4px solid #ffa000; }
   .warn::before { content: "⚠️ "; }
-  .info { background: #e3f2fd; border-left: 4px solid #1565c0; padding: 10px 14px; margin: 12px 0; }
+  .info { background: #e3f2fd; border-left: 4px solid var(--blue); }
   .info::before { content: "ℹ️ "; }
-  .danger { background: #ffebee; border-left: 4px solid #c62828; padding: 10px 14px; margin: 12px 0; }
+  .danger { background: #ffebee; border-left: 4px solid var(--red); }
   .danger::before { content: "🚨 "; }
-  code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-family: Consolas, monospace; }
-  .small { font-size: 12px; color: #666; }
-  .pin-table { font-family: Consolas, monospace; font-size: 13px; }
+  .mock { background: #f3e5f5; border-left: 4px solid #7b1fa2; }
+  .mock::before { content: "📐 "; }
+  code { background: #eceff1; padding: 1px 5px; border-radius: 3px; font-family: Consolas, monospace; }
+  .small { font-size: 12px; color: #607d8b; }
+  .pin-table { font-family: Consolas, "Microsoft YaHei", monospace; font-size: 13px; }
+  .nowrap { white-space: nowrap; }
+  @media (max-width: 720px) {
+    body { margin: 12px auto; padding: 0 12px; }
+    h1 { font-size: 22px; }
+    table { display: block; overflow-x: auto; white-space: nowrap; }
+  }
 </style>
 </head>
 <body>
 
-<h1>接线检查表 · ESP32-S3 + 双轴步进 + 双 GEAR 减速电机</h1>
-<p class="small">对应固件 env: <code>esp32s3_gear</code> · 配置文件 <code>esp32_stepper/src/config.h</code> · 端口 COM9</p>
+<h1>接线检查表 · ESP32-S3 + 6×DM422/DM442 + 2×GEAR + 轨道 D</h1>
+<p class="small">对应 <code>esp32s3_gear</code> / <code>DRIVE_MODE_GEAR</code> · 固件引脚源：<code>esp32_stepper/src/config.h</code> · PCB 接口源：<code>pcb/README.md</code></p>
 
 <div class="legend">
-  <span class="p24">24V 电源</span>
-  <span class="p12">12V 电源</span>
-  <span class="p33">3.3V (ESP32)</span>
-  <span class="pgnd">GND（共地）</span>
-  <span class="pdng">易接错/烧设备</span>
+  <span class="p24">DM 驱动专用 24V（板外）</span>
+  <span class="pvm">VM_MOTOR（按电机额定电压）</span>
+  <span class="p33">3.3V 逻辑</span>
+  <span class="pgnd">公共 GND</span>
+  <span class="pdng">禁止误接</span>
 </div>
 
-<h2>1. 电源拓扑</h2>
-<pre class="diagram">
-墙插
-  │
-  └── 24V DC 电源（≥3A）
-        │
-        ├── 24V ────── DM422 #0  V+   ◄─ 步进 L
-        ├── 24V ────── DM422 #1  V+   ◄─ 步进 R
-        │
-        └── DC-DC 降压模块（LM2596 等）─── 12V ──┬── DRV8871 #0 Power+ ◄─ 减速 L
-                                                  └── DRV8871 #1 Power+ ◄─ 减速 R
-
-24V GND ─┐
-12V GND ─┤
-ESP32 GND（USB）─┼── ★ 共地汇合点（一颗接线柱）★
-DM422 ×2 V-   ─┤
-DRV8871 ×2 GND ┤
-2 个编码器 GND ┘
-
-ESP32 USB ─── PC（COM9 / 115200）  ◄─ 通信
-</pre>
+<div class="mock">
+<strong>PCB 仍是 MOCK 机械版本。</strong>当前板框为 180 × 210 mm；ESP32-S3 DevKit、3 块 DRV8871、TCA9548A、PCF8575、RS485 模块、端子和安装孔都只是参数化占位。打样前必须按实物测量外形、排针中心距、孔位、插装方向和引脚顺序，并更新 <code>pcb/generate_pcb.py</code> 顶部的 <code>MODULE_GEOMETRY</code>。当前文件只确认电气目标，不代表机械尺寸已经定版。
+</div>
 
 <div class="danger">
-<strong>三方共地是硬约束</strong>：用万用表测 24V GND ↔ 12V GND ↔ ESP32 GND，三者两两之间必须 0Ω。不共地 = ESP32 GPIO 浮动 → 烧。
+<strong>DM422/DM442 的 24V 绝不进入模块化 PCB，也绝不接到 N20、轨道 D 电机或 DRV8871。</strong>六套 DM 驱动的 24V 必须由板外、额定电流足够且带保险的成品分配模块供电。三块 DRV8871 只接独立的 <code>VM_MOTOR</code> 低压电源；VM 电压以实际电机和模块额定值为准，不再假定固定 12V。
 </div>
 
-<h2>2. ESP32-S3 GPIO 全表</h2>
+<h2>1. 当前系统与电源拓扑</h2>
+
+<pre class="diagram">
+PC / 台式机 USB
+  └── ESP32-S3 DevKitC-1
+        └── 模块化 PCB：6 路 PUL/DIR、2 路 GEAR、轨道 D、AUX
+
+DM 专用 24V 电源
+  └── 板外带保险的成品 24V 分配模块
+        ├── DM422/DM442 #0  V+ / V-
+        ├── DM422/DM442 #1  V+ / V-
+        ├── DM422/DM442 #2  V+ / V-
+        ├── DM422/DM442 #3  V+ / V-
+        ├── DM422/DM442 #4  V+ / V-
+        └── DM422/DM442 #5  V+ / V-
+             （24V 不进入模块化 PCB）
+
+独立低压电机电源（电压按 N20 / 轨道 D 实物铭牌）
+  └── PCB J_VM_IN：VM_MOTOR / GND
+        ├── U_DRV0：闭环 GEAR 0 的 DRV8871 成品模块
+        ├── U_DRV1：闭环 GEAR 1 的 DRV8871 成品模块
+        └── U_DRVD：轨道 D 的第 3 块 DRV8871 成品模块
+
+可选后装编码器（当前 DNP，六路 DM 仍开环）
+  └── GPIO42/47 I²C
+        ├── U_I2CMUX：TCA9548A @ 0x70
+        │     └── CH0～CH5：AS5600 #0～#5 @ 0x36
+        └── U_IOEXP：PCF8575 @ 0x20（仅低速逻辑预留）
+
+公共 GND 汇合：
+  ESP32 GND ─ PCB GND 平面 ─ DM 24V 负极 ─ VM_MOTOR 负极
+             ├─ 6×DM 的 PUL-/DIR-
+             ├─ 3×DRV8871 GND
+             ├─ 2×编码器 GND
+             └─ AUX / RS485 GND
+</pre>
+
+<div class="warn">
+“公共 GND”只表示信号参考地相连，不表示把不同电压的正极相连。<strong>24V+、VM_MOTOR+、5V_USB 和 3V3 必须保持分域。</strong>
+</div>
+
+<h2>2. ESP32-S3 GPIO 总表</h2>
 
 <table class="pin-table">
-  <tr><th>GPIO</th><th>I/O</th><th>用途</th><th>接到</th></tr>
-  <tr><td class="gpio">5</td><td>OUT</td><td>步进 L PUL+</td><td>DM422 #0 PUL+</td></tr>
-  <tr><td class="gpio">6</td><td>OUT</td><td>步进 L DIR+</td><td>DM422 #0 DIR+</td></tr>
-  <tr><td class="gpio">7</td><td>OUT</td><td>步进 R PUL+</td><td>DM422 #1 PUL+</td></tr>
-  <tr><td class="gpio">15</td><td>OUT</td><td>步进 R DIR+</td><td>DM422 #1 DIR+</td></tr>
-  <tr><td class="gpio">11</td><td>OUT PWM</td><td>GEAR L IN1</td><td>DRV8871 #0 IN1</td></tr>
-  <tr><td class="gpio">16</td><td>OUT PWM</td><td>GEAR L IN2</td><td>DRV8871 #0 IN2</td></tr>
-  <tr><td class="gpio">18</td><td>IN PCNT</td><td>GEAR L 编码器 A (C1)</td><td>编码器 #0 C1</td></tr>
-  <tr><td class="gpio">21</td><td>IN PCNT</td><td>GEAR L 编码器 B (C2)</td><td>编码器 #0 C2</td></tr>
-  <tr><td class="gpio">12</td><td>OUT PWM</td><td>GEAR R IN1</td><td>DRV8871 #1 IN1</td></tr>
-  <tr><td class="gpio">17</td><td>OUT PWM</td><td>GEAR R IN2</td><td>DRV8871 #1 IN2</td></tr>
-  <tr><td class="gpio">13</td><td>IN PCNT</td><td>GEAR R 编码器 A (C1)</td><td>编码器 #1 C1</td></tr>
-  <tr><td class="gpio">14</td><td>IN PCNT</td><td>GEAR R 编码器 B (C2)</td><td>编码器 #1 C2</td></tr>
-  <tr><td class="gpio">3V3</td><td>PWR</td><td>编码器 ×2 VCC + 上拉</td><td>编码器 VCC + 4.7kΩ 上拉（可选）</td></tr>
-  <tr><td class="gpio">GND</td><td>PWR</td><td>共地</td><td>共地汇合点</td></tr>
+  <tr><th>功能组</th><th>GPIO</th><th>方向</th><th>PCB / 模块去向</th></tr>
+  <tr><td>DM #0 PUL / DIR</td><td class="gpio">5 / 6</td><td>OUT</td><td>J_DM0_SIG → PUL+ / DIR+</td></tr>
+  <tr><td>DM #1 PUL / DIR</td><td class="gpio">7 / 15</td><td>OUT</td><td>J_DM1_SIG → PUL+ / DIR+</td></tr>
+  <tr><td>DM #2 PUL / DIR</td><td class="gpio">1 / 2</td><td>OUT</td><td>J_DM2_SIG → PUL+ / DIR+</td></tr>
+  <tr><td>DM #3 PUL / DIR</td><td class="gpio">4 / 8</td><td>OUT</td><td>J_DM3_SIG → PUL+ / DIR+</td></tr>
+  <tr><td>DM #4 PUL / DIR</td><td class="gpio">9 / 10</td><td>OUT</td><td>J_DM4_SIG → PUL+ / DIR+</td></tr>
+  <tr><td>DM #5 PUL / DIR</td><td class="gpio">38 / 39</td><td>OUT</td><td>J_DM5_SIG → PUL+ / DIR+</td></tr>
+  <tr><td>GEAR 0 实体 IN1 / IN2</td><td class="gpio">11 / 16</td><td>OUT PWM</td><td>U_DRV0 → DRV8871 IN1 / IN2</td></tr>
+  <tr><td>GEAR 0 实体 ENC A(C1) / B(C2)</td><td class="gpio">18 / 21</td><td>IN PCNT</td><td>J_ENC0 → A / B</td></tr>
+  <tr><td>GEAR 1 实体 IN1 / IN2</td><td class="gpio">12 / 17</td><td>OUT PWM</td><td>U_DRV1 → DRV8871 IN1 / IN2</td></tr>
+  <tr><td>GEAR 1 实体 ENC A(C1) / B(C2)</td><td class="gpio">13 / 14</td><td>IN PCNT</td><td>J_ENC1 → A / B</td></tr>
+  <tr><td>轨道 D IN1 / IN2</td><td class="gpio">40 / 41</td><td>OUT PWM</td><td>U_DRVD → 第 3 块 DRV8871 IN1 / IN2</td></tr>
+  <tr><td>预留 AUX TX/SDA / RX/SCL / DE</td><td class="gpio">42 / 47 / 48</td><td>预留</td><td>J_AUX_UART；可选 I²C 或 U_RS485</td></tr>
+  <tr><td>3V3 / GND</td><td class="gpio">3V3 / GND</td><td>PWR</td><td>编码器与 3.3V 逻辑模块 / 公共地</td></tr>
 </table>
-
-<p class="small">不接的：GPIO 1, 2, 4, 8, 9, 10, 19, 20（USB CDC）, 33–48 一律空</p>
 
 <div class="info">
-固件里 IN1/IN2 和编码器 A/B 都做了"软件反向"以匹配电机/编码器的实际方向特性。<strong>你按上表实际接线即可</strong>，不用关心固件内部的引脚映射。
+GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pico/RP2040 UART、低速 I²C 或 RS485 扩展预留，三种用途只能选一种；当前固件尚未启用该接口。部分 ESP32-S3 DevKit 版本用 GPIO48 驱动板载 RGB LED，正式启用 DE 前必须核对实物版本。
 </div>
 
-<h2>3. 步进 L（DM422 #0）</h2>
+<h2>3. 六套 DM422 / DM442 接线</h2>
+
+<p>模块化 PCB 上 <code>J_DM0_SIG</code> 到 <code>J_DM5_SIG</code> 的端子顺序完全相同：</p>
 
 <table>
-  <tr><th>DM422 端子</th><th>接到</th><th>类型</th></tr>
-  <tr><td>V+</td><td>24V 电源 +</td><td class="power24">24V</td></tr>
-  <tr><td>V-</td><td>共地汇合点</td><td class="gnd">GND</td></tr>
-  <tr><td>PUL+</td><td>ESP32 GPIO <strong>5</strong></td><td class="gpio">5</td></tr>
-  <tr><td>PUL-</td><td>ESP32 GND</td><td class="gnd">GND</td></tr>
-  <tr><td>DIR+</td><td>ESP32 GPIO <strong>6</strong></td><td class="gpio">6</td></tr>
-  <tr><td>DIR-</td><td>ESP32 GND</td><td class="gnd">GND</td></tr>
-  <tr><td>A+ / A- / B+ / B-</td><td>步进电机 #0 四线（按电机说明书）</td><td>—</td></tr>
-  <tr><td>EN+ / EN-</td><td>不接（或都接 GND 永远使能）</td><td class="gnd">—</td></tr>
+  <tr><th>PCB 端子 Pin</th><th>信号</th><th>接 DM 驱动端子</th><th>说明</th></tr>
+  <tr><td>1</td><td>对应轴 GPIO PUL</td><td>PUL+</td><td>脉冲正端</td></tr>
+  <tr><td>2</td><td>GND</td><td>PUL-</td><td class="gnd">公共地</td></tr>
+  <tr><td>3</td><td>对应轴 GPIO DIR</td><td>DIR+</td><td>方向正端</td></tr>
+  <tr><td>4</td><td>GND</td><td>DIR-</td><td class="gnd">公共地</td></tr>
 </table>
 
-<h2>4. 步进 R（DM422 #1）</h2>
-
-<table>
-  <tr><th>DM422 端子</th><th>接到</th><th>类型</th></tr>
-  <tr><td>V+</td><td>24V 电源 +</td><td class="power24">24V</td></tr>
-  <tr><td>V-</td><td>共地汇合点</td><td class="gnd">GND</td></tr>
-  <tr><td>PUL+</td><td>ESP32 GPIO <strong>7</strong></td><td class="gpio">7</td></tr>
-  <tr><td>PUL-</td><td>ESP32 GND</td><td class="gnd">GND</td></tr>
-  <tr><td>DIR+</td><td>ESP32 GPIO <strong>15</strong></td><td class="gpio">15</td></tr>
-  <tr><td>DIR-</td><td>ESP32 GND</td><td class="gnd">GND</td></tr>
-  <tr><td>A+ / A- / B+ / B-</td><td>步进电机 #1 四线</td><td>—</td></tr>
-  <tr><td>EN+ / EN-</td><td>不接</td><td class="gnd">—</td></tr>
+<table class="pin-table">
+  <tr><th>轴</th><th>PCB 接口</th><th>PUL+</th><th>DIR+</th><th>24V 供电</th></tr>
+  <tr><td>0</td><td>J_DM0_SIG</td><td class="gpio">GPIO5</td><td class="gpio">GPIO6</td><td rowspan="6" class="power24">板外带保险分配模块 → 各 DM 的 V+/V-；不得经过 PCB</td></tr>
+  <tr><td>1</td><td>J_DM1_SIG</td><td class="gpio">GPIO7</td><td class="gpio">GPIO15</td></tr>
+  <tr><td>2</td><td>J_DM2_SIG</td><td class="gpio">GPIO1</td><td class="gpio">GPIO2</td></tr>
+  <tr><td>3</td><td>J_DM3_SIG</td><td class="gpio">GPIO4</td><td class="gpio">GPIO8</td></tr>
+  <tr><td>4</td><td>J_DM4_SIG</td><td class="gpio">GPIO9</td><td class="gpio">GPIO10</td></tr>
+  <tr><td>5</td><td>J_DM5_SIG</td><td class="gpio">GPIO38</td><td class="gpio">GPIO39</td></tr>
 </table>
-
-<h2>5. 减速 L（DRV8871 #0 + N20 #0 + 编码器 #0）</h2>
-
-<h3>DRV8871 #0 模块（8 端子版）</h3>
-<table>
-  <tr><th>模块端子</th><th>接到</th><th>类型</th></tr>
-  <tr><td><strong>Power +</strong></td><td>12V 电源 +</td><td class="power12">12V</td></tr>
-  <tr><td><strong>Power -</strong></td><td>共地汇合点</td><td class="gnd">GND</td></tr>
-  <tr><td>VM</td><td><strong>留空</strong>（内部已和 Power+ 连）</td><td class="danger">不接</td></tr>
-  <tr><td>GND</td><td>留空（可选接共地，冗余无害）</td><td class="gnd">—</td></tr>
-  <tr><td>IN1</td><td>ESP32 GPIO <strong>11</strong></td><td class="gpio">11</td></tr>
-  <tr><td>IN2</td><td>ESP32 GPIO <strong>16</strong></td><td class="gpio">16</td></tr>
-  <tr><td>Motor 1</td><td>N20 电机 #0 M+</td><td>—</td></tr>
-  <tr><td>Motor 2</td><td>N20 电机 #0 M-</td><td>—</td></tr>
-</table>
-
-<h3>编码器 #0（4 线，磁性霍尔 AB 增量）</h3>
-<table>
-  <tr><th>编码器线</th><th>接到</th><th>类型</th></tr>
-  <tr><td>VCC（一般红）</td><td>ESP32 <strong>3V3</strong>（先试 3.3V；不工作再改 5V）</td><td class="power3v3">3.3V</td></tr>
-  <tr><td>GND（一般黑）</td><td>共地汇合点</td><td class="gnd">GND</td></tr>
-  <tr><td>C1 / A 相</td><td>ESP32 GPIO <strong>18</strong></td><td class="gpio">18</td></tr>
-  <tr><td>C2 / B 相</td><td>ESP32 GPIO <strong>21</strong></td><td class="gpio">21</td></tr>
-</table>
-<p class="small">A/B 上拉电阻（可选，4.7kΩ × 2）：从 GPIO 18 / 21 各拉一根到 3.3V。无电阻时固件用内置上拉，对 1000:1 减速电机够用。</p>
-
-<h2>6. 减速 R（DRV8871 #1 + N20 #1 + 编码器 #1）</h2>
-
-<h3>DRV8871 #1 模块</h3>
-<table>
-  <tr><th>模块端子</th><th>接到</th><th>类型</th></tr>
-  <tr><td><strong>Power +</strong></td><td>12V 电源 +（和 #0 共享）</td><td class="power12">12V</td></tr>
-  <tr><td><strong>Power -</strong></td><td>共地汇合点</td><td class="gnd">GND</td></tr>
-  <tr><td>VM</td><td><strong>留空</strong></td><td class="danger">不接</td></tr>
-  <tr><td>GND</td><td>留空</td><td class="gnd">—</td></tr>
-  <tr><td>IN1</td><td>ESP32 GPIO <strong>12</strong></td><td class="gpio">12</td></tr>
-  <tr><td>IN2</td><td>ESP32 GPIO <strong>17</strong></td><td class="gpio">17</td></tr>
-  <tr><td>Motor 1</td><td>N20 电机 #1 M+</td><td>—</td></tr>
-  <tr><td>Motor 2</td><td>N20 电机 #1 M-</td><td>—</td></tr>
-</table>
-
-<h3>编码器 #1</h3>
-<table>
-  <tr><th>编码器线</th><th>接到</th><th>类型</th></tr>
-  <tr><td>VCC</td><td>ESP32 3V3</td><td class="power3v3">3.3V</td></tr>
-  <tr><td>GND</td><td>共地汇合点</td><td class="gnd">GND</td></tr>
-  <tr><td>C1 / A 相</td><td>ESP32 GPIO <strong>13</strong></td><td class="gpio">13</td></tr>
-  <tr><td>C2 / B 相</td><td>ESP32 GPIO <strong>14</strong></td><td class="gpio">14</td></tr>
-</table>
-
-<h2>7. 共地汇合点（最关键的一个端子）</h2>
-
-<p>买一个 6~8 位的接线柱，把以下所有 GND 汇到同一颗螺丝上：</p>
 
 <ul class="checklist">
-  <li>24V 电源 - 输出</li>
-  <li>12V 电源 - 输出（或 24V→12V 降压模块输出 GND）</li>
-  <li>ESP32 GND 排针</li>
-  <li>DM422 #0 V-</li>
-  <li>DM422 #1 V-</li>
-  <li>DM422 #0 PUL- 和 DIR-</li>
-  <li>DM422 #1 PUL- 和 DIR-</li>
-  <li>DRV8871 #0 Power-</li>
-  <li>DRV8871 #1 Power-</li>
-  <li>编码器 #0 GND</li>
-  <li>编码器 #1 GND</li>
+  <li>每套驱动器的 V+/V- 名称、允许电压和拨码电流以实物 DM422/DM442 手册为准。</li>
+  <li>六路 24V 支路分别有合适的保险或可复位保护，分配模块和线径满足总电流。</li>
+  <li>每套 DM 的 PUL-、DIR- 与 PCB GND 连通；不要把 PUL-/DIR- 接到 24V+。</li>
+  <li>A+/A-/B+/B- 只接对应步进电机绕组，先用万用表找出两组线圈。</li>
+  <li>EN+/EN- 当前 PCB 未引出；保持驱动器默认使能方式，不要把两端随意同时接地。</li>
 </ul>
 
-<h2>8. 上电前逐项检查（断电状态用万用表）</h2>
+<h2>4. 两路闭环 GEAR（DRV8871 + 编码器）</h2>
 
-<h3>电源接错检查</h3>
+<h3>4.1 DRV8871 成品模块插座</h3>
+
+<p><code>U_DRV0</code> 与 <code>U_DRV1</code> 当前 MOCK footprint 假设 1×4P 顺序为 <code>VM / GND / IN2 / IN1</code>。必须按实物模块核对，不能只看模块颜色或商品图。</p>
+
+<div class="info">
+<code>config.h</code> 为统一 PID 正方向，逻辑上交换了 GEAR 的 IN1/IN2 和 ENCA/ENCB 名称；本页与 PCB 丝印一律按模块和编码器的<strong>实体脚名</strong>列出。接线时不要把固件逻辑名直接当作实体脚名。
+</div>
+
+<table>
+  <tr><th>轴</th><th>模块端子</th><th>PCB 网络 / GPIO</th><th>说明</th></tr>
+  <tr><td rowspan="6">GEAR 0<br>U_DRV0</td><td>VM</td><td>VM_MOTOR</td><td class="powervm">由 J_VM_IN 独立低压电源供电</td></tr>
+  <tr><td>GND</td><td>公共 GND</td><td class="gnd">必须连接</td></tr>
+  <tr><td>实体 IN1</td><td class="gpio">GPIO11</td><td>PWM；固件逻辑名 PIN_GEAR_IN2_0</td></tr>
+  <tr><td>实体 IN2</td><td class="gpio">GPIO16</td><td>PWM；固件逻辑名 PIN_GEAR_IN1_0</td></tr>
+  <tr><td>Motor+ / Motor-</td><td>N20 / GEAR 0 电机两线</td><td>接模块自带电机端子，不绕回 PCB</td></tr>
+  <tr><td>额定电压</td><td>以实际 N20 铭牌为准</td><td class="danger-cell">不是固定 12V，更不是 DM 24V</td></tr>
+  <tr><td rowspan="6">GEAR 1<br>U_DRV1</td><td>VM</td><td>VM_MOTOR</td><td class="powervm">与 U_DRV0 共用独立低压源</td></tr>
+  <tr><td>GND</td><td>公共 GND</td><td class="gnd">必须连接</td></tr>
+  <tr><td>实体 IN1</td><td class="gpio">GPIO12</td><td>PWM；固件逻辑名 PIN_GEAR_IN2_1</td></tr>
+  <tr><td>实体 IN2</td><td class="gpio">GPIO17</td><td>PWM；固件逻辑名 PIN_GEAR_IN1_1</td></tr>
+  <tr><td>Motor+ / Motor-</td><td>N20 / GEAR 1 电机两线</td><td>接模块自带电机端子</td></tr>
+  <tr><td>额定电压</td><td>以实际 N20 铭牌为准</td><td class="danger-cell">不得假定 12V 或接 24V</td></tr>
+</table>
+
+<h3>4.2 两路 AB 编码器</h3>
+
+<table>
+  <tr><th>接口</th><th>Pin 1</th><th>Pin 2</th><th>Pin 3</th><th>Pin 4</th></tr>
+  <tr><td>J_ENC0</td><td class="power3v3">3V3</td><td class="gnd">GND</td><td class="gpio">A/C1 = GPIO18</td><td class="gpio">B/C2 = GPIO21</td></tr>
+  <tr><td>J_ENC1</td><td class="power3v3">3V3</td><td class="gnd">GND</td><td class="gpio">A/C1 = GPIO13</td><td class="gpio">B/C2 = GPIO14</td></tr>
+</table>
+
+<div class="warn">
+只有确认编码器输出兼容 3.3V ESP32 输入后才能直连。若编码器必须用 5V 或输出高电平可能达到 5V，请加成品电平转换模块；不要直接把 5V 信号送入 GPIO。若闭环使能后立即 runaway，先断开 VM_MOTOR，再检查 A/B 与电机方向，不要带电反复试线。
+</div>
+
+<h2>5. 独立轨道 D（第 3 块 DRV8871）</h2>
+
+<p>轨道 D 是开环直流电机，不占用两路闭环 GEAR 轴，也没有编码器接口。它通过 <code>U_DRVD</code> 控制前进、后退和停止。</p>
+
+<table>
+  <tr><th>U_DRVD 端子</th><th>PCB 网络 / GPIO</th><th>接线</th></tr>
+  <tr><td>VM</td><td>VM_MOTOR</td><td class="powervm">J_VM_IN 独立低压源；电压按轨道电机额定值</td></tr>
+  <tr><td>GND</td><td>公共 GND</td><td class="gnd">必须连接</td></tr>
+  <tr><td>IN1</td><td class="gpio">GPIO40</td><td>轨道 D PWM / 方向控制</td></tr>
+  <tr><td>IN2</td><td class="gpio">GPIO41</td><td>轨道 D PWM / 方向控制</td></tr>
+  <tr><td>Motor+ / Motor-</td><td>轨道 D 电机两线</td><td>接 DRV8871 模块自带电机端子</td></tr>
+</table>
+
+<div class="danger">
+轨道 D 与两路 N20 当前共用同一 <code>VM_MOTOR</code> 电源域。只有三台电机允许相同供电电压且电源容量足够时才可以这样装配；如果额定电压不同，必须拆分为独立成品电源/降压模块并保持 GND 共地，不能直接共用正极。
+</div>
+
+<h2>6. 模块化 PCB 接口总表</h2>
+
+<table>
+  <tr><th>位号</th><th>模块 / 端子</th><th>用途</th><th>装配前核对</th></tr>
+  <tr><td>U1</td><td>ESP32-S3 DevKitC-1 2×22P</td><td>主控制器模块</td><td>版本、22.86 mm 排距、天线/USB 方向</td></tr>
+  <tr><td>J_DM0_SIG…J_DM5_SIG</td><td>4P 5.08 mm</td><td>六路 DM PUL/DIR</td><td>P+/P-/D+/D- 顺序与端子进线方向</td></tr>
+  <tr><td>U_DRV0 / U_DRV1</td><td>DRV8871 成品模块</td><td>两路闭环 GEAR</td><td>外形、孔位、VM/GND/IN2/IN1 实际顺序</td></tr>
+  <tr><td>U_DRVD</td><td>DRV8871 成品模块</td><td>轨道 D</td><td>同上，且核对电机额定电压</td></tr>
+  <tr><td>J_ENC0 / J_ENC1</td><td>4P 5.08 mm</td><td>3V3/GND/A/B</td><td>编码器电平和线色，不要凭线色直接接</td></tr>
+  <tr><td>U_I2CMUX</td><td>TCA9548A 成品模块 MOCK / DNP</td><td>隔离 6 个同地址 AS5600</td><td>实测尺寸、主机/通道针序、0x70 地址和 3.3V 上拉</td></tr>
+  <tr><td>J_AS0…J_AS5</td><td>4P 5.08 mm / DNP</td><td>3V3/GND/SDAx/SCLx</td><td>AS5600 模块针序、磁铁同轴安装和短线抗干扰</td></tr>
+  <tr><td>U_IOEXP</td><td>PCF8575 成品模块 MOCK / DNP</td><td>未来 DIR/ENA 低速逻辑预留</td><td>实测尺寸、针序、0x20 地址、上电状态和 3.3V 上拉</td></tr>
+  <tr><td>J_PCF_DIR / J_PCF_ENA / J_PCF_RSVD</td><td>PCF raw logic / DNP</td><td>P0-P15/INT 引出</td><td class="danger-cell">不直连 DM；先选型并验证成品开集电极/ULN/隔离缓冲模块</td></tr>
+  <tr><td>J_VM_IN</td><td>2P 5.08 mm</td><td>VM_MOTOR/GND</td><td class="danger-cell">只接低压电机源，不接 DM 24V</td></tr>
+  <tr><td>J_AUX_UART</td><td>1×6P 2.54 mm</td><td>Pico/RP2040 UART 或低速 I²C 预留</td><td>5V/3V3/GND/TX-SDA42/RX-SCL47/DE48</td></tr>
+  <tr><td>U_RS485</td><td>3.3V RS485 成品模块 MOCK</td><td>可选 UART-RS485</td><td>实物 footprint、3.3V 兼容、A/B 定义</td></tr>
+  <tr><td>J_RS485</td><td>3P 5.08 mm</td><td>A/B/GND</td><td>A/B 极性及总线终端配置</td></tr>
+</table>
+
+<h2>7. AUX UART / I²C / RS485 扩展</h2>
+
+<table class="pin-table">
+  <tr><th>J_AUX_UART Pin</th><th>网络</th><th>用途 / 注意</th></tr>
+  <tr><td>1</td><td>5V_USB</td><td>来自 DevKit 5V/USB，仅作可选扩展供电；不要驱动电机</td></tr>
+  <tr><td>2</td><td>3V3</td><td>3.3V 逻辑电源，确认电流预算</td></tr>
+  <tr><td>3</td><td>GND</td><td class="gnd">公共地</td></tr>
+  <tr><td>4</td><td class="gpio">TX / SDA = GPIO42</td><td>未来 ESP32 → Pico/RP2040 / RS485 DI，或 I²C SDA</td></tr>
+  <tr><td>5</td><td class="gpio">RX / SCL = GPIO47</td><td>未来 Pico/RP2040 / RS485 RO → ESP32，或 I²C SCL</td></tr>
+  <tr><td>6</td><td class="gpio">DE = GPIO48</td><td>未来 RS485 DE 与 /RE；核对板载 RGB LED 冲突</td></tr>
+</table>
+
 <ul class="checklist">
-  <li>24V 电源 +/- 接入 DM422，正负无反接</li>
-  <li>12V 电源 +/- 接入 DRV8871 Power+/-，正负无反接</li>
-  <li>DRV8871 的 <strong>VM 端子留空</strong>（接 24V 会烧 N20，接 12V 也比直接走 Power+ 缺保护）</li>
-  <li>编码器 VCC 接到 ESP32 <strong>3V3</strong>，不是 5V（即使编码器规格支持 5V，3.3V 更安全）</li>
+  <li>Pico/RP2040 UART 使用 3.3V 逻辑电平，TX 与 RX 交叉连接，双方 GND 必须连接。</li>
+  <li>编码器模式使用 TCA9548A 隔离 6 个固定地址 0x36 的 AS5600；PCF8575 不能代替 TCA9548A。</li>
+  <li>PCF8575 只用于 DIR、ENA、限位等低速扩展，不用 GPIO 扩展器实时生成 PUL，当前也不接管原生 DIR。</li>
+  <li>外部 Pico 同时接自己的 USB 时，不再从 J_AUX_UART 的 5V_USB 反向供电；只保留一种供电路径。</li>
+  <li>直接 TTL UART、编码器/PCF I²C 与 U_RS485 共用 GPIO42/47，正常装配三选一；TCA 与 PCF 可在同一 I²C 模式内并存。</li>
+  <li>U_RS485 只装 3.3V 逻辑兼容的成品模块；A/B/GND 从 J_RS485 出板。</li>
+  <li>RS485 长线时的终端电阻、偏置和拓扑按所选成品模块及现场总线设计，不在当前 MOCK PCB 中假定。</li>
 </ul>
 
-<h3>共地连通检查</h3>
+<h2>8. 公共 GND 与线束检查</h2>
+
+<p>使用额定电流足够的成品地线分配端子，把以下各点接到同一参考地：</p>
+
 <ul class="checklist">
-  <li>万用表测：24V 电源 GND ↔ 共地汇合点 = <strong>0Ω</strong></li>
-  <li>万用表测：12V 电源 GND ↔ 共地汇合点 = <strong>0Ω</strong></li>
-  <li>万用表测：ESP32 GND 排针 ↔ 共地汇合点 = <strong>0Ω</strong></li>
+  <li>ESP32 / 模块化 PCB 的 GND。</li>
+  <li>DM 专用 24V 电源负极及板外保险分配模块负极。</li>
+  <li>六套 DM422/DM442 的 V-、PUL- 和 DIR-。</li>
+  <li>VM_MOTOR 独立低压电源负极。</li>
+  <li>U_DRV0、U_DRV1、U_DRVD 的 GND。</li>
+  <li>J_ENC0、J_ENC1 的 GND。</li>
+  <li>如使用 AUX/Pico/RS485，其 GND。</li>
 </ul>
 
-<h3>短路检查（断电下用阻值档）</h3>
+<div class="danger">
+断电后用万用表通断档确认上述 GND 两两连通。不要用“测得 0Ω”作为不同电源正极可以并联的依据；所有正电源仍必须严格分域。
+</div>
+
+<h2>9. 打样与装配前检查</h2>
+
+<h3>机械与模块核对</h3>
 <ul class="checklist">
-  <li>24V 电源 + ↔ GND = <strong>几 kΩ – MΩ</strong>（不应该 &lt; 100Ω）</li>
-  <li>12V 电源 + ↔ GND = <strong>几 kΩ – MΩ</strong></li>
-  <li>ESP32 3V3 ↔ GND = <strong>几 kΩ – MΩ</strong></li>
-  <li>DRV8871 #0 Power+ ↔ Power- = 几 kΩ（H 桥开路 + 滤波电容）</li>
-  <li>DRV8871 #1 Power+ ↔ Power- = 几 kΩ</li>
+  <li>实测 ESP32-S3 DevKit 是 2×22P，排距、总尺寸和 USB/天线方向与 U1 占位一致。</li>
+  <li>实测三块 DRV8871 的外形、排针中心、孔位及 VM/GND/IN2/IN1 顺序。</li>
+  <li>实测 RS485 模块布局；不确定时不焊 U_RS485，只保留 J_AUX_UART。</li>
+  <li>端子进线面朝板外且不会与模块、螺钉、外壳或线束干涉。</li>
+  <li>DevKit 天线 keepout 内没有铜、线束、螺柱或大块金属遮挡。</li>
 </ul>
 
-<h2>9. 上电顺序</h2>
+<h3>断电电气核对</h3>
+<ul class="checklist">
+  <li>DM 24V+ 只到板外 DM 驱动分配，不进入 PCB 的任何端子。</li>
+  <li>J_VM_IN 正端只接实际电机允许的 VM 电压，不与 24V+、5V_USB、3V3 连通。</li>
+  <li>公共 GND 全部连通；每个 DM 的 PUL-/DIR- 均到 GND。</li>
+  <li>3V3 ↔ GND、5V_USB ↔ GND、VM_MOTOR ↔ GND 均无明显短路。</li>
+  <li>六组 PUL/DIR、两组编码器、三块 DRV 的 GPIO 与 §2 完全一致。</li>
+  <li>轨道 D 明确为 GPIO40/41；AUX 明确为 GPIO42/47/48。</li>
+</ul>
+
+<h2>10. 安全上电顺序</h2>
 
 <ol>
-  <li><strong>所有线接好</strong>，但 24V / 12V 电源开关 OFF，ESP32 USB 不插</li>
-  <li>万用表做上面 §8 检查全部通过</li>
-  <li><strong>先开 12V 电源</strong>，确认稳定 12V 不进 CC（电流 &lt; 50mA 空载）</li>
-  <li><strong>再开 24V 电源</strong>，确认稳定 24V，DM422 灯亮</li>
-  <li><strong>最后插 ESP32 USB</strong>，打开串口监视器（COM9, 115200, Newline）</li>
-  <li>启动 banner 应出现：<code>ESP32 Controller Ready (GEAR mode, stepper + DC gear motor)</code></li>
-  <li>电机暂时不会动，PWM 都是 0</li>
+  <li>架空所有机械负载或确保运动范围无人、无线束和硬限位碰撞；准备可立即切断 DM 24V 与 VM_MOTOR 的物理开关。</li>
+  <li>保持 DM 24V 和 VM_MOTOR 关闭，先给 ESP32 接 USB。</li>
+  <li>连接 PC GUI / 网页服务后立即执行全局停止，确认固件处于 <code>GEAR</code> 模式且没有待执行命令。</li>
+  <li>先开启 VM_MOTOR，确认三块 DRV8871 与电机都静止、无发热和异常电流。</li>
+  <li>再开启板外 DM 专用 24V，确认六套驱动器状态正常且步进电机没有意外运动。</li>
+  <li>首次仅用最低合理速度/占空比，逐轴点动；一次只验证一个执行器。</li>
+  <li>最后验证轨道 D 前进、停止、后退及租约超时停止，不要从高速直接反向。</li>
 </ol>
 
-<h2>10. GUI 启动 + 首次测试</h2>
+<h2>11. 首次逐项验证清单</h2>
 
-<ol>
-  <li><code>python pc_gui.py</code></li>
-  <li>选串口 COM9 → 点"连接"</li>
-  <li>"生效模式"应显示 <strong>GEAR</strong>（绿色）</li>
-  <li>GUI 自动跳到 <strong>⚙ 减速 L</strong> tab</li>
-  <li>把 Kp 滑块拉到 20 → 松鼠标看 💾 保存日志</li>
-  <li>"使能 PID" → 状态变"运行"</li>
-  <li>目标 45° → 前往，watcher 日志应该看到 ✓ 到位</li>
-  <li>切到 ⚙ 减速 R tab，同样操作（Kp 起步 10，Kd 0.3，Ki 0.5）</li>
-  <li>步进 L / R tab 也试一下"向外 1mm"按钮</li>
-</ol>
+<ul class="checklist">
+  <li>DM #0～#5 逐轴短距离前进/后退，方向与机械定义一致。</li>
+  <li>任意步进运动中发送 STOP，实际停止位置不会被当作完整目标位置。</li>
+  <li>发送 <code>ESTOP</code>，确认收到唯一响应 <code>OK,ESTOP</code>，全部步进/轨道停止且两路闭环失能。</li>
+  <li>GEAR 0 低输出闭环点动，编码器 A/B 计数方向与目标方向一致。</li>
+  <li>GEAR 1 重复相同步骤，不直接复制未经验证的 PID 参数。</li>
+  <li>轨道 D 低占空比前进 → 停止 → 后退，GPIO40/41 对应正确。</li>
+  <li>轨道 D 控制端断开或租约到期时自动停止。</li>
+  <li>如使用手机网页端，确认手机断网/锁屏后轨道 D 不会持续运行。</li>
+  <li>如使用 AUX，只在固件已正式实现对应 UART/I²C 后连接 Pico、扩展器或 RS485；当前仅为硬件预留。</li>
+  <li>AS5600 尚未安装时保持 <code>STEPPER_ENCODER_DIAGNOSTICS_ENABLED=0</code>；安装后先只读执行 <code>ENC,0,S</code>～<code>ENC,5,S</code>，禁止直接启用闭环。</li>
+  <li>AS5600 是单圈绝对传感器；掉电后多圈累计丢失，丝杠机构必须重新回零。</li>
+</ul>
 
-<h2>11. 故障排除速查</h2>
+<h2>12. 故障排除速查</h2>
 
 <table>
-  <tr><th>现象</th><th>原因</th><th>修法</th></tr>
-  <tr>
-    <td>电源开机进 CC（电压被压到 &lt; 5V）</td>
-    <td>VM 端子误接到电源 +，或者电机 OUT 短路到 GND</td>
-    <td>关电源，万用表测 §8 短路检查</td>
-  </tr>
-  <tr>
-    <td>ESP32 USB 一插就发烫</td>
-    <td>3.3V 轨被外部短路（编码器 VCC 接错？）</td>
-    <td>立刻断电，检查 3.3V ↔ GND 阻值</td>
-  </tr>
-  <tr>
-    <td>GUI 连接后"生效模式 = ?"</td>
-    <td>固件没烧最新版（缺 MODE 命令）</td>
-    <td><code>pio run -e esp32s3_gear -t upload</code></td>
-  </tr>
-  <tr>
-    <td>电机使能后立刻 runaway</td>
-    <td>编码器方向反 或 电机方向反</td>
-    <td>看日志 cur 走向，对调对应 OUT 或 ENC 线</td>
-  </tr>
-  <tr>
-    <td>"前往" 后电机不动</td>
-    <td>Kp 太小，跨不过死区</td>
-    <td>把 Kp 滑块拉到 20+</td>
-  </tr>
-  <tr>
-    <td>电机过冲且卡死</td>
-    <td>Kp 大、Kd 小、齿轮静摩擦锁死</td>
-    <td>减 Kp、加 Kd、加少量 Ki</td>
-  </tr>
+  <tr><th>现象</th><th>优先检查</th><th>处理</th></tr>
+  <tr><td>DM 有锁力但不转</td><td>PUL-/DIR- 未共地、PUL/DIR 轴号接错、拨码或脉宽</td><td>断电按 §3 逐线核对，不用 24V 测 GPIO</td></tr>
+  <tr><td>某两路 DM 同时异常</td><td>是否把 6 轴旧图当成双轴图接线</td><td>按 GPIO 5/6、7/15、1/2、4/8、9/10、38/39 重新核对</td></tr>
+  <tr><td>DRV8871 / N20 发热</td><td>VM_MOTOR 电压过高、堵转、模块 pin 顺序错误</td><td>立刻切断 VM，按铭牌和实物模块资料检查</td></tr>
+  <tr><td>GEAR 使能后 runaway</td><td>编码器 A/B 或电机方向反、编码器无计数</td><td>切断 VM 后检查 A/B；低输出重新验证闭环方向</td></tr>
+  <tr><td>轨道 D 不动</td><td>GPIO40/41、U_DRVD IN1/IN2、租约是否有效</td><td>核对第三块模块，不要误接到 AUX 42/47</td></tr>
+  <tr><td>轨道 D 不会停止</td><td>客户端租约/心跳、STOP 命令、功率级接线</td><td>立即物理断开 VM_MOTOR，再排查软件</td></tr>
+  <tr><td>AUX UART/I²C 无通信</td><td>当前固件未启用、模式选择或接线/上拉错误、未共地</td><td>先完成固件扩展，再接硬件；不要假定预留口已可用</td></tr>
+  <tr><td>AS5600 全部离线</td><td>诊断开关、TCA 0x70、GPIO42/47、3.3V 上拉</td><td>保持开环，先只接 TCA 和一个通道逐级排查</td></tr>
+  <tr><td>AS5600 角度跳变</td><td>磁铁偏心/间隙、长线干扰、相邻采样跨越半圈</td><td>停止机构，改善安装与线束；重新上电回零后再验证</td></tr>
+  <tr><td>RS485 收发冲突</td><td>GPIO48 DE、板载 RGB LED、RE/DE、A/B 极性</td><td>核对 DevKit 版本与成品模块，UART/I²C/RS485 三选一</td></tr>
+  <tr><td>ESP32 USB 一插就发热</td><td>3V3/5V 回灌或短路</td><td>立即断开全部电源，检查 AUX 和编码器供电</td></tr>
 </table>
 
 <hr>
-<p class="small">本文件由 GUI 配套生成 · 对应 config.h 中 <code>DRIVE_MODE_GEAR</code> 块（NUM_AXES=2） · 2026-05-26</p>
+<p class="small">当前目标：<code>NUM_AXES=6</code>、<code>NUM_GEAR_AXES=2</code>、独立 TRACK D · 模块尺寸状态：<strong>MOCK，未完成实物机械核验</strong> · 更新日期：2026-08-03</p>
 
 </body>
 </html>

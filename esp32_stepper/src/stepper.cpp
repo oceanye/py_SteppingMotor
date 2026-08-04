@@ -5,14 +5,30 @@
 #include <math.h>
 
 // 每轴引脚（编译期常量数组）
-static const int PIN_PUL[NUM_AXES] = { PIN_STEP_PUL_0, PIN_STEP_PUL_1 };
-static const int PIN_DIR[NUM_AXES] = { PIN_STEP_DIR_0, PIN_STEP_DIR_1 };
+#if defined(DRIVE_MODE_FOC)
+static const int PIN_PUL[NUM_AXES] = {PIN_STEP_PUL_0, PIN_STEP_PUL_1};
+static const int PIN_DIR[NUM_AXES] = {PIN_STEP_DIR_0, PIN_STEP_DIR_1};
+#elif defined(DRIVE_MODE_GEAR)
+static const int PIN_PUL[NUM_AXES] = {
+  PIN_STEP_PUL_0, PIN_STEP_PUL_1, PIN_STEP_PUL_2,
+  PIN_STEP_PUL_3, PIN_STEP_PUL_4, PIN_STEP_PUL_5
+};
+static const int PIN_DIR[NUM_AXES] = {
+  PIN_STEP_DIR_0, PIN_STEP_DIR_1, PIN_STEP_DIR_2,
+  PIN_STEP_DIR_3, PIN_STEP_DIR_4, PIN_STEP_DIR_5
+};
+#endif
 
 // 每轴异步任务状态
-static TaskHandle_t      s_task[NUM_AXES]      = {nullptr, nullptr};
-static SemaphoreHandle_t s_start_sem[NUM_AXES] = {nullptr, nullptr};
-static std::atomic<bool> s_busy[NUM_AXES];
-static std::atomic<bool> s_abort[NUM_AXES];
+static TaskHandle_t      s_task[NUM_AXES]      = {};
+static SemaphoreHandle_t s_start_sem[NUM_AXES] = {};
+enum StepState : uint8_t {
+  STEP_IDLE = 0,
+  STEP_RUNNING = 1,
+  STEP_ABORTING = 2,
+  STEP_FINISHING = 3,
+};
+static std::atomic<uint8_t> s_state[NUM_AXES];
 static int               s_steps[NUM_AXES], s_dir[NUM_AXES], s_delay_us[NUM_AXES];
 
 static bool valid_axis(int axis) { return axis >= 0 && axis < NUM_AXES; }
@@ -61,8 +77,6 @@ static void stepper_task(void* arg) {
 
     digitalWrite(dpin, dir);
     delayMicroseconds(100);
-    s_abort[axis].store(false);  // 清除中止标志
-
     // ── 梯形加减速曲线 ──
     float cruise_delay = (float)dus;
     float start_delay  = (float)STEP_RAMP_START_US;
@@ -92,32 +106,43 @@ static void stepper_task(void* arg) {
     float current_delay = start_delay;
     int step_count = 0;
     uint32_t last_yield_ms = millis();
-    bool aborted = false;
+    bool aborted = s_state[axis].load() == STEP_ABORTING;
 
     // 加速阶段：逐步缩短延时
     for (int i = 0; i < accel_steps && !aborted; i++) {
       emit_pulse(pul, (int)current_delay, &step_count, &last_yield_ms, axis, steps);
       current_delay *= (1.0f - STEP_RAMP_FACTOR);
       if (current_delay < cruise_delay) current_delay = cruise_delay;
-      if (s_abort[axis].load()) aborted = true;
+      if (s_state[axis].load() == STEP_ABORTING) aborted = true;
     }
     // 巡航阶段：恒速
     for (int i = 0; i < cruise_steps && !aborted; i++) {
       emit_pulse(pul, (int)cruise_delay, &step_count, &last_yield_ms, axis, steps);
-      if (s_abort[axis].load()) aborted = true;
+      if (s_state[axis].load() == STEP_ABORTING) aborted = true;
     }
     // 减速阶段：逐步加长延时（镜像加速）
     for (int i = 0; i < decel_steps && !aborted; i++) {
       current_delay /= (1.0f - STEP_RAMP_FACTOR);
       if (current_delay > start_delay) current_delay = start_delay;
       emit_pulse(pul, (int)current_delay, &step_count, &last_yield_ms, axis, steps);
-      if (s_abort[axis].load()) aborted = true;
+      if (s_state[axis].load() == STEP_ABORTING) aborted = true;
     }
 
-    s_busy[axis].store(false);
+    // Claim the terminal transition before printing. A concurrent STOP either
+    // wins RUNNING->ABORTING, or observes FINISHING after all pulses are done.
+    uint8_t expected = STEP_RUNNING;
+    if (!s_state[axis].compare_exchange_strong(expected, STEP_FINISHING)) {
+      if (expected == STEP_ABORTING) aborted = true;
+      s_state[axis].store(STEP_FINISHING);
+    }
     Serial.print("STEP,");
     Serial.print(axis);
-    Serial.println(aborted ? ",ABORT" : ",DONE");
+    Serial.print(aborted ? ",ABORT," : ",DONE,");
+    Serial.print(step_count);
+    Serial.print(',');
+    Serial.println(steps);
+    // A new MOVE cannot be accepted until the previous terminal line is sent.
+    s_state[axis].store(STEP_IDLE);
   }
 }
 
@@ -128,8 +153,7 @@ void stepper_init() {
     digitalWrite(PIN_PUL[axis], LOW);
     digitalWrite(PIN_DIR[axis], LOW);
     s_start_sem[axis] = xSemaphoreCreateBinary();
-    s_busy[axis].store(false);
-    s_abort[axis].store(false);
+    s_state[axis].store(STEP_IDLE);
     char name[16]; snprintf(name, sizeof(name), "stepper%d", axis);
     xTaskCreatePinnedToCore(stepper_task, name, 4096,
                             (void*)(intptr_t)axis, 2, &s_task[axis], 1);
@@ -153,20 +177,24 @@ void stepper_move(int axis, int steps, int direction, int delay_us) {
 
 bool stepper_is_busy(int axis) {
   if (!valid_axis(axis)) return false;
-  return s_busy[axis].load();
+  return s_state[axis].load() != STEP_IDLE;
 }
 
-void stepper_abort(int axis) {
-  if (valid_axis(axis)) s_abort[axis].store(true);
+bool stepper_abort(int axis) {
+  if (!valid_axis(axis)) return false;
+  uint8_t expected = STEP_RUNNING;
+  if (s_state[axis].compare_exchange_strong(expected, STEP_ABORTING)) return true;
+  return expected == STEP_ABORTING;
 }
 
 bool stepper_move_async(int axis, int steps, int direction, int delay_us) {
-  if (!valid_axis(axis)) return false;
-  if (s_busy[axis].load()) return false;
+  if (!valid_axis(axis) || steps <= 0 || (direction != 0 && direction != 1) ||
+      delay_us <= 0) return false;
+  uint8_t expected = STEP_IDLE;
+  if (!s_state[axis].compare_exchange_strong(expected, STEP_RUNNING)) return false;
   s_steps[axis]    = steps;
   s_dir[axis]      = direction;
   s_delay_us[axis] = delay_us;
-  s_busy[axis].store(true);
   xSemaphoreGive(s_start_sem[axis]);
   return true;
 }
