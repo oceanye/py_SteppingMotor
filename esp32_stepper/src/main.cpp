@@ -66,6 +66,17 @@ void setup() {
   foc_init();   // GEAR 构建里这个符号由 gear_motor.cpp 提供
   track_motor_init();
   stepper_encoders_init();
+#if HW_ESTOP_ENABLED
+  pinMode(PIN_HW_ESTOP, INPUT_PULLUP);
+  Serial.print("  hw estop: GPIO"); Serial.print(PIN_HW_ESTOP);
+  Serial.println(HW_ESTOP_ACTIVE_LOW ? " active-low(NC button)" : " active-high");
+#endif
+#if GEAR_NFAULT_ENABLED
+  pinMode(PIN_GEAR_NFAULT_0, INPUT_PULLUP);
+  pinMode(PIN_GEAR_NFAULT_1, INPUT_PULLUP);
+  Serial.print("  gear nFAULT: GPIO"); Serial.print(PIN_GEAR_NFAULT_0);
+  Serial.print("/GPIO"); Serial.println(PIN_GEAR_NFAULT_1);
+#endif
   Serial.print("  track D: IN1="); Serial.print(PIN_TRACK_D_IN1);
   Serial.print(" IN2="); Serial.println(PIN_TRACK_D_IN2);
 #if STEPPER_ENCODER_DIAGNOSTICS_ENABLED
@@ -102,6 +113,37 @@ void loop() {
         Serial.print("FOC,"); Serial.print(a); Serial.println(",FAULT");
       }
     }
+  }
+#elif defined(DRIVE_MODE_GEAR)
+  static uint32_t s_last_gear_safety_check = 0;
+  uint32_t now = millis();
+  if (now - s_last_gear_safety_check >= FAULT_POLL_MS) {
+    s_last_gear_safety_check = now;
+#if HW_ESTOP_ENABLED
+    {
+      static bool s_hwestop_latched = false;
+      bool active = (digitalRead(PIN_HW_ESTOP) == LOW);
+      if (!HW_ESTOP_ACTIVE_LOW) active = !active;
+      if (active && !s_hwestop_latched) {
+        s_hwestop_latched = true;
+        system_estop();
+        Serial.println("HWESTOP,TRIGGERED");
+      } else if (!active) {
+        s_hwestop_latched = false;
+      }
+    }
+#endif
+#if GEAR_NFAULT_ENABLED
+    for (int a = 0; a < NUM_GEAR_AXES; ++a) {
+      static const int nfault_pin[NUM_GEAR_AXES] = { PIN_GEAR_NFAULT_0, PIN_GEAR_NFAULT_1 };
+      if (digitalRead(nfault_pin[a]) == LOW &&
+          foc_get_state(a) != FOC_STATE_DISABLED &&
+          foc_get_state(a) != FOC_STATE_FAULT) {
+        foc_latch_fault(a);
+        Serial.print("FOC,"); Serial.print(a); Serial.println(",FAULT");
+      }
+    }
+#endif
   }
 #endif
 }

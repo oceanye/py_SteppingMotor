@@ -77,8 +77,7 @@ static void handle_stop(const String tok[], int n) {
   reply_ok_axis(axis);
 }
 
-static void handle_estop(const String tok[], int n) {
-  if (n != 1) { reply_err("bad format"); return; }
+void system_estop() {
   for (int axis = 0; axis < NUM_AXES; ++axis) stepper_abort(axis);
 #if defined(DRIVE_MODE_GEAR)
   track_motor_stop();
@@ -87,6 +86,11 @@ static void handle_estop(const String tok[], int n) {
   constexpr int motor_axes = NUM_AXES;
 #endif
   for (int axis = 0; axis < motor_axes; ++axis) foc_request_enable(axis, false);
+}
+
+static void handle_estop(const String tok[], int n) {
+  if (n != 1) { reply_err("bad format"); return; }
+  system_estop();
   Serial.println("OK,ESTOP");
 }
 

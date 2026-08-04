@@ -183,8 +183,8 @@ GEAR 专用：`GR`、`PI`、`PD`，其中 `V` 表示 PWM duty cap 百分比而�
 ### 中优先级
 
 - 继续解决右 GEAR 轴的稳态误差和两轴 PID 差异。
-- 增加固件硬件限位、急停和真正的 GEAR 故障输入/检测。
-- 安装可用的 `gcc/g++` 后恢复 `pio test -e native_test`。
+- 硬件限位仍待（空闲 GPIO 仅 35/36/37，不够 6 轴 ×2 限位，需 PCF8575 扩展或继续用软件行程范围）；硬件急停框架已落位：GPIO35 active-low 常闭输入，ESTOP 命令与硬件急停共用 `system_estop()` 停止链，2026-08-04 编译+烧录+运行验证通过（按钮未接时不误触发）；GEAR DRV8871 nFAULT 检测条件编译预留（`GEAR_NFAULT_ENABLED` 默认 0，待确认模块是否引出 nFAULT）。
+- ~~安装可用的 `gcc/g++` 后恢复 `pio test -e native_test`。~~ 已完成（2026-08-04）：WinLibs MinGW-W64 gcc 16.1.0 + Unity 2.6.1，6 个协议边界测试全 PASSED。
 - PCB 当前使用模块 mock 尺寸；拿到 ESP32-S3 DevKit、DRV8871 模块和端子实测尺寸后
   替换封装 courtyard 并复核孔距；TCA9548A、PCF8575、AS5600 的模块尺寸、针序、
   地址跳线和 3.3V 上拉也必须逐项实测。
