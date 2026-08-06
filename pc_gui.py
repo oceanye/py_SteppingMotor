@@ -20,9 +20,18 @@ NUM_GEAR_AXES = NUM_MOTOR_AXES    # 向后兼容
 AXIS_LABEL = ["L", "R", "A", "B", "C", "D"]
 
 # ============== 步进标定 ==============
-# 六轴统一: 28HD140GT81-200LR 贯通式步进, 200 微步/圈, 导程 1.0 mm/圈
-PULSES_PER_MM = [200.0 / 1.0] * NUM_STEPPER_AXES
-# 速度档位 (mm/s) —— 根据 200 微步 + 1.0mm 导程 + 加减速曲线设定
+# ESP32-S3 PUL/DIR 引脚（与 esp32_stepper/src/config.h DRIVE_MODE_GEAR 一致），仅用于界面显示。
+STEPPER_PINS = [(5, 6), (7, 15), (1, 2), (4, 8), (9, 10), (38, 39)]
+# 步进控制模式：直线（高度-导程，单位 mm）或 旋转（圈/角度，单位 °）。
+MODE_LINEAR = "linear"
+MODE_ROTARY = "rotary"
+# 每轴电机默认参数：脉冲每转（微步/圈）、减速比（电机→负载）、导程（mm/转，仅直线模式）。
+DEFAULT_PULSE_PER_REV = 200.0
+DEFAULT_GEAR_RATIO = 1.0
+DEFAULT_LEAD_MM = 1.0
+# 兼容：默认 200 微步/圈 ÷ 1.0mm 导程 = 200 pulse/mm（28HD140GT81-200LR 贯通式步进）。
+PULSES_PER_MM = [DEFAULT_PULSE_PER_REV / DEFAULT_LEAD_MM] * NUM_STEPPER_AXES
+# 速度档位（单位/s：直线=mm/s, 旋转=°/s）
 SPEED_PRESETS = [0.3, 0.5, 0.6, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 10]
 SPEED_DEFAULT = 3.0
 # 实测：delayMicroseconds 路径每步固定开销 ~200us（50us HIGH + yield + 调度）
@@ -68,7 +77,7 @@ class StepperGUI:
     def __init__(self, root, web_server_factory=None):
         self.root = root
         self.root.title("六轴步进 + FOC/GEAR + 轨道 D 控制器")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
 
         # ── 共享：串口 ──
         self.ser = None
@@ -155,6 +164,17 @@ class StepperGUI:
         self.web_address_var = tk.StringVar(value="—")
         self.web_port_var = tk.StringVar(value="—")
         self.web_url_var = tk.StringVar(value="网页服务未启动")
+
+        # ── 每轴步进配置：控制模式 + 电机参数（脉冲每转/减速比/导程）──
+        self.axis_mode          = [MODE_LINEAR] * NUM_STEPPER_AXES
+        self.axis_pulse_per_rev = [DEFAULT_PULSE_PER_REV] * NUM_STEPPER_AXES
+        self.axis_gear_ratio    = [DEFAULT_GEAR_RATIO] * NUM_STEPPER_AXES
+        self.axis_lead_mm       = [DEFAULT_LEAD_MM] * NUM_STEPPER_AXES
+        self.axis_mode_var = [tk.StringVar(value=MODE_LINEAR) for _ in range(NUM_STEPPER_AXES)]
+        self.axis_ppr_var  = [tk.DoubleVar(value=DEFAULT_PULSE_PER_REV) for _ in range(NUM_STEPPER_AXES)]
+        self.axis_gr_var   = [tk.DoubleVar(value=DEFAULT_GEAR_RATIO) for _ in range(NUM_STEPPER_AXES)]
+        self.axis_lead_var = [tk.DoubleVar(value=DEFAULT_LEAD_MM) for _ in range(NUM_STEPPER_AXES)]
+        self._load_axis_config()
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -284,58 +304,103 @@ class StepperGUI:
 
         self._raw_log_fh = None  # 串口原始日志文件句柄（开关控制）
 
+        # 窗口自适应屏幕：允许缩放，notebook 行可伸缩，初始高度不超出屏幕。
+        self.root.rowconfigure(1, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        self.root.update_idletasks()
+        req_w = self.root.winfo_reqwidth()
+        req_h = self.root.winfo_reqheight()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = min(req_w, screen_w - 40)
+        win_h = min(req_h, screen_h - 80)
+        self.root.geometry(f"{int(win_w)}x{int(win_h)}")
+        self.root.minsize(720, 480)
+
         self.refresh_ports()
 
     # ═════════════ 步进 Tab（参数化）═════════════
     def _build_stepper_tab(self, parent, axis):
         pad = dict(padx=10, pady=5)
         sw = self.sw[axis]
+        unit = self._unit_label(axis)
+
+        # 轴配置：GPIO 引脚 + 控制模式 + 电机参数（脉冲每转/减速比/导程）。
+        axf = ttk.LabelFrame(parent, text=f"轴配置 — 轴 {AXIS_LABEL[axis]}")
+        axf.grid(row=0, column=0, columnspan=2, sticky="ew", **pad)
+        pul, dr = STEPPER_PINS[axis] if axis < len(STEPPER_PINS) else ("?", "?")
+        ttk.Label(axf, text=f"引脚:  PUL=GPIO{pul}   DIR=GPIO{dr}",
+                  font=("Consolas", 10, "bold"), foreground="#1565c0").grid(
+            row=0, column=0, columnspan=6, sticky="w", **pad)
+        ttk.Label(axf, text="模式:").grid(row=1, column=0, sticky="w", **pad)
+        mf = ttk.Frame(axf); mf.grid(row=1, column=1, columnspan=5, sticky="w")
+        ttk.Radiobutton(mf, text="直线 高度/导程 (mm)", variable=self.axis_mode_var[axis],
+                        value=MODE_LINEAR, command=lambda a=axis: self._on_axis_mode_change(a)).pack(side="left", padx=6)
+        ttk.Radiobutton(mf, text="旋转 圈/角度 (°)", variable=self.axis_mode_var[axis],
+                        value=MODE_ROTARY, command=lambda a=axis: self._on_axis_mode_change(a)).pack(side="left", padx=6)
+        ttk.Label(axf, text="脉冲/转:").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Spinbox(axf, from_=1.0, to=10000.0, increment=1.0,
+                    textvariable=self.axis_ppr_var[axis], width=8, format="%.1f",
+                    command=lambda a=axis: self._on_axis_param_change(a)).grid(row=2, column=1, **pad)
+        ttk.Label(axf, text="减速比:").grid(row=2, column=2, sticky="w", padx=(16,0))
+        ttk.Spinbox(axf, from_=0.001, to=1000.0, increment=0.01,
+                    textvariable=self.axis_gr_var[axis], width=8, format="%.2f",
+                    command=lambda a=axis: self._on_axis_param_change(a)).grid(row=2, column=3, **pad)
+        sw['lead_label'] = ttk.Label(axf, text="导程(mm/转):")
+        sw['lead_label'].grid(row=2, column=4, sticky="w", padx=(16,0))
+        sw['lead_spin'] = ttk.Spinbox(axf, from_=0.01, to=100.0, increment=0.1,
+                                      textvariable=self.axis_lead_var[axis], width=8, format="%.3f",
+                                      command=lambda a=axis: self._on_axis_param_change(a))
+        sw['lead_spin'].grid(row=2, column=5, **pad)
+        self._apply_axis_param_ui(axis)
 
         pf = ttk.LabelFrame(parent, text=f"运动参数 — 轴 {AXIS_LABEL[axis]}")
-        pf.grid(row=0, column=0, sticky="nsew", **pad)
-        ttk.Label(pf, text="距离 (mm):").grid(row=0, column=0, sticky="w", **pad)
+        pf.grid(row=1, column=0, sticky="nsew", **pad)
+        sw['dist_label'] = ttk.Label(pf, text=f"距离 ({unit}):")
+        sw['dist_label'].grid(row=0, column=0, sticky="w", **pad)
         ttk.Spinbox(pf, from_=0.2, to=500.0, increment=1.0,
                     textvariable=self.v_dist[axis], width=10, format="%.1f").grid(row=0, column=1, **pad)
         ttk.Label(pf, text="快捷:").grid(row=1, column=0, sticky="w", **pad)
         qbf = ttk.Frame(pf); qbf.grid(row=1, column=1, sticky="w", pady=5)
-        for label, mm in [("1mm", 1), ("10mm", 10), ("50mm", 50), ("100mm", 100)]:
+        for label, val in [("1", 1), ("10", 10), ("50", 50), ("100", 100)]:
             ttk.Button(qbf, text=label, width=6,
-                       command=lambda d=mm, a=axis: self.v_dist[a].set(d)).pack(side="left", padx=2)
+                       command=lambda d=val, a=axis: self.v_dist[a].set(d)).pack(side="left", padx=2)
         ttk.Label(pf, text="方向:").grid(row=2, column=0, sticky="w", **pad)
         df = ttk.Frame(pf); df.grid(row=2, column=1, sticky="w")
-        ttk.Radiobutton(df, text="向上 ▶", variable=self.v_dir[axis], value=DIR_OUTWARD).pack(side="left", padx=4)
-        ttk.Radiobutton(df, text="◀ 向下", variable=self.v_dir[axis], value=DIR_INWARD).pack(side="left", padx=4)
+        ttk.Radiobutton(df, text="正向 ▶", variable=self.v_dir[axis], value=DIR_OUTWARD).pack(side="left", padx=4)
+        ttk.Radiobutton(df, text="◀ 反向", variable=self.v_dir[axis], value=DIR_INWARD).pack(side="left", padx=4)
         ttk.Label(pf, text="速度档位:").grid(row=3, column=0, sticky="w", **pad)
         sf = ttk.Frame(pf); sf.grid(row=3, column=1, sticky="w", pady=5)
         sw['speed_combo'] = ttk.Combobox(sf, textvariable=self.v_speed_str[axis],
                                          values=[str(s) for s in SPEED_PRESETS],
                                          width=6, state="readonly")
         sw['speed_combo'].pack(side="left")
-        ttk.Label(sf, text="mm/s").pack(side="left", padx=2)
+        sw['speed_unit_label'] = ttk.Label(sf, text=self._unit_per_s(axis))
+        sw['speed_unit_label'].pack(side="left", padx=2)
         sw['delay_label'] = ttk.Label(sf, text="", width=16)
         sw['delay_label'].pack(side="left", padx=6)
         sw['speed_combo'].bind("<<ComboboxSelected>>", lambda e, a=axis: self._on_speed_select(a))
         self._update_speed_label(axis)
 
         cf = ttk.LabelFrame(parent, text="控制")
-        cf.grid(row=0, column=1, sticky="nsew", **pad)
+        cf.grid(row=1, column=1, sticky="nsew", **pad)
         sw['move_btn'] = ttk.Button(cf, text="执行运动",
                                     command=lambda a=axis: self.send_move(a), state="disabled")
         sw['move_btn'].grid(row=0, column=0, columnspan=2, padx=10, pady=10, ipadx=10, ipady=8)
-        sw['jog_out_btn'] = ttk.Button(cf, text="向上 1mm ▶",
+        sw['jog_out_btn'] = ttk.Button(cf, text="正向 1 ▶",
                                        command=lambda a=axis: self._quick_move(a, 1.0, DIR_OUTWARD),
                                        state="disabled")
         sw['jog_out_btn'].grid(row=1, column=0, **pad)
-        sw['jog_in_btn'] = ttk.Button(cf, text="◀ 向下 1mm",
+        sw['jog_in_btn'] = ttk.Button(cf, text="◀ 反向 1",
                                       command=lambda a=axis: self._quick_move(a, 1.0, DIR_INWARD),
                                       state="disabled")
         sw['jog_in_btn'].grid(row=1, column=1, **pad)
-        sw['cont_out_btn'] = ttk.Button(cf, text="向上 (按住) ▶▶", state="disabled")
+        sw['cont_out_btn'] = ttk.Button(cf, text="正向 (按住) ▶▶", state="disabled")
         sw['cont_out_btn'].grid(row=2, column=0, **pad)
         sw['cont_out_btn'].bind("<ButtonPress-1>",   lambda e, a=axis: self._press_continuous(a, DIR_OUTWARD))
         sw['cont_out_btn'].bind("<ButtonRelease-1>", lambda e, a=axis: self._release_continuous(a))
         sw['cont_out_btn'].bind("<Leave>",           lambda e, a=axis: self._release_continuous(a))
-        sw['cont_in_btn'] = ttk.Button(cf, text="◀◀ 向下 (按住)", state="disabled")
+        sw['cont_in_btn'] = ttk.Button(cf, text="◀◀ 反向 (按住)", state="disabled")
         sw['cont_in_btn'].grid(row=2, column=1, **pad)
         sw['cont_in_btn'].bind("<ButtonPress-1>",   lambda e, a=axis: self._press_continuous(a, DIR_INWARD))
         sw['cont_in_btn'].bind("<ButtonRelease-1>", lambda e, a=axis: self._release_continuous(a))
@@ -349,17 +414,18 @@ class StepperGUI:
         sw['progress_label'].grid(row=5, column=0, columnspan=2, sticky="w", padx=10)
 
         rf = ttk.LabelFrame(parent, text="位置与原点（软件跟踪）")
-        rf.grid(row=1, column=0, columnspan=2, sticky="ew", **pad)
+        rf.grid(row=2, column=0, columnspan=2, sticky="ew", **pad)
         ttk.Label(rf, text="当前位置:").grid(row=0, column=0, sticky="w", **pad)
-        sw['pos_label'] = ttk.Label(rf, text="0.0 mm", font=("Consolas", 14, "bold"), foreground="blue")
+        sw['pos_label'] = ttk.Label(rf, text=f"0.0 {unit}", font=("Consolas", 14, "bold"), foreground="blue")
         sw['pos_label'].grid(row=0, column=1, sticky="w", **pad)
-        sw['set_home_btn'] = ttk.Button(rf, text="⌂ 设为原点 (0 mm)",
+        sw['set_home_btn'] = ttk.Button(rf, text=f"⌂ 设为原点 (0 {unit})",
                                         command=lambda a=axis: self.set_home(a), state="disabled")
         sw['set_home_btn'].grid(row=0, column=2, **pad)
         sw['go_home_btn'] = ttk.Button(rf, text="⟲ 回到原点",
                                        command=lambda a=axis: self.go_home(a), state="disabled")
         sw['go_home_btn'].grid(row=0, column=3, **pad)
-        ttk.Label(rf, text="前往位置 (mm):").grid(row=1, column=0, sticky="w", **pad)
+        sw['goto_label'] = ttk.Label(rf, text=f"前往位置 ({unit}):")
+        sw['goto_label'].grid(row=1, column=0, sticky="w", **pad)
         ttk.Spinbox(rf, from_=-1000.0, to=1000.0, increment=1.0,
                     textvariable=self.v_goto[axis], width=10, format="%.1f").grid(row=1, column=1, **pad)
         sw['goto_btn'] = ttk.Button(rf, text="前往",
@@ -483,7 +549,7 @@ class StepperGUI:
 
         scf = ttk.LabelFrame(parent, text="响应曲线 (10s · 蓝=目标 红=实测)")
         scf.grid(row=0, column=1, rowspan=4, sticky="nsew", **pad)
-        fw['scope'] = tk.Canvas(scf, width=420, height=420, bg="white",
+        fw['scope'] = tk.Canvas(scf, width=420, height=280, bg="white",
                                 highlightthickness=1, highlightbackground="#999")
         fw['scope'].pack(padx=5, pady=5)
 
@@ -652,7 +718,7 @@ class StepperGUI:
         except ValueError:
             return
         if speed <= 0: return
-        self.v_delay[axis].set(_speed_to_delay_ms(speed, PULSES_PER_MM[axis]))
+        self.v_delay[axis].set(_speed_to_delay_ms(speed, self._pulses_per_unit(axis)))
         self._update_speed_label(axis)
 
     def _update_speed_label(self, axis):
@@ -670,9 +736,126 @@ class StepperGUI:
             self.sw[axis]['progress']['value'] = 0
             self.sw[axis]['progress_label'].config(text="")
 
+    # ═════════════ 步进：每轴配置（模式/减速比/导程）═════════════
+    def _pulses_per_unit(self, axis):
+        """当前模式下每单位（直线=mm, 旋转=度）对应的脉冲数。"""
+        ppr = max(1.0, self.axis_pulse_per_rev[axis])
+        gr = max(1e-6, self.axis_gear_ratio[axis])
+        if self.axis_mode[axis] == MODE_ROTARY:
+            return ppr * gr / 360.0
+        lead = max(1e-6, self.axis_lead_mm[axis])
+        return ppr * gr / lead
+
+    def _unit_label(self, axis):
+        return "°" if self.axis_mode[axis] == MODE_ROTARY else "mm"
+
+    def _unit_per_s(self, axis):
+        return "°/s" if self.axis_mode[axis] == MODE_ROTARY else "mm/s"
+
+    def _on_axis_mode_change(self, axis):
+        mode = self.axis_mode_var[axis].get()
+        if mode not in (MODE_LINEAR, MODE_ROTARY) or mode == self.axis_mode[axis]:
+            return
+        self.axis_mode[axis] = mode
+        # 模式切换后位置语义改变：重置位置与行程，标记需要重新校准。
+        with self.state_lock:
+            self.position_mm[axis] = 0.0
+            self.position_trusted[axis] = False
+            self.travel_min_mm[axis] = None
+            self.travel_max_mm[axis] = None
+        self._apply_axis_param_ui(axis)
+        self._refresh_axis_unit_labels(axis)
+        self._update_pos_label(axis)
+        self._update_range_display(axis)
+        self._on_axis_param_change(axis)
+        self._save_axis_config()
+        self.log(f"轴{AXIS_LABEL[axis]} 切换为 {'旋转(°)' if mode == MODE_ROTARY else '直线(mm)'}，位置已重置需重新校准")
+
+    def _on_axis_param_change(self, axis):
+        try:
+            self.axis_pulse_per_rev[axis] = max(1.0, float(self.axis_ppr_var[axis].get()))
+            self.axis_gear_ratio[axis] = max(1e-6, float(self.axis_gr_var[axis].get()))
+            self.axis_lead_mm[axis] = max(1e-6, float(self.axis_lead_var[axis].get()))
+        except (tk.TclError, ValueError):
+            return
+        try:
+            speed = float(self.v_speed_str[axis].get())
+        except ValueError:
+            speed = SPEED_DEFAULT
+        self.v_delay[axis].set(_speed_to_delay_ms(speed, self._pulses_per_unit(axis)))
+        self._update_speed_label(axis)
+        self._save_axis_config()
+
+    def _apply_axis_param_ui(self, axis):
+        state = "normal" if self.axis_mode[axis] == MODE_LINEAR else "disabled"
+        sw = self.sw[axis]
+        if 'lead_spin' in sw:
+            sw['lead_spin'].config(state=state)
+            sw['lead_label'].config(state=state)
+
+    def _refresh_axis_unit_labels(self, axis):
+        unit = self._unit_label(axis)
+        sw = self.sw[axis]
+        if 'dist_label' in sw: sw['dist_label'].config(text=f"距离 ({unit}):")
+        if 'speed_unit_label' in sw: sw['speed_unit_label'].config(text=self._unit_per_s(axis))
+        if 'goto_label' in sw: sw['goto_label'].config(text=f"前往位置 ({unit}):")
+        if 'set_home_btn' in sw: sw['set_home_btn'].config(text=f"⌂ 设为原点 (0 {unit})")
+
+    AXIS_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stepper_axis.json")
+
+    def _save_axis_config(self):
+        try:
+            data = {
+                "mode": list(self.axis_mode),
+                "pulse_per_rev": list(self.axis_pulse_per_rev),
+                "gear_ratio": list(self.axis_gear_ratio),
+                "lead_mm": list(self.axis_lead_mm),
+            }
+            with open(self.AXIS_CONFIG_FILE, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def _load_axis_config(self):
+        try:
+            with open(self.AXIS_CONFIG_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return
+        mode_list = data.get("mode", [])
+        ppr_list = data.get("pulse_per_rev", [])
+        gr_list = data.get("gear_ratio", [])
+        lead_list = data.get("lead_mm", [])
+        for axis in range(NUM_STEPPER_AXES):
+            if axis < len(mode_list) and mode_list[axis] in (MODE_LINEAR, MODE_ROTARY):
+                self.axis_mode[axis] = mode_list[axis]
+                self.axis_mode_var[axis].set(self.axis_mode[axis])
+            if axis < len(ppr_list):
+                try:
+                    v = max(1.0, float(ppr_list[axis]))
+                    self.axis_pulse_per_rev[axis] = v
+                    self.axis_ppr_var[axis].set(v)
+                except (ValueError, TypeError):
+                    pass
+            if axis < len(gr_list):
+                try:
+                    v = max(1e-6, float(gr_list[axis]))
+                    self.axis_gear_ratio[axis] = v
+                    self.axis_gr_var[axis].set(v)
+                except (ValueError, TypeError):
+                    pass
+            if axis < len(lead_list):
+                try:
+                    v = max(1e-6, float(lead_list[axis]))
+                    self.axis_lead_mm[axis] = v
+                    self.axis_lead_var[axis].set(v)
+                except (ValueError, TypeError):
+                    pass
+
     def _update_pos_label(self, axis):
         trusted = self.position_trusted[axis]
-        text = f"{self.position_mm[axis]:.1f} mm" if trusted else f"≈ {self.position_mm[axis]:.1f} mm（需校准）"
+        unit = self._unit_label(axis)
+        text = f"{self.position_mm[axis]:.1f} {unit}" if trusted else f"≈ {self.position_mm[axis]:.1f} {unit}（需校准）"
         self.sw[axis]['pos_label'].config(
             text=text, foreground="blue" if trusted else "#d84315")
 
@@ -948,10 +1131,10 @@ class StepperGUI:
             self._move_dispatching[axis] = True
         resp = self._send_and_read(
             f"MOVE,{axis},{steps},{actual_dir},{delay_us}", guard=guard)
-        dist_mm = steps / PULSES_PER_MM[axis]
-        dir_txt = "向上" if direction == DIR_OUTWARD else "向下"
-        mm_s = 1000.0 / (PULSES_PER_MM[axis] * max(0.001, delay_ms))
-        self.log(f"轴{AXIS_LABEL[axis]} {dist_mm:.1f}mm {dir_txt} @ {delay_ms:.2f}ms ({mm_s:.1f}mm/s) → {resp}")
+        dist_mm = steps / self._pulses_per_unit(axis)
+        dir_txt = "正向" if direction == DIR_OUTWARD else "反向"
+        mm_s = 1000.0 / (self._pulses_per_unit(axis) * max(0.001, delay_ms))
+        self.log(f"轴{AXIS_LABEL[axis]} {dist_mm:.1f}{self._unit_label(axis)} {dir_txt} @ {delay_ms:.2f}ms ({mm_s:.1f}{self._unit_per_s(axis)}) → {resp}")
         with self.state_lock:
             self._move_dispatching[axis] = False
             accepted = resp.startswith("ACK,")
@@ -970,12 +1153,12 @@ class StepperGUI:
         self.sw[axis]['progress_label'].config(text="运动中...")
 
     def _send_mm(self, axis, distance_mm, direction, delay_ms, guard=None):
-        steps = int(round(distance_mm * PULSES_PER_MM[axis]))
+        steps = int(round(distance_mm * self._pulses_per_unit(axis)))
         if steps <= 0:
             self.log(f"轴{AXIS_LABEL[axis]}: 忽略距离过小 ({distance_mm})")
             return False
         sign = +1.0 if direction == DIR_OUTWARD else -1.0
-        target = self.position_mm[axis] + sign * (steps / PULSES_PER_MM[axis])
+        target = self.position_mm[axis] + sign * (steps / self._pulses_per_unit(axis))
         if not self._check_range(axis, target): return False
         return self._send_pulses(axis, steps, direction, delay_ms, guard=guard)
 
@@ -1077,7 +1260,7 @@ class StepperGUI:
             self.position_trusted[axis] = True
         self._update_pos_label(axis)
         self._save_calib()
-        self.log(f"✓ 轴{AXIS_LABEL[axis]} 位置校准为 {val:.1f} mm")
+        self.log(f"✓ 轴{AXIS_LABEL[axis]} 位置校准为 {val:.1f} {self._unit_label(axis)}")
 
     def go_home(self, axis):
         self._goto(axis, 0.0)
@@ -1091,11 +1274,12 @@ class StepperGUI:
     def _goto(self, axis, target_mm):
         if not self._check_range(axis, target_mm): return
         delta = target_mm - self.position_mm[axis]
-        if abs(delta) < 1.0 / PULSES_PER_MM[axis]:
+        if abs(delta) < 1.0 / self._pulses_per_unit(axis):
             self.log(f"轴{AXIS_LABEL[axis]} 已在目标附近"); return
         direction = DIR_OUTWARD if delta > 0 else DIR_INWARD
         distance = abs(delta)
-        self.log(f"轴{AXIS_LABEL[axis]} 前往 {target_mm:.1f}mm (移动 {distance:.1f}mm)")
+        unit = self._unit_label(axis)
+        self.log(f"轴{AXIS_LABEL[axis]} 前往 {target_mm:.1f}{unit} (移动 {distance:.1f}{unit})")
         self._start_control_worker(
             self._send_mm, axis, distance, direction, self.v_delay[axis].get())
 
@@ -1107,7 +1291,7 @@ class StepperGUI:
             messagebox.showerror("范围无效", "最小不能 ≥ 最大"); return
         self.travel_min_mm[axis] = self.position_mm[axis]
         self._update_range_display(axis); self._save_calib()
-        self.log(f"⊖ 轴{AXIS_LABEL[axis]} 最小 = {self.travel_min_mm[axis]:.1f}mm")
+        self.log(f"⊖ 轴{AXIS_LABEL[axis]} 最小 = {self.travel_min_mm[axis]:.1f}{self._unit_label(axis)}")
 
     def _mark_max(self, axis):
         if not self.position_trusted[axis]:
@@ -1116,7 +1300,7 @@ class StepperGUI:
             messagebox.showerror("范围无效", "最大不能 ≤ 最小"); return
         self.travel_max_mm[axis] = self.position_mm[axis]
         self._update_range_display(axis); self._save_calib()
-        self.log(f"⊕ 轴{AXIS_LABEL[axis]} 最大 = {self.travel_max_mm[axis]:.1f}mm")
+        self.log(f"⊕ 轴{AXIS_LABEL[axis]} 最大 = {self.travel_max_mm[axis]:.1f}{self._unit_label(axis)}")
 
     def _clear_range(self, axis):
         self.travel_min_mm[axis] = None
@@ -1132,7 +1316,7 @@ class StepperGUI:
         else:
             mn_s = f"{mn:.1f}" if mn is not None else "?"
             mx_s = f"{mx:.1f}" if mx is not None else "?"
-            travel = f"  (行程 {mx-mn:.1f}mm)" if (mn is not None and mx is not None) else ""
+            travel = f"  (行程 {mx-mn:.1f}{self._unit_label(axis)})" if (mn is not None and mx is not None) else ""
             label.config(text=f"min={mn_s} max={mx_s}{travel}", foreground="black")
 
     def _check_range(self, axis, target_mm):
@@ -1141,9 +1325,9 @@ class StepperGUI:
             return False
         mn, mx = self.travel_min_mm[axis], self.travel_max_mm[axis]
         if mn is not None and target_mm < mn - 0.05:
-            self.log(f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_mm:.1f}<下限{mn:.1f}"); return False
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_mm:.1f}{self._unit_label(axis)}<下限{mn:.1f}"); return False
         if mx is not None and target_mm > mx + 0.05:
-            self.log(f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_mm:.1f}>上限{mx:.1f}"); return False
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_mm:.1f}{self._unit_label(axis)}>上限{mx:.1f}"); return False
         return True
 
     def _save_calib(self):
@@ -1533,7 +1717,7 @@ class StepperGUI:
         # 简单响应曲线（复用 foc_trace_buf）
         scf = ttk.LabelFrame(parent, text="响应曲线 (10s · 蓝=目标 红=实测)")
         scf.grid(row=0, column=1, rowspan=4, sticky="nsew", **pad)
-        gw['scope'] = tk.Canvas(scf, width=420, height=420, bg="white",
+        gw['scope'] = tk.Canvas(scf, width=420, height=280, bg="white",
                                 highlightthickness=1, highlightbackground="#999")
         gw['scope'].pack(padx=5, pady=5)
 
@@ -1961,7 +2145,7 @@ class StepperGUI:
             if mx is not None and target > mx + 0.05:
                 raise RuntimeError("目标超出软件上限")
             self._web_step_pending[axis] = True
-        delay_ms = _speed_to_delay_ms(speed_mm_s, PULSES_PER_MM[axis])
+        delay_ms = _speed_to_delay_ms(speed_mm_s, self._pulses_per_unit(axis))
 
         def worker():
             try:
