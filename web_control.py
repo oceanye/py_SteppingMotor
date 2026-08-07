@@ -69,6 +69,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         routes = {
             "/api/stepper/move": self._stepper_move,
             "/api/stepper/stop": self._stepper_stop,
+            "/api/stepper/config": self._stepper_config,
             "/api/motor": self._motor,
             "/api/track": self._track,
             "/api/estop": self._estop,
@@ -178,6 +179,23 @@ class _RequestHandler(BaseHTTPRequestHandler):
         axis = self._integer(body["axis"], "axis", 0, 5)
         self._invoke(self.server.owner.controller.web_stepper_stop, axis)
 
+    def _stepper_config(self, body: dict[str, Any]) -> None:
+        self._keys(body, {"axis"}, {"mode", "pulse_per_rev", "gear_ratio", "lead_mm"})
+        axis = self._integer(body["axis"], "axis", 0, 5)
+        kwargs: dict[str, Any] = {}
+        if "mode" in body:
+            m = body["mode"]
+            if m not in ("linear", "rotary"):
+                raise ValueError("mode 必须是 linear 或 rotary")
+            kwargs["mode"] = m
+        if "pulse_per_rev" in body:
+            kwargs["pulse_per_rev"] = self._number(body["pulse_per_rev"], "pulse_per_rev", 1.0, 10000.0)
+        if "gear_ratio" in body:
+            kwargs["gear_ratio"] = self._number(body["gear_ratio"], "gear_ratio", 0.001, 1000.0)
+        if "lead_mm" in body:
+            kwargs["lead_mm"] = self._number(body["lead_mm"], "lead_mm", 0.01, 100.0)
+        self._invoke(self.server.owner.controller.web_stepper_config, axis, **kwargs)
+
     def _motor(self, body: dict[str, Any]) -> None:
         self._keys(body, {"mode", "axis", "action"}, {"target_deg"})
         mode = body["mode"]
@@ -216,9 +234,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self._keys(body, set())
         self._invoke(self.server.owner.controller.web_emergency_stop)
 
-    def _invoke(self, method, *args: Any) -> None:
+    def _invoke(self, method, *args: Any, **kwargs: Any) -> None:
         try:
-            result = method(*args)
+            result = method(*args, **kwargs)
             if result is None:
                 result = {"ok": True}
             elif not isinstance(result, Mapping):

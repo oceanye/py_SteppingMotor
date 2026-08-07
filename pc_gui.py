@@ -2073,6 +2073,11 @@ class StepperGUI:
                     "continuous": self.running[axis],
                     "travel_min_mm": self.travel_min_mm[axis],
                     "travel_max_mm": self.travel_max_mm[axis],
+                    "mode": self.axis_mode[axis],
+                    "unit": "°" if self.axis_mode[axis] == MODE_ROTARY else "mm",
+                    "pulse_per_rev": self.axis_pulse_per_rev[axis],
+                    "gear_ratio": self.axis_gear_ratio[axis],
+                    "lead_mm": self.axis_lead_mm[axis],
                 }
                 for axis in range(NUM_STEPPER_AXES)
             ]
@@ -2089,7 +2094,7 @@ class StepperGUI:
             "connected": self._is_serial_connected(),
             "mode": mode,
             "steppers": [
-                (f"{item['position_mm']:.1f} mm"
+                (f"{item['position_mm']:.1f} {item['unit']}"
                  if item["position_trusted"] else "需重新校准")
                 + (" · 运行中" if item["in_progress"] else "")
                 for item in steppers
@@ -2176,6 +2181,32 @@ class StepperGUI:
         if not response:
             raise RuntimeError("步进停止命令未获固件确认")
         return {"ok": True, "confirmed": True, "axis": axis}
+
+    def web_stepper_config(self, axis, mode=None, pulse_per_rev=None, gear_ratio=None, lead_mm=None):
+        """网页切换步进轴模式或参数；在 UI 线程改 Tk 变量并触发持久化。"""
+        try:
+            axis = int(axis)
+        except (TypeError, ValueError):
+            raise ValueError("axis 必须是整数")
+        if not 0 <= axis < NUM_STEPPER_AXES:
+            raise ValueError("步进轴编号越界")
+        if mode is not None and mode not in (MODE_LINEAR, MODE_ROTARY):
+            raise ValueError("mode 必须是 linear 或 rotary")
+
+        def ui():
+            if mode is not None:
+                self.axis_mode_var[axis].set(mode)
+                self._on_axis_mode_change(axis)
+            if pulse_per_rev is not None:
+                self.axis_ppr_var[axis].set(float(pulse_per_rev))
+            if gear_ratio is not None:
+                self.axis_gr_var[axis].set(float(gear_ratio))
+            if lead_mm is not None:
+                self.axis_lead_var[axis].set(float(lead_mm))
+            if pulse_per_rev is not None or gear_ratio is not None or lead_mm is not None:
+                self._on_axis_param_change(axis)
+        self._post_ui(ui)
+        return {"ok": True, "axis": axis}
 
     def web_motor_command(self, mode, axis, action, target_deg=None):
         """控制两路闭环电机；签名与 WebControlServer 的 HTTP 路由一致。"""
