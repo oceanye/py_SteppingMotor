@@ -170,7 +170,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
   <li>六路 24V 支路分别有合适的保险或可复位保护，分配模块和线径满足总电流。</li>
   <li>每套 DM 的 PUL-、DIR- 与 PCB GND 连通；不要把 PUL-/DIR- 接到 24V+。</li>
   <li>A+/A-/B+/B- 只接对应步进电机绕组，先用万用表找出两组线圈。</li>
-  <li>EN+/EN- 当前 PCB 未引出；保持驱动器默认使能方式，不要把两端随意同时接地。</li>
+  <li><strong>ENA+ 悬空不接</strong>（每轴只需 PUL+ 和 DIR+ 两根信号到 ESP32）；DM422/DM442 默认使能驱动。不要把 EN+/EN- 随意同时接地。</li>
 </ul>
 
 <h2>4. 两路闭环 GEAR（DRV8871 + 编码器）</h2>
@@ -341,7 +341,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
 
 <table>
   <tr><th>现象</th><th>优先检查</th><th>处理</th></tr>
-  <tr><td>DM 有锁力但不转</td><td>PUL-/DIR- 未共地、PUL/DIR 轴号接错、拨码或脉宽</td><td>断电按 §3 逐线核对，不用 24V 测 GPIO</td></tr>
+  <tr><td>DM 有锁力但不转（运动时 24V 电流不增）</td><td>信号线接触不良、PUL-/DIR- 未共地、PUL/DIR 轴号接错、拨码或脉宽</td><td>断电按 §3 逐线核对；<strong>拔插 PUL+/DIR+ 信号线排除接触不良</strong>（R 轴曾因此误判驱动器损坏）；万用表测 GPIO 端有 3.3V 翻转即 ESP32 正常，病根在 DM 侧回路</td></tr>
   <tr><td>某两路 DM 同时异常</td><td>是否把 6 轴旧图当成双轴图接线</td><td>按 GPIO 5/6、7/15、1/2、4/8、9/10、38/39 重新核对</td></tr>
   <tr><td>DRV8871 / N20 发热</td><td>VM_MOTOR 电压过高、堵转、模块 pin 顺序错误</td><td>立刻切断 VM，按铭牌和实物模块资料检查</td></tr>
   <tr><td>GEAR 使能后 runaway</td><td>编码器 A/B 或电机方向反、编码器无计数</td><td>切断 VM 后检查 A/B；低输出重新验证闭环方向</td></tr>
@@ -355,7 +355,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
 </table>
 
 <hr>
-<p class="small">当前目标：<code>NUM_AXES=6</code>、<code>NUM_GEAR_AXES=2</code>、独立 TRACK D · 模块尺寸状态：<strong>MOCK，未完成实物机械核验</strong> · 更新日期：2026-08-04（补硬件急停 GPIO35）</p>
+<p class="small">当前目标：<code>NUM_AXES=6</code>、<code>NUM_GEAR_AXES=2</code>、独立 TRACK D · 模块尺寸状态：<strong>MOCK，未完成实物机械核验</strong> · 更新日期：2026-08-06（补 ENA 悬空、R 轴接触不良教训）</p>
 
 </body>
 </html>
