@@ -73,7 +73,7 @@ const uint16_t step_program_instructions[] = {
 const pio_program step_program = {
     step_program_instructions,
     sizeof(step_program_instructions) / sizeof(step_program_instructions[0]),
-    -1,
+    0,  // Branch targets above are absolute; reserve instructions 0..10.
 };
 
 uint32_t estimateExecuted(const AxisState &state, uint32_t now_us) {
@@ -138,6 +138,7 @@ void stopAxis(uint8_t axis, bool terminal_event) {
   pio_sm_set_enabled(step_pio, axis, false);
   pio_sm_clear_fifos(step_pio, axis);
   pio_sm_restart(step_pio, axis);
+  pio_sm_exec(step_pio, axis, pio_encode_jmp(step_program_offset));
   digitalWrite(kPulsePins[axis], LOW);
   state.moving = false;
   if (terminal_event) {
@@ -253,6 +254,7 @@ void handleLine(char *line) {
       pio_sm_set_enabled(step_pio, command.axis, false);
       pio_sm_clear_fifos(step_pio, command.axis);
       pio_sm_restart(step_pio, command.axis);
+      pio_sm_exec(step_pio, command.axis, pio_encode_jmp(step_program_offset));
       pio_interrupt_clear(step_pio, command.axis);
       state.moving = true;
       state.requested = command.steps;
