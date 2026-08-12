@@ -1052,6 +1052,10 @@ class StepperGUI:
                 self._post_ui(lambda: self.v_track_status.set("硬件急停触发，已停止"))
                 self._post_ui(lambda: self.log("⚠️ 硬件急停触发（HWESTOP,TRIGGERED）：固件已停止全部步进/轨道并失能闭环轴；释放急停按钮后可重新操作"))
                 continue
+            if line == "HWESTOP,CLEARED":
+                self._post_ui(lambda: self.v_track_status.set("硬件急停已释放"))
+                self._post_ui(lambda: self.log("硬件急停回路已恢复（HWESTOP,CLEARED）；请确认现场安全后再手动发起运动"))
+                continue
             if line.startswith("FOC,") and ",FAULT" in line:
                 parts = line.split(",")
                 if len(parts) >= 3 and parts[2] == "FAULT":

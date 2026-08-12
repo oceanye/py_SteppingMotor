@@ -4,6 +4,7 @@
 #include "foc_motor.h"
 #include "stepper.h"     // 两个构建都需要步进
 #if defined(DRIVE_MODE_GEAR)
+#include "hardware_estop.h"
 #include "track_motor.h"
 #include "stepper_encoders.h"
 #endif
@@ -40,6 +41,7 @@ void setup() {
   foc_init();
   Serial.println("Protocol: MOVE/STOP/ESTOP | FOC,<axis>,... | DIAG,<axis> | STDIAG,<axis> | MODE");
 #elif defined(DRIVE_MODE_GEAR)
+  hardware_estop_init();
   Serial.println("ESP32 Controller Ready (GEAR mode, stepper + DC gear motor)");
   Serial.println("  fw: accel-ramp + 6-axis stepper + PCNT-clear");
   Serial.print("NUM_AXES (stepper) = "); Serial.println(NUM_AXES);
@@ -67,9 +69,10 @@ void setup() {
   track_motor_init();
   stepper_encoders_init();
 #if HW_ESTOP_ENABLED
-  pinMode(PIN_HW_ESTOP, INPUT_PULLUP);
   Serial.print("  hw estop: GPIO"); Serial.print(PIN_HW_ESTOP);
-  Serial.println(HW_ESTOP_ACTIVE_LOW ? " active-low(NC button)" : " active-high");
+  Serial.println(HW_ESTOP_ACTIVE_HIGH ? " active-high(NC+pullup, open=fault)" : " active-low");
+#else
+  Serial.println("  hw estop: DISABLED (enable only after wiring NC loop)");
 #endif
 #if GEAR_NFAULT_ENABLED
   pinMode(PIN_GEAR_NFAULT_0, INPUT_PULLUP);
@@ -122,14 +125,18 @@ void loop() {
 #if HW_ESTOP_ENABLED
     {
       static bool s_hwestop_latched = false;
-      bool active = (digitalRead(PIN_HW_ESTOP) == LOW);
-      if (!HW_ESTOP_ACTIVE_LOW) active = !active;
-      if (active && !s_hwestop_latched) {
-        s_hwestop_latched = true;
+      const bool active = hardware_estop_is_active();
+      if (active) {
+        // Keep enforcing the stop while the NC loop is open.  The protocol
+        // also rejects all motion-starting commands during this interval.
         system_estop();
-        Serial.println("HWESTOP,TRIGGERED");
-      } else if (!active) {
+        if (!s_hwestop_latched) {
+          s_hwestop_latched = true;
+          Serial.println("HWESTOP,TRIGGERED");
+        }
+      } else if (s_hwestop_latched) {
         s_hwestop_latched = false;
+        Serial.println("HWESTOP,CLEARED");
       }
     }
 #endif

@@ -183,7 +183,7 @@ GEAR 专用：`GR`、`PI`、`PD`，其中 `V` 表示 PWM duty cap 百分比而�
 ### 中优先级
 
 - 继续解决右 GEAR 轴的稳态误差和两轴 PID 差异。
-- 硬件限位仍待（空闲 GPIO 仅 35/36/37，不够 6 轴 ×2 限位，需 PCF8575 扩展或继续用软件行程范围）；硬件急停框架已落位：GPIO35 active-low 常闭输入，ESTOP 命令与硬件急停共用 `system_estop()` 停止链，2026-08-04 编译+烧录+运行验证通过（按钮未接时不误触发）；GEAR DRV8871 nFAULT 检测条件编译预留（`GEAR_NFAULT_ENABLED` 默认 0，待确认模块是否引出 nFAULT）。
+- 硬件限位仍待（空闲 GPIO 仅 35/36/37，不够 6 轴 ×2 限位，需 PCF8575 扩展或继续用软件行程范围）。GPIO35 急停在 2026-08-12 离线审查时更正为失效安全的常闭 NC 逻辑：安全态接地为低，按下或断线后上拉为高并触发；未安装回路时默认构建不启用，已安装回路时使用 `esp32s3_gear_hwestop`。此更正只完成离线验证，仍需现场按钮/断线测试。GEAR DRV8871 nFAULT 检测条件编译预留（`GEAR_NFAULT_ENABLED` 默认 0，待确认模块是否引出 nFAULT）。
 - ~~安装可用的 `gcc/g++` 后恢复 `pio test -e native_test`。~~ 已完成（2026-08-04）：WinLibs MinGW-W64 gcc 16.1.0 + Unity 2.6.1，6 个协议边界测试全 PASSED。
 - PCB 当前使用模块 mock 尺寸；拿到 ESP32-S3 DevKit、DRV8871 模块和端子实测尺寸后
   替换封装 courtyard 并复核孔距；TCA9548A、PCF8575、AS5600 的模块尺寸、针序、
@@ -221,6 +221,7 @@ GEAR 专用：`GR`、`PI`、`PD`，其中 `V` 表示 PWM duty cap 百分比而�
 .\.venv\Scripts\python.exe -m py_compile pc_gui.py web_control.py pc_control.py esp32_main.py
 cd esp32_stepper
 .\.venv\Scripts\python.exe -m platformio run -e esp32s3_gear
+.\.venv\Scripts\python.exe -m platformio run -e esp32s3_gear_hwestop
 .\.venv\Scripts\python.exe -m platformio run -e esp32s3
 ```
 

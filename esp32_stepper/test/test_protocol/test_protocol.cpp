@@ -1,6 +1,7 @@
 // esp32_stepper/test/test_protocol/test_protocol.cpp
 #include <unity.h>
 #include "../../src/protocol_parse.h"
+#include "../../src/safety_input.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -62,6 +63,18 @@ void test_stop_and_track_field_counts(void) {
     TEST_ASSERT_EQUAL_INT(6, protocol_count_fields("TRACK,D,REV,50,1000,unexpected"));
 }
 
+void test_nc_pullup_estop_polarity(void) {
+    // NC contact closed: GPIO is grounded/low and the machine may operate.
+    TEST_ASSERT_FALSE(safety_input_is_active(false, true));
+    // Button pressed or cable broken: contact opens, pull-up makes GPIO high.
+    TEST_ASSERT_TRUE(safety_input_is_active(true, true));
+}
+
+void test_active_low_input_remains_supported(void) {
+    TEST_ASSERT_TRUE(safety_input_is_active(false, false));
+    TEST_ASSERT_FALSE(safety_input_is_active(true, false));
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     UNITY_BEGIN();
     RUN_TEST(test_integer_accepts_boundaries);
@@ -70,5 +83,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN_TEST(test_float_requires_finite_complete_value);
     RUN_TEST(test_track_duty_and_lease_boundaries);
     RUN_TEST(test_stop_and_track_field_counts);
+    RUN_TEST(test_nc_pullup_estop_polarity);
+    RUN_TEST(test_active_low_input_remains_supported);
     return UNITY_END();
 }

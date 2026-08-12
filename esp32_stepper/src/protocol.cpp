@@ -4,6 +4,7 @@
 #include "config.h"
 #include "stepper.h"
 #if defined(DRIVE_MODE_GEAR)
+#include "hardware_estop.h"
 #include "track_motor.h"
 #include "stepper_encoders.h"
 #endif
@@ -14,6 +15,16 @@ static constexpr int MAX_STEP_DELAY_US = 1000000;
 
 static void reply_ok_axis(int axis) { Serial.print("OK,"); Serial.println(axis); }
 static void reply_err(const char* why) { Serial.print("ERR:"); Serial.println(why); }
+
+static bool reject_if_hardware_estop_active() {
+#if defined(DRIVE_MODE_GEAR)
+  if (hardware_estop_is_active()) {
+    reply_err("hardware estop active");
+    return true;
+  }
+#endif
+  return false;
+}
 
 // Returns -1 when the line contains more fields than the caller can hold.
 static int split_tokens(const String& line, String tokens[], int capacity) {
@@ -37,6 +48,7 @@ static bool parse_axis(const String& token, int axis_count, int& axis) {
 
 static void handle_move(const String tok[], int n) {
   if (n != 5) { reply_err("bad format"); return; }
+  if (reject_if_hardware_estop_active()) return;
   int steps = 0, direction = 0, delay_us = 0;
   if (!protocol_parse_int(tok[2].c_str(), 1, MAX_MOVE_STEPS, steps) ||
       !protocol_parse_int(tok[3].c_str(), 0, 1, direction) ||
@@ -96,6 +108,7 @@ static void handle_estop(const String tok[], int n) {
 
 static void handle_stdiag(const String tok[], int n) {
   if (n != 2) { reply_err("bad format"); return; }
+  if (reject_if_hardware_estop_active()) return;
   int axis = 0;
   if (!parse_axis(tok[1], NUM_AXES, axis)) { reply_err("bad axis"); return; }
   if (stepper_is_busy(axis)) { reply_err("busy"); return; }
@@ -132,11 +145,13 @@ static void dispatch_foc_single(int axis, const String& sub,
   if (sub == "EN" && has_arg) {
     int value = 0;
     if (!protocol_parse_int(arg.c_str(), 0, 1, value)) { reply_err("bad value"); return; }
+    if (value == 1 && reject_if_hardware_estop_active()) return;
     if (foc_request_enable(axis, value == 1)) reply_ok_axis(axis);
     else reply_err("fault latched");
     return;
   }
   if (sub == "A" && has_arg) {
+    if (reject_if_hardware_estop_active()) return;
     float value = 0.0f;
 #if defined(DRIVE_MODE_FOC)
     constexpr float limit = FOC_MAX_ANGLE_ABS;
@@ -147,7 +162,10 @@ static void dispatch_foc_single(int axis, const String& sub,
     if (foc_set_target_deg(axis, value)) reply_ok_axis(axis); else reply_err("out of range");
     return;
   }
-  if (sub == "H" && !has_arg) { foc_home(axis); reply_ok_axis(axis); return; }
+  if (sub == "H" && !has_arg) {
+    if (reject_if_hardware_estop_active()) return;
+    foc_home(axis); reply_ok_axis(axis); return;
+  }
   if (sub == "CLR" && !has_arg) {
     if (foc_clear_fault(axis)) reply_ok_axis(axis); else reply_err("no fault");
     return;
@@ -277,6 +295,7 @@ static void handle_track(const String tok[], int n) {
     return;
   }
   if ((tok[2] == "FWD" || tok[2] == "REV") && (n == 4 || n == 5)) {
+    if (reject_if_hardware_estop_active()) return;
     int duty = 0, lease = TRACK_DEFAULT_LEASE_MS;
     if (!protocol_parse_int(tok[3].c_str(), 1, 100, duty) ||
         (n == 5 && !protocol_parse_int(tok[4].c_str(), TRACK_MIN_LEASE_MS,
