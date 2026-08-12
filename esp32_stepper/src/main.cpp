@@ -7,6 +7,7 @@
 #include "hardware_estop.h"
 #include "track_motor.h"
 #include "stepper_encoders.h"
+#include "remote_stepper.h"
 #endif
 #if defined(DRIVE_MODE_FOC)
   static const int PIN_NFAULT[NUM_AXES] = { PIN_FOC_NFAULT_0, PIN_FOC_NFAULT_1 };
@@ -68,6 +69,7 @@ void setup() {
   foc_init();   // GEAR 构建里这个符号由 gear_motor.cpp 提供
   track_motor_init();
   stepper_encoders_init();
+  remote_stepper_init();
 #if HW_ESTOP_ENABLED
   Serial.print("  hw estop: GPIO"); Serial.print(PIN_HW_ESTOP);
   Serial.println(HW_ESTOP_ACTIVE_HIGH ? " active-high(NC+pullup, open=fault)" : " active-low");
@@ -88,6 +90,15 @@ void setup() {
   Serial.println(PIN_STEPPER_ENCODER_I2C_SCL);
 #else
   Serial.println("  optional step encoders: DISABLED/reserved (set diagnostics flag after hardware install)");
+#endif
+#if REMOTE_STEPPER_ENABLED
+  Serial.print("  RS485 Pico nodes: ENABLED, global axes 6..");
+  Serial.print(REMOTE_STEPPER_TOTAL_AXES - 1); Serial.print(" RX/TX/DE=");
+  Serial.print(PIN_REMOTE_STEPPER_RX); Serial.print('/');
+  Serial.print(PIN_REMOTE_STEPPER_TX); Serial.print('/');
+  Serial.println(PIN_REMOTE_STEPPER_DE);
+#else
+  Serial.println("  RS485 Pico nodes: DISABLED (select a *_remote environment)");
 #endif
   Serial.println("Protocol: MOVE/STOP/ESTOP | FOC | TRACK | ENC,<axis>,S | DIAG | STDIAG | MODE");
 #endif
@@ -118,6 +129,7 @@ void loop() {
     }
   }
 #elif defined(DRIVE_MODE_GEAR)
+  remote_stepper_tick();
   static uint32_t s_last_gear_safety_check = 0;
   uint32_t now = millis();
   if (now - s_last_gear_safety_check >= FAULT_POLL_MS) {

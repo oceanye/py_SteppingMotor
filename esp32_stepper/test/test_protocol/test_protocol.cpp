@@ -2,6 +2,7 @@
 #include <unity.h>
 #include "../../src/protocol_parse.h"
 #include "../../src/safety_input.h"
+#include "../../src/remote_stepper_map.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -75,6 +76,22 @@ void test_active_low_input_remains_supported(void) {
     TEST_ASSERT_FALSE(safety_input_is_active(true, false));
 }
 
+void test_remote_axis_mapping_boundaries(void) {
+    int node = 0, local = 0, global = 0;
+    TEST_ASSERT_TRUE(remote_stepper_global_to_node(6, 6, 6, 4, node, local));
+    TEST_ASSERT_EQUAL_INT(1, node);
+    TEST_ASSERT_EQUAL_INT(0, local);
+    TEST_ASSERT_TRUE(remote_stepper_global_to_node(29, 6, 6, 4, node, local));
+    TEST_ASSERT_EQUAL_INT(6, node);
+    TEST_ASSERT_EQUAL_INT(3, local);
+    TEST_ASSERT_FALSE(remote_stepper_global_to_node(5, 6, 6, 4, node, local));
+    TEST_ASSERT_FALSE(remote_stepper_global_to_node(30, 6, 6, 4, node, local));
+    TEST_ASSERT_TRUE(remote_stepper_node_to_global(4, 2, 6, 6, 4, global));
+    TEST_ASSERT_EQUAL_INT(20, global);
+    TEST_ASSERT_FALSE(remote_stepper_node_to_global(0, 0, 6, 6, 4, global));
+    TEST_ASSERT_FALSE(remote_stepper_node_to_global(1, 4, 6, 6, 4, global));
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     UNITY_BEGIN();
     RUN_TEST(test_integer_accepts_boundaries);
@@ -85,5 +102,6 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN_TEST(test_stop_and_track_field_counts);
     RUN_TEST(test_nc_pullup_estop_polarity);
     RUN_TEST(test_active_low_input_remains_supported);
+    RUN_TEST(test_remote_axis_mapping_boundaries);
     return UNITY_END();
 }

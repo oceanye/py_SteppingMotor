@@ -150,6 +150,29 @@
   #error "Closed-loop DM442 control is not implemented; keep PUL/DIR open-loop"
 #endif
 
+// Optional RS485 master for six Raspberry Pi Pico (RP2040) stepper nodes.
+// Local axes remain 0..5; nodes 1..6 add global axes 6..29 (four per node).
+// GPIO42/47 are shared with the optional diagnostic I2C bus above, so the two
+// features are intentionally compile-time exclusive.
+#ifndef REMOTE_STEPPER_ENABLED
+  #define REMOTE_STEPPER_ENABLED              0
+#endif
+#define REMOTE_STEPPER_NODE_COUNT              6
+#define REMOTE_STEPPER_AXES_PER_NODE            4
+#define REMOTE_STEPPER_FIRST_AXIS               NUM_AXES
+#define REMOTE_STEPPER_TOTAL_AXES              (NUM_AXES + REMOTE_STEPPER_NODE_COUNT * REMOTE_STEPPER_AXES_PER_NODE)
+#define PIN_REMOTE_STEPPER_RX                   42
+#define PIN_REMOTE_STEPPER_TX                   47
+#define PIN_REMOTE_STEPPER_DE                   48
+#define REMOTE_STEPPER_BAUD                 115200
+#define REMOTE_STEPPER_HEARTBEAT_MS            250
+#define REMOTE_STEPPER_NODE_TIMEOUT_MS        1000
+#define REMOTE_STEPPER_RESPONSE_TIMEOUT_MS      35
+#define REMOTE_STEPPER_POLL_INTERVAL_MS          8
+#if REMOTE_STEPPER_ENABLED && STEPPER_ENCODER_DIAGNOSTICS_ENABLED
+  #error "RS485 remote steppers and GPIO42/47 diagnostic I2C cannot be enabled together"
+#endif
+
 // ── 可选硬件急停输入（常闭 NC 接点：GPIO35 ↔ GND + 内部上拉）──
 // NC 接点在安全态导通，因此安全态=低；按下或断线后由内部上拉变高=触发。
 // 未安装 NC 回路时必须保持 0，否则悬空/未接线会按失效安全原则触发急停。

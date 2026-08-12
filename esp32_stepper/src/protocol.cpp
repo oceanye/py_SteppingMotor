@@ -7,6 +7,7 @@
 #include "hardware_estop.h"
 #include "track_motor.h"
 #include "stepper_encoders.h"
+#include "remote_stepper.h"
 #endif
 
 static constexpr int MAX_TOKENS = 6;
@@ -46,6 +47,14 @@ static bool parse_axis(const String& token, int axis_count, int& axis) {
   return protocol_parse_int(token.c_str(), 0, axis_count - 1, axis);
 }
 
+static constexpr int stepper_axis_count() {
+#if defined(DRIVE_MODE_GEAR) && REMOTE_STEPPER_ENABLED
+  return REMOTE_STEPPER_TOTAL_AXES;
+#else
+  return NUM_AXES;
+#endif
+}
+
 static void handle_move(const String tok[], int n) {
   if (n != 5) { reply_err("bad format"); return; }
   if (reject_if_hardware_estop_active()) return;
@@ -64,10 +73,32 @@ static void handle_move(const String tok[], int n) {
         Serial.print("ERR:busy "); Serial.println(axis);
       }
     }
+#if defined(DRIVE_MODE_GEAR) && REMOTE_STEPPER_ENABLED
+    for (int axis = NUM_AXES; axis < REMOTE_STEPPER_TOTAL_AXES; ++axis) {
+      if (remote_stepper_move(axis, steps, direction, delay_us)) {
+        Serial.print("ACK,"); Serial.println(axis);
+      } else {
+        Serial.print("ERR:"); Serial.print(remote_stepper_last_error());
+        Serial.print(' '); Serial.println(axis);
+      }
+    }
+#endif
     return;
   }
   int axis = 0;
-  if (!parse_axis(tok[1], NUM_AXES, axis)) { reply_err("bad axis"); return; }
+  if (!parse_axis(tok[1], stepper_axis_count(), axis)) { reply_err("bad axis"); return; }
+#if defined(DRIVE_MODE_GEAR) && REMOTE_STEPPER_ENABLED
+  if (axis >= NUM_AXES) {
+    // RP2040 nodes guarantee pulse timing only at/above 100 us. Keep the
+    // existing 1 us lower bound for the six directly wired ESP32 axes.
+    if (delay_us < 100) { reply_err("remote delay below 100us"); return; }
+    if (!remote_stepper_move(axis, steps, direction, delay_us)) {
+      reply_err(remote_stepper_last_error()); return;
+    }
+    Serial.print("ACK,"); Serial.println(axis);
+    return;
+  }
+#endif
   if (!stepper_move_async(axis, steps, direction, delay_us)) {
     reply_err("busy"); return;
   }
@@ -81,10 +112,22 @@ static void handle_stop(const String tok[], int n) {
       stepper_abort(axis);
       reply_ok_axis(axis);
     }
+#if defined(DRIVE_MODE_GEAR) && REMOTE_STEPPER_ENABLED
+    remote_stepper_stop_all();
+    for (int axis = NUM_AXES; axis < REMOTE_STEPPER_TOTAL_AXES; ++axis)
+      reply_ok_axis(axis);
+#endif
     return;
   }
   int axis = 0;
-  if (!parse_axis(tok[1], NUM_AXES, axis)) { reply_err("bad axis"); return; }
+  if (!parse_axis(tok[1], stepper_axis_count(), axis)) { reply_err("bad axis"); return; }
+#if defined(DRIVE_MODE_GEAR) && REMOTE_STEPPER_ENABLED
+  if (axis >= NUM_AXES) {
+    if (!remote_stepper_stop(axis)) { reply_err(remote_stepper_last_error()); return; }
+    reply_ok_axis(axis);
+    return;
+  }
+#endif
   stepper_abort(axis);  // STOP is idempotent; a valid idle axis is still OK.
   reply_ok_axis(axis);
 }
@@ -92,6 +135,9 @@ static void handle_stop(const String tok[], int n) {
 void system_estop() {
   for (int axis = 0; axis < NUM_AXES; ++axis) stepper_abort(axis);
 #if defined(DRIVE_MODE_GEAR)
+  #if REMOTE_STEPPER_ENABLED
+  remote_stepper_estop();
+  #endif
   track_motor_stop();
   constexpr int motor_axes = NUM_GEAR_AXES;
 #else
@@ -110,7 +156,15 @@ static void handle_stdiag(const String tok[], int n) {
   if (n != 2) { reply_err("bad format"); return; }
   if (reject_if_hardware_estop_active()) return;
   int axis = 0;
-  if (!parse_axis(tok[1], NUM_AXES, axis)) { reply_err("bad axis"); return; }
+  if (!parse_axis(tok[1], stepper_axis_count(), axis)) { reply_err("bad axis"); return; }
+#if defined(DRIVE_MODE_GEAR) && REMOTE_STEPPER_ENABLED
+  if (axis >= NUM_AXES) {
+    if (remote_stepper_is_busy(axis)) { reply_err("busy"); return; }
+    if (!remote_stepper_run_diagnostics(axis)) reply_err(remote_stepper_last_error());
+    else { Serial.print("ACK,"); Serial.println(axis); }
+    return;
+  }
+#endif
   if (stepper_is_busy(axis)) { reply_err("busy"); return; }
   stepper_run_diagnostics(axis);
 }
@@ -311,6 +365,22 @@ static void handle_track(const String tok[], int n) {
   }
   reply_err("bad format");
 }
+
+static void handle_node(const String tok[], int n) {
+#if REMOTE_STEPPER_ENABLED
+  if (n != 3 || tok[2] != "S") { reply_err("bad format"); return; }
+  if (tok[1] == "*") { remote_stepper_print_status(0); return; }
+  int node = 0;
+  if (!protocol_parse_int(tok[1].c_str(), 1,
+                          REMOTE_STEPPER_NODE_COUNT, node)) {
+    reply_err("bad node"); return;
+  }
+  remote_stepper_print_status(node);
+#else
+  (void)tok; (void)n;
+  reply_err("remote steppers disabled");
+#endif
+}
 #endif
 
 void protocol_handle_line(const String& command) {
@@ -339,6 +409,7 @@ void protocol_handle_line(const String& command) {
 #if defined(DRIVE_MODE_GEAR)
   else if (tok[0] == "TRACK") handle_track(tok, n);
   else if (tok[0] == "ENC") handle_encoder(tok, n);
+  else if (tok[0] == "NODE") handle_node(tok, n);
 #endif
   else reply_err("unknown command");
 }
