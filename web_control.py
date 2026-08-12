@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 MAX_REQUEST_BODY = 16 * 1024
 MAX_REQUEST_TARGET = 2 * 1024
+MAX_STEPPER_AXIS = 29
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 INDEX_FILE = WEB_ROOT / "index.html"
 
@@ -160,7 +161,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _stepper_move(self, body: dict[str, Any]) -> None:
         self._keys(body, {"axis", "direction", "distance_mm", "speed_mm_s"})
-        axis = self._integer(body["axis"], "axis", 0, 5)
+        axis = self._integer(body["axis"], "axis", 0, MAX_STEPPER_AXIS)
         direction = body["direction"]
         if direction not in ("forward", "reverse"):
             raise ValueError("direction 必须是 forward 或 reverse")
@@ -176,12 +177,12 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _stepper_stop(self, body: dict[str, Any]) -> None:
         self._keys(body, {"axis"})
-        axis = self._integer(body["axis"], "axis", 0, 5)
+        axis = self._integer(body["axis"], "axis", 0, MAX_STEPPER_AXIS)
         self._invoke(self.server.owner.controller.web_stepper_stop, axis)
 
     def _stepper_config(self, body: dict[str, Any]) -> None:
         self._keys(body, {"axis"}, {"mode", "pulse_per_rev", "gear_ratio", "lead_mm"})
-        axis = self._integer(body["axis"], "axis", 0, 5)
+        axis = self._integer(body["axis"], "axis", 0, MAX_STEPPER_AXIS)
         kwargs: dict[str, Any] = {}
         if "mode" in body:
             m = body["mode"]

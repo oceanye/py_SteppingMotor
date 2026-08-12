@@ -13,11 +13,46 @@ import webbrowser
 # ============== 轴配置 ==============
 # 步进轴和闭环电机是两套独立的轴集合。兼容常量仅供旧配置使用，
 # 新代码必须明确选择 NUM_STEPPER_AXES 或 NUM_MOTOR_AXES。
-NUM_STEPPER_AXES = 6
+NUM_LOCAL_STEPPER_AXES = 6
+NUM_PICO_NODES = 6
+PICO_AXES_PER_NODE = 4
+NUM_STEPPER_AXES = NUM_LOCAL_STEPPER_AXES + NUM_PICO_NODES * PICO_AXES_PER_NODE
 NUM_MOTOR_AXES = 2
 NUM_AXES = NUM_STEPPER_AXES       # 向后兼容
 NUM_GEAR_AXES = NUM_MOTOR_AXES    # 向后兼容
-AXIS_LABEL = ["L", "R", "A", "B", "C", "D"]
+LOCAL_AXIS_LABELS = ["L", "R", "A", "B", "C", "D"]
+AXIS_LABEL = LOCAL_AXIS_LABELS + [
+    f"P{node}-{local_axis}"
+    for node in range(1, NUM_PICO_NODES + 1)
+    for local_axis in range(1, PICO_AXES_PER_NODE + 1)
+]
+
+
+def stepper_axis_topology(axis):
+    """Return the fixed ESP32/Pico routing metadata for a global stepper axis."""
+    if not 0 <= axis < NUM_STEPPER_AXES:
+        raise ValueError("stepper axis out of range")
+    if axis < NUM_LOCAL_STEPPER_AXES:
+        pul, direction = STEPPER_PINS[axis]
+        return {
+            "axis": axis,
+            "label": AXIS_LABEL[axis],
+            "controller": "esp32",
+            "node": None,
+            "local_axis": axis,
+            "pins": {"pulse": pul, "direction": direction},
+        }
+    offset = axis - NUM_LOCAL_STEPPER_AXES
+    node = offset // PICO_AXES_PER_NODE + 1
+    local_axis = offset % PICO_AXES_PER_NODE
+    return {
+        "axis": axis,
+        "label": AXIS_LABEL[axis],
+        "controller": "pico",
+        "node": node,
+        "local_axis": local_axis,
+        "pins": None,
+    }
 
 # ============== 步进标定 ==============
 # ESP32-S3 PUL/DIR 引脚（与 esp32_stepper/src/config.h DRIVE_MODE_GEAR 一致），仅用于界面显示。
@@ -76,7 +111,7 @@ def _empty_axis_dict():
 class StepperGUI:
     def __init__(self, root, web_server_factory=None):
         self.root = root
-        self.root.title("六轴步进 + FOC/GEAR + 轨道 D 控制器")
+        self.root.title("30轴步进（ESP32 + Pico）+ FOC/GEAR + 轨道 D 控制器")
         self.root.resizable(True, True)
 
         # ── 共享：串口 ──
@@ -250,18 +285,34 @@ class StepperGUI:
             foreground="#555",
         ).grid(row=4, column=0, columnspan=9, sticky="w", padx=8, pady=(1, 5))
 
-        # Notebook: 步进 ×6 + FOC ×2 + GEAR ×2 + 轨道 D。
+        # 顶层只保留一个步进页；30 轴在页内按 ESP32/Pico 节点分组，避免标签栏失控。
         # FOC/GEAR 互斥：连接后根据固件 MODE 灰掉另一组。
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
         self.tab_index_step = [None] * NUM_STEPPER_AXES
         self.tab_index_foc  = [None] * NUM_MOTOR_AXES
         self.tab_index_gear = [None] * NUM_MOTOR_AXES
-        for axis in range(NUM_STEPPER_AXES):
-            tab = ttk.Frame(self.notebook)
-            self.tab_index_step[axis] = self.notebook.index("end")
-            self.notebook.add(tab, text=f"🔩 步进 {AXIS_LABEL[axis]}")
-            self._build_stepper_tab(tab, axis)
+        stepper_tab = ttk.Frame(self.notebook)
+        stepper_index = self.notebook.index("end")
+        self.notebook.add(stepper_tab, text="🔩 步进轴 (30)")
+        self.tab_index_step = [stepper_index] * NUM_STEPPER_AXES
+        group_book = ttk.Notebook(stepper_tab)
+        group_book.pack(fill="both", expand=True, padx=5, pady=5)
+        groups = [("ESP32 本地", list(range(NUM_LOCAL_STEPPER_AXES)))]
+        for node in range(1, NUM_PICO_NODES + 1):
+            start = NUM_LOCAL_STEPPER_AXES + (node - 1) * PICO_AXES_PER_NODE
+            groups.append((f"Pico {node}", list(range(start, start + PICO_AXES_PER_NODE))))
+        self.stepper_axis_tabs = [None] * NUM_STEPPER_AXES
+        for group_label, axes in groups:
+            group = ttk.Frame(group_book)
+            group_book.add(group, text=group_label)
+            axis_book = ttk.Notebook(group)
+            axis_book.pack(fill="both", expand=True)
+            for axis in axes:
+                tab = ttk.Frame(axis_book)
+                axis_book.add(tab, text=f"轴 {AXIS_LABEL[axis]}")
+                self.stepper_axis_tabs[axis] = tab
+                self._build_stepper_tab(tab, axis)
         for axis in range(NUM_MOTOR_AXES):
             tab = ttk.Frame(self.notebook)
             self.tab_index_foc[axis] = self.notebook.index("end")
@@ -328,8 +379,14 @@ class StepperGUI:
         # 轴配置：GPIO 引脚 + 控制模式 + 电机参数（脉冲每转/减速比/导程）。
         axf = ttk.LabelFrame(parent, text=f"轴配置 — 轴 {AXIS_LABEL[axis]}")
         axf.grid(row=0, column=0, columnspan=2, sticky="ew", **pad)
-        pul, dr = STEPPER_PINS[axis] if axis < len(STEPPER_PINS) else ("?", "?")
-        ttk.Label(axf, text=f"引脚:  PUL=GPIO{pul}   DIR=GPIO{dr}",
+        topology = stepper_axis_topology(axis)
+        if topology["controller"] == "esp32":
+            pins = topology["pins"]
+            route_text = f"ESP32 本地 · PUL=GPIO{pins['pulse']}   DIR=GPIO{pins['direction']}"
+        else:
+            route_text = (f"RS485 → Pico {topology['node']} · "
+                          f"本地轴 {topology['local_axis'] + 1}")
+        ttk.Label(axf, text=route_text,
                   font=("Consolas", 10, "bold"), foreground="#1565c0").grid(
             row=0, column=0, columnspan=6, sticky="w", **pad)
         ttk.Label(axf, text="模式:").grid(row=1, column=0, sticky="w", **pad)
@@ -2064,6 +2121,7 @@ class StepperGUI:
 
     def web_get_status(self):
         """返回只含 JSON 基础类型的线程安全快照，不读取任何 Tk 变量。"""
+        topology_axes = [stepper_axis_topology(axis) for axis in range(NUM_STEPPER_AXES)]
         with self.state_lock:
             steppers = [
                 {
@@ -2082,6 +2140,10 @@ class StepperGUI:
                     "pulse_per_rev": self.axis_pulse_per_rev[axis],
                     "gear_ratio": self.axis_gear_ratio[axis],
                     "lead_mm": self.axis_lead_mm[axis],
+                    "controller": topology_axes[axis]["controller"],
+                    "node": topology_axes[axis]["node"],
+                    "local_axis": topology_axes[axis]["local_axis"],
+                    "pins": topology_axes[axis]["pins"],
                 }
                 for axis in range(NUM_STEPPER_AXES)
             ]
@@ -2112,6 +2174,13 @@ class StepperGUI:
             "stepper_axes": steppers,
             "motor_axes": motors,
             "track_detail": track,
+            "topology": {
+                "total_axes": NUM_STEPPER_AXES,
+                "local_axes": NUM_LOCAL_STEPPER_AXES,
+                "pico_nodes": NUM_PICO_NODES,
+                "axes_per_pico": PICO_AXES_PER_NODE,
+                "axes": topology_axes,
+            },
         }
 
     @staticmethod
