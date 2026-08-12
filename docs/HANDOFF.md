@@ -6,6 +6,11 @@
 > `.venv`（pyserial 3.5）与 PlatformIO Core 6.1.19 已就绪，`py_compile` 与 `esp32s3_gear`
 > / `esp32s3` / `esp32s3_minimal` 三套固件均已编译通过；详见 `docs/PROJECT_MEMORY.md`
 > 第 7 节。下文 2026-08-03 正文作为历史交接基线保留。
+>
+> 2026-08-12 更新：已按“新增 24 路步进轴”实现普通 Pico（RP2040）RS485 扩展、
+> ESP32 主站桥接以及 30 轴桌面/网页 UI。该路径与既有“24 路 GEAR 电机”提案不是
+> 同一需求，详细拓扑、构建环境和远端验收项见
+> `docs/HANDOFF_2026-08-12_RP2040_STEPPERS.md`。
 
 本文是后续迁移到开发机、真实控制柜和实物机构时的执行基线。当前这台电脑不是开发/硬件环境，本轮只完成代码、接口、PCB 模块占位和文档落位；**没有宣称编译、烧录、KiCad DRC 或电机实测通过**。
 
@@ -239,3 +244,4 @@ PCB 的固定实现路线是“完整成品模块载板”：默认用排针/排
 4. `pcb/README.md`：模块载板、电源边界与打样前检查
 5. `docs/wiring_check.html`：现场接线核对页
 6. `docs/PROJECT_MEMORY.md`：历史决策与调试背景
+7. `docs/HANDOFF_2026-08-12_RP2040_STEPPERS.md`：24 路 RP2040 步进扩展与远端验收

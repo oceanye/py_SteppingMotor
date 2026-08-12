@@ -161,8 +161,8 @@
 #define REMOTE_STEPPER_AXES_PER_NODE            4
 #define REMOTE_STEPPER_FIRST_AXIS               NUM_AXES
 #define REMOTE_STEPPER_TOTAL_AXES              (NUM_AXES + REMOTE_STEPPER_NODE_COUNT * REMOTE_STEPPER_AXES_PER_NODE)
-#define PIN_REMOTE_STEPPER_RX                   42
-#define PIN_REMOTE_STEPPER_TX                   47
+#define PIN_REMOTE_STEPPER_RX                   47
+#define PIN_REMOTE_STEPPER_TX                   42
 #define PIN_REMOTE_STEPPER_DE                   48
 #define REMOTE_STEPPER_BAUD                 115200
 #define REMOTE_STEPPER_HEARTBEAT_MS            250
