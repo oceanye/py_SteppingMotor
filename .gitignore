@@ -9,3 +9,7 @@ __pycache__/
 .gear_tune.json
 logs/
 build_upload*.log
+
+# KiCad 本地文件（界面状态/历史缓存，不入库）
+*.kicad_prl
+pcb/.history/
