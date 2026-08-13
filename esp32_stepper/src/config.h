@@ -150,13 +150,37 @@
   #error "Closed-loop DM442 control is not implemented; keep PUL/DIR open-loop"
 #endif
 
-// ── 可选硬件急停输入（active-low 常闭按钮接 GND + 内部上拉）──
-// HW_ESTOP_ENABLED=1 时固件在 setup() 把 GPIO35 配成 INPUT_PULLUP，loop() 每
-// FAULT_POLL_MS 轮询：按钮未按时内部上拉=高=安全；按下或断线拉低=立即 system_estop()。
-// 当前为预留框架，物理按钮接好后无需改固件即可工作。
-#define HW_ESTOP_ENABLED        1
+// Optional RS485 master for six Raspberry Pi Pico (RP2040) stepper nodes.
+// Local axes remain 0..5; nodes 1..6 add global axes 6..29 (four per node).
+// GPIO42/47 are shared with the optional diagnostic I2C bus above, so the two
+// features are intentionally compile-time exclusive.
+#ifndef REMOTE_STEPPER_ENABLED
+  #define REMOTE_STEPPER_ENABLED              0
+#endif
+#define REMOTE_STEPPER_NODE_COUNT              6
+#define REMOTE_STEPPER_AXES_PER_NODE            4
+#define REMOTE_STEPPER_FIRST_AXIS               NUM_AXES
+#define REMOTE_STEPPER_TOTAL_AXES              (NUM_AXES + REMOTE_STEPPER_NODE_COUNT * REMOTE_STEPPER_AXES_PER_NODE)
+#define PIN_REMOTE_STEPPER_RX                   47
+#define PIN_REMOTE_STEPPER_TX                   42
+#define PIN_REMOTE_STEPPER_DE                   48
+#define REMOTE_STEPPER_BAUD                 115200
+#define REMOTE_STEPPER_HEARTBEAT_MS            250
+#define REMOTE_STEPPER_NODE_TIMEOUT_MS        1000
+#define REMOTE_STEPPER_RESPONSE_TIMEOUT_MS      35
+#define REMOTE_STEPPER_POLL_INTERVAL_MS          8
+#if REMOTE_STEPPER_ENABLED && STEPPER_ENCODER_DIAGNOSTICS_ENABLED
+  #error "RS485 remote steppers and GPIO42/47 diagnostic I2C cannot be enabled together"
+#endif
+
+// ── 可选硬件急停输入（常闭 NC 接点：GPIO35 ↔ GND + 内部上拉）──
+// NC 接点在安全态导通，因此安全态=低；按下或断线后由内部上拉变高=触发。
+// 未安装 NC 回路时必须保持 0，否则悬空/未接线会按失效安全原则触发急停。
+#ifndef HW_ESTOP_ENABLED
+  #define HW_ESTOP_ENABLED      0
+#endif
 #define PIN_HW_ESTOP            35
-#define HW_ESTOP_ACTIVE_LOW     1   // 1=低电平有效（常闭按钮/断线触发，工业安全标准）
+#define HW_ESTOP_ACTIVE_HIGH    1   // NC+PULLUP：1=高电平有效（按下或断线）
 // ── 可选 GEAR DRV8871 nFAULT 故障输入（active-low 开漏）──
 // DRV8871 成品模块是否引出 nFAULT 未确认，默认 0 不占用 GPIO36/37；确认模块有 nFAULT
 // 引脚并接线后改为 1，固件在 loop() 轮询并 foc_latch_fault()。

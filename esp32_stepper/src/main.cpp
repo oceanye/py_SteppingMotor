@@ -4,8 +4,10 @@
 #include "foc_motor.h"
 #include "stepper.h"     // 两个构建都需要步进
 #if defined(DRIVE_MODE_GEAR)
+#include "hardware_estop.h"
 #include "track_motor.h"
 #include "stepper_encoders.h"
+#include "remote_stepper.h"
 #endif
 #if defined(DRIVE_MODE_FOC)
   static const int PIN_NFAULT[NUM_AXES] = { PIN_FOC_NFAULT_0, PIN_FOC_NFAULT_1 };
@@ -40,6 +42,7 @@ void setup() {
   foc_init();
   Serial.println("Protocol: MOVE/STOP/ESTOP | FOC,<axis>,... | DIAG,<axis> | STDIAG,<axis> | MODE");
 #elif defined(DRIVE_MODE_GEAR)
+  hardware_estop_init();
   Serial.println("ESP32 Controller Ready (GEAR mode, stepper + DC gear motor)");
   Serial.println("  fw: accel-ramp + 6-axis stepper + PCNT-clear");
   Serial.print("NUM_AXES (stepper) = "); Serial.println(NUM_AXES);
@@ -66,10 +69,12 @@ void setup() {
   foc_init();   // GEAR 构建里这个符号由 gear_motor.cpp 提供
   track_motor_init();
   stepper_encoders_init();
+  remote_stepper_init();
 #if HW_ESTOP_ENABLED
-  pinMode(PIN_HW_ESTOP, INPUT_PULLUP);
   Serial.print("  hw estop: GPIO"); Serial.print(PIN_HW_ESTOP);
-  Serial.println(HW_ESTOP_ACTIVE_LOW ? " active-low(NC button)" : " active-high");
+  Serial.println(HW_ESTOP_ACTIVE_HIGH ? " active-high(NC+pullup, open=fault)" : " active-low");
+#else
+  Serial.println("  hw estop: DISABLED (enable only after wiring NC loop)");
 #endif
 #if GEAR_NFAULT_ENABLED
   pinMode(PIN_GEAR_NFAULT_0, INPUT_PULLUP);
@@ -85,6 +90,15 @@ void setup() {
   Serial.println(PIN_STEPPER_ENCODER_I2C_SCL);
 #else
   Serial.println("  optional step encoders: DISABLED/reserved (set diagnostics flag after hardware install)");
+#endif
+#if REMOTE_STEPPER_ENABLED
+  Serial.print("  RS485 Pico nodes: ENABLED, global axes 6..");
+  Serial.print(REMOTE_STEPPER_TOTAL_AXES - 1); Serial.print(" RX/TX/DE=");
+  Serial.print(PIN_REMOTE_STEPPER_RX); Serial.print('/');
+  Serial.print(PIN_REMOTE_STEPPER_TX); Serial.print('/');
+  Serial.println(PIN_REMOTE_STEPPER_DE);
+#else
+  Serial.println("  RS485 Pico nodes: DISABLED (select a *_remote environment)");
 #endif
   Serial.println("Protocol: MOVE/STOP/ESTOP | FOC | TRACK | ENC,<axis>,S | DIAG | STDIAG | MODE");
 #endif
@@ -115,6 +129,7 @@ void loop() {
     }
   }
 #elif defined(DRIVE_MODE_GEAR)
+  remote_stepper_tick();
   static uint32_t s_last_gear_safety_check = 0;
   uint32_t now = millis();
   if (now - s_last_gear_safety_check >= FAULT_POLL_MS) {
@@ -122,14 +137,18 @@ void loop() {
 #if HW_ESTOP_ENABLED
     {
       static bool s_hwestop_latched = false;
-      bool active = (digitalRead(PIN_HW_ESTOP) == LOW);
-      if (!HW_ESTOP_ACTIVE_LOW) active = !active;
-      if (active && !s_hwestop_latched) {
-        s_hwestop_latched = true;
+      const bool active = hardware_estop_is_active();
+      if (active) {
+        // Keep enforcing the stop while the NC loop is open.  The protocol
+        // also rejects all motion-starting commands during this interval.
         system_estop();
-        Serial.println("HWESTOP,TRIGGERED");
-      } else if (!active) {
+        if (!s_hwestop_latched) {
+          s_hwestop_latched = true;
+          Serial.println("HWESTOP,TRIGGERED");
+        }
+      } else if (s_hwestop_latched) {
         s_hwestop_latched = false;
+        Serial.println("HWESTOP,CLEARED");
       }
     }
 #endif

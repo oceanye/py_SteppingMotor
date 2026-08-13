@@ -6,6 +6,11 @@
 > `.venv`（pyserial 3.5）与 PlatformIO Core 6.1.19 已就绪，`py_compile` 与 `esp32s3_gear`
 > / `esp32s3` / `esp32s3_minimal` 三套固件均已编译通过；详见 `docs/PROJECT_MEMORY.md`
 > 第 7 节。下文 2026-08-03 正文作为历史交接基线保留。
+>
+> 2026-08-12 更新：已按“新增 24 路步进轴”实现普通 Pico（RP2040）RS485 扩展、
+> ESP32 主站桥接以及 30 轴桌面/网页 UI。该路径与既有“24 路 GEAR 电机”提案不是
+> 同一需求，详细拓扑、构建环境和远端验收项见
+> `docs/HANDOFF_2026-08-12_RP2040_STEPPERS.md`。
 
 本文是后续迁移到开发机、真实控制柜和实物机构时的执行基线。当前这台电脑不是开发/硬件环境，本轮只完成代码、接口、PCB 模块占位和文档落位；**没有宣称编译、烧录、KiCad DRC 或电机实测通过**。
 
@@ -156,9 +161,14 @@ python -m venv .venv
 
 cd esp32_stepper
 pio run -e esp32s3_gear
+pio run -e esp32s3_gear_hwestop
 pio run -e esp32s3
 pio test -e native_test
 ```
+
+`esp32s3_gear` 默认不启用 GPIO35 急停输入，适用于尚未安装急停回路的机器。
+只有在 GPIO35↔GND 常闭 NC 回路已接好并验证后，才烧录
+`esp32s3_gear_hwestop`。该回路安全态为低，按下或断线时由内部上拉变高并触发。
 
 历史 FOC 环境也应编译，以确认条件编译没有被默认 GEAR 改动破坏。根据现场端口修改 `platformio.ini` 的 upload/monitor port，不要把当前 COM4/COM9 当作固定事实。
 
@@ -184,7 +194,8 @@ PCB 的固定实现路线是“完整成品模块载板”：默认用排针/排
 2. 串口发送 `MODE`，应返回 `MODE,GEAR`。
 3. 逐轴示波器/逻辑分析仪检查 PUL、DIR；先不接 DM442 功率端。
 4. 检查 `ESTOP` 响应 `OK,ESTOP`，并确认所有输出停止、旧工作线程不能再次启动电机。
-5. 启动 GUI 与手机网页，确认 GUI 显示的网址和端口可由手机访问、串口只有 GUI 占用、网页断开后轨道 D 租约会超时停车。
+5. 如烧录 `esp32s3_gear_hwestop`：闭合 NC 回路后允许控制；按下急停或拆断任一根回路线应上报 `HWESTOP,TRIGGERED`，并在保持断开时拒绝 `MOVE`、`FOC,...,EN,1`、`FOC,...,A`、`FOC,...,H` 和 `TRACK,D,FWD|REV`；恢复回路后应上报 `HWESTOP,CLEARED`，不得自动恢复运动。
+6. 启动 GUI 与手机网页，确认 GUI 显示的网址和端口可由手机访问、串口只有 GUI 占用、网页断开后轨道 D 租约会超时停车。
 
 ### D. 当前开环逐轴验收
 
@@ -233,3 +244,4 @@ PCB 的固定实现路线是“完整成品模块载板”：默认用排针/排
 4. `pcb/README.md`：模块载板、电源边界与打样前检查
 5. `docs/wiring_check.html`：现场接线核对页
 6. `docs/PROJECT_MEMORY.md`：历史决策与调试背景
+7. `docs/HANDOFF_2026-08-12_RP2040_STEPPERS.md`：24 路 RP2040 步进扩展与远端验收
