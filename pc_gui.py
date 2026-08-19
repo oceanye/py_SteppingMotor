@@ -212,6 +212,14 @@ class StepperGUI:
         self._load_axis_config()
 
         self._build_ui()
+        # 参数框手输（不点上下箭头）也必须生效：Spinbox 的 command= 只在点箭头时触发，
+        # 因此对三个参数 var 加写入监听。放在 _build_ui 之后绑定，避免 _load_axis_config
+        # 初始化 set 时触发回调访问未建成的控件。
+        for axis in range(NUM_STEPPER_AXES):
+            _param_cb = lambda *_args, _a=axis: self._on_axis_param_change(_a)
+            self.axis_ppr_var[axis].trace_add("write", _param_cb)
+            self.axis_gr_var[axis].trace_add("write", _param_cb)
+            self.axis_lead_var[axis].trace_add("write", _param_cb)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(25, self._drain_ui_actions)
         self._load_calib()
@@ -1214,6 +1222,8 @@ class StepperGUI:
         self.sw[axis]['progress_label'].config(text="运动中...")
 
     def _send_mm(self, axis, distance_mm, direction, delay_ms, guard=None):
+        # 兜底：发送前从输入框同步一次参数，确保脉冲数按当前界面值计算。
+        self._on_axis_param_change(axis)
         steps = int(round(distance_mm * self._pulses_per_unit(axis)))
         if steps <= 0:
             self.log(f"轴{AXIS_LABEL[axis]}: 忽略距离过小 ({distance_mm})")
