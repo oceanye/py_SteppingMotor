@@ -833,24 +833,57 @@ class StepperGUI:
     def _unit_per_s(self, axis):
         return "°/s" if self.axis_mode[axis] == MODE_ROTARY else "mm/s"
 
+    @staticmethod
+    def _convert_axis_value(value, old_pulses_per_unit, new_pulses_per_unit):
+        """按等效脉冲数在 mm/° 表示之间转换位置或软件限位。"""
+        if value is None:
+            return None
+        return float(value) * old_pulses_per_unit / new_pulses_per_unit
+
     def _on_axis_mode_change(self, axis):
         mode = self.axis_mode_var[axis].get()
-        if mode not in (MODE_LINEAR, MODE_ROTARY) or mode == self.axis_mode[axis]:
+        old_mode = self.axis_mode[axis]
+        if mode not in (MODE_LINEAR, MODE_ROTARY) or mode == old_mode:
             return
-        self.axis_mode[axis] = mode
-        # 模式切换后位置语义改变：重置位置与行程，标记需要重新校准。
+
         with self.state_lock:
-            self.position_mm[axis] = 0.0
-            self.position_trusted[axis] = False
-            self.travel_min_mm[axis] = None
-            self.travel_max_mm[axis] = None
+            moving = (self.running[axis] or self.stepper_in_progress[axis]
+                      or self._move_dispatching[axis] or self._web_step_pending[axis]
+                      or self._pending_step[axis] is not None)
+        if moving:
+            self.axis_mode_var[axis].set(old_mode)
+            message = f"轴{AXIS_LABEL[axis]}正在运动，停止后才能切换直线/旋转模式"
+            self.log(f"⛔ {message}")
+            messagebox.showwarning("暂不能切换模式", message)
+            return
+
+        # 参数必须先在旧模式下完成 UI 线程校验，避免用无效值换算坐标。
+        if not self._require_axis_params(axis):
+            self.axis_mode_var[axis].set(old_mode)
+            return
+        old_ppu = self._pulses_per_unit(axis)
+        old_unit = self._unit_label(axis)
+
+        self.axis_mode[axis] = mode
+        new_ppu = self._pulses_per_unit(axis)
+        new_unit = self._unit_label(axis)
+        with self.state_lock:
+            self.position_mm[axis] = self._convert_axis_value(
+                self.position_mm[axis], old_ppu, new_ppu)
+            self.travel_min_mm[axis] = self._convert_axis_value(
+                self.travel_min_mm[axis], old_ppu, new_ppu)
+            self.travel_max_mm[axis] = self._convert_axis_value(
+                self.travel_max_mm[axis], old_ppu, new_ppu)
+            trusted = self.position_trusted[axis]
         self._apply_axis_param_ui(axis)
         self._refresh_axis_unit_labels(axis)
         self._update_pos_label(axis)
         self._update_range_display(axis)
         self._on_axis_param_change(axis)
         self._save_axis_config()
-        self.log(f"轴{AXIS_LABEL[axis]} 切换为 {'旋转(°)' if mode == MODE_ROTARY else '直线(mm)'}，位置已重置需重新校准")
+        self._save_calib()
+        trust_text = "位置可信状态已保留" if trusted else "原位置本就不可信，仍需校准"
+        self.log(f"轴{AXIS_LABEL[axis]} {old_unit}→{new_unit}，已按等效脉冲换算坐标/限位；{trust_text}")
 
     @staticmethod
     def _coerce_axis_param(value, minimum, maximum, label):
