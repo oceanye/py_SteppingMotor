@@ -342,6 +342,11 @@ class StepperGUI:
         log_frame.grid(row=2, column=0, sticky="ew", **pad)
         self.log_text = tk.Text(log_frame, height=10, width=96, state="disabled", font=("Consolas", 9))
         self.log_text.pack(side="left", fill="both", padx=5, pady=5)
+        # 滚轮支持：Windows 下 Tk 滚轮事件只派发给键盘焦点控件，日志区平时无焦点，
+        # 中键滚轮无效。鼠标进入时取焦点（disabled 仅禁编辑不禁焦点），并绑定滚动。
+        self.log_text.bind("<Enter>", lambda _e: self.log_text.focus_set())
+        self.log_text.bind("<MouseWheel>",
+                           lambda e: self.log_text.yview_scroll(int(-e.delta / 120), "units"))
         scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         scroll.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=scroll.set)
