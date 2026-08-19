@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import webbrowser
+import math
 
 # ============== 轴配置 ==============
 # 步进轴和闭环电机是两套独立的轴集合。兼容常量仅供旧配置使用，
@@ -205,6 +206,7 @@ class StepperGUI:
         self.axis_pulse_per_rev = [DEFAULT_PULSE_PER_REV] * NUM_STEPPER_AXES
         self.axis_gear_ratio    = [DEFAULT_GEAR_RATIO] * NUM_STEPPER_AXES
         self.axis_lead_mm       = [DEFAULT_LEAD_MM] * NUM_STEPPER_AXES
+        self.axis_param_valid   = [True] * NUM_STEPPER_AXES
         self.axis_mode_var = [tk.StringVar(value=MODE_LINEAR) for _ in range(NUM_STEPPER_AXES)]
         self.axis_ppr_var  = [tk.DoubleVar(value=DEFAULT_PULSE_PER_REV) for _ in range(NUM_STEPPER_AXES)]
         self.axis_gr_var   = [tk.DoubleVar(value=DEFAULT_GEAR_RATIO) for _ in range(NUM_STEPPER_AXES)]
@@ -342,11 +344,8 @@ class StepperGUI:
         log_frame.grid(row=2, column=0, sticky="ew", **pad)
         self.log_text = tk.Text(log_frame, height=10, width=96, state="disabled", font=("Consolas", 9))
         self.log_text.pack(side="left", fill="both", padx=5, pady=5)
-        # 滚轮支持：Windows 下 Tk 滚轮事件只派发给键盘焦点控件，日志区平时无焦点，
-        # 中键滚轮无效。鼠标进入时取焦点（disabled 仅禁编辑不禁焦点），并绑定滚动。
-        self.log_text.bind("<Enter>", lambda _e: self.log_text.focus_set())
-        self.log_text.bind("<MouseWheel>",
-                           lambda e: self.log_text.yview_scroll(int(-e.delta / 120), "units"))
+        # 在顶层按鼠标位置路由滚轮，避免鼠标进入日志区时抢走参数输入框焦点。
+        self.root.bind("<MouseWheel>", self._on_root_mousewheel, add="+")
         scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         scroll.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=scroll.set)
@@ -791,6 +790,18 @@ class StepperGUI:
         self.v_delay[axis].set(_speed_to_delay_ms(speed, self._pulses_per_unit(axis)))
         self._update_speed_label(axis)
 
+    def _on_root_mousewheel(self, event):
+        """鼠标位于日志区时滚动日志，不改变当前键盘焦点。"""
+        try:
+            target = self.root.winfo_containing(event.x_root, event.y_root)
+            if target is not self.log_text or event.delta == 0:
+                return None
+            units = -1 if event.delta > 0 else 1
+            self.log_text.yview_scroll(units, "units")
+            return "break"
+        except tk.TclError:
+            return None
+
     def _update_speed_label(self, axis):
         d = self.v_delay[axis].get()
         self.sw[axis]['delay_label'].config(text=f"({d:.2f} ms/脉冲)")
@@ -841,20 +852,48 @@ class StepperGUI:
         self._save_axis_config()
         self.log(f"轴{AXIS_LABEL[axis]} 切换为 {'旋转(°)' if mode == MODE_ROTARY else '直线(mm)'}，位置已重置需重新校准")
 
+    @staticmethod
+    def _coerce_axis_param(value, minimum, maximum, label):
+        number = float(value)
+        if not math.isfinite(number) or not minimum <= number <= maximum:
+            raise ValueError(f"{label}必须在 {minimum:g}–{maximum:g} 范围内")
+        return number
+
     def _on_axis_param_change(self, axis):
         try:
-            self.axis_pulse_per_rev[axis] = max(1.0, float(self.axis_ppr_var[axis].get()))
-            self.axis_gear_ratio[axis] = max(1e-6, float(self.axis_gr_var[axis].get()))
-            self.axis_lead_mm[axis] = max(1e-6, float(self.axis_lead_var[axis].get()))
-        except (tk.TclError, ValueError):
-            return
+            ppr = self._coerce_axis_param(
+                self.axis_ppr_var[axis].get(), 1.0, 10000.0, "脉冲/转")
+            gear_ratio = self._coerce_axis_param(
+                self.axis_gr_var[axis].get(), 0.001, 1000.0, "减速比")
+            lead_mm = self._coerce_axis_param(
+                self.axis_lead_var[axis].get(), 0.01, 100.0, "导程")
+        except (tk.TclError, TypeError, ValueError):
+            with self.state_lock:
+                self.axis_param_valid[axis] = False
+            return False
+        with self.state_lock:
+            self.axis_pulse_per_rev[axis] = ppr
+            self.axis_gear_ratio[axis] = gear_ratio
+            self.axis_lead_mm[axis] = lead_mm
+            self.axis_param_valid[axis] = True
         try:
             speed = float(self.v_speed_str[axis].get())
-        except ValueError:
+        except (tk.TclError, ValueError):
             speed = SPEED_DEFAULT
         self.v_delay[axis].set(_speed_to_delay_ms(speed, self._pulses_per_unit(axis)))
         self._update_speed_label(axis)
         self._save_axis_config()
+        return True
+
+    def _require_axis_params(self, axis):
+        """仅从 UI 线程调用；运动前拒绝无效或尚未输入完成的参数。"""
+        if self._on_axis_param_change(axis):
+            return True
+        message = (f"轴{AXIS_LABEL[axis]}参数无效：脉冲/转 1–10000，"
+                   "减速比 0.001–1000，导程 0.01–100")
+        self.log(f"⛔ {message}")
+        messagebox.showerror("轴参数无效", message)
+        return False
 
     def _apply_axis_param_ui(self, axis):
         state = "normal" if self.axis_mode[axis] == MODE_LINEAR else "disabled"
@@ -902,21 +941,24 @@ class StepperGUI:
                 self.axis_mode_var[axis].set(self.axis_mode[axis])
             if axis < len(ppr_list):
                 try:
-                    v = max(1.0, float(ppr_list[axis]))
+                    v = self._coerce_axis_param(
+                        ppr_list[axis], 1.0, 10000.0, "脉冲/转")
                     self.axis_pulse_per_rev[axis] = v
                     self.axis_ppr_var[axis].set(v)
                 except (ValueError, TypeError):
                     pass
             if axis < len(gr_list):
                 try:
-                    v = max(1e-6, float(gr_list[axis]))
+                    v = self._coerce_axis_param(
+                        gr_list[axis], 0.001, 1000.0, "减速比")
                     self.axis_gear_ratio[axis] = v
                     self.axis_gr_var[axis].set(v)
                 except (ValueError, TypeError):
                     pass
             if axis < len(lead_list):
                 try:
-                    v = max(1e-6, float(lead_list[axis]))
+                    v = self._coerce_axis_param(
+                        lead_list[axis], 0.01, 100.0, "导程")
                     self.axis_lead_mm[axis] = v
                     self.axis_lead_var[axis].set(v)
                 except (ValueError, TypeError):
@@ -1227,8 +1269,7 @@ class StepperGUI:
         self.sw[axis]['progress_label'].config(text="运动中...")
 
     def _send_mm(self, axis, distance_mm, direction, delay_ms, guard=None):
-        # 兜底：发送前从输入框同步一次参数，确保脉冲数按当前界面值计算。
-        self._on_axis_param_change(axis)
+        # 本方法运行在控制工作线程，只读取 UI 线程已校验并同步的普通 Python 缓存。
         steps = int(round(distance_mm * self._pulses_per_unit(axis)))
         if steps <= 0:
             self.log(f"轴{AXIS_LABEL[axis]}: 忽略距离过小 ({distance_mm})")
@@ -1283,16 +1324,22 @@ class StepperGUI:
 
     # ═════════════ 步进：命令 ═════════════
     def send_move(self, axis):
+        if not self._require_axis_params(axis):
+            return
         self._start_control_worker(
             self._send_mm, axis, self.v_dist[axis].get(), self.v_dir[axis].get(),
             self.v_delay[axis].get())
 
     def _quick_move(self, axis, distance_mm, direction):
+        if not self._require_axis_params(axis):
+            return
         self._start_control_worker(
             self._send_mm, axis, distance_mm, direction, self.v_delay[axis].get())
 
     def _press_continuous(self, axis, direction):
         if self.running[axis] or not self.ser or not self.ser.is_open: return
+        if not self._require_axis_params(axis):
+            return
         self.running[axis] = True
         delay_ms = self.v_delay[axis].get()
         dir_txt = "向上" if direction == DIR_OUTWARD else "向下"
@@ -1348,6 +1395,8 @@ class StepperGUI:
         self._goto(axis, target)
 
     def _goto(self, axis, target_mm):
+        if not self._require_axis_params(axis):
+            return
         if not self._check_range(axis, target_mm): return
         delta = target_mm - self.position_mm[axis]
         if abs(delta) < 1.0 / self._pulses_per_unit(axis):
@@ -2225,6 +2274,8 @@ class StepperGUI:
         if distance_mm <= 0 or speed_mm_s <= 0:
             raise ValueError("距离和速度必须大于 0")
         with self.state_lock:
+            if not self.axis_param_valid[axis]:
+                raise RuntimeError("轴参数无效或尚未输入完成，请先在 GUI 中修正")
             if not self.position_trusted[axis]:
                 raise RuntimeError("位置不可信，请在 GUI 中重新校准")
             if (self.stepper_in_progress[axis] or self._move_dispatching[axis]
@@ -2280,6 +2331,18 @@ class StepperGUI:
             raise ValueError("步进轴编号越界")
         if mode is not None and mode not in (MODE_LINEAR, MODE_ROTARY):
             raise ValueError("mode 必须是 linear 或 rotary")
+        try:
+            if pulse_per_rev is not None:
+                pulse_per_rev = self._coerce_axis_param(
+                    pulse_per_rev, 1.0, 10000.0, "pulse_per_rev")
+            if gear_ratio is not None:
+                gear_ratio = self._coerce_axis_param(
+                    gear_ratio, 0.001, 1000.0, "gear_ratio")
+            if lead_mm is not None:
+                lead_mm = self._coerce_axis_param(
+                    lead_mm, 0.01, 100.0, "lead_mm")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
 
         def ui():
             if mode is not None:

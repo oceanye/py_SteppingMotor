@@ -42,10 +42,10 @@
 1. 在开发机运行：
 
    ```powershell
-   .\.venv\Scripts\python.exe -m platformio test -e native_test
-   .\.venv\Scripts\python.exe -m platformio run -e esp32s3_gear
-   .\.venv\Scripts\python.exe -m platformio run -e esp32s3_gear_hwestop
-   .\.venv\Scripts\python.exe -m platformio run -e esp32s3
+   .\.venv\Scripts\python.exe -m platformio test -d esp32_stepper -e native_test
+   .\.venv\Scripts\python.exe -m platformio run -d esp32_stepper -e esp32s3_gear
+   .\.venv\Scripts\python.exe -m platformio run -d esp32_stepper -e esp32s3_gear_hwestop
+   .\.venv\Scripts\python.exe -m platformio run -d esp32_stepper -e esp32s3
    ```
 
 2. 未安装 GPIO35 NC 回路的机器只能烧录 `esp32s3_gear`。
