@@ -1,29 +1,17 @@
 @echo off
 cd /d "%~dp0"
 
-echo [1/3] Working dir: %CD%
-
-if not exist ".venv\Scripts\python.exe" (
-    echo [ERROR] .venv\Scripts\python.exe not found.
+if not exist ".venv\Scripts\pythonw.exe" (
+    echo [ERROR] .venv\Scripts\pythonw.exe not found.
     echo Please run run.bat first to create venv and install dependencies.
     pause
     exit /b 1
 )
 
-echo [2/3] Activating venv...
-call ".venv\Scripts\activate.bat"
-if errorlevel 1 (
-    echo [ERROR] activate.bat failed.
-    pause
-    exit /b 1
-)
-
-echo [3/3] Launching GUI...
-python pc_gui.py
-set RC=%errorlevel%
-
-if not "%RC%"=="0" (
-    echo.
-    echo [GUI exited with code %RC%]
-    pause
-)
+rem Launch without a console window. This removes the CMD box entirely,
+rem which sidesteps two known issues: (1) wheel-scroll in the console box
+rem did nothing, (2) resizing the console box after a move killed the app.
+rem Runtime logs go to the GUI log pane and logs\gui_<date>.log; crash
+rem tracebacks are captured to logs\gui_stderr.log by pc_gui.py itself.
+rem Use start_gui_console.bat when you need live tracebacks for debugging.
+start "" ".venv\Scripts\pythonw.exe" "pc_gui.py"

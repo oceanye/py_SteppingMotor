@@ -10,6 +10,21 @@ import os
 import socket
 import webbrowser
 import math
+import sys
+
+# pythonw 无控制台启动时未捕获异常的堆栈会丢失（双击 bat 经 start 启动时即使
+# stderr 非 None，也是即将随 bat 消失的临时句柄）。凡以 pythonw 运行或 std 流为
+# None，一律重定向到 logs/gui_stderr.log 兜底（正常时几乎无输出，崩溃后可查）。
+if (os.path.basename(sys.executable).lower().startswith("pythonw")
+        or sys.stderr is None or sys.stdout is None):
+    _stderr_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(_stderr_dir, exist_ok=True)
+    sys.stderr = open(os.path.join(_stderr_dir, "gui_stderr.log"), "a",
+                      buffering=1, encoding="utf-8", errors="replace")
+    sys.stderr.write(
+        f"--- session {time.strftime('%Y-%m-%d %H:%M:%S')} "
+        "(pythonw 启动，stderr 已重定向) ---\n")
+    sys.stdout = sys.stderr
 
 # ============== 轴配置 ==============
 # 步进轴和闭环电机是两套独立的轴集合。兼容常量仅供旧配置使用，
