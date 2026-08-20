@@ -9,7 +9,9 @@ namespace {
 
 constexpr size_t kMaxFields = 8;
 constexpr uint32_t kMinDelayUs = 100;
-constexpr uint32_t kMaxDelayUs = 2000000;
+// Covers the default rotary configuration at 0.3 deg/s. The PIO state machine
+// consumes this 32-bit period directly, so ten seconds remains well in range.
+constexpr uint32_t kMaxDelayUs = 10000000;
 
 bool parseU32(const char *text, uint32_t &value) {
   if (text == nullptr || *text == '\0' || *text == '-') return false;

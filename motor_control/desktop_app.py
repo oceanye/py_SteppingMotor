@@ -1,0 +1,2686 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import serial
+import serial.tools.list_ports
+import threading
+import time
+import os
+import math
+import socket
+import webbrowser
+import sys
+import traceback
+
+from motor_control import (
+    AXIS_LABEL,
+    DEFAULT_GEAR_RATIO,
+    DEFAULT_LEAD_MM,
+    DEFAULT_PULSE_PER_REV,
+    MODE_LINEAR,
+    MODE_ROTARY,
+    NUM_LOCAL_STEPPER_AXES,
+    NUM_PICO_NODES,
+    NUM_STEPPER_AXES,
+    PICO_AXES_PER_NODE,
+    SPEED_DEFAULT,
+    STEPPER_PINS,
+    AxisProfile,
+    AxisRuntime,
+    clamp_step_delay_us,
+    convert_axis_value,
+    speed_to_delay_ms,
+    stepper_axis_topology,
+)
+from motor_control.axis_math import coerce_finite_in_range
+from motor_control.autotune import AutotuneRunner
+from motor_control.protocol import (
+    HardwareEstopEvent,
+    HardwareEstopState,
+    MotorFaultEvent,
+    NodeOfflineEvent,
+    StepProgress,
+    StepResult,
+    StepTerminal,
+    TrackTimeout,
+    UnknownMessage,
+    ProtocolEncodingError,
+    build_move_command,
+    build_stop_command,
+    build_track_command,
+)
+from motor_control.serial_session import (
+    RequestCancelled,
+    RequestTimeout,
+    SerialSession,
+    SerialSessionError,
+)
+from motor_control.state_store import StateStore, StateStoreError
+from motor_control.ui_dispatch import UiDispatcher
+from motor_control.ui import (
+    build_foc_tab as build_foc_tab_view,
+    build_gear_tab as build_gear_tab_view,
+    build_stepper_tab as build_stepper_tab_view,
+    build_track_tab as build_track_tab_view,
+    build_ui as build_main_ui,
+)
+from motor_control.web_adapter import DesktopWebController
+
+# ============== 轴配置 ==============
+# 步进拓扑与单位模型位于 motor_control；这里仅保留闭环电机兼容常量。
+NUM_MOTOR_AXES = 2
+NUM_AXES = NUM_STEPPER_AXES       # 向后兼容
+NUM_GEAR_AXES = NUM_MOTOR_AXES    # 向后兼容
+
+# ============== 步进标定 ==============
+# 兼容：默认 200 微步/圈 ÷ 1.0mm 导程 = 200 pulse/mm（28HD140GT81-200LR 贯通式步进）。
+PULSES_PER_MM = [DEFAULT_PULSE_PER_REV / DEFAULT_LEAD_MM] * NUM_STEPPER_AXES
+# 速度档位（单位/s：直线=mm/s, 旋转=°/s）
+SPEED_PRESETS = [0.3, 0.5, 0.6, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 10]
+_speed_to_delay_ms = speed_to_delay_ms
+
+DELAY_DEFAULT_MS = [_speed_to_delay_ms(SPEED_DEFAULT, PULSES_PER_MM[a]) for a in range(NUM_STEPPER_AXES)]
+DIR_OUTWARD = 1
+DIR_INWARD  = 0
+# 每轴方向翻转标志（电机安装方向不同时用）
+# 0 = 不翻转, 1 = 翻转 DIR 信号。两轴原始方向均正确，不翻转。
+DIR_INVERT = [0] * NUM_STEPPER_AXES
+CONTINUOUS_BURST_MM = 0.2
+
+
+def _continuous_burst_units(profile):
+    """Return a responsive continuous-jog burst that is at least one pulse."""
+
+    return max(CONTINUOUS_BURST_MM, profile.units_from_steps(1))
+
+# ============== FOC ==============
+FOC_STATE_NAMES = {"0": "失能", "1": "对齐中", "2": "运行", "3": "故障"}
+GEAR_STATE_NAMES = {"0": "失能", "1": "—", "2": "运行", "3": "故障"}  # GEAR 没有"对齐"阶段
+FOC_POLL_INTERVAL_S = 0.1
+
+# ============== 模式 ==============
+MODE_FOC  = "FOC"
+MODE_GEAR = "GEAR"
+
+PROJECT_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR        = os.path.join(PROJECT_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def _empty_axis_dict():
+    return {i: None for i in range(NUM_STEPPER_AXES)}
+
+
+class StepperGUI:
+    def __init__(self, root, web_server_factory=None):
+        self.root = root
+        self.state_store = StateStore(PROJECT_DIR)
+        self._startup_warnings = []
+        self.root.title("30轴步进（ESP32 + Pico）+ FOC/GEAR + 轨道 D 控制器")
+        self.root.resizable(True, True)
+
+        # ── 共享：串口 ──
+        self.ser = None
+        self.serial_session = None
+        self.state_lock = threading.RLock()
+        self._disconnect_lock = threading.Lock()
+        self._estop_lock = threading.Lock()
+        self._control_context = threading.local()
+        self._ui_dispatcher = UiDispatcher(self._handle_ui_dispatch_error)
+        self.foc_poll_running = False
+        self._last_serial_error_log = 0.0
+        self._serial_failure_handled = False
+        self._serial_generation = 0
+        self._control_generation = 0
+        self._closing = False
+        self._disconnecting = False
+        self._disconnect_teardown_in_progress = False
+        self._estop_in_progress = False
+        self._hardware_estop_active = False
+        self._estop_unconfirmed = False
+
+        # ── 每轴状态（list 按 axis 索引）──
+        self.running            = [False] * NUM_STEPPER_AXES  # 连续运动 flag
+        # 位置与限位使用与显示模式无关的脉冲坐标；mm/° 只在边界换算。
+        self.axis_runtime = [
+            AxisRuntime(position_trusted=True) for _ in range(NUM_STEPPER_AXES)
+        ]
+        self.stepper_in_progress= [False] * NUM_STEPPER_AXES
+        self._pending_step      = [None]  * NUM_STEPPER_AXES
+        self._move_dispatching  = [False] * NUM_STEPPER_AXES
+        self._move_reservation  = [None]  * NUM_STEPPER_AXES
+        self._web_step_pending  = [None]  * NUM_STEPPER_AXES
+        self._axis_motion_generation = [0] * NUM_STEPPER_AXES
+        self._foc_enabled_ui    = [False] * NUM_MOTOR_AXES
+        self.foc_trace_buf      = [[] for _ in range(NUM_MOTOR_AXES)]
+        self._motor_status      = [
+            {"state": "?", "current_deg": None, "target_deg": None, "fault": None}
+            for _ in range(NUM_MOTOR_AXES)
+        ]
+        # goto watcher 代数：每次新 goto +1，旧 watcher 检测到 gen 变了就退出
+        self._goto_watcher_gen  = [0] * NUM_MOTOR_AXES
+
+        # ── 每轴 Tk 变量 ──
+        self.v_dist   = [tk.DoubleVar(value=10.0) for _ in range(NUM_STEPPER_AXES)]
+        self.v_dir    = [tk.IntVar   (value=DIR_OUTWARD) for _ in range(NUM_STEPPER_AXES)]
+        self.v_delay  = [tk.DoubleVar(value=DELAY_DEFAULT_MS[a]) for a in range(NUM_STEPPER_AXES)]
+        self.v_speed_str = [tk.StringVar(value=str(SPEED_DEFAULT)) for _ in range(NUM_STEPPER_AXES)]
+        self.v_goto   = [tk.DoubleVar(value=0.0)  for _ in range(NUM_STEPPER_AXES)]
+        self.v_foctgt = [tk.DoubleVar(value=0.0)  for _ in range(NUM_MOTOR_AXES)]
+        self.v_focstate   = [tk.StringVar(value="未连接") for _ in range(NUM_MOTOR_AXES)]
+        self.v_focfault   = [tk.StringVar(value="--")    for _ in range(NUM_MOTOR_AXES)]
+        self.v_foccur     = [tk.StringVar(value="--")    for _ in range(NUM_MOTOR_AXES)]
+        self.v_focvlimit  = [tk.DoubleVar(value=10.0)    for _ in range(NUM_MOTOR_AXES)]
+        self.v_focpangle  = [tk.DoubleVar(value=25.0)    for _ in range(NUM_MOTOR_AXES)]
+        self.v_focvp      = [tk.DoubleVar(value=0.2)     for _ in range(NUM_MOTOR_AXES)]
+        self.v_focpp      = [tk.IntVar   (value=7)       for _ in range(NUM_MOTOR_AXES)]
+
+        # ── GEAR 模式调参变量（和 FOC 共享 v_foctgt / v_focstate / v_foccur / v_focfault）──
+        self.v_gearpwm = [tk.DoubleVar(value=100.0)  for _ in range(NUM_MOTOR_AXES)]   # PWM duty cap %（0-100）
+        self.v_gearkp  = [tk.DoubleVar(value=1.0)    for _ in range(NUM_MOTOR_AXES)]
+        self.v_gearki  = [tk.DoubleVar(value=0.0)    for _ in range(NUM_MOTOR_AXES)]
+        self.v_gearkd  = [tk.DoubleVar(value=0.05)   for _ in range(NUM_MOTOR_AXES)]
+        self.v_geargr  = [tk.DoubleVar(value=1000.0) for _ in range(NUM_MOTOR_AXES)]   # 齿轮比（NVS）
+
+        # 轨道 D（独立 DRV8871）状态。命令采用 800 ms 租约，GUI 按住时续租。
+        self.v_track_duty = tk.IntVar(value=60)
+        self.v_track_status = tk.StringVar(value="已停止")
+        self._track_direction = "STOP"
+        self._track_lease_ms = 800
+        self._track_lease_generation = 0
+        self._track_last_response = ""
+
+        # ── 模式：
+        #    mode_select_var: 用户选择 (Auto/FOC/GEAR)；Auto 时从固件 MODE 命令读
+        #    fw_mode_var:      当前实际生效的模式显示 (FOC/GEAR/?)
+        self.mode_select_var = tk.StringVar(value="Auto")
+        self.fw_mode_var = tk.StringVar(value="?")
+        self._fw_mode_cache = "?"
+
+        # ── 每轴 widget refs（dict-per-axis）──
+        self.sw = [dict() for _ in range(NUM_STEPPER_AXES)]  # stepper widgets
+        self.fw = [dict() for _ in range(NUM_MOTOR_AXES)]    # FOC widgets
+        self.gw = [dict() for _ in range(NUM_MOTOR_AXES)]    # GEAR widgets
+        self.tw = {}
+        self.web_server = None
+        self._web_controller = DesktopWebController(self)
+        self._autotune_runner = AutotuneRunner(
+            send=self._send_and_read,
+            trace_provider=lambda axis: list(self.foc_trace_buf[axis]),
+            log=self.log,
+            sleep=time.sleep,
+            axis_label=lambda axis: AXIS_LABEL[axis],
+            cancelled=self._control_worker_cancelled,
+        )
+        self.web_status_var = tk.StringVar(value="● 服务未启动")
+        self.web_address_var = tk.StringVar(value="—")
+        self.web_port_var = tk.StringVar(value="—")
+        self.web_url_var = tk.StringVar(value="网页服务未启动")
+
+        # ── 每轴步进配置：控制模式 + 电机参数（脉冲每转/减速比/导程）──
+        self.axis_profiles = [AxisProfile() for _ in range(NUM_STEPPER_AXES)]
+        self._axis_profile_load_fallback = set()
+        self.axis_param_valid   = [True] * NUM_STEPPER_AXES
+        self.axis_mode_var = [tk.StringVar(value=MODE_LINEAR) for _ in range(NUM_STEPPER_AXES)]
+        self.axis_ppr_var  = [tk.DoubleVar(value=DEFAULT_PULSE_PER_REV) for _ in range(NUM_STEPPER_AXES)]
+        self.axis_gr_var   = [tk.DoubleVar(value=DEFAULT_GEAR_RATIO) for _ in range(NUM_STEPPER_AXES)]
+        self.axis_lead_var = [tk.DoubleVar(value=DEFAULT_LEAD_MM) for _ in range(NUM_STEPPER_AXES)]
+        self._load_axis_config()
+
+        self._build_ui()
+        for warning in self._startup_warnings:
+            self.log(warning)
+        self._startup_warnings.clear()
+        # 参数框手输（不点上下箭头）也必须生效：Spinbox 的 command= 只在点箭头时触发，
+        # 因此对三个参数 var 加写入监听。放在 _build_ui 之后绑定，避免 _load_axis_config
+        # 初始化 set 时触发回调访问未建成的控件。
+        for axis in range(NUM_STEPPER_AXES):
+            _param_cb = lambda *_args, _a=axis: self._on_axis_param_change(_a)
+            self.axis_ppr_var[axis].trace_add("write", _param_cb)
+            self.axis_gr_var[axis].trace_add("write", _param_cb)
+            self.axis_lead_var[axis].trace_add("write", _param_cb)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(25, self._drain_ui_actions)
+        self._load_calib()
+        self._load_foc_tune()
+        self._load_gear_tune()
+        if web_server_factory is not None:
+            self._start_web_server(web_server_factory)
+
+    # ═════════════ 顶层 UI ═════════════
+    def _build_ui(self):
+        build_main_ui(self, LOG_DIR, NUM_MOTOR_AXES)
+
+    # ═════════════ 步进 Tab（参数化）═════════════
+    def _build_stepper_tab(self, parent, axis):
+        build_stepper_tab_view(
+            self, parent, axis, SPEED_PRESETS, DIR_OUTWARD, DIR_INWARD)
+
+    # ═════════════ FOC Tab（参数化）═════════════
+    def _build_foc_tab(self, parent, axis):
+        build_foc_tab_view(self, parent, axis)
+
+    # ═════════════ 轨道 D（独立 DRV8871）═════════════
+    def _build_track_tab(self, parent):
+        build_track_tab_view(self, parent)
+
+
+    def _set_track_controls(self, state):
+        for key in ("duty", "fwd_btn", "rev_btn", "stop_btn"):
+            widget = self.tw.get(key)
+            if widget is not None:
+                widget.config(state=state)
+
+    def _track_press(self, direction):
+        try:
+            duty = max(1, min(100, int(self.v_track_duty.get())))
+        except (TypeError, ValueError, tk.TclError):
+            duty = 60
+            self.v_track_duty.set(duty)
+        self._start_track_lease(direction, duty)
+
+    def _start_track_lease(self, direction, duty):
+        if direction not in ("FWD", "REV"):
+            return False
+        if not self._is_serial_connected():
+            self.v_track_status.set("未连接")
+            return False
+        with self.state_lock:
+            if (self._hardware_estop_active or self._estop_in_progress
+                    or self._estop_unconfirmed or self._closing
+                    or self._disconnecting):
+                self.v_track_status.set("控制器正在停止或急停")
+                return False
+            self._track_lease_generation += 1
+            generation = self._track_lease_generation
+            control_generation = self._control_generation
+            self._track_direction = direction
+            self._track_lease_ms = 800
+        self.v_track_status.set(f"{direction} · PWM {duty}% · 租约续租中")
+        self.tw['status_label'].config(foreground="#1565c0")
+        self._track_lease_tick(
+            generation, direction, duty, control_generation
+        )
+        return True
+
+    def _track_lease_tick(
+        self, generation, direction, duty, control_generation
+    ):
+        with self.state_lock:
+            if (generation != self._track_lease_generation
+                    or self._track_direction != direction
+                    or control_generation != self._control_generation
+                    or self._hardware_estop_active):
+                return
+
+        def lease_is_current():
+            with self.state_lock:
+                return (generation == self._track_lease_generation
+                        and self._track_direction == direction
+                        and control_generation == self._control_generation
+                        and not self._hardware_estop_active)
+
+        def worker():
+            response = self._send_and_read(
+                build_track_command(direction, duty, 800),
+                timeout=0.25,
+                guard=lease_is_current,
+            )
+            with self.state_lock:
+                current = (generation == self._track_lease_generation
+                           and self._track_direction == direction
+                           and control_generation == self._control_generation)
+                if current:
+                    self._track_last_response = response
+                    if response != "OK,TRACK,D":
+                        self._track_direction = "STOP"
+                        current = False
+            if response == "OK,TRACK,D" and current:
+                self._post_ui(lambda: self.root.after(
+                    250, lambda: self._track_lease_tick(
+                        generation, direction, duty, control_generation
+                    )))
+            elif response and response != "OK,TRACK,D":
+                def show_failure():
+                    with self.state_lock:
+                        if (generation != self._track_lease_generation
+                                or self._track_direction != "STOP"
+                                or self._track_last_response != response):
+                            return
+                    self.v_track_status.set(f"轨道命令失败: {response}")
+
+                self._post_ui(show_failure)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _track_release(self):
+        with self.state_lock:
+            self._track_lease_generation += 1
+            generation = self._track_lease_generation
+            self._track_direction = "STOP"
+        self.v_track_status.set("已停止")
+        if self.tw.get('status_label'):
+            self.tw['status_label'].config(foreground="#555")
+        threading.Thread(target=self._send_track_stop,
+                         args=(generation,), daemon=True).start()
+
+    def _send_track_stop(self, generation=None, control_guard=None):
+        def guard():
+            with self.state_lock:
+                track_ok = (generation is None or
+                            (generation == self._track_lease_generation
+                             and self._track_direction == "STOP"))
+                return track_ok and (control_guard is None or control_guard())
+        response = self._send_and_read(
+            build_track_command("STOP"), timeout=0.6, guard=guard)
+        with self.state_lock:
+            if (generation is None or
+                    (generation == self._track_lease_generation
+                     and self._track_direction == "STOP")):
+                self._track_last_response = response
+        return response
+
+    # ═════════════ 共享辅助 ═════════════
+    def _post_ui(self, callback):
+        """从工作线程安全投递 Tk 操作；HTTP/串口线程不得直接调用 Tk。"""
+        self._ui_dispatcher.post(callback)
+
+    def _call_ui(self, callback, timeout=2.0):
+        """在 Tk 线程执行操作并等待结果，供需要确认已生效的 API 使用。"""
+        return self._ui_dispatcher.call(callback, timeout=timeout)
+
+    def _handle_ui_dispatch_error(self, exc):
+        """异步 UI 更新失败必须可诊断，不能静默表现为按钮无响应。"""
+        message = f"⚠️ UI 更新失败: {exc}"
+        try:
+            self.log(message)
+        except Exception:
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+
+    def _start_control_worker(self, target, *args, **kwargs):
+        """启动绑定当前控制代数的写命令线程；ESTOP 后旧代数自动失效。"""
+        with self.state_lock:
+            if (self._estop_in_progress or self._hardware_estop_active
+                    or self._estop_unconfirmed or self._closing
+                    or self._disconnecting):
+                self.log("控制器正在停止或急停，已拒绝新的 GUI 控制命令")
+                return None
+            generation = self._control_generation
+
+        def runner():
+            self._control_context.generation = generation
+            try:
+                target(*args, **kwargs)
+            finally:
+                try:
+                    del self._control_context.generation
+                except AttributeError:
+                    pass
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        return thread
+
+    def _control_worker_cancelled(self):
+        generation = getattr(self._control_context, "generation", None)
+        with self.state_lock:
+            return (
+                generation is not None
+                and (
+                    generation != self._control_generation
+                    or self._closing
+                    or self._disconnecting
+                    or self._estop_in_progress
+                    or self._hardware_estop_active
+                    or self._estop_unconfirmed
+                )
+            )
+
+    def _drain_ui_actions(self):
+        self._ui_dispatcher.drain(limit=100)
+        try:
+            self.root.after(25, self._drain_ui_actions)
+        except tk.TclError:
+            pass
+
+    def _on_speed_select(self, axis):
+        try:
+            speed = float(self.v_speed_str[axis].get())
+        except ValueError:
+            return
+        if speed <= 0: return
+        self.v_delay[axis].set(_speed_to_delay_ms(speed, self._pulses_per_unit(axis)))
+        self._update_speed_label(axis)
+
+    def _on_root_mousewheel(self, event):
+        """鼠标位于日志区时滚动日志，不改变当前键盘焦点。"""
+        try:
+            target = self.root.winfo_containing(event.x_root, event.y_root)
+            if target is not self.log_text or event.delta == 0:
+                return None
+            units = -1 if event.delta > 0 else 1
+            self.log_text.yview_scroll(units, "units")
+            return "break"
+        except tk.TclError:
+            return None
+
+    def _update_speed_label(self, axis):
+        d = self.v_delay[axis].get()
+        self.sw[axis]['delay_label'].config(text=f"({d:.2f} ms/脉冲)")
+
+    def _on_step_progress(self, axis, done, total):
+        if 0 <= axis < len(self.sw) and 'progress' in self.sw[axis]:
+            pct = int(done * 100 / total) if total > 0 else 0
+            self.sw[axis]['progress']['value'] = pct
+            self.sw[axis]['progress_label'].config(text=f"{pct}%  ({done}/{total} 步)")
+
+    def _reset_progress(self, axis):
+        if axis < len(self.sw) and 'progress' in self.sw[axis]:
+            self.sw[axis]['progress']['value'] = 0
+            self.sw[axis]['progress_label'].config(text="")
+
+    # ═════════════ 步进：每轴配置（模式/减速比/导程）═════════════
+    def _pulses_per_unit(self, axis):
+        """当前模式下每单位（直线=mm, 旋转=度）对应的脉冲数。"""
+        return self.axis_profiles[axis].pulses_per_unit
+
+    def _unit_label(self, axis):
+        return self.axis_profiles[axis].unit
+
+    def _unit_per_s(self, axis):
+        return self.axis_profiles[axis].speed_unit
+
+    @staticmethod
+    def _convert_axis_value(value, old_pulses_per_unit, new_pulses_per_unit):
+        """按等效脉冲数在 mm/° 表示之间转换位置或软件限位。"""
+        return convert_axis_value(value, old_pulses_per_unit, new_pulses_per_unit)
+
+    def _on_axis_mode_change(self, axis):
+        mode = self.axis_mode_var[axis].get()
+        old_profile = self.axis_profiles[axis]
+        old_mode = old_profile.mode
+        if mode not in (MODE_LINEAR, MODE_ROTARY):
+            return False
+        if mode == old_mode:
+            return True
+
+        with self.state_lock:
+            moving = (self.running[axis] or self.stepper_in_progress[axis]
+                      or self._move_dispatching[axis]
+                      or self._move_reservation[axis] is not None
+                      or self._web_step_pending[axis] is not None
+                      or self._pending_step[axis] is not None)
+        if moving:
+            self.axis_mode_var[axis].set(old_mode)
+            message = f"轴{AXIS_LABEL[axis]}正在运动，停止后才能切换直线/旋转模式"
+            self.log(f"⛔ {message}")
+            messagebox.showwarning("暂不能切换模式", message)
+            return False
+
+        # 参数必须先在旧模式下完成 UI 线程校验，避免用无效值换算坐标。
+        if not self._require_axis_params(axis):
+            self.axis_mode_var[axis].set(old_mode)
+            return False
+        with self.state_lock:
+            # _require_axis_params may run long enough for a web MOVE to
+            # reserve this axis.  Recheck and commit under the reservation
+            # lock, and keep the freshly validated PPR/GR/lead values.
+            moving = (self.running[axis] or self.stepper_in_progress[axis]
+                      or self._move_dispatching[axis]
+                      or self._move_reservation[axis] is not None
+                      or self._web_step_pending[axis] is not None
+                      or self._pending_step[axis] is not None)
+            if moving:
+                applied_profile = None
+                trusted = self.axis_runtime[axis].position_trusted
+            else:
+                current_profile = self.axis_profiles[axis]
+                applied_profile = current_profile.with_mode(mode)
+                self.axis_profiles[axis] = applied_profile
+                trusted = self.axis_runtime[axis].position_trusted
+        if applied_profile is None:
+            self.axis_mode_var[axis].set(old_mode)
+            message = f"轴{AXIS_LABEL[axis]}正在运动，停止后才能切换直线/旋转模式"
+            self.log(f"⛔ {message}")
+            messagebox.showwarning("暂不能切换模式", message)
+            return False
+
+        old_unit = old_profile.unit
+        new_unit = applied_profile.unit
+
+        # AxisRuntime 始终保存 steps；切换模式只替换显示配置，位置/限位
+        # 不再先换算成另一种浮点单位再写回。
+        self._apply_axis_param_ui(axis)
+        self._refresh_axis_unit_labels(axis)
+        self._update_pos_label(axis)
+        self._update_range_display(axis)
+        self._on_axis_param_change(axis)
+        self._save_axis_config()
+        self._save_calib()
+        trust_text = "位置可信状态已保留" if trusted else "原位置本就不可信，仍需校准"
+        self.log(f"轴{AXIS_LABEL[axis]} {old_unit}→{new_unit}，已按等效脉冲换算坐标/限位；{trust_text}")
+        return True
+
+    @staticmethod
+    def _coerce_axis_param(value, minimum, maximum, label):
+        try:
+            return coerce_finite_in_range(value, minimum, maximum, label)
+        except ValueError as exc:
+            raise ValueError(f"{label}必须在 {minimum:g}–{maximum:g} 范围内") from exc
+
+    def _on_axis_param_change(self, axis):
+        try:
+            ppr = self._coerce_axis_param(
+                self.axis_ppr_var[axis].get(), 1.0, 10000.0, "脉冲/转")
+            gear_ratio = self._coerce_axis_param(
+                self.axis_gr_var[axis].get(), 0.001, 1000.0, "减速比")
+            lead_mm = self._coerce_axis_param(
+                self.axis_lead_var[axis].get(), 0.01, 100.0, "导程")
+        except (tk.TclError, TypeError, ValueError):
+            with self.state_lock:
+                self.axis_param_valid[axis] = False
+            return False
+        with self.state_lock:
+            current_mode = self.axis_profiles[axis].mode
+            updated_profile = AxisProfile(
+                mode=current_mode,
+                pulse_per_rev=ppr,
+                gear_ratio=gear_ratio,
+                lead_mm=lead_mm,
+            )
+            moving = self._axis_motion_active_locked(axis)
+            if moving and updated_profile != self.axis_profiles[axis]:
+                # Keep the active/queued command's immutable unit contract.
+                # The edited Tk value remains visible and will be applied by
+                # the next explicit action after the axis is idle.
+                self.axis_param_valid[axis] = False
+                return False
+            self.axis_profiles[axis] = updated_profile
+            self.axis_param_valid[axis] = True
+        try:
+            speed = float(self.v_speed_str[axis].get())
+        except (tk.TclError, ValueError):
+            speed = SPEED_DEFAULT
+        self.v_delay[axis].set(_speed_to_delay_ms(speed, self._pulses_per_unit(axis)))
+        self._update_speed_label(axis)
+        self._update_pos_label(axis)
+        self._update_range_display(axis)
+        self._save_axis_config()
+        self._save_calib()
+        return True
+
+    def _require_axis_params(self, axis):
+        """仅从 UI 线程调用；运动前拒绝无效或尚未输入完成的参数。"""
+        if self._on_axis_param_change(axis):
+            return True
+        message = (f"轴{AXIS_LABEL[axis]}参数无效：脉冲/转 1–10000，"
+                   "减速比 0.001–1000，导程 0.01–100")
+        self.log(f"⛔ {message}")
+        messagebox.showerror("轴参数无效", message)
+        return False
+
+    def _apply_axis_param_ui(self, axis):
+        state = "normal" if self.axis_profiles[axis].mode == MODE_LINEAR else "disabled"
+        sw = self.sw[axis]
+        if 'lead_spin' in sw:
+            sw['lead_spin'].config(state=state)
+            sw['lead_label'].config(state=state)
+
+    def _refresh_axis_unit_labels(self, axis):
+        unit = self._unit_label(axis)
+        sw = self.sw[axis]
+        if 'dist_label' in sw: sw['dist_label'].config(text=f"距离 ({unit}):")
+        if 'speed_unit_label' in sw: sw['speed_unit_label'].config(text=self._unit_per_s(axis))
+        if 'goto_label' in sw: sw['goto_label'].config(text=f"前往位置 ({unit}):")
+        if 'set_home_btn' in sw: sw['set_home_btn'].config(text=f"⌂ 设为原点 (0 {unit})")
+
+    def _save_axis_config(self):
+        data = {
+            "mode": [profile.mode for profile in self.axis_profiles],
+            "pulse_per_rev": [profile.pulse_per_rev for profile in self.axis_profiles],
+            "gear_ratio": [profile.gear_ratio for profile in self.axis_profiles],
+            "lead_mm": [profile.lead_mm for profile in self.axis_profiles],
+        }
+        try:
+            self.state_store.save_axis_config(data)
+        except StateStoreError as exc:
+            self.log(f"⚠️ 轴配置保存失败: {exc}")
+
+    def _load_axis_config(self):
+        try:
+            data = self.state_store.load_axis_config()
+        except StateStoreError as exc:
+            self._startup_warnings.append(f"⚠️ 轴配置读取失败: {exc}")
+            return
+        if data is None:
+            return
+        mode_list = data.get("mode", [])
+        ppr_list = data.get("pulse_per_rev", [])
+        gr_list = data.get("gear_ratio", [])
+        lead_list = data.get("lead_mm", [])
+        loaded_lists = {
+            "mode": mode_list,
+            "pulse_per_rev": ppr_list,
+            "gear_ratio": gr_list,
+            "lead_mm": lead_list,
+        }
+        for field, value in loaded_lists.items():
+            if not isinstance(value, list):
+                self._startup_warnings.append(
+                    f"⚠️ 轴配置字段 {field} 不是数组，已忽略"
+                )
+                self._axis_profile_load_fallback.update(
+                    range(NUM_STEPPER_AXES)
+                )
+                loaded_lists[field] = []
+        mode_list = loaded_lists["mode"]
+        ppr_list = loaded_lists["pulse_per_rev"]
+        gr_list = loaded_lists["gear_ratio"]
+        lead_list = loaded_lists["lead_mm"]
+        for axis in range(NUM_STEPPER_AXES):
+            profile = self.axis_profiles[axis]
+            mode = profile.mode
+            ppr = profile.pulse_per_rev
+            gear_ratio = profile.gear_ratio
+            lead_mm = profile.lead_mm
+            if axis < len(mode_list) and mode_list[axis] in (MODE_LINEAR, MODE_ROTARY):
+                mode = mode_list[axis]
+            elif axis < len(mode_list):
+                self._axis_profile_load_fallback.add(axis)
+            if axis < len(ppr_list):
+                try:
+                    ppr = self._coerce_axis_param(
+                        ppr_list[axis], 1.0, 10000.0, "脉冲/转")
+                except (ValueError, TypeError):
+                    self._axis_profile_load_fallback.add(axis)
+            if axis < len(gr_list):
+                try:
+                    gear_ratio = self._coerce_axis_param(
+                        gr_list[axis], 0.001, 1000.0, "减速比")
+                except (ValueError, TypeError):
+                    self._axis_profile_load_fallback.add(axis)
+            if axis < len(lead_list):
+                try:
+                    lead_mm = self._coerce_axis_param(
+                        lead_list[axis], 0.01, 100.0, "导程")
+                except (ValueError, TypeError):
+                    self._axis_profile_load_fallback.add(axis)
+            self.axis_profiles[axis] = AxisProfile(
+                mode=mode,
+                pulse_per_rev=ppr,
+                gear_ratio=gear_ratio,
+                lead_mm=lead_mm,
+            )
+            self.axis_mode_var[axis].set(mode)
+            self.axis_ppr_var[axis].set(ppr)
+            self.axis_gr_var[axis].set(gear_ratio)
+            self.axis_lead_var[axis].set(lead_mm)
+
+    def _update_pos_label(self, axis):
+        runtime = self.axis_runtime[axis]
+        trusted = runtime.position_trusted
+        position = runtime.position_in(self.axis_profiles[axis])
+        unit = self._unit_label(axis)
+        text = f"{position:.1f} {unit}" if trusted else f"≈ {position:.1f} {unit}（需校准）"
+        self.sw[axis]['pos_label'].config(
+            text=text, foreground="blue" if trusted else "#d84315")
+
+    def _enable_stepper_buttons(self, axis, state):
+        sw = self.sw[axis]
+        keys = ['move_btn', 'jog_out_btn', 'jog_in_btn', 'cont_out_btn', 'cont_in_btn',
+                'stop_btn', 'set_home_btn', 'go_home_btn', 'goto_btn', 'calib_btn',
+                'set_min_btn', 'set_max_btn', 'clear_range_btn']
+        for k in keys:
+            sw[k].config(state=state)
+
+    # ═════════════ 串口 ═════════════
+    def refresh_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_cb["values"] = ports
+        if ports:
+            self.port_cb.set(ports[0])
+
+    def toggle_connect(self):
+        with self.state_lock:
+            teardown_in_progress = self._disconnect_teardown_in_progress
+        if teardown_in_progress:
+            messagebox.showinfo("正在断开", "串口仍在回收，请稍后再连接")
+            return
+        if self._is_serial_connected():
+            # 正常断开前停止所有输出；否则断开串口后电机仍可能继续执行或保持使能。
+            with self.state_lock:
+                self._disconnecting = True
+            if not self._stop_all_outputs(allow_closing=True):
+                messagebox.showerror(
+                    "停车未确认",
+                    "控制器没有确认 ESTOP。串口仍可用时将保持连接并封锁新命令；"
+                    "请立即使用物理急停或断电，确认安全后重试断开。",
+                )
+                return
+            self._disconnect_serial("用户断开串口", is_error=False)
+            return
+        try:
+            self._serial_failure_handled = False
+            with self.state_lock:
+                self._disconnecting = False
+                self._hardware_estop_active = False
+                self._estop_unconfirmed = True
+            opened_serial = serial.Serial(
+                self.port_var.get(), int(self.baud_var.get()), timeout=0.2
+            )
+            with self.state_lock:
+                self.ser = opened_serial
+                self._serial_generation += 1
+                generation = self._serial_generation
+            time.sleep(1.0)
+            while opened_serial.in_waiting:
+                opened_serial.readline()
+            new_session = SerialSession(
+                opened_serial,
+                event_handler=lambda event: self._handle_serial_event(
+                    event, generation, new_session
+                ),
+                unsolicited_handler=lambda message: self._handle_serial_unsolicited(
+                    message, generation, new_session
+                ),
+                error_handler=lambda exc: self._handle_serial_failure(
+                    exc, "会话", generation, new_session
+                ),
+                trace_handler=lambda direction, line: self._trace_serial_line(
+                    direction, line, generation, new_session
+                ),
+            )
+            with self.state_lock:
+                self.serial_session = new_session
+            new_session.start()
+            if not self._stop_all_outputs():
+                raise RuntimeError(
+                    "连接安全握手失败：固件未精确确认 OK,ESTOP"
+                )
+            self.conn_status.config(text="● 已连接", foreground="green")
+            self.conn_btn.config(text="断开")
+            for a in range(NUM_STEPPER_AXES):
+                self._enable_stepper_buttons(a, "normal")
+                self._update_pos_label(a)
+            self._set_track_controls("normal")
+            self.log(f"已连接 {self.port_var.get()} @ {self.baud_var.get()}")
+            self.foc_poll_running = True
+            threading.Thread(
+                target=self._foc_poll_loop,
+                args=(generation, new_session),
+                daemon=True,
+            ).start()
+            # 自动查固件模式，并根据模式灰掉另一组 tab + 下发对应模式的 tune
+            self._query_mode_and_apply()
+        except Exception as e:
+            self._disconnect_serial(str(e), is_error=True)
+            messagebox.showerror("连接失败", str(e))
+
+    def _is_serial_connected(self):
+        session = self.serial_session
+        return bool(session and session.is_open)
+
+    def _disconnect_serial(
+        self,
+        reason="",
+        is_error=False,
+        expected_generation=None,
+        expected_session=None,
+    ):
+        """统一停止读写/轮询并关闭串口；可安全地从任意线程重复调用。"""
+        with self._disconnect_lock:
+            with self.state_lock:
+                if expected_generation is not None and (
+                    expected_generation != self._serial_generation
+                    or expected_session is not self.serial_session
+                ):
+                    return
+            if self._serial_failure_handled and is_error:
+                return
+            if is_error:
+                self._serial_failure_handled = True
+            self.foc_poll_running = False
+            with self.state_lock:
+                self._serial_generation += 1
+                disconnect_generation = self._serial_generation
+                self._control_generation += 1
+                self._disconnecting = True
+                self._disconnect_teardown_in_progress = True
+                self._estop_unconfirmed = True
+                self._track_lease_generation += 1
+                self._track_direction = "STOP"
+                self._fw_mode_cache = "?"
+                self._motor_status = [
+                    {"state": "?", "current_deg": None,
+                     "target_deg": None, "fault": None}
+                    for _ in range(NUM_MOTOR_AXES)
+                ]
+                invalidated_axes = []
+                for axis in range(NUM_STEPPER_AXES):
+                    self._axis_motion_generation[axis] += 1
+                    active = (
+                        self.running[axis]
+                        or self.stepper_in_progress[axis]
+                        or self._move_dispatching[axis]
+                        or self._move_reservation[axis] is not None
+                        or self._web_step_pending[axis] is not None
+                        or self._pending_step[axis] is not None
+                    )
+                    if active:
+                        self.axis_runtime[axis].position_trusted = False
+                        invalidated_axes.append(axis)
+                    self.running[axis] = False
+                    self.stepper_in_progress[axis] = False
+                    self._move_dispatching[axis] = False
+                    self._move_reservation[axis] = None
+                    self._web_step_pending[axis] = None
+                    self._pending_step[axis] = None
+                session, self.serial_session = self.serial_session, None
+                ser, self.ser = self.ser, None
+
+        # close() may join the reader, whose error callback can re-enter this
+        # method.  Never hold the desktop disconnect lock across that join.
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        elif ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        with self.state_lock:
+            self._disconnect_teardown_in_progress = False
+        self._save_calib()
+
+        def update_ui():
+            with self.state_lock:
+                if (
+                    disconnect_generation != self._serial_generation
+                    or self.serial_session is not None
+                ):
+                    return
+            self.v_track_status.set("连接中断，已停止")
+            self._set_track_controls("disabled")
+            if self._raw_log_fh:
+                try:
+                    self._raw_log_fh.close()
+                except Exception:
+                    pass
+                self._raw_log_fh = None
+                self.raw_log_var.set(False)
+            self.conn_status.config(text="● 未连接", foreground="red")
+            self.conn_btn.config(text="连接")
+            self.fw_mode_var.set("?")
+            self.mode_label.config(foreground="gray")
+            for axis in range(NUM_STEPPER_AXES):
+                if axis in invalidated_axes:
+                    self._update_pos_label(axis)
+                self._enable_stepper_buttons(axis, "disabled")
+            for axis in range(NUM_MOTOR_AXES):
+                self._apply_foc_gating(axis, state="?", fault="?")
+                self._apply_gear_gating(axis, state="?", fault="?")
+                self.v_focstate[axis].set("未连接")
+                self.v_foccur[axis].set("--")
+                self.v_focfault[axis].set("--")
+                self.notebook.tab(self.tab_index_foc[axis], state="normal")
+                self.notebook.tab(self.tab_index_gear[axis], state="normal")
+
+        self._post_ui(update_ui)
+        now = time.monotonic()
+        if not is_error or now - self._last_serial_error_log >= 5.0:
+            self._last_serial_error_log = now
+            prefix = "串口 I/O 异常，已停止轮询并断开" if is_error else "串口已断开"
+            self.log(f"{prefix}: {reason}" if reason else prefix)
+
+    def _serial_source_is_current(self, generation=None, session=None):
+        if generation is None:
+            return True
+        with self.state_lock:
+            return (
+                generation == self._serial_generation
+                and session is self.serial_session
+            )
+
+    def _handle_serial_failure(
+        self, exc, source, generation=None, session=None
+    ):
+        self._disconnect_serial(
+            f"{source}: {exc}",
+            is_error=True,
+            expected_generation=generation,
+            expected_session=session,
+        )
+
+    def _trace_serial_line(
+        self, direction, line, generation=None, session=None
+    ):
+        """SerialSession 的唯一原始流记录入口。"""
+        if not self._serial_source_is_current(generation, session):
+            return
+        handle = self._raw_log_fh
+        if handle is None:
+            return
+        try:
+            handle.write(f"{time.time():.3f}  {direction}: {line}\n")
+            handle.flush()
+        except Exception:
+            pass
+
+    def _handle_serial_event(self, event, generation=None, session=None):
+        """把 typed 串口异步事件转成控制状态和 UI 更新。"""
+        if not self._serial_source_is_current(generation, session):
+            return
+
+        def post_ui(callback):
+            self._post_ui(
+                lambda: callback()
+                if self._serial_source_is_current(generation, session)
+                else None
+            )
+
+        if isinstance(event, StepProgress):
+            if 0 <= event.axis < NUM_STEPPER_AXES:
+                post_ui(lambda e=event: self._on_step_progress(
+                    e.axis, e.executed_steps, e.requested_steps))
+            return
+        if isinstance(event, StepTerminal):
+            if not 0 <= event.axis < NUM_STEPPER_AXES:
+                return
+            callback = self._on_step_done if event.result == StepResult.DONE else self._on_step_aborted
+            post_ui(lambda e=event, cb=callback: cb(
+                e.axis, e.executed_steps, e.requested_steps))
+            return
+        if isinstance(event, TrackTimeout):
+            with self.state_lock:
+                if not self._serial_source_is_current(generation, session):
+                    return
+                self._track_lease_generation += 1
+                self._track_direction = "STOP"
+                self._track_last_response = event.raw
+            post_ui(lambda: self.v_track_status.set("轨道租约到期，已停止"))
+            post_ui(lambda: self.log("轨道 D 固件租约到期，已自动停止"))
+            return
+        if isinstance(event, HardwareEstopEvent):
+            if event.state == HardwareEstopState.TRIGGERED:
+                with self.state_lock:
+                    if not self._serial_source_is_current(generation, session):
+                        return
+                    self._control_generation += 1
+                    self._hardware_estop_active = True
+                    self._track_lease_generation += 1
+                    self._track_direction = "STOP"
+                    self._track_last_response = event.raw
+                    for axis in range(NUM_STEPPER_AXES):
+                        self.running[axis] = False
+                    for axis in range(NUM_MOTOR_AXES):
+                        self._foc_enabled_ui[axis] = False
+                post_ui(lambda: self.v_track_status.set("硬件急停触发，已停止"))
+                post_ui(lambda: self.log(
+                    "⚠️ 硬件急停触发：固件已停止全部步进/轨道并失能闭环轴；"
+                    "释放急停按钮后可重新操作"))
+            else:
+                with self.state_lock:
+                    if not self._serial_source_is_current(generation, session):
+                        return
+                    self._hardware_estop_active = False
+                post_ui(lambda: self.v_track_status.set("硬件急停已释放"))
+                post_ui(lambda: self.log(
+                    "硬件急停回路已恢复；请确认现场安全后再手动发起运动"))
+            return
+        if isinstance(event, MotorFaultEvent):
+            if 0 <= event.axis < NUM_MOTOR_AXES:
+                post_ui(lambda e=event: self.log(
+                    f"⚠️ 轴{AXIS_LABEL[e.axis]}: {e.raw}"))
+            return
+        if isinstance(event, NodeOfflineEvent):
+            post_ui(lambda e=event: self.log(
+                f"⚠️ Pico 节点 {e.node} 离线；对应远端轴暂不可用"))
+            return
+        post_ui(lambda e=event: self.log(f"⚠️ 未处理串口事件: {e.raw}"))
+
+    def _handle_serial_unsolicited(
+        self, message, generation=None, session=None
+    ):
+        """显示启动诊断、畸形帧和迟到回复，但绝不让它们完成新请求。"""
+        if (not message.raw
+                or not self._serial_source_is_current(generation, session)):
+            return
+        prefix = "⚠️ 串口未识别" if isinstance(message, UnknownMessage) else "⚠️ 串口迟到/未匹配"
+        self._post_ui(
+            lambda p=prefix, line=message.raw: self.log(f"{p}: {line}")
+            if self._serial_source_is_current(generation, session)
+            else None
+        )
+
+    def _send_and_read(
+        self,
+        cmd,
+        timeout=1.0,
+        guard=None,
+        allow_closing=False,
+        propagate_request_error=False,
+    ):
+        context_generation = getattr(self._control_context, "generation", None)
+        with self.state_lock:
+            session = self.serial_session
+            session_generation = self._serial_generation
+
+        def can_send():
+            if not self._serial_source_is_current(
+                session_generation, session
+            ):
+                return False
+            if ((self._closing or self._disconnecting) and not allow_closing):
+                return False
+            if (context_generation is not None
+                    and context_generation != self._control_generation):
+                return False
+            return guard is None or guard()
+
+        if session is None or not session.is_open or not can_send():
+            if propagate_request_error:
+                raise RequestCancelled(f"request cancelled before send: {cmd!r}")
+            return ""
+        try:
+            return session.request_line(cmd, timeout=timeout, guard=can_send)
+        except RequestCancelled:
+            if propagate_request_error:
+                raise
+            return ""
+        except RequestTimeout as exc:
+            # A timed-out reply can be indistinguishable from a later command's
+            # OK/ACK.  SerialSession therefore retires the stream; force the
+            # same visible disconnect path instead of continuing unsafely.
+            if self._serial_source_is_current(session_generation, session):
+                self._handle_serial_failure(
+                    exc, "请求超时", session_generation, session
+                )
+            if propagate_request_error:
+                raise
+            return ""
+        except SerialSessionError as exc:
+            if self._serial_source_is_current(session_generation, session):
+                self._handle_serial_failure(
+                    exc, "请求", session_generation, session
+                )
+            if propagate_request_error:
+                raise
+            return ""
+
+    # ═════════════ 步进：发送 ═════════════
+    def _send_pulses(
+        self, axis, steps, direction, delay_ms, guard=None, profile=None
+    ):
+        if not 0 <= axis < NUM_STEPPER_AXES:
+            return False
+        if steps <= 0 or not self._is_serial_connected():
+            return False
+        with self.state_lock:
+            if profile is None:
+                profile = self.axis_profiles[axis]
+            position_trusted = self.axis_runtime[axis].position_trusted
+        if not position_trusted:
+            self.log(f"⚠️ 轴 {AXIS_LABEL[axis]} 位置不可信；请先设置原点或校准位置")
+            return False
+        # 不在 PC 侧排队第二段 MOVE：等待期间当前位置可能因上一段 DONE
+        # 改变，令先前的限位预检失效。连续运动由自己的循环等待 terminal。
+        with self.state_lock:
+            busy = (
+                self.stepper_in_progress[axis]
+                or self._move_dispatching[axis]
+                or self._pending_step[axis] is not None
+            )
+        if busy:
+            self.log(f"轴{AXIS_LABEL[axis]} 正在运动，已拒绝排队 MOVE")
+            return False
+        delay_us = max(1, int(round(delay_ms * 1000)))
+        # RP2040 远端节点的 PIO/RS485 契约要求至少 100 us。
+        delay_us = clamp_step_delay_us(axis, delay_us)
+        actual_dir = direction ^ DIR_INVERT[axis]   # 按轴翻转DIR信号
+        sign = +1 if direction == DIR_OUTWARD else -1
+        signed_steps = sign * steps
+        with self.state_lock:
+            if self._pending_step[axis] is not None:
+                self.log(f"轴{AXIS_LABEL[axis]} 已有待结算运动，拒绝覆盖")
+                return False
+            self._move_dispatching[axis] = True
+            # MOVE 写出后 DONE/ABORT 可能先于 ACK 到达。发送前预挂账，
+            # terminal 事件即可立即、且只结算一次。
+            self._pending_step[axis] = signed_steps
+            self.stepper_in_progress[axis] = True
+        try:
+            command = build_move_command(axis, steps, actual_dir, delay_us)
+        except ProtocolEncodingError as exc:
+            with self.state_lock:
+                self._move_dispatching[axis] = False
+                if self._pending_step[axis] == signed_steps:
+                    self._pending_step[axis] = None
+                    self.stepper_in_progress[axis] = False
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]} MOVE 参数无效: {exc}")
+            return False
+        request_error = None
+        try:
+            resp = self._send_and_read(
+                command, guard=guard, propagate_request_error=True
+            )
+        except RequestCancelled as exc:
+            request_error = exc
+            resp = ""
+        except (RequestTimeout, SerialSessionError) as exc:
+            request_error = exc
+            resp = ""
+        dist_mm = profile.units_from_steps(steps)
+        dir_txt = "正向" if direction == DIR_OUTWARD else "反向"
+        effective_delay_ms = delay_us / 1000.0
+        mm_s = 1000.0 / (profile.pulses_per_unit * effective_delay_ms)
+        self.log(f"轴{AXIS_LABEL[axis]} {dist_mm:.1f}{profile.unit} {dir_txt} "
+                 f"@ {effective_delay_ms:.2f}ms ({mm_s:.1f}{profile.speed_unit}) → {resp}")
+        with self.state_lock:
+            self._move_dispatching[axis] = False
+            accepted = resp == f"ACK,{axis}"
+            terminal_already_settled = self._pending_step[axis] is None
+            if not accepted and not terminal_already_settled:
+                self._pending_step[axis] = None
+                self.stepper_in_progress[axis] = False
+                if request_error is not None and not isinstance(
+                    request_error, RequestCancelled
+                ):
+                    # Bytes may have reached the controller even though the
+                    # reply was lost.  Never keep a trusted host position.
+                    self.axis_runtime[axis].position_trusted = False
+        if accepted and not terminal_already_settled:
+            if 'progress' in self.sw[axis]:
+                self._post_ui(lambda a=axis: self._show_step_started(a))
+        return accepted
+
+    def _show_step_started(self, axis):
+        with self.state_lock:
+            if not self.stepper_in_progress[axis]:
+                return
+        self.sw[axis]['progress']['value'] = 0
+        self.sw[axis]['progress_label'].config(text="运动中...")
+
+    def _reserve_axis_move(self, axis):
+        """Synchronously pin one GUI MOVE to its validated axis profile."""
+
+        with self.state_lock:
+            if self._axis_motion_active_locked(axis):
+                return None
+            reservation = object()
+            self._move_reservation[axis] = reservation
+            return (
+                reservation,
+                self._axis_motion_generation[axis],
+                self.axis_profiles[axis],
+            )
+
+    def _release_axis_move(self, axis, reservation):
+        with self.state_lock:
+            if self._move_reservation[axis] is reservation:
+                self._move_reservation[axis] = None
+
+    def _start_reserved_axis_worker(
+        self, axis, worker_reservation, target, *args, **kwargs
+    ):
+        try:
+            worker = self._start_control_worker(target, *args, **kwargs)
+        except BaseException:
+            self._release_axis_move(axis, worker_reservation)
+            raise
+        if worker is None:
+            self._release_axis_move(axis, worker_reservation)
+        return worker
+
+    def _begin_axis_stop(self, axis):
+        """Invalidate queued MOVE work and reserve the axis until STOP replies."""
+
+        with self.state_lock:
+            self._axis_motion_generation[axis] += 1
+            stop_reservation = object()
+            self.running[axis] = False
+            self._move_reservation[axis] = stop_reservation
+            # A Web MOVE worker holding the previous token will observe the
+            # generation/reservation mismatch before SerialSession writes it.
+            self._web_step_pending[axis] = None
+        return stop_reservation
+
+    def _send_axis_stop(self, axis, stop_reservation=None, guard=None):
+        """Send one per-axis STOP while keeping later MOVE work behind it."""
+
+        if stop_reservation is None:
+            stop_reservation = self._begin_axis_stop(axis)
+        try:
+            return self._send_and_read(
+                build_stop_command(axis), timeout=0.6, guard=guard
+            )
+        finally:
+            with self.state_lock:
+                if self._move_reservation[axis] is stop_reservation:
+                    self._move_reservation[axis] = None
+
+    def _send_mm(
+        self,
+        axis,
+        distance_mm,
+        direction,
+        delay_ms,
+        profile=None,
+        guard=None,
+        reservation=None,
+        motion_generation=None,
+    ):
+        with self.state_lock:
+            if motion_generation is None:
+                motion_generation = self._axis_motion_generation[axis]
+            if motion_generation != self._axis_motion_generation[axis]:
+                return False
+            if reservation is None:
+                if self._move_reservation[axis] is not None:
+                    return False
+                reservation = object()
+                self._move_reservation[axis] = reservation
+            elif self._move_reservation[axis] is not reservation:
+                return False
+
+        def move_guard():
+            with self.state_lock:
+                current = (
+                    motion_generation == self._axis_motion_generation[axis]
+                    and self._move_reservation[axis] is reservation
+                )
+            return current and (guard is None or guard())
+
+        try:
+            return self._send_mm_reserved(
+                axis,
+                distance_mm,
+                direction,
+                delay_ms,
+                profile=profile,
+                guard=move_guard,
+            )
+        finally:
+            with self.state_lock:
+                if self._move_reservation[axis] is reservation:
+                    self._move_reservation[axis] = None
+
+    def _send_mm_reserved(
+        self, axis, distance_mm, direction, delay_ms, profile=None, guard=None
+    ):
+        # profile 是请求被接受时的不可变快照；配置与工作线程交错时也不能
+        # 把旧模式的距离/速度和新模式的脉冲换算混在同一条 MOVE 中。
+        with self.state_lock:
+            if profile is None:
+                profile = self.axis_profiles[axis]
+            runtime = self.axis_runtime[axis]
+            position_trusted = runtime.position_trusted
+            position_steps = runtime.position_steps
+            minimum_steps = runtime.min_steps
+            maximum_steps = runtime.max_steps
+        if not position_trusted:
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]} 位置不可信，禁止运动；请先重新校准")
+            return False
+        try:
+            steps = profile.command_steps_from_units(distance_mm)
+        except (TypeError, ValueError, OverflowError):
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]} 距离必须是有限数值")
+            return False
+        if steps <= 0:
+            self.log(f"轴{AXIS_LABEL[axis]}: 忽略距离过小 ({distance_mm})")
+            return False
+        sign = +1.0 if direction == DIR_OUTWARD else -1.0
+        target_steps = position_steps + sign * steps
+        tolerance_steps = profile.exact_steps_from_units(0.05)
+        target = profile.units_from_steps(target_steps)
+        if minimum_steps is not None and target_steps < minimum_steps - tolerance_steps:
+            minimum = profile.units_from_steps(minimum_steps)
+            self.log(
+                f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target:.1f}{profile.unit}"
+                f"<下限{minimum:.1f}"
+            )
+            return False
+        if maximum_steps is not None and target_steps > maximum_steps + tolerance_steps:
+            maximum = profile.units_from_steps(maximum_steps)
+            self.log(
+                f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target:.1f}{profile.unit}"
+                f">上限{maximum:.1f}"
+            )
+            return False
+        return self._send_pulses(
+            axis, steps, direction, delay_ms, guard=guard, profile=profile
+        )
+
+    def _send_to_position(
+        self,
+        axis,
+        target_units,
+        delay_ms,
+        profile=None,
+        reservation=None,
+        motion_generation=None,
+    ):
+        """Resolve an absolute target only after owning the per-axis reservation."""
+
+        try:
+            target_units = float(target_units)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(target_units):
+            return False
+        with self.state_lock:
+            if motion_generation is None:
+                motion_generation = self._axis_motion_generation[axis]
+            if motion_generation != self._axis_motion_generation[axis]:
+                return False
+            if reservation is None:
+                if self._move_reservation[axis] is not None:
+                    return False
+                reservation = object()
+                self._move_reservation[axis] = reservation
+            elif self._move_reservation[axis] is not reservation:
+                return False
+            current_profile = self.axis_profiles[axis]
+            profile_changed = profile is not None and profile != current_profile
+            if profile is None:
+                profile = current_profile
+            busy = (
+                self.running[axis]
+                or self.stepper_in_progress[axis]
+                or self._move_dispatching[axis]
+                or self._web_step_pending[axis] is not None
+                or self._pending_step[axis] is not None
+            )
+            runtime = self.axis_runtime[axis]
+            position_trusted = runtime.position_trusted
+            position_steps = runtime.position_steps
+            minimum_steps = runtime.min_steps
+            maximum_steps = runtime.max_steps
+            target_steps = profile.exact_steps_from_units(target_units)
+            tolerance_steps = profile.exact_steps_from_units(0.05)
+
+        try:
+            if profile_changed:
+                self.log(
+                    f"轴{AXIS_LABEL[axis]} 配置已变化，绝对定位已取消；请重试"
+                )
+                return False
+            if busy:
+                self.log(f"轴{AXIS_LABEL[axis]} 正在运动，绝对定位未排队")
+                return False
+            if not position_trusted:
+                self.log(
+                    f"⛔ 轴{AXIS_LABEL[axis]} 位置不可信，禁止运动；请先重新校准"
+                )
+                return False
+            if (
+                minimum_steps is not None
+                and target_steps < minimum_steps - tolerance_steps
+            ):
+                minimum = profile.units_from_steps(minimum_steps)
+                self.log(
+                    f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_units:.1f}{profile.unit}"
+                    f"<下限{minimum:.1f}"
+                )
+                return False
+            if (
+                maximum_steps is not None
+                and target_steps > maximum_steps + tolerance_steps
+            ):
+                maximum = profile.units_from_steps(maximum_steps)
+                self.log(
+                    f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_units:.1f}{profile.unit}"
+                    f">上限{maximum:.1f}"
+                )
+                return False
+
+            delta_steps = target_steps - position_steps
+            if abs(delta_steps) < 1.0:
+                self.log(f"轴{AXIS_LABEL[axis]} 已在目标附近")
+                return False
+            direction = DIR_OUTWARD if delta_steps > 0 else DIR_INWARD
+            distance = abs(profile.units_from_steps(delta_steps))
+            self.log(
+                f"轴{AXIS_LABEL[axis]} 前往 {target_units:.1f}{profile.unit} "
+                f"(移动 {distance:.1f}{profile.unit})"
+            )
+            return self._send_mm(
+                axis,
+                distance,
+                direction,
+                delay_ms,
+                profile=profile,
+                reservation=reservation,
+                motion_generation=motion_generation,
+            )
+        finally:
+            with self.state_lock:
+                if self._move_reservation[axis] is reservation:
+                    self._move_reservation[axis] = None
+
+    @staticmethod
+    def _executed_fraction(executed_steps, requested_steps, default):
+        if executed_steps is None or requested_steps is None or requested_steps <= 0:
+            return default
+        return max(0.0, min(1.0, float(executed_steps) / float(requested_steps)))
+
+    def _on_step_done(self, axis, executed_steps=None, requested_steps=None):
+        with self.state_lock:
+            pending_step = self._pending_step[axis]
+            if pending_step is not None:
+                fraction = self._executed_fraction(
+                    executed_steps, requested_steps, 1.0
+                )
+                self.axis_runtime[axis].apply_completed_steps(
+                    pending_step * fraction
+                )
+                self._pending_step[axis] = None
+            self.stepper_in_progress[axis] = False
+        if pending_step is not None:
+            self._update_pos_label(axis)
+        if 'progress' in self.sw[axis]:
+            self.sw[axis]['progress']['value'] = 100
+            self.sw[axis]['progress_label'].config(text="✓ 完成")
+            self.root.after(2000, lambda a=axis: self._reset_progress(a))
+        self._save_calib()
+        self.log(f"轴{AXIS_LABEL[axis]} 步进完成")
+
+    def _on_step_aborted(self, axis, executed_steps=None, requested_steps=None):
+        """按固件回报记入部分位移；旧协议不回报脉冲时绝不记入整段位移。"""
+        fraction = self._executed_fraction(executed_steps, requested_steps, 0.0)
+        with self.state_lock:
+            pending_step = self._pending_step[axis]
+            partial_steps = 0.0
+            if pending_step is not None:
+                partial_steps = pending_step * fraction
+                self.axis_runtime[axis].apply_completed_steps(partial_steps)
+            self._pending_step[axis] = None
+            self.stepper_in_progress[axis] = False
+            self.running[axis] = False
+            self.axis_runtime[axis].position_trusted = False
+            profile = self.axis_profiles[axis]
+        self._update_pos_label(axis)
+        if 'progress' in self.sw[axis]:
+            self.sw[axis]['progress_label'].config(text="⚠ 已中止 · 位置需重新校准")
+        self._save_calib()
+        partial_units = profile.units_from_steps(partial_steps)
+        detail = (f"，已按固件回报记入 {partial_units:+.3f} {profile.unit}"
+                  if executed_steps is not None and requested_steps else
+                  "，旧固件未回报实际脉冲，未记入待执行位移")
+        self.log(f"⚠️ 轴{AXIS_LABEL[axis]} 运动已中止{detail}；软件位置已标记为不可信")
+
+    # ═════════════ 步进：命令 ═════════════
+    def send_move(self, axis):
+        if not self._require_axis_params(axis):
+            return
+        try:
+            distance = float(self.v_dist[axis].get())
+        except (tk.TclError, TypeError, ValueError, OverflowError):
+            distance = math.nan
+        if not math.isfinite(distance) or distance <= 0:
+            messagebox.showerror("输入无效", "运动距离必须是大于 0 的有限数值")
+            return
+        move = self._reserve_axis_move(axis)
+        if move is None:
+            self.log(f"轴{AXIS_LABEL[axis]} 正在运动，MOVE 未排队")
+            return
+        reservation, motion_generation, profile = move
+        self._start_reserved_axis_worker(
+            axis, reservation, self._send_mm,
+            axis, distance, self.v_dir[axis].get(),
+            self.v_delay[axis].get(), profile,
+            reservation=reservation,
+            motion_generation=motion_generation)
+
+    def _quick_move(self, axis, distance_mm, direction):
+        if not self._require_axis_params(axis):
+            return
+        move = self._reserve_axis_move(axis)
+        if move is None:
+            self.log(f"轴{AXIS_LABEL[axis]} 正在运动，MOVE 未排队")
+            return
+        reservation, motion_generation, profile = move
+        self._start_reserved_axis_worker(
+            axis, reservation, self._send_mm,
+            axis, distance_mm, direction,
+            self.v_delay[axis].get(), profile,
+            reservation=reservation,
+            motion_generation=motion_generation)
+
+    def _press_continuous(self, axis, direction):
+        if self.running[axis] or not self.ser or not self.ser.is_open: return
+        if not self._require_axis_params(axis):
+            return
+        delay_ms = self.v_delay[axis].get()
+        with self.state_lock:
+            if self.running[axis]:
+                return
+            self.running[axis] = True
+            profile = self.axis_profiles[axis]
+            motion_generation = self._axis_motion_generation[axis]
+        burst_units = _continuous_burst_units(profile)
+        dir_txt = "向上" if direction == DIR_OUTWARD else "向下"
+        self.log(f"轴{AXIS_LABEL[axis]} 按住连续{dir_txt}")
+        def worker():
+            while self.running[axis]:
+                while self.stepper_in_progress[axis] and self.running[axis]:
+                    time.sleep(0.02)
+                if not self.running[axis]: break
+                if not self._send_mm(
+                    axis, burst_units, direction, delay_ms, profile,
+                    motion_generation=motion_generation,
+                ):
+                    with self.state_lock:
+                        self.running[axis] = False
+                    break
+            self.log(f"轴{AXIS_LABEL[axis]} 连续运动停止")
+        if self._start_control_worker(worker) is None:
+            self.running[axis] = False
+
+    def _release_continuous(self, axis):
+        with self.state_lock:
+            if self.running[axis]:
+                self.running[axis] = False
+                self._axis_motion_generation[axis] += 1
+
+    def stop_continuous(self, axis):
+        stop_reservation = self._begin_axis_stop(axis)
+        if self._is_serial_connected():
+            threading.Thread(
+                target=self._send_axis_stop,
+                args=(axis, stop_reservation),
+                daemon=True,
+            ).start()
+        else:
+            with self.state_lock:
+                if self._move_reservation[axis] is stop_reservation:
+                    self._move_reservation[axis] = None
+        self.log(f"⛔ 轴{AXIS_LABEL[axis]} 紧急停止")
+
+    # ═════════════ 步进：位置/原点 ═════════════
+    def _axis_motion_active_locked(self, axis):
+        return (
+            self.running[axis]
+            or self.stepper_in_progress[axis]
+            or self._move_dispatching[axis]
+            or self._move_reservation[axis] is not None
+            or self._web_step_pending[axis] is not None
+            or self._pending_step[axis] is not None
+        )
+
+    def _warn_calibration_while_moving(self, axis):
+        message = f"轴{AXIS_LABEL[axis]}正在运动，停止后才能修改位置或限位"
+        self.log(f"⛔ {message}")
+        messagebox.showwarning("暂不能校准", message)
+
+    def set_home(self, axis):
+        with self.state_lock:
+            blocked = self._axis_motion_active_locked(axis)
+            if not blocked:
+                self.axis_runtime[axis].set_position(
+                    self.axis_profiles[axis], 0.0, trusted=True)
+        if blocked:
+            self._warn_calibration_while_moving(axis)
+            return
+        self._update_pos_label(axis)
+        self._save_calib()
+        self.log(f"✓ 轴{AXIS_LABEL[axis]} 当前位置设为原点")
+
+    def calibrate_position(self, axis):
+        try: val = float(self.v_goto[axis].get())
+        except (tk.TclError, TypeError, ValueError, OverflowError):
+            messagebox.showerror("输入无效", "请先填目标位置"); return
+        if not math.isfinite(val):
+            messagebox.showerror("输入无效", "校准位置必须是有限数值"); return
+        with self.state_lock:
+            blocked = self._axis_motion_active_locked(axis)
+            if not blocked:
+                self.axis_runtime[axis].set_position(
+                    self.axis_profiles[axis], val, trusted=True)
+        if blocked:
+            self._warn_calibration_while_moving(axis)
+            return
+        self._update_pos_label(axis)
+        self._save_calib()
+        self.log(f"✓ 轴{AXIS_LABEL[axis]} 位置校准为 {val:.1f} {self._unit_label(axis)}")
+
+    def go_home(self, axis):
+        self._goto(axis, 0.0)
+
+    def goto_target_position(self, axis):
+        try: target = float(self.v_goto[axis].get())
+        except (tk.TclError, TypeError, ValueError, OverflowError):
+            messagebox.showerror("输入无效", "请输入有效目标位置"); return
+        if not math.isfinite(target):
+            messagebox.showerror("输入无效", "目标位置必须是有限数值"); return
+        self._goto(axis, target)
+
+    def _goto(self, axis, target_mm):
+        try:
+            target_mm = float(target_mm)
+        except (TypeError, ValueError, OverflowError):
+            target_mm = math.nan
+        if not math.isfinite(target_mm):
+            messagebox.showerror("输入无效", "目标位置必须是有限数值")
+            return
+        if not self._require_axis_params(axis):
+            return
+        move = self._reserve_axis_move(axis)
+        if move is None:
+            self.log(f"轴{AXIS_LABEL[axis]} 正在运动，绝对定位未排队")
+            return
+        reservation, motion_generation, profile = move
+        self._start_reserved_axis_worker(
+            axis, reservation, self._send_to_position,
+            axis, target_mm,
+            self.v_delay[axis].get(), profile,
+            reservation=reservation,
+            motion_generation=motion_generation)
+
+    # ═════════════ 行程校准 ═════════════
+    def _mark_min(self, axis):
+        with self.state_lock:
+            blocked = self._axis_motion_active_locked(axis)
+            runtime = self.axis_runtime[axis]
+            profile = self.axis_profiles[axis]
+            trusted = runtime.position_trusted
+            invalid = (
+                runtime.max_steps is not None
+                and runtime.position_steps >= runtime.max_steps
+            )
+            if not blocked and trusted and not invalid:
+                runtime.min_steps = runtime.position_steps
+                value = runtime.position_in(profile)
+        if blocked:
+            self._warn_calibration_while_moving(axis); return
+        if not trusted:
+            messagebox.showerror("位置不可信", "请先设置原点或校准当前位置"); return
+        if invalid:
+            messagebox.showerror("范围无效", "最小不能 ≥ 最大"); return
+        self._update_range_display(axis); self._save_calib()
+        self.log(f"⊖ 轴{AXIS_LABEL[axis]} 最小 = {value:.1f}{profile.unit}")
+
+    def _mark_max(self, axis):
+        with self.state_lock:
+            blocked = self._axis_motion_active_locked(axis)
+            runtime = self.axis_runtime[axis]
+            profile = self.axis_profiles[axis]
+            trusted = runtime.position_trusted
+            invalid = (
+                runtime.min_steps is not None
+                and runtime.position_steps <= runtime.min_steps
+            )
+            if not blocked and trusted and not invalid:
+                runtime.max_steps = runtime.position_steps
+                value = runtime.position_in(profile)
+        if blocked:
+            self._warn_calibration_while_moving(axis); return
+        if not trusted:
+            messagebox.showerror("位置不可信", "请先设置原点或校准当前位置"); return
+        if invalid:
+            messagebox.showerror("范围无效", "最大不能 ≤ 最小"); return
+        self._update_range_display(axis); self._save_calib()
+        self.log(f"⊕ 轴{AXIS_LABEL[axis]} 最大 = {value:.1f}{profile.unit}")
+
+    def _clear_range(self, axis):
+        with self.state_lock:
+            blocked = self._axis_motion_active_locked(axis)
+            if not blocked:
+                self.axis_runtime[axis].min_steps = None
+                self.axis_runtime[axis].max_steps = None
+        if blocked:
+            self._warn_calibration_while_moving(axis)
+            return
+        self._update_range_display(axis); self._save_calib()
+        self.log(f"轴{AXIS_LABEL[axis]} 行程限位已清除")
+
+    def _update_range_display(self, axis):
+        mn, mx = self.axis_runtime[axis].limits_in(self.axis_profiles[axis])
+        label = self.sw[axis]['range_label']
+        if mn is None and mx is None:
+            label.config(text="未校准（无软件限位）", foreground="gray")
+        else:
+            mn_s = f"{mn:.1f}" if mn is not None else "?"
+            mx_s = f"{mx:.1f}" if mx is not None else "?"
+            travel = f"  (行程 {mx-mn:.1f}{self._unit_label(axis)})" if (mn is not None and mx is not None) else ""
+            label.config(text=f"min={mn_s} max={mx_s}{travel}", foreground="black")
+
+    def _check_range(self, axis, target_mm):
+        runtime = self.axis_runtime[axis]
+        profile = self.axis_profiles[axis]
+        if not runtime.position_trusted:
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]} 位置不可信，禁止运动；请先重新校准")
+            return False
+        mn, mx = runtime.limits_in(profile)
+        target_steps = profile.exact_steps_from_units(target_mm)
+        tolerance_steps = profile.exact_steps_from_units(0.05)
+        if runtime.min_steps is not None and target_steps < runtime.min_steps - tolerance_steps:
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_mm:.1f}{self._unit_label(axis)}<下限{mn:.1f}"); return False
+        if runtime.max_steps is not None and target_steps > runtime.max_steps + tolerance_steps:
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]}: 目标{target_mm:.1f}{self._unit_label(axis)}>上限{mx:.1f}"); return False
+        return True
+
+    @staticmethod
+    def _profile_metadata(profile):
+        return {
+            "mode": profile.mode,
+            "pulse_per_rev": profile.pulse_per_rev,
+            "gear_ratio": profile.gear_ratio,
+            "lead_mm": profile.lead_mm,
+        }
+
+    @staticmethod
+    def _profile_metadata_matches(profile, value):
+        if not isinstance(value, dict):
+            return False
+        try:
+            stored = AxisProfile(
+                mode=value["mode"],
+                pulse_per_rev=value["pulse_per_rev"],
+                gear_ratio=value["gear_ratio"],
+                lead_mm=value["lead_mm"],
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        return stored == profile
+
+    def _save_calib(self):
+        with self.state_lock:
+            data = {}
+            for axis in range(NUM_STEPPER_AXES):
+                profile = self.axis_profiles[axis]
+                entry = self.axis_runtime[axis].as_legacy_units(profile)
+                # Additive metadata lets the next startup detect a crash or
+                # failed write between axis-config and calibration files.
+                entry["_profile"] = self._profile_metadata(profile)
+                data[str(axis)] = entry
+        try:
+            self.state_store.save_calibration(data)
+        except StateStoreError as e:
+            self.log(f"⚠️ 校准保存失败: {e}")
+
+    def _load_calib(self):
+        try:
+            data = self.state_store.load_calibration()
+            if data is None:
+                return
+            mismatched_axes = []
+            for a in range(NUM_STEPPER_AXES):
+                d = data.get(str(a), {})
+                if not isinstance(d, dict):
+                    self.axis_runtime[a] = AxisRuntime(position_trusted=False)
+                    mismatched_axes.append(a)
+                    self._update_pos_label(a)
+                    self._update_range_display(a)
+                    continue
+                profile = self.axis_profiles[a]
+                metadata = d.get("_profile")
+                profile_mismatch = (
+                    a in self._axis_profile_load_fallback
+                    or (
+                        metadata is not None
+                        and not self._profile_metadata_matches(profile, metadata)
+                    )
+                )
+                try:
+                    runtime = AxisRuntime.from_legacy_units(
+                        profile,
+                        minimum=d.get("min"),
+                        maximum=d.get("max"),
+                        position=d.get("position", 0.0),
+                        trusted=(
+                            bool(d.get("trusted", True))
+                            and not profile_mismatch
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    runtime = AxisRuntime(position_trusted=False)
+                    profile_mismatch = True
+                self.axis_runtime[a] = runtime
+                if profile_mismatch:
+                    mismatched_axes.append(a)
+                self._update_pos_label(a)
+                self._update_range_display(a)
+            if mismatched_axes:
+                labels = ", ".join(AXIS_LABEL[a] for a in mismatched_axes)
+                self.log(
+                    f"⚠️ 轴配置与校准不一致或损坏，位置已标记为不可信: {labels}"
+                )
+            any_set = any(
+                runtime.min_steps is not None or runtime.max_steps is not None
+                for runtime in self.axis_runtime
+            )
+            if any_set:
+                self.log("已加载行程校准")
+        except (StateStoreError, TypeError, ValueError) as e:
+            self.log(f"⚠️ 校准读取失败: {e}")
+
+    # ═════════════ FOC 调参持久化 ═════════════
+    def _save_foc_tune(self):
+        """把每轴 V/PA/VP/PP 当前值写到 .foc_tune.json。"""
+        try:
+            data = {str(a): {
+                "V":  round(self.v_focvlimit[a].get(), 2),
+                "PA": round(self.v_focpangle[a].get(), 2),
+                "VP": round(self.v_focvp[a].get(),     3),
+                "PP": int(self.v_focpp[a].get()),
+            } for a in range(NUM_MOTOR_AXES)}
+            self.state_store.save_foc_tune(data)
+        except (StateStoreError, tk.TclError, TypeError, ValueError) as e:
+            self.log(f"⚠️ FOC 调参保存失败: {e}")
+
+    def _load_foc_tune(self):
+        """启动时从 json 读回 Tk 变量 + 更新滑条标签。不自动下发到固件，
+        要等 toggle_connect 成功后 _apply_foc_tune_to_firmware 再推。"""
+        try:
+            data = self.state_store.load_foc_tune()
+            if data is None:
+                return
+            for a in range(NUM_MOTOR_AXES):
+                d = data.get(str(a), {})
+                if not isinstance(d, dict):
+                    raise TypeError(f"FOC 轴 {a} 调参项必须是对象")
+                if "V"  in d: self.v_focvlimit[a].set(float(d["V"]))
+                if "PA" in d: self.v_focpangle[a].set(float(d["PA"]))
+                if "VP" in d: self.v_focvp[a].set(float(d["VP"]))
+                if "PP" in d: self.v_focpp[a].set(int(d["PP"]))
+                # 同步标签
+                self.fw[a]['vlimit_label'].config(text=f"{self.v_focvlimit[a].get():.1f} V (扭矩)")
+                self.fw[a]['pangle_label'].config(text=f"{self.v_focpangle[a].get():.1f} (刚度)")
+                self.fw[a]['vp_label'].config(text=f"{self.v_focvp[a].get():.2f} (阻尼)")
+            self.log("已加载 FOC 调参")
+        except (StateStoreError, tk.TclError, TypeError, ValueError, KeyError) as e:
+            self.log(f"⚠️ FOC 调参读取失败: {e}")
+
+    def _apply_foc_tune_to_firmware(self):
+        """连接成功后将已加载的 V/PA/VP 下发给固件；PP 在固件 NVS 里，不需要重发。"""
+        values = [
+            (self.v_focvlimit[axis].get(), self.v_focpangle[axis].get(),
+             self.v_focvp[axis].get())
+            for axis in range(NUM_MOTOR_AXES)
+        ]
+        def worker():
+            time.sleep(0.3)
+            for axis, (v, pa, vp) in enumerate(values):
+                self._send_and_read(f"FOC,{axis},V,{v:.1f}")
+                self._send_and_read(f"FOC,{axis},PA,{pa:.1f}")
+                self._send_and_read(f"FOC,{axis},VP,{vp:.2f}")
+            self.log("FOC 调参已下发固件")
+        self._start_control_worker(worker)
+
+    # ═════════════ FOC：命令 ═════════════
+    def _send_foc(self, axis, sub_and_arg):
+        """例：_send_foc(0, 'EN,1') → 发 FOC,0,EN,1 → 日志记响应"""
+        cmd = f"FOC,{axis},{sub_and_arg}"
+        def worker():
+            resp = self._send_and_read(cmd)
+            self.log(f"{cmd} → {resp}")
+        self._start_control_worker(worker)
+
+    def _foc_goto(self, axis):
+        self._send_foc(axis, f"A,{self.v_foctgt[axis].get():.1f}")
+
+    def _foc_quick(self, axis, deg):
+        self.v_foctgt[axis].set(deg); self._foc_goto(axis)
+
+    def _foc_increment(self, axis, delta):
+        self.v_foctgt[axis].set(self.v_foctgt[axis].get() + delta); self._foc_goto(axis)
+
+    def _foc_home(self, axis):
+        self._send_foc(axis, "H")
+
+    def _foc_toggle_enable(self, axis):
+        self._foc_enabled_ui[axis] = not self._foc_enabled_ui[axis]
+        v = 1 if self._foc_enabled_ui[axis] else 0
+        self._send_foc(axis, f"EN,{v}")
+
+    def _foc_on_vlimit(self, axis, _):
+        v = self.v_focvlimit[axis].get()
+        if v > 12.0:
+            txt = f"{v:.1f} V ⚠️ 超额定"
+            self.fw[axis]['vlimit_label'].config(text=txt, foreground="red")
+        else:
+            self.fw[axis]['vlimit_label'].config(text=f"{v:.1f} V (扭矩)", foreground="black")
+        self._send_foc(axis, f"V,{v:.1f}")
+
+    def _foc_on_pangle(self, axis, _):
+        p = self.v_focpangle[axis].get()
+        self.fw[axis]['pangle_label'].config(text=f"{p:.1f} (刚度)")
+        self._send_foc(axis, f"PA,{p:.1f}")
+
+    def _foc_on_vp(self, axis, _):
+        p = self.v_focvp[axis].get()
+        self.fw[axis]['vp_label'].config(text=f"{p:.2f} (阻尼)")
+        self._send_foc(axis, f"VP,{p:.2f}")
+
+    def _foc_save_pp(self, axis):
+        n = int(self.v_focpp[axis].get())
+        self._send_foc(axis, f"PP,{n}")
+        self._save_foc_tune()
+
+    def _foc_clear_fault(self, axis):
+        self._send_foc(axis, "CLR")
+        self._foc_enabled_ui[axis] = False
+
+    # ═════════════ FOC：轮询 + 显示 ═════════════
+    def _foc_poll_loop(self, generation, session):
+        while (self.foc_poll_running
+               and self._serial_source_is_current(generation, session)):
+            for axis in range(NUM_MOTOR_AXES):
+                if not (self.foc_poll_running
+                        and self._serial_source_is_current(generation, session)):
+                    break
+                resp = self._send_and_read(
+                    f"FOC,{axis},S",
+                    guard=lambda: self._serial_source_is_current(
+                        generation, session
+                    ),
+                )
+                prefix = f"FOC,{axis},S,"
+                if resp.startswith(prefix):
+                    parts = resp.split(",")
+                    # 格式: FOC,<axis>,S,<state>,<cur>,<tgt>,<fault>
+                    if len(parts) == 7:
+                        s, c, t, f = parts[3], parts[4], parts[5], parts[6]
+                        self._post_ui(
+                            lambda a=axis, s=s, c=c, t=t, f=f:
+                            self._update_foc_display(a, s, c, t, f)
+                            if self._serial_source_is_current(generation, session)
+                            else None
+                        )
+                time.sleep(FOC_POLL_INTERVAL_S / NUM_MOTOR_AXES)  # 总周期仍 ~100ms
+
+    def _update_foc_display(self, axis, state, cur, tgt, fault):
+        self.v_focstate[axis].set(FOC_STATE_NAMES.get(state, "?"))
+        try:
+            cur_f = float(cur); tgt_f = float(tgt)
+        except ValueError:
+            cur_f = tgt_f = None
+        with self.state_lock:
+            self._motor_status[axis] = {
+                "state": state,
+                "current_deg": cur_f,
+                "target_deg": tgt_f,
+                "fault": fault == "1",
+            }
+        cur_text = f"{cur_f:.1f}°" if cur_f is not None else "--"
+        if self.stepper_in_progress[axis]: cur_text += " ⏸"
+        self.v_foccur[axis].set(cur_text)
+        self.v_focfault[axis].set("报警" if fault == "1" else "正常")
+        self.fw[axis]['fault_label'].config(foreground="red" if fault == "1" else "green")
+        self.gw[axis]['fault_label'].config(foreground="red" if fault == "1" else "green")
+        # 两个模式都按响应门控（只激活当前模式的会真正生效）
+        self._apply_foc_gating(axis, state, fault)
+        self._apply_gear_gating(axis, state, fault)
+
+        if cur_f is not None and state == "2":
+            now = time.time()
+            self.foc_trace_buf[axis].append((now, tgt_f, cur_f))
+            cutoff = now - 10.0
+            self.foc_trace_buf[axis] = [x for x in self.foc_trace_buf[axis] if x[0] >= cutoff]
+            self._redraw_scope(axis)
+
+    def _apply_gear_gating(self, axis, state, fault):
+        gw = self.gw[axis]
+        if not self.ser or not self.ser.is_open:
+            for w in gw['motion_btns'] + gw['cfg_widgets']:
+                w.config(state="disabled")
+            gw['enable_btn'].config(state="disabled")
+            gw['clear_btn'].config(state="disabled")
+            return
+        is_fault    = (fault == "1" or state == "3")
+        is_disabled = (state == "0")
+        is_running  = (state == "2")
+        motion_state = "normal" if is_running else "disabled"
+        for b in gw['motion_btns']: b.config(state=motion_state)
+        cfg_state = "normal" if (is_disabled or is_running) else "disabled"
+        for w in gw['cfg_widgets']: w.config(state=cfg_state)
+        en_state = "normal" if (is_disabled or is_running) else "disabled"
+        gw['enable_btn'].config(state=en_state)
+        if is_running:    gw['enable_btn'].config(text="■ 失能 PID")
+        elif is_fault:    gw['enable_btn'].config(text="(故障，先清除)")
+        else:             gw['enable_btn'].config(text="▶ 使能 PID")
+        gw['clear_btn'].config(state="normal" if is_fault else "disabled")
+
+    def _apply_foc_gating(self, axis, state, fault):
+        fw = self.fw[axis]
+        if not self.ser or not self.ser.is_open:
+            for w in fw['motion_btns'] + fw['cfg_btns']:
+                w.config(state="disabled")
+            fw['enable_btn'].config(state="disabled")
+            fw['clear_btn'].config(state="disabled")
+            return
+        is_fault    = (fault == "1" or state == "3")
+        is_disabled = (state == "0")
+        is_running  = (state == "2")
+        is_aligning = (state == "1")
+        motion_state = "normal" if is_running else "disabled"
+        for b in fw['motion_btns']: b.config(state=motion_state)
+        cfg_state = "normal" if (is_disabled or is_running) else "disabled"
+        for w in fw['cfg_btns']: w.config(state=cfg_state)
+        en_state = "normal" if (is_disabled or is_running) else "disabled"
+        fw['enable_btn'].config(state=en_state)
+        if is_running:    fw['enable_btn'].config(text="■ 失能 FOC")
+        elif is_aligning: fw['enable_btn'].config(text="… 对齐中")
+        elif is_fault:    fw['enable_btn'].config(text="(故障，先清除)")
+        else:             fw['enable_btn'].config(text="▶ 使能 FOC")
+        fw['clear_btn'].config(state="normal" if is_fault else "disabled")
+
+    def _redraw_scope(self, axis):
+        # 在 FOC tab 和 GEAR tab 的画布上都画（共用同一份 trace 缓冲）
+        canvases = []
+        if axis < len(self.fw) and 'scope' in self.fw[axis]: canvases.append(self.fw[axis]['scope'])
+        if axis < len(self.gw) and 'scope' in self.gw[axis]: canvases.append(self.gw[axis]['scope'])
+        for cv in canvases:
+            self._draw_scope_on(cv, axis)
+
+    def _draw_scope_on(self, cv, axis):
+        W, H = 420, 420
+        cv.delete("all")
+        buf = self.foc_trace_buf[axis]
+        if len(buf) < 2:
+            cv.create_text(W/2, H/2, text="(等待数据，使能 + 设目标后开始)", fill="#888")
+            return
+        t0 = buf[0][0]; t_span = max(0.1, buf[-1][0] - t0)
+        ys = [p[1] for p in buf] + [p[2] for p in buf]
+        y_min, y_max = min(ys), max(ys)
+        if y_max - y_min < 10:
+            c = (y_min + y_max) / 2; y_min, y_max = c - 5, c + 5
+        y_pad = (y_max - y_min) * 0.1
+        y_min -= y_pad; y_max += y_pad
+        for frac in (0.25, 0.5, 0.75):
+            y = H * frac; cv.create_line(0, y, W, y, fill="#e5e5e5")
+        if y_min < 0 < y_max:
+            y0 = H * (y_max - 0) / (y_max - y_min)
+            cv.create_line(0, y0, W, y0, fill="#aaa", dash=(3, 3))
+        cv.create_text(3, 3, text=f"{y_max:.0f}°", anchor="nw", fill="#555", font=("Arial", 8))
+        cv.create_text(3, H-3, text=f"{y_min:.0f}°", anchor="sw", fill="#555", font=("Arial", 8))
+        pts_t, pts_c = [], []
+        for t, tgt, cur in buf:
+            x = W * (t - t0) / t_span
+            yt = H * (y_max - tgt) / (y_max - y_min)
+            yc = H * (y_max - cur) / (y_max - y_min)
+            pts_t.extend([x, yt]); pts_c.extend([x, yc])
+        if len(pts_t) >= 4: cv.create_line(*pts_t, fill="#1565c0", width=1)
+        if len(pts_c) >= 4: cv.create_line(*pts_c, fill="#d32f2f", width=2)
+
+    # ═════════════ GEAR Tab（参数化）═════════════
+    def _build_gear_tab(self, parent, axis):
+        build_gear_tab_view(self, parent, axis)
+
+    # ═════════════ GEAR：命令 ═════════════
+    def _send_gear(self, axis, sub_and_arg):
+        """和 _send_foc 一样格式，GEAR 固件也用 FOC,<axis>,... 命名空间。"""
+        cmd = f"FOC,{axis},{sub_and_arg}"
+        def worker():
+            resp = self._send_and_read(cmd)
+            self.log(f"{cmd} → {resp}")
+        self._start_control_worker(worker)
+
+    def _gear_goto(self, axis):
+        target = self.v_foctgt[axis].get()
+        self._send_gear(axis, f"A,{target:.1f}")
+        self._start_goto_watcher(axis, target)
+
+    def _start_goto_watcher(self, axis, target_deg, tol_deg=2.0, timeout_s=15.0):
+        """后台监视 cur → tgt 的逼近，每 1.5s 打印进度。新 goto / 失能 自动取消旧 watcher。"""
+        self._goto_watcher_gen[axis] += 1
+        my_gen = self._goto_watcher_gen[axis]
+        def worker():
+            t0 = time.time()
+            last_log = 0.0
+            self.log(f"→ 轴{AXIS_LABEL[axis]} 前往 {target_deg:.1f}°")
+            while self.ser and self.ser.is_open:
+                # 1. 被新 goto 取代 → 退出（不打日志）
+                if self._goto_watcher_gen[axis] != my_gen:
+                    return
+                # 2. 使用线程安全状态快照，不从后台线程读取 Tk 变量。
+                with self.state_lock:
+                    motor = dict(self._motor_status[axis])
+                if motor["state"] != "2":
+                    self.log(f"  轴{AXIS_LABEL[axis]} watcher 退出（PID 状态={motor['state']}）")
+                    return
+                # 3. 读当前角度
+                cur = motor["current_deg"]
+                if cur is None:
+                    time.sleep(0.3); continue
+                err = target_deg - cur
+                dt = time.time() - t0
+                # 4. 到位
+                if abs(err) < tol_deg:
+                    self.log(f"✓ 轴{AXIS_LABEL[axis]} 到位 cur={cur:.1f}° (用时 {dt:.1f}s)")
+                    return
+                # 5. 超时
+                if dt > timeout_s:
+                    self.log(f"⚠️ 轴{AXIS_LABEL[axis]} {timeout_s:.0f}s 未到位 "
+                             f"cur={cur:.1f}° 差 {err:+.1f}° (Kp 太小？发 DIAG,0 看 PWM)")
+                    return
+                # 6. 周期进度
+                if time.time() - last_log > 1.5:
+                    self.log(f"  轴{AXIS_LABEL[axis]} cur={cur:.1f}° 差 {err:+.1f}° (t={dt:.1f}s)")
+                    last_log = time.time()
+                time.sleep(0.3)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _gear_quick(self, axis, deg):
+        self.v_foctgt[axis].set(deg); self._gear_goto(axis)
+
+    def _gear_increment(self, axis, delta):
+        self.v_foctgt[axis].set(self.v_foctgt[axis].get() + delta); self._gear_goto(axis)
+
+    def _gear_home(self, axis):
+        self._send_gear(axis, "H")
+
+    def _gear_toggle_enable(self, axis):
+        self._foc_enabled_ui[axis] = not self._foc_enabled_ui[axis]
+        v = 1 if self._foc_enabled_ui[axis] else 0
+        self._send_gear(axis, f"EN,{v}")
+
+    def _gear_on_pwm(self, axis, _):
+        v = self.v_gearpwm[axis].get()
+        self.gw[axis]['pwm_label'].config(text=f"{v:.1f} %")
+        self._send_gear(axis, f"V,{v:.1f}")   # GEAR 固件 V 是 PWM 百分比
+
+    def _gear_on_kp(self, axis, _):
+        v = self.v_gearkp[axis].get()
+        self.gw[axis]['kp_label'].config(text=f"{v:.2f}")
+        self._send_gear(axis, f"PA,{v:.2f}")
+
+    def _gear_on_ki(self, axis, _):
+        v = self.v_gearki[axis].get()
+        self.gw[axis]['ki_label'].config(text=f"{v:.2f}")
+        self._send_gear(axis, f"PI,{v:.2f}")
+
+    def _gear_on_kd(self, axis, _):
+        v = self.v_gearkd[axis].get()
+        self.gw[axis]['kd_label'].config(text=f"{v:.3f}")
+        self._send_gear(axis, f"PD,{v:.3f}")
+
+    def _gear_save_gr(self, axis):
+        gr = float(self.v_geargr[axis].get())
+        self._send_gear(axis, f"GR,{gr:.1f}")
+        self._save_gear_tune()
+
+    def _gear_clear_fault(self, axis):
+        self._send_gear(axis, "CLR")
+        self._foc_enabled_ui[axis] = False
+
+    # ═════════════ GEAR 调参持久化 ═════════════
+    def _save_gear_tune(self):
+        try:
+            data = {str(a): {
+                "PWM": round(self.v_gearpwm[a].get(), 2),
+                "Kp":  round(self.v_gearkp[a].get(),  3),
+                "Ki":  round(self.v_gearki[a].get(),  3),
+                "Kd":  round(self.v_gearkd[a].get(),  4),
+                "GR":  round(self.v_geargr[a].get(),  1),
+            } for a in range(NUM_MOTOR_AXES)}
+            self.state_store.save_gear_tune(data)
+            # 简短日志反馈 axis 0 当前值（最常用）
+            d = data["0"]
+            self.log(f"💾 GEAR 调参已保存到 {self.state_store.paths.gear_tune.name} "
+                     f"(L: PWM={d['PWM']}% Kp={d['Kp']} Ki={d['Ki']} Kd={d['Kd']} GR={d['GR']})")
+        except (StateStoreError, tk.TclError, TypeError, ValueError, KeyError) as e:
+            self.log(f"⚠️ GEAR 调参保存失败: {e}")
+
+    def _load_gear_tune(self):
+        try:
+            data = self.state_store.load_gear_tune()
+            if data is None:
+                return
+            for a in range(NUM_MOTOR_AXES):
+                d = data.get(str(a), {})
+                if not isinstance(d, dict):
+                    raise TypeError(f"GEAR 轴 {a} 调参项必须是对象")
+                if "PWM" in d: self.v_gearpwm[a].set(float(d["PWM"]))
+                if "Kp"  in d: self.v_gearkp[a].set(float(d["Kp"]))
+                if "Ki"  in d: self.v_gearki[a].set(float(d["Ki"]))
+                if "Kd"  in d: self.v_gearkd[a].set(float(d["Kd"]))
+                if "GR"  in d: self.v_geargr[a].set(float(d["GR"]))
+                self.gw[a]['pwm_label'].config(text=f"{self.v_gearpwm[a].get():.1f} %")
+                self.gw[a]['kp_label'].config(text=f"{self.v_gearkp[a].get():.2f}")
+                self.gw[a]['ki_label'].config(text=f"{self.v_gearki[a].get():.2f}")
+                self.gw[a]['kd_label'].config(text=f"{self.v_gearkd[a].get():.3f}")
+            self.log("已加载 GEAR 调参")
+        except (StateStoreError, tk.TclError, TypeError, ValueError, KeyError) as e:
+            self.log(f"⚠️ GEAR 调参读取失败: {e}")
+
+    def _apply_gear_tune_to_firmware(self):
+        values = [
+            (self.v_gearpwm[axis].get(), self.v_gearkp[axis].get(),
+             self.v_gearki[axis].get(), self.v_gearkd[axis].get())
+            for axis in range(NUM_MOTOR_AXES)
+        ]
+        def worker():
+            time.sleep(0.3)
+            for axis, (pwm, kp, ki, kd) in enumerate(values):
+                self._send_and_read(f"FOC,{axis},V,{pwm:.1f}")
+                self._send_and_read(f"FOC,{axis},PA,{kp:.2f}")
+                self._send_and_read(f"FOC,{axis},PI,{ki:.2f}")
+                self._send_and_read(f"FOC,{axis},PD,{kd:.3f}")
+            self.log("GEAR 调参已下发固件")
+        self._start_control_worker(worker)
+
+    # ═════════════ 模式自动检测 + tab 灰显 ═════════════
+    def _query_mode_and_apply(self):
+        """连接成功后调一次。用户选 Auto 时发 MODE 命令自动检测；
+        用户选 FOC/GEAR 时直接强制应用，不查询固件。"""
+        sel = self.mode_select_var.get()
+        with self.state_lock:
+            generation = self._serial_generation
+            session = self.serial_session
+
+        def apply_if_current(mode):
+            if self._serial_source_is_current(generation, session):
+                self._apply_mode_to_tabs(mode)
+
+        if sel in (MODE_FOC, MODE_GEAR):
+            self.log(f"模式选择 = 强制 {sel}（跳过固件 MODE 查询）")
+            self._post_ui(lambda: apply_if_current(sel))
+            return
+        # Auto
+        def worker():
+            time.sleep(0.4)
+            if not self._serial_source_is_current(generation, session):
+                return
+            resp = self._send_and_read(
+                "MODE",
+                timeout=1.5,
+                guard=lambda: self._serial_source_is_current(
+                    generation, session
+                ),
+            )
+            if not self._serial_source_is_current(generation, session):
+                return
+            mode = MODE_FOC
+            if resp.startswith("MODE,"):
+                m = resp.split(",", 1)[1].strip().upper()
+                if m in (MODE_FOC, MODE_GEAR): mode = m
+            else:
+                self.log(f"⚠️ 固件未返回 MODE（响应={resp!r}）。请烧含 MODE 命令的固件，"
+                         f"或用'强制 FOC/GEAR'手动选。先按 FOC 处理。")
+            self._post_ui(lambda: apply_if_current(mode))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mode_select_change(self):
+        """用户切换 Auto/FOC/GEAR radio 时调用。如果已连接，立即重新应用模式。"""
+        sel = self.mode_select_var.get()
+        self.log(f"模式选择 → {sel}")
+        if self.ser and self.ser.is_open:
+            self._query_mode_and_apply()
+
+    def _apply_mode_to_tabs(self, mode):
+        """灰掉非当前模式的 tab，更新 mode 标签，下发对应模式的 tune。"""
+        self.fw_mode_var.set(mode)
+        with self.state_lock:
+            self._fw_mode_cache = mode
+        if mode == MODE_FOC:
+            self.mode_label.config(foreground="#1565c0")
+            for a in range(NUM_MOTOR_AXES):
+                self.notebook.tab(self.tab_index_foc[a],  state="normal")
+                self.notebook.tab(self.tab_index_gear[a], state="disabled")
+            # 自动跳到第一个 FOC tab
+            self.notebook.select(self.tab_index_foc[0])
+            self._apply_foc_tune_to_firmware()
+        elif mode == MODE_GEAR:
+            self.mode_label.config(foreground="#2e7d32")
+            for a in range(NUM_MOTOR_AXES):
+                self.notebook.tab(self.tab_index_foc[a],  state="disabled")
+                self.notebook.tab(self.tab_index_gear[a], state="normal")
+            self.notebook.select(self.tab_index_gear[0])
+            self._apply_gear_tune_to_firmware()
+        self.log(f"固件模式 = {mode}")
+
+    # ═════════════ 网页服务公开接口（允许从非 Tk 线程调用）═════════════
+    @staticmethod
+    def _lan_ipv4():
+        """尽量取得手机可访问的局域网 IPv4；失败时安全回退到本机地址。"""
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            address = probe.getsockname()[0]
+            if address and not address.startswith("127."):
+                return address
+        except OSError:
+            pass
+        finally:
+            probe.close()
+        try:
+            address = socket.gethostbyname(socket.gethostname())
+            return address if address else "127.0.0.1"
+        except OSError:
+            return "127.0.0.1"
+
+    def _start_web_server(self, factory):
+        """启动随 GUI 生命周期运行的局域网网页服务。"""
+        try:
+            server = factory(self._web_controller)
+            server.start()
+            self.attach_web_server(server)
+            port = server.bound_port
+            if port is None:
+                raise RuntimeError("网页服务未取得监听端口")
+            address = self._lan_ipv4()
+            url = f"http://{address}:{port}/"
+            self.web_address_var.set(address)
+            self.web_port_var.set(str(port))
+            self.web_url_var.set(url)
+            if address.startswith("127."):
+                self.web_status_var.set("● 已启动（仅检测到本机地址）")
+                self.web_status_label.configure(foreground="#b26a00")
+                self.log("⚠️ 网页服务已启动，但只检测到本机地址；请联网后重启 GUI")
+            else:
+                self.web_status_var.set("● 服务已启动")
+                self.web_status_label.configure(foreground="#16803a")
+                self.log(f"网页服务已启动：{url}（固定地址，无控制令牌）")
+        except Exception as exc:
+            self.web_server = None
+            self.web_status_var.set("● 服务启动失败")
+            self.web_address_var.set("—")
+            self.web_port_var.set("—")
+            self.web_url_var.set(f"网页服务启动失败：{exc}")
+            self.web_status_label.configure(foreground="#b42318")
+            self.log(f"⚠️ 网页服务启动失败：{exc}")
+
+    def _copy_web_url(self):
+        url = self.web_url_var.get()
+        if not url.startswith("http://"):
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self.root.update_idletasks()
+        self.log("手机控制固定网址已复制")
+
+    def _open_web_url(self):
+        url = self.web_url_var.get()
+        if url.startswith("http://"):
+            webbrowser.open(url)
+
+    def _on_close(self):
+        """尽力停车，然后回收串口和网页服务器。"""
+        with self.state_lock:
+            if self._closing:
+                return
+            self._closing = True
+            active_axes = [
+                axis for axis in range(NUM_STEPPER_AXES)
+                if (self.running[axis] or self.stepper_in_progress[axis]
+                    or self._move_dispatching[axis]
+                    or self._move_reservation[axis] is not None
+                    or self._pending_step[axis] is not None)
+            ]
+        if self._is_serial_connected():
+            confirmed = self._stop_all_outputs(allow_closing=True)
+            if not confirmed and not messagebox.askyesno(
+                "停车未确认",
+                "控制器没有确认 ESTOP，电机可能仍在运动或保持使能。\n\n"
+                "请立即使用物理急停或断电。是否仍要强制退出？",
+                icon="warning",
+            ):
+                with self.state_lock:
+                    self._closing = False
+                return
+        # 确认停车或操作者明确选择强制退出后，再关闭 HTTP 入口。
+        if self.web_server is not None:
+            try:
+                self.web_server.stop()
+            except Exception:
+                pass
+            self.web_server = None
+        if self._is_serial_connected():
+            self._disconnect_serial("GUI 已关闭", is_error=False)
+        # _disconnect_serial 的 UI 更新来不及在 destroy 前执行；关闭路径必须同步持久化失信状态。
+        with self.state_lock:
+            for axis in active_axes:
+                self.axis_runtime[axis].position_trusted = False
+                self.running[axis] = False
+                self.stepper_in_progress[axis] = False
+                self._move_dispatching[axis] = False
+                self._move_reservation[axis] = None
+                self._pending_step[axis] = None
+        self._save_calib()
+        self.root.destroy()
+
+    def _ensure_web_control_available(self, *, allow_estop_retry=False):
+        with self.state_lock:
+            if self._closing:
+                raise RuntimeError("控制器正在关闭")
+            if self._disconnecting:
+                raise RuntimeError("串口正在断开")
+            if self._estop_in_progress:
+                raise RuntimeError("软件急停正在执行")
+            if self._hardware_estop_active:
+                raise RuntimeError("硬件急停已触发")
+            if self._estop_unconfirmed and not allow_estop_retry:
+                raise RuntimeError(
+                    "ESTOP 未获确认，普通运动已锁定；请重试急停或物理断电"
+                )
+            generation = self._control_generation
+        if not self._is_serial_connected():
+            raise RuntimeError("串口未连接")
+        return generation
+
+    def _stop_all_outputs(self, allow_closing=False):
+        """发送固件原子软件急停；返回是否收到精确确认。"""
+        with self.state_lock:
+            self._control_generation += 1
+            self._track_lease_generation += 1
+            for axis in range(NUM_STEPPER_AXES):
+                self._axis_motion_generation[axis] += 1
+                self.running[axis] = False
+                self._move_reservation[axis] = None
+                self._web_step_pending[axis] = None
+            for axis in range(NUM_MOTOR_AXES):
+                self._foc_enabled_ui[axis] = False
+            self._track_direction = "STOP"
+        response = self._send_and_read("ESTOP", timeout=0.8, allow_closing=allow_closing)
+        confirmed = response == "OK,ESTOP"
+        with self.state_lock:
+            self._estop_unconfirmed = not confirmed
+        status = "已停止" if confirmed else "⚠ 停车未确认"
+        self._post_ui(lambda value=status: self.v_track_status.set(value))
+        return confirmed
+
+    def attach_web_server(self, server):
+        """保存 WebControlServer 实例，供外部启动/关闭流程统一管理。"""
+        self.web_server = server
+        return server
+
+    def web_get_status(self):
+        """兼容旧调用方；HTTP 服务直接使用 ``DesktopWebController``。"""
+        return self._web_controller.web_get_status()
+
+    @staticmethod
+    def _web_direction(direction):
+        return DesktopWebController.parse_direction(direction)
+
+    def web_stepper_move(self, axis, direction, distance_mm, speed_mm_s=SPEED_DEFAULT):
+        return self._web_controller.web_stepper_move(
+            axis, direction, distance_mm, speed_mm_s)
+
+    def web_stepper_stop(self, axis):
+        return self._web_controller.web_stepper_stop(axis)
+
+    def web_stepper_config(self, axis, mode=None, pulse_per_rev=None, gear_ratio=None, lead_mm=None):
+        return self._web_controller.web_stepper_config(
+            axis,
+            mode=mode,
+            pulse_per_rev=pulse_per_rev,
+            gear_ratio=gear_ratio,
+            lead_mm=lead_mm,
+        )
+
+    def web_motor_command(self, mode, axis, action, target_deg=None):
+        return self._web_controller.web_motor_command(
+            mode, axis, action, target_deg=target_deg)
+
+    def web_track_command(self, action, pwm=0, lease_ms=0):
+        return self._web_controller.web_track_command(
+            action, pwm=pwm, lease_ms=lease_ms)
+
+    def web_emergency_stop(self):
+        return self._web_controller.web_emergency_stop()
+
+    # ═════════════ FOC：自动调参（单轴）═════════════
+    def _foc_autotune(self, axis):
+        if not self.ser or not self.ser.is_open:
+            messagebox.showerror("未连接", "请先连接串口"); return
+        if not messagebox.askokcancel(
+            "自动调参确认",
+            f"轴 {AXIS_LABEL[axis]} 两阶段扫描 PA + VP，约 2 分钟。\n电机会来回转动，请先固定好。"):
+            return
+        self.fw[axis]['autotune_btn'].config(state="disabled")
+        if self._start_control_worker(self._foc_autotune_worker, axis) is None:
+            self.fw[axis]['autotune_btn'].config(state="normal")
+
+    def _step_response_test(self, axis, target, pre_settle=2.5, duration=5.0):
+        metrics = self._autotune_runner.step_response_test(
+            axis, target, pre_settle_s=pre_settle, duration_s=duration)
+        if metrics is None:
+            return None
+        return (
+            metrics.overshoot_deg,
+            metrics.steady_state_error_deg,
+            metrics.rise_time_s,
+            metrics.jitter_deg,
+        )
+
+    def _foc_autotune_worker(self, axis):
+        generation = getattr(self._control_context, "generation", None)
+        try:
+            result = self._autotune_runner.run_foc(axis)
+            if not result.completed:
+                return
+            best_pa = result.best_pa
+            best_vp = result.best_vp
+            def apply_result():
+                with self.state_lock:
+                    if (
+                        generation != self._control_generation
+                        or self._closing
+                        or self._disconnecting
+                        or self._estop_in_progress
+                        or self._hardware_estop_active
+                        or self._estop_unconfirmed
+                    ):
+                        return
+                self.v_focpangle[axis].set(float(best_pa))
+                self.fw[axis]['pangle_label'].config(text=f"{best_pa:.1f} (刚度)")
+                self.v_focvp[axis].set(float(best_vp))
+                self.fw[axis]['vp_label'].config(text=f"{best_vp:.2f} (阻尼)")
+                self._save_foc_tune()
+            self._post_ui(apply_result)
+        finally:
+            self._post_ui(lambda: self.fw[axis]['autotune_btn'].config(state="normal"))
+
+    # ═════════════ GEAR：自动调参（三阶段 Kp → Kd → Ki）═════════════
+    def _gear_autotune(self, axis):
+        if not self.ser or not self.ser.is_open:
+            messagebox.showerror("未连接", "请先连接串口"); return
+        if not messagebox.askokcancel(
+            "GEAR 自动调参",
+            f"轴 {AXIS_LABEL[axis]} 三阶段扫描 Kp → Kd → Ki，约 3 分钟。\n"
+            f"电机会反复在 0° ↔ 60° 之间走，请确认机械空间够。"):
+            return
+        self.gw[axis]['autotune_btn'].config(state="disabled")
+        if self._start_control_worker(self._gear_autotune_worker, axis) is None:
+            self.gw[axis]['autotune_btn'].config(state="normal")
+
+    def _gear_autotune_worker(self, axis):
+        generation = getattr(self._control_context, "generation", None)
+        try:
+            result = self._autotune_runner.run_gear(axis)
+            if not result.completed:
+                return
+            best_kp = result.best_kp
+            best_kd = result.best_kd
+            best_ki = result.best_ki
+            def apply_result():
+                with self.state_lock:
+                    if (
+                        generation != self._control_generation
+                        or self._closing
+                        or self._disconnecting
+                        or self._estop_in_progress
+                        or self._hardware_estop_active
+                        or self._estop_unconfirmed
+                    ):
+                        return
+                self.v_gearkp[axis].set(float(best_kp))
+                self.gw[axis]['kp_label'].config(text=f"{best_kp:.2f}")
+                self.v_gearkd[axis].set(float(best_kd))
+                self.gw[axis]['kd_label'].config(text=f"{best_kd:.3f}")
+                self.v_gearki[axis].set(float(best_ki))
+                self.gw[axis]['ki_label'].config(text=f"{best_ki:.2f}")
+                self._save_gear_tune()
+            self._post_ui(apply_result)
+        finally:
+            self._post_ui(lambda: self.gw[axis]['autotune_btn'].config(state="normal"))
+
+    # ═════════════ 日志 ═════════════
+    def _classify_log(self, msg):
+        if any(k in msg for k in ("⛔", "ERR", "FAULT", "失败", "异常", "拒绝")):
+            return "err"
+        if any(k in msg for k in ("⚠️", "warn")):
+            return "warn"
+        if "轴L" in msg or "axis 0" in msg or "FOC,0," in msg or "MOVE,0" in msg:
+            return "axisL"
+        if "轴R" in msg or "axis 1" in msg or "FOC,1," in msg or "MOVE,1" in msg:
+            return "axisR"
+        if any(k in msg for k in ("✓", "OK", "DONE", "完成", "通过")):
+            return "ok"
+        if msg.startswith("MOT:") or msg.startswith("[FOC"):
+            return "rx"
+        return ""
+
+    def _log_file_path(self):
+        return os.path.join(LOG_DIR, f"gui_{time.strftime('%Y-%m-%d')}.log")
+
+    def log(self, msg):
+        ts = time.strftime("%H:%M:%S")
+        full = f"{ts}  {msg}"
+        # 写日期分割的日志文件（追加）
+        try:
+            with open(self._log_file_path(), "a", encoding="utf-8") as f:
+                f.write(full + "\n")
+        except Exception:
+            pass
+        # UI 上色显示
+        tag = self._classify_log(msg)
+        def _append():
+            self.log_text.config(state="normal")
+            if tag:
+                self.log_text.insert("end", full + "\n", tag)
+            else:
+                self.log_text.insert("end", full + "\n")
+            self.log_text.see("end")
+            self.log_text.config(state="disabled")
+        self._post_ui(_append)
+
+    def clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
+
+    def _open_log_dir(self):
+        try:
+            os.startfile(LOG_DIR)  # Windows
+        except Exception:
+            messagebox.showinfo("日志目录", LOG_DIR)
+
+    def _toggle_raw_log(self):
+        """打开/关闭串口原始流文件记录（每条 RX 行写到独立 log）。"""
+        if self.raw_log_var.get():
+            try:
+                path = os.path.join(LOG_DIR, f"raw_{time.strftime('%Y%m%d_%H%M%S')}.log")
+                self._raw_log_fh = open(path, "w", encoding="utf-8")
+                self.log(f"串口原始流 → {os.path.basename(path)}")
+            except Exception as e:
+                self.log(f"⚠️ 原始流打开失败: {e}")
+                self.raw_log_var.set(False)
+        else:
+            if self._raw_log_fh:
+                try: self._raw_log_fh.close()
+                except Exception: pass
+                self._raw_log_fh = None
+                self.log("串口原始流已停止")

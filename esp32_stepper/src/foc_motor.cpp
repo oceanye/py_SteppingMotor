@@ -4,6 +4,7 @@
 #include <SimpleFOC.h>
 #include <Preferences.h>
 #include <atomic>
+#include "serial_tx.h"
 
 // ── 每轴 SimpleFOC 对象（文件级静态数组）──
 // 注意：sensors 必须在 foc_init 里用 init(&Wire) / init(&Wire1) 分别初始化不同总线。
@@ -60,7 +61,7 @@ static void foc_task(void* arg) {
       if (!s_aligned_once[axis]) {
         int ok = motor.initFOC();
         if (!ok) {
-          Serial.print("FOC,"); Serial.print(axis); Serial.println(",FAULT");
+          serial_tx_printf("FOC,%d,FAULT", axis);
           g_fault_latched[axis].store(true);
           g_state[axis].store(FOC_STATE_FAULT);
           g_enable_req[axis].store(false);
@@ -120,11 +121,11 @@ void foc_init() {
     int pp = s_prefs.getInt(key, FOC_POLE_PAIRS_DEFAULT);
     s_prefs.end();
     motors[axis].pole_pairs = pp;
-    Serial.print("[FOC "); Serial.print(axis); Serial.print("] pole_pairs = "); Serial.println(pp);
+    serial_tx_printf("[FOC %d] pole_pairs = %d", axis, pp);
 
     // 传感器到对应总线
     sensors[axis].init(axis == 0 ? &Wire : &Wire1);
-    Serial.print("[FOC "); Serial.print(axis); Serial.println("] sensor init done");
+    serial_tx_printf("[FOC %d] sensor init done", axis);
 
     // 驱动
     drivers[axis].voltage_power_supply = FOC_PSU_VOLTAGE;
@@ -134,7 +135,9 @@ void foc_init() {
     // 电机
     motors[axis].linkSensor(&sensors[axis]);
     motors[axis].linkDriver(&drivers[axis]);
-    motors[axis].useMonitoring(Serial);
+    // SimpleFOC's monitoring/debug path writes directly to Print in several
+    // fragments and bypasses the controller's line mutex. Runtime status is
+    // exposed through FOC,<axis>,S, so leave library monitoring disabled.
     motors[axis].voltage_limit         = FOC_INITIAL_V_LIMIT;
     motors[axis].voltage_sensor_align  = 6.0f;
     motors[axis].velocity_limit        = FOC_VELOCITY_LIMIT;
@@ -154,7 +157,7 @@ void foc_init() {
     xTaskCreatePinnedToCore(foc_task, tname, FOC_TASK_STACK,
                             (void*)(intptr_t)axis, FOC_TASK_PRIORITY,
                             &s_task[axis], FOC_TASK_CORE);
-    Serial.print("[FOC "); Serial.print(axis); Serial.println("] Core 0 task started");
+    serial_tx_printf("[FOC %d] Core 0 task started", axis);
   }
 }
 

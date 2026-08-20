@@ -3,6 +3,7 @@
 #include "../../src/protocol_parse.h"
 #include "../../src/safety_input.h"
 #include "../../src/remote_stepper_map.h"
+#include "../../src/protocol_limits.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -29,6 +30,24 @@ void test_integer_rejects_overflow_and_decimal(void) {
     int value = 0;
     TEST_ASSERT_FALSE(protocol_parse_int("999999999999999999999", 0, 100, value));
     TEST_ASSERT_FALSE(protocol_parse_int("10.0", 0, 100, value));
+}
+
+void test_move_delay_upper_boundary(void) {
+    int value = 0;
+    TEST_ASSERT_TRUE(protocol_parse_int("10000000", 1,
+                                       STEPPER_MAX_DELAY_US, value));
+    TEST_ASSERT_EQUAL_INT(10000000, value);
+    TEST_ASSERT_FALSE(protocol_parse_int("10000001", 1,
+                                        STEPPER_MAX_DELAY_US, value));
+}
+
+void test_remote_move_delay_lower_boundary(void) {
+    int value = 0;
+    TEST_ASSERT_TRUE(protocol_parse_int("100", REMOTE_STEPPER_MIN_DELAY_US,
+                                       STEPPER_MAX_DELAY_US, value));
+    TEST_ASSERT_EQUAL_INT(100, value);
+    TEST_ASSERT_FALSE(protocol_parse_int("99", REMOTE_STEPPER_MIN_DELAY_US,
+                                        STEPPER_MAX_DELAY_US, value));
 }
 
 void test_float_requires_finite_complete_value(void) {
@@ -97,6 +116,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN_TEST(test_integer_accepts_boundaries);
     RUN_TEST(test_axis_rejects_invalid_tokens);
     RUN_TEST(test_integer_rejects_overflow_and_decimal);
+    RUN_TEST(test_move_delay_upper_boundary);
+    RUN_TEST(test_remote_move_delay_lower_boundary);
     RUN_TEST(test_float_requires_finite_complete_value);
     RUN_TEST(test_track_duty_and_lease_boundaries);
     RUN_TEST(test_stop_and_track_field_counts);
