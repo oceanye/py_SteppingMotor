@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "config.h"
 #include "stepper.h"
+#include "serial_tx.h"
 #include <atomic>
 #include <math.h>
 
@@ -56,12 +57,7 @@ static inline void emit_pulse(int pul, int delay_us, int* step_count, uint32_t* 
   }
   (*step_count)++;
   if (total_steps > 500 && (*step_count % 500) == 0) {
-    Serial.print("STEP,");
-    Serial.print(axis);
-    Serial.print(",P,");
-    Serial.print(*step_count);
-    Serial.print(",");
-    Serial.println(total_steps);
+    serial_tx_printf("STEP,%d,P,%d,%d", axis, *step_count, total_steps);
   }
 }
 
@@ -135,12 +131,8 @@ static void stepper_task(void* arg) {
       if (expected == STEP_ABORTING) aborted = true;
       s_state[axis].store(STEP_FINISHING);
     }
-    Serial.print("STEP,");
-    Serial.print(axis);
-    Serial.print(aborted ? ",ABORT," : ",DONE,");
-    Serial.print(step_count);
-    Serial.print(',');
-    Serial.println(steps);
+    serial_tx_printf("STEP,%d,%s,%d,%d", axis,
+                     aborted ? "ABORT" : "DONE", step_count, steps);
     // A new MOVE cannot be accepted until the previous terminal line is sent.
     s_state[axis].store(STEP_IDLE);
   }
@@ -161,7 +153,7 @@ void stepper_init() {
 }
 
 void stepper_move(int axis, int steps, int direction, int delay_us) {
-  if (!valid_axis(axis)) { Serial.print("ERR:bad axis "); Serial.println(axis); return; }
+  if (!valid_axis(axis)) { serial_tx_printf("ERR:bad axis %d", axis); return; }
   int pul = PIN_PUL[axis], dpin = PIN_DIR[axis];
   digitalWrite(dpin, direction);
   delayMicroseconds(100);
@@ -172,7 +164,7 @@ void stepper_move(int axis, int steps, int direction, int delay_us) {
     if (delay_us >= 2000) delay(delay_us / 1000);
     else if (delay_us > 0) delayMicroseconds(delay_us);
   }
-  Serial.print("OK,"); Serial.println(axis);
+  serial_tx_printf("OK,%d", axis);
 }
 
 bool stepper_is_busy(int axis) {
@@ -200,22 +192,22 @@ bool stepper_move_async(int axis, int steps, int direction, int delay_us) {
 }
 
 void stepper_run_diagnostics(int axis) {
-  if (!valid_axis(axis)) { Serial.println("ERR:bad axis"); return; }
+  if (!valid_axis(axis)) { serial_tx_line("ERR:bad axis"); return; }
   int pul = PIN_PUL[axis], dpin = PIN_DIR[axis];
-  Serial.println();
-  Serial.print("===== DIAG axis="); Serial.print(axis); Serial.println(" =====");
-  Serial.print(">>> PUL(GPIO"); Serial.print(pul); Serial.println(") 将置 HIGH 5 秒");
+  serial_tx_line("");
+  serial_tx_printf("===== DIAG axis=%d =====", axis);
+  serial_tx_printf(">>> PUL(GPIO%d) 将置 HIGH 5 秒", pul);
   delay(1000);
   digitalWrite(pul, HIGH);
   delay(5000);
   digitalWrite(pul, LOW);
   delay(500);
-  Serial.print(">>> DIR(GPIO"); Serial.print(dpin); Serial.println(") 将置 HIGH 3 秒");
+  serial_tx_printf(">>> DIR(GPIO%d) 将置 HIGH 3 秒", dpin);
   delay(500);
   digitalWrite(dpin, HIGH);
   delay(3000);
   digitalWrite(dpin, LOW);
-  Serial.println(">>> 5 + 5 脉冲测试");
+  serial_tx_line(">>> 5 + 5 脉冲测试");
   digitalWrite(dpin, HIGH);
   delayMicroseconds(100);
   for (int i = 0; i < 5; i++) {
@@ -229,5 +221,5 @@ void stepper_run_diagnostics(int axis) {
     digitalWrite(pul, HIGH); delay(20);
     digitalWrite(pul, LOW);  delay(80);
   }
-  Serial.println("===== DIAG 结束 =====");
+  serial_tx_line("===== DIAG 结束 =====");
 }

@@ -3,6 +3,8 @@
 #include "foc_motor.h"
 #include "config.h"
 #include "stepper.h"
+#include "protocol_limits.h"
+#include "serial_tx.h"
 #if defined(DRIVE_MODE_GEAR)
 #include "hardware_estop.h"
 #include "track_motor.h"
@@ -12,10 +14,9 @@
 
 static constexpr int MAX_TOKENS = 6;
 static constexpr int MAX_MOVE_STEPS = 20000000;
-static constexpr int MAX_STEP_DELAY_US = 1000000;
 
-static void reply_ok_axis(int axis) { Serial.print("OK,"); Serial.println(axis); }
-static void reply_err(const char* why) { Serial.print("ERR:"); Serial.println(why); }
+static void reply_ok_axis(int axis) { serial_tx_printf("OK,%d", axis); }
+static void reply_err(const char* why) { serial_tx_printf("ERR:%s", why); }
 
 static bool reject_if_hardware_estop_active() {
 #if defined(DRIVE_MODE_GEAR)
@@ -61,25 +62,31 @@ static void handle_move(const String tok[], int n) {
   int steps = 0, direction = 0, delay_us = 0;
   if (!protocol_parse_int(tok[2].c_str(), 1, MAX_MOVE_STEPS, steps) ||
       !protocol_parse_int(tok[3].c_str(), 0, 1, direction) ||
-      !protocol_parse_int(tok[4].c_str(), 1, MAX_STEP_DELAY_US, delay_us)) {
+      !protocol_parse_int(tok[4].c_str(), 1, STEPPER_MAX_DELAY_US, delay_us)) {
     reply_err("bad value"); return;
   }
 
   if (tok[1] == "*") {
+#if defined(DRIVE_MODE_GEAR) && REMOTE_STEPPER_ENABLED
+    // Wildcard spans local and remote axes. Validate the stricter RP2040
+    // period before starting any local motor, avoiding a partial broadcast.
+    if (delay_us < REMOTE_STEPPER_MIN_DELAY_US) {
+      reply_err("remote delay below 100us"); return;
+    }
+#endif
     for (int axis = 0; axis < NUM_AXES; ++axis) {
       if (stepper_move_async(axis, steps, direction, delay_us)) {
-        Serial.print("ACK,"); Serial.println(axis);
+        serial_tx_printf("ACK,%d", axis);
       } else {
-        Serial.print("ERR:busy "); Serial.println(axis);
+        serial_tx_printf("ERR:busy %d", axis);
       }
     }
 #if defined(DRIVE_MODE_GEAR) && REMOTE_STEPPER_ENABLED
     for (int axis = NUM_AXES; axis < REMOTE_STEPPER_TOTAL_AXES; ++axis) {
       if (remote_stepper_move(axis, steps, direction, delay_us)) {
-        Serial.print("ACK,"); Serial.println(axis);
+        serial_tx_printf("ACK,%d", axis);
       } else {
-        Serial.print("ERR:"); Serial.print(remote_stepper_last_error());
-        Serial.print(' '); Serial.println(axis);
+        serial_tx_printf("ERR:%s %d", remote_stepper_last_error(), axis);
       }
     }
 #endif
@@ -91,18 +98,20 @@ static void handle_move(const String tok[], int n) {
   if (axis >= NUM_AXES) {
     // RP2040 nodes guarantee pulse timing only at/above 100 us. Keep the
     // existing 1 us lower bound for the six directly wired ESP32 axes.
-    if (delay_us < 100) { reply_err("remote delay below 100us"); return; }
+    if (delay_us < REMOTE_STEPPER_MIN_DELAY_US) {
+      reply_err("remote delay below 100us"); return;
+    }
     if (!remote_stepper_move(axis, steps, direction, delay_us)) {
       reply_err(remote_stepper_last_error()); return;
     }
-    Serial.print("ACK,"); Serial.println(axis);
+    serial_tx_printf("ACK,%d", axis);
     return;
   }
 #endif
   if (!stepper_move_async(axis, steps, direction, delay_us)) {
     reply_err("busy"); return;
   }
-  Serial.print("ACK,"); Serial.println(axis);
+  serial_tx_printf("ACK,%d", axis);
 }
 
 static void handle_stop(const String tok[], int n) {
@@ -149,7 +158,7 @@ void system_estop() {
 static void handle_estop(const String tok[], int n) {
   if (n != 1) { reply_err("bad format"); return; }
   system_estop();
-  Serial.println("OK,ESTOP");
+  serial_tx_line("OK,ESTOP");
 }
 
 static void handle_stdiag(const String tok[], int n) {
@@ -161,7 +170,7 @@ static void handle_stdiag(const String tok[], int n) {
   if (axis >= NUM_AXES) {
     if (remote_stepper_is_busy(axis)) { reply_err("busy"); return; }
     if (!remote_stepper_run_diagnostics(axis)) reply_err(remote_stepper_last_error());
-    else { Serial.print("ACK,"); Serial.println(axis); }
+    else { serial_tx_printf("ACK,%d", axis); }
     return;
   }
 #endif
@@ -189,11 +198,11 @@ static void handle_diag(const String tok[], int n) {
 static void dispatch_foc_single(int axis, const String& sub,
                                 bool has_arg, const String& arg) {
   if (sub == "S" && !has_arg) {
-    Serial.print("FOC,"); Serial.print(axis); Serial.print(",S,");
-    Serial.print((int)foc_get_state(axis)); Serial.print(',');
-    Serial.print(foc_get_current_deg(axis), 1); Serial.print(',');
-    Serial.print(foc_get_target_deg(axis), 1); Serial.print(',');
-    Serial.println(foc_is_fault_latched(axis) ? 1 : 0);
+    serial_tx_printf("FOC,%d,S,%d,%.1f,%.1f,%d", axis,
+                     (int)foc_get_state(axis),
+                     (double)foc_get_current_deg(axis),
+                     (double)foc_get_target_deg(axis),
+                     foc_is_fault_latched(axis) ? 1 : 0);
     return;
   }
   if (sub == "EN" && has_arg) {
@@ -314,16 +323,14 @@ static void reply_encoder_status(int axis) {
   const double multi_deg = (double)status.multi_turn_counts * 360.0 / 4096.0;
   // ENC,<axis>,S,<diag>,<mux>,<online>,<magnet>,<raw>,<single_deg>,
   //     <runtime_multi_deg>,<age_ms>,<errors>
-  Serial.print("ENC,"); Serial.print(axis); Serial.print(",S,");
-  Serial.print(status.diagnostics_enabled ? 1 : 0); Serial.print(',');
-  Serial.print(status.mux_online ? 1 : 0); Serial.print(',');
-  Serial.print(status.sensor_online ? 1 : 0); Serial.print(',');
-  Serial.print(status.magnet_detected ? 1 : 0); Serial.print(',');
-  Serial.print(status.raw_angle); Serial.print(',');
-  Serial.print(single_deg, 2); Serial.print(',');
-  Serial.print(multi_deg, 2); Serial.print(',');
-  Serial.print(status.age_ms); Serial.print(',');
-  Serial.println(status.error_count);
+  serial_tx_printf("ENC,%d,S,%d,%d,%d,%d,%u,%.2f,%.2f,%lu,%lu", axis,
+                   status.diagnostics_enabled ? 1 : 0,
+                   status.mux_online ? 1 : 0,
+                   status.sensor_online ? 1 : 0,
+                   status.magnet_detected ? 1 : 0,
+                   (unsigned int)status.raw_angle, single_deg, multi_deg,
+                   (unsigned long)status.age_ms,
+                   (unsigned long)status.error_count);
 }
 
 static void handle_encoder(const String tok[], int n) {
@@ -337,15 +344,16 @@ static void handle_track(const String tok[], int n) {
   if (n < 3 || tok[1] != "D") { reply_err("bad format"); return; }
   if (tok[2] == "STOP" && n == 3) {
     track_motor_stop();
-    Serial.println("OK,TRACK,D");
+    serial_tx_line("OK,TRACK,D");
     return;
   }
   if (tok[2] == "S" && n == 3) {
     const TrackStatus status = track_motor_get_status();
     const char* state = status.direction == TRACK_FORWARD ? "FWD" :
                         status.direction == TRACK_REVERSE ? "REV" : "STOP";
-    Serial.print("TRACK,D,S,"); Serial.print(state); Serial.print(',');
-    Serial.print(status.duty_pct); Serial.print(','); Serial.println(status.remaining_ms);
+    serial_tx_printf("TRACK,D,S,%s,%u,%lu", state,
+                     (unsigned int)status.duty_pct,
+                     (unsigned long)status.remaining_ms);
     return;
   }
   if ((tok[2] == "FWD" || tok[2] == "REV") && (n == 4 || n == 5)) {
@@ -360,7 +368,7 @@ static void handle_track(const String tok[], int n) {
     if (!track_motor_drive(direction, (uint8_t)duty, (uint32_t)lease)) {
       reply_err("bad value"); return;
     }
-    Serial.println("OK,TRACK,D");
+    serial_tx_line("OK,TRACK,D");
     return;
   }
   reply_err("bad format");
@@ -396,9 +404,9 @@ void protocol_handle_line(const String& command) {
   if (tok[0] == "MODE") {
     if (n != 1) { reply_err("bad format"); return; }
 #if defined(DRIVE_MODE_FOC)
-    Serial.println("MODE,FOC");
+    serial_tx_line("MODE,FOC");
 #elif defined(DRIVE_MODE_GEAR)
-    Serial.println("MODE,GEAR");
+    serial_tx_line("MODE,GEAR");
 #endif
   } else if (tok[0] == "MOVE") handle_move(tok, n);
   else if (tok[0] == "STOP") handle_stop(tok, n);

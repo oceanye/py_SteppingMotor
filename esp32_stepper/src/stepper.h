@@ -4,7 +4,7 @@
 // 多轴：所有函数都按 axis 索引（0=L, 1=R），axis 超界返回 false / 忽略
 void stepper_init();
 
-// 同步版本：阻塞执行脉冲串，末尾 Serial.println("OK,<axis>")。DIAG 内部用。
+// 同步版本：阻塞执行脉冲串，末尾通过共享 TX helper 返回 "OK,<axis>"。DIAG 内部用。
 void stepper_move(int axis, int steps, int direction, int delay_us);
 
 // 异步版本（协议分发用）：立即返回；后台任务执行脉冲。

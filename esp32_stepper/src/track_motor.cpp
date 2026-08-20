@@ -1,5 +1,6 @@
 #include "track_motor.h"
 #include "config.h"
+#include "serial_tx.h"
 #include <Arduino.h>
 
 #if defined(DRIVE_MODE_GEAR)
@@ -39,7 +40,7 @@ static void safety_task(void*) {
     const uint8_t duty_pct = s_duty_pct;
     write_outputs(direction, duty_pct);
     xSemaphoreGive(s_track_mutex);
-    if (timed_out) Serial.println("TRACK,D,TIMEOUT");
+    if (timed_out) serial_tx_line("TRACK,D,TIMEOUT");
     vTaskDelay(pdMS_TO_TICKS(TRACK_SAFETY_TICK_MS));
   }
 }
@@ -52,12 +53,12 @@ void track_motor_init() {
   ledcAttachPin(PIN_TRACK_D_IN2, TRACK_D_LEDC_CH_IN2);
   write_outputs(TRACK_STOPPED, 0);
   if (s_track_mutex == nullptr) {
-    Serial.println("ERR:track mutex init failed");
+    serial_tx_line("ERR:track mutex init failed");
     return;
   }
   s_ready = xTaskCreatePinnedToCore(safety_task, "trackD", 2048, nullptr,
                                     3, &s_track_task, 0) == pdPASS;
-  if (!s_ready) Serial.println("ERR:track safety task init failed");
+  if (!s_ready) serial_tx_line("ERR:track safety task init failed");
 }
 
 bool track_motor_drive(TrackDirection direction, uint8_t duty_pct, uint32_t lease_ms) {

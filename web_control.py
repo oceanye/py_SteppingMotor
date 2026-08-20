@@ -6,6 +6,7 @@ passes a controller object implementing these methods::
     web_get_status()
     web_stepper_move(axis, direction, distance_mm, speed_mm_s)
     web_stepper_stop(axis)
+    web_stepper_config(axis, mode=None, pulse_per_rev=None, gear_ratio=None, lead_mm=None)
     web_motor_command(mode, axis, action, target_deg=None)
     web_track_command(action, pwm=0.0, lease_ms=0)
     web_emergency_stop()
@@ -25,10 +26,13 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from motor_control.topology import NUM_STEPPER_AXES
+from motor_control.web_contract import WebController
+
 
 MAX_REQUEST_BODY = 16 * 1024
 MAX_REQUEST_TARGET = 2 * 1024
-MAX_STEPPER_AXIS = 29
+MAX_STEPPER_AXIS = NUM_STEPPER_AXES - 1
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 INDEX_FILE = WEB_ROOT / "index.html"
 
@@ -303,7 +307,7 @@ class WebControlServer:
     without application-level authentication; deploy it only on a trusted LAN.
     """
 
-    def __init__(self, controller: Any, host: str = "0.0.0.0", port: int = 8765):
+    def __init__(self, controller: WebController, host: str = "0.0.0.0", port: int = 8765):
         if not isinstance(host, str) or not host:
             raise ValueError("host must be a non-empty string")
         if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:

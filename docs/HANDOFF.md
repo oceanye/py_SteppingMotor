@@ -14,8 +14,15 @@
 >
 > 2026-08-19 更新：GUI 轴参数手输、日志滚轮和 L/R 现场标定已有新结论；最新状态、
 > 仍待复测的轴 L 36:1/行程矛盾以及复审修正见 `docs/HANDOFF_2026-08-19.md`。
+>
+> 2026-08-20 待合并分支更新：PC GUI 已进行渐进式模块化、step-based 轴状态和
+> typed 串口会话重构；ESP32 整行串口 TX 与 ESP32/RP2040 慢速步进上限也已同步。
+> 离线结果及远端实机合并清单见
+> `docs/HANDOFF_2026-08-20_MODULAR_REFACTOR.md`。
 
-本文是后续迁移到开发机、真实控制柜和实物机构时的执行基线。当前这台电脑不是开发/硬件环境，本轮只完成代码、接口、PCB 模块占位和文档落位；**没有宣称编译、烧录、KiCad DRC 或电机实测通过**。
+本文是后续迁移到开发机、真实控制柜和实物机构时的执行基线。2026-08-20 分支已完成
+Python 离线回归及 ESP32/RP2040 PlatformIO 交叉编译；**没有宣称烧录、KiCad DRC 或
+电机实测通过**。
 
 ## 1. 当前交付状态
 
@@ -143,6 +150,14 @@ TRACK,D,S
 ENC,<axis>,S
 ```
 
+`MOVE` 的 `delay_us` 上限统一为 `10,000,000 us`。ESP32 直连轴接受
+`1..10,000,000 us`；经 RS485 的 RP2040 轴因 50 us 高电平脉宽约束，接受
+`100..10,000,000 us`。该上限覆盖默认旋转参数 `0.3°/s`。
+
+ESP32 发往 PC 的运行期文本必须先组装成完整一行，再通过 `serial_tx` 的
+共享 mutex 输出。协议回复及异步 `STEP`、`FOC`、`TRACK`、`NODE` 事件均遵循
+此规则；新增固件路径不得直接分段调用 `Serial.print/println`。
+
 `FOC,...` 这个历史协议名在 GEAR 构建中控制两路 DRV8871/N20 闭环轴，不代表六路 DM442 已使用 FOC。详细字段以根目录 `MD422_20K-2M.md` 为准。
 
 网页 API：
@@ -150,6 +165,7 @@ ENC,<axis>,S
 - `GET /api/status`
 - `POST /api/stepper/move`
 - `POST /api/stepper/stop`
+- `POST /api/stepper/config`
 - `POST /api/motor`
 - `POST /api/track`
 - `POST /api/estop`
@@ -166,7 +182,8 @@ ENC,<axis>,S
 cd <项目根目录>
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m py_compile pc_gui.py web_control.py pc_control.py esp32_main.py
+.\.venv\Scripts\python.exe -m compileall -q pc_gui.py web_control.py pc_control.py esp32_main.py motor_control tests
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
 cd esp32_stepper
 pio run -e esp32s3_gear

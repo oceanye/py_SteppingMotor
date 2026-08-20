@@ -18,12 +18,24 @@ static ParseResult parse(const char *input, Command &command, uint8_t node = 2) 
 void test_move() {
   Command command;
   TEST_ASSERT_EQUAL_INT(static_cast<int>(ParseResult::Ok),
-                        static_cast<int>(parse("N,2,MOVE,3,12000,1,80", command)));
+                        static_cast<int>(parse("N,2,MOVE,3,12000,1,100", command)));
   TEST_ASSERT_EQUAL_INT(static_cast<int>(CommandType::Move), static_cast<int>(command.type));
   TEST_ASSERT_EQUAL_INT(3, command.axis);
   TEST_ASSERT_EQUAL_UINT32(12000, command.steps);
   TEST_ASSERT_TRUE(command.direction);
-  TEST_ASSERT_EQUAL_UINT32(80, command.delay_us);
+  TEST_ASSERT_EQUAL_UINT32(100, command.delay_us);
+}
+
+void test_move_delay_boundaries() {
+  Command command;
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(ParseResult::Ok),
+                        static_cast<int>(parse("N,2,MOVE,0,1,0,100", command)));
+  TEST_ASSERT_EQUAL_UINT32(100, command.delay_us);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(ParseResult::Ok),
+                        static_cast<int>(parse("N,2,MOVE,0,1,0,10000000", command)));
+  TEST_ASSERT_EQUAL_UINT32(10000000, command.delay_us);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(ParseResult::BadDelay),
+                        static_cast<int>(parse("N,2,MOVE,0,1,0,10000001", command)));
 }
 
 void test_other_node_is_ignored() {
@@ -78,6 +90,7 @@ void test_rejects_bad_values_and_broadcast_move() {
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_move);
+  RUN_TEST(test_move_delay_boundaries);
   RUN_TEST(test_other_node_is_ignored);
   RUN_TEST(test_broadcast_safety_commands);
   RUN_TEST(test_poll_and_stop_all);

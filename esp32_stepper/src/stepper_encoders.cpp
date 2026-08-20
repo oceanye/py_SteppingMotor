@@ -1,6 +1,7 @@
 #include "stepper_encoders.h"
 #include "config.h"
 #include <Arduino.h>
+#include "serial_tx.h"
 
 #if defined(DRIVE_MODE_GEAR)
 #include <Wire.h>
@@ -117,8 +118,11 @@ void stepper_encoders_init() {
       encoder_poll_task, "stepEnc", STEPPER_ENCODER_TASK_STACK, nullptr,
       STEPPER_ENCODER_TASK_PRIORITY, &s_poll_task,
       STEPPER_ENCODER_TASK_CORE) == pdPASS;
-  if (!s_task_started) Serial.println("ERR:optional encoder diagnostic task init failed");
-  else Serial.println("[ENC] optional TCA9548A/AS5600 diagnostics enabled; open-loop step control unchanged");
+  if (!s_task_started) {
+    serial_tx_line("ERR:optional encoder diagnostic task init failed");
+  } else {
+    serial_tx_line("[ENC] optional TCA9548A/AS5600 diagnostics enabled; open-loop step control unchanged");
+  }
 #else
   s_task_started = false;
 #endif

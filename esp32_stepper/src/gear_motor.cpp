@@ -7,6 +7,7 @@
 #include <cmath>
 #include "driver/pcnt.h"
 #include "driver/gpio.h"
+#include "serial_tx.h"
 
 struct GearAxis {
   pcnt_unit_t pcnt_unit;
@@ -45,12 +46,6 @@ static void publish_counts(GearAxis& axis) {
   axis.published_counts = axis.position_counts;
   portEXIT_CRITICAL(&s_data_mux);
 }
-static void print_int64(int64_t value) {
-  char text[32];
-  snprintf(text, sizeof(text), "%lld", (long long)value);
-  Serial.print(text);
-}
-
 static void set_pwm(GearAxis& axis, float output) {
   const float cap = axis.duty_cap_pct.load() * 0.01f * GEAR_PWM_MAX;
   float magnitude = fabsf(output);
@@ -173,9 +168,8 @@ void foc_init() {
     axis.target_deg.store(0.0f); axis.current_deg.store(0.0f);
     axis.enable_req.store(false); axis.fault_latched.store(false);
     axis.state.store(FOC_STATE_DISABLED);
-    Serial.print("[GEAR "); Serial.print(index); Serial.print("] ratio=");
-    Serial.print(ratio, 1); Serial.print(" counts/deg=");
-    Serial.println(counts_per_degree(axis), 2);
+    serial_tx_printf("[GEAR %d] ratio=%.1f counts/deg=%.2f", index,
+                     (double)ratio, (double)counts_per_degree(axis));
     init_pcnt(axis.pcnt_unit, axis.pin_enca, axis.pin_encb);
     ledcSetup(axis.ledc_ch_in1, GEAR_PWM_FREQ_HZ, GEAR_PWM_RES_BITS);
     ledcSetup(axis.ledc_ch_in2, GEAR_PWM_FREQ_HZ, GEAR_PWM_RES_BITS);
@@ -237,31 +231,38 @@ bool foc_set_p_derivative(int axis, float value) {
 }
 
 void foc_run_diagnostics(int axis) {
-  if (!valid_axis(axis)) { Serial.println("ERR:bad axis"); return; }
+  if (!valid_axis(axis)) { serial_tx_line("ERR:bad axis"); return; }
   GearAxis& item = axes[axis];
-  Serial.print("[DIAG "); Serial.print(axis); Serial.println("]");
-  Serial.print("  pins IN1/IN2/ENC_A/ENC_B="); Serial.print(item.pin_in1); Serial.print('/');
-  Serial.print(item.pin_in2); Serial.print('/'); Serial.print(item.pin_enca); Serial.print('/'); Serial.println(item.pin_encb);
-  Serial.print("  raw A/B="); Serial.print(digitalRead(item.pin_enca)); Serial.print('/'); Serial.println(digitalRead(item.pin_encb));
-  Serial.print("  ratio="); Serial.print(item.gear_ratio.load(), 1);
-  Serial.print(" Kp/Ki/Kd="); Serial.print(item.kp.load(), 3); Serial.print('/');
-  Serial.print(item.ki.load(), 3); Serial.print('/'); Serial.println(item.kd.load(), 3);
-  Serial.print("  duty_cap="); Serial.print(item.duty_cap_pct.load(), 1); Serial.println('%');
-  Serial.print("  encoder_total_int64="); print_int64(get_published_counts(item)); Serial.println();
-  Serial.print("  current/target="); Serial.print(item.current_deg.load(), 2); Serial.print('/'); Serial.println(item.target_deg.load(), 2);
-  Serial.print("  state/fault="); Serial.print((int)item.state.load()); Serial.print('/'); Serial.println(item.fault_latched.load() ? 1 : 0);
-  Serial.print("  PWM IN1/IN2="); Serial.print(ledcRead(item.ledc_ch_in1)); Serial.print('/'); Serial.println(ledcRead(item.ledc_ch_in2));
+  serial_tx_printf("[DIAG %d]", axis);
+  serial_tx_printf("  pins IN1/IN2/ENC_A/ENC_B=%d/%d/%d/%d",
+                   item.pin_in1, item.pin_in2, item.pin_enca, item.pin_encb);
+  serial_tx_printf("  raw A/B=%d/%d", digitalRead(item.pin_enca),
+                   digitalRead(item.pin_encb));
+  serial_tx_printf("  ratio=%.1f Kp/Ki/Kd=%.3f/%.3f/%.3f",
+                   (double)item.gear_ratio.load(), (double)item.kp.load(),
+                   (double)item.ki.load(), (double)item.kd.load());
+  serial_tx_printf("  duty_cap=%.1f%%", (double)item.duty_cap_pct.load());
+  serial_tx_printf("  encoder_total_int64=%lld",
+                   (long long)get_published_counts(item));
+  serial_tx_printf("  current/target=%.2f/%.2f",
+                   (double)item.current_deg.load(),
+                   (double)item.target_deg.load());
+  serial_tx_printf("  state/fault=%d/%d", (int)item.state.load(),
+                   item.fault_latched.load() ? 1 : 0);
+  serial_tx_printf("  PWM IN1/IN2=%lu/%lu",
+                   (unsigned long)ledcRead(item.ledc_ch_in1),
+                   (unsigned long)ledcRead(item.ledc_ch_in2));
 }
 void foc_run_diagnostics_live(int axis) {
-  if (!valid_axis(axis)) { Serial.println("ERR:bad axis"); return; }
+  if (!valid_axis(axis)) { serial_tx_line("ERR:bad axis"); return; }
   GearAxis& item = axes[axis];
-  Serial.println("[LIVE] 5 seconds at 10 Hz; turn the encoder shaft now");
+  serial_tx_line("[LIVE] 5 seconds at 10 Hz; turn the encoder shaft now");
   const uint32_t end_ms = millis() + 5000;
   while ((int32_t)(millis() - end_ms) < 0) {
-    Serial.print("A="); Serial.print(digitalRead(item.pin_enca));
-    Serial.print(" B="); Serial.print(digitalRead(item.pin_encb));
-    Serial.print(" total="); print_int64(get_published_counts(item)); Serial.println();
+    serial_tx_printf("A=%d B=%d total=%lld", digitalRead(item.pin_enca),
+                     digitalRead(item.pin_encb),
+                     (long long)get_published_counts(item));
     delay(100);
   }
-  Serial.println("[LIVE] done");
+  serial_tx_line("[LIVE] done");
 }

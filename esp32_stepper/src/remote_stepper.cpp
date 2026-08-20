@@ -2,7 +2,9 @@
 
 #include "config.h"
 #include "protocol_parse.h"
+#include "protocol_limits.h"
 #include "remote_stepper_map.h"
+#include "serial_tx.h"
 
 #if defined(DRIVE_MODE_GEAR) && REMOTE_STEPPER_ENABLED
 
@@ -122,9 +124,9 @@ void mark_node_offline(int node) {
     remote_stepper_node_to_global(node, local, NUM_AXES,
                                   REMOTE_STEPPER_NODE_COUNT,
                                   REMOTE_STEPPER_AXES_PER_NODE, global);
-    Serial.print("STEP,"); Serial.print(global); Serial.println(",ABORT,0,0");
+    serial_tx_printf("STEP,%d,ABORT,0,0", global);
   }
-  Serial.print("NODE,"); Serial.print(node); Serial.println(",OFFLINE");
+  serial_tx_printf("NODE,%d,OFFLINE", node);
 }
 
 void handle_poll(int node) {
@@ -151,9 +153,8 @@ void handle_poll(int node) {
   }
   if (tokens[5] == "DONE" || tokens[5] == "ABORT")
     s_busy[node - 1][local] = false;
-  Serial.print("STEP,"); Serial.print(global); Serial.print(',');
-  Serial.print(tokens[5]); Serial.print(','); Serial.print(completed);
-  Serial.print(','); Serial.println(total);
+  serial_tx_printf("STEP,%d,%s,%d,%d", global, tokens[5].c_str(),
+                   completed, total);
 }
 
 }  // namespace
@@ -189,7 +190,12 @@ void remote_stepper_tick() {
 bool remote_stepper_move(int global_axis, int steps, int direction, int delay_us) {
   int node = 0, local = 0;
   if (!map_global(global_axis, node, local)) { set_error("bad axis"); return false; }
-  if (delay_us < 100) { set_error("remote delay below 100us"); return false; }
+  if (delay_us < REMOTE_STEPPER_MIN_DELAY_US) {
+    set_error("remote delay below 100us"); return false;
+  }
+  if (delay_us > STEPPER_MAX_DELAY_US) {
+    set_error("remote delay above 10000000us"); return false;
+  }
   if (s_busy[node - 1][local]) { set_error("busy"); return false; }
   String tokens[6];
   int count = 0;
@@ -271,10 +277,10 @@ void remote_stepper_print_status(int requested_node) {
     int busy_mask = 0;
     for (int local = 0; local < REMOTE_STEPPER_AXES_PER_NODE; ++local)
       if (s_busy[node - 1][local]) busy_mask |= 1 << local;
-    Serial.print("NODE,"); Serial.print(node); Serial.print(",S,");
-    Serial.print(pong ? "ONLINE" : "OFFLINE"); Serial.print(',');
-    Serial.print(busy_mask); Serial.print(',');
-    Serial.println(s_online[node - 1] ? millis() - s_last_seen[node - 1] : 0);
+    serial_tx_printf("NODE,%d,S,%s,%d,%lu", node,
+                     pong ? "ONLINE" : "OFFLINE", busy_mask,
+                     (unsigned long)(s_online[node - 1]
+                         ? millis() - s_last_seen[node - 1] : 0));
   }
 }
 
