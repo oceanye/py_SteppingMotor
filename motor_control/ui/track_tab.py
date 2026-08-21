@@ -1,24 +1,27 @@
 from tkinter import ttk
 
+from motor_control.ui.common import PAD, attach_numeric_input
+
 
 def build_track_tab(app, parent):
-    pad = dict(padx=12, pady=8)
+    pad = PAD
     frame = ttk.LabelFrame(parent, text="轨道 D 直流电机（DRV8871）")
     frame.grid(row=0, column=0, sticky="nsew", **pad)
 
     ttk.Label(frame, text="PWM 占空比:").grid(row=0, column=0, sticky="w", **pad)
     duty = ttk.Spinbox(frame, from_=1, to=100, increment=1,
                        textvariable=app.v_track_duty, width=8, state="disabled")
+    attach_numeric_input(duty, app.v_track_duty)
     duty.grid(row=0, column=1, sticky="w", **pad)
     ttk.Label(frame, text="%（按住按钮期间有效）").grid(row=0, column=2, sticky="w", **pad)
 
     fwd = ttk.Button(frame, text="▶ 按住前进", state="disabled")
-    fwd.grid(row=1, column=0, **pad, ipadx=18, ipady=12)
+    fwd.grid(row=1, column=0, **pad, ipadx=12, ipady=6)
     rev = ttk.Button(frame, text="◀ 按住后退", state="disabled")
-    rev.grid(row=1, column=1, **pad, ipadx=18, ipady=12)
+    rev.grid(row=1, column=1, **pad, ipadx=12, ipady=6)
     stop = ttk.Button(frame, text="■ STOP", command=app._track_release,
                       state="disabled")
-    stop.grid(row=1, column=2, **pad, ipadx=18, ipady=12)
+    stop.grid(row=1, column=2, **pad, ipadx=12, ipady=6)
 
     for button, direction in ((fwd, "FWD"), (rev, "REV")):
         button.bind("<ButtonPress-1>",

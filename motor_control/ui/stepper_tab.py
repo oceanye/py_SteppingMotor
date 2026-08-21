@@ -1,10 +1,11 @@
 from tkinter import ttk
 
 from motor_control import AXIS_LABEL, MODE_LINEAR, MODE_ROTARY, stepper_axis_topology
+from motor_control.ui.common import PAD, attach_numeric_input
 
 
 def build_stepper_tab(app, parent, axis, speed_presets, dir_outward, dir_inward):
-    pad = dict(padx=10, pady=5)
+    pad = PAD
     sw = app.sw[axis]
     unit = app._unit_label(axis)
 
@@ -28,30 +29,38 @@ def build_stepper_tab(app, parent, axis, speed_presets, dir_outward, dir_inward)
     ttk.Radiobutton(mf, text="旋转 圈/角度 (°)", variable=app.axis_mode_var[axis],
                     value=MODE_ROTARY, command=lambda a=axis: app._on_axis_mode_change(a)).pack(side="left", padx=6)
     ttk.Label(axf, text="脉冲/转:").grid(row=2, column=0, sticky="w", **pad)
-    ttk.Spinbox(axf, from_=1.0, to=10000.0, increment=1.0,
-                textvariable=app.axis_ppr_var[axis], width=8, format="%.1f",
-                command=lambda a=axis: app._on_axis_param_change(a)).grid(row=2, column=1, **pad)
+    ppr_spin = ttk.Spinbox(axf, from_=1.0, to=10000.0, increment=1.0,
+                           textvariable=app.axis_ppr_var[axis], width=8, format="%.1f",
+                           command=lambda a=axis: app._on_axis_param_change(a))
+    attach_numeric_input(ppr_spin, app.axis_ppr_var[axis])
+    ppr_spin.grid(row=2, column=1, **pad)
     ttk.Label(axf, text="减速比:").grid(row=2, column=2, sticky="w", padx=(16, 0))
-    ttk.Spinbox(axf, from_=0.001, to=1000.0, increment=0.01,
-                textvariable=app.axis_gr_var[axis], width=8, format="%.2f",
-                command=lambda a=axis: app._on_axis_param_change(a)).grid(row=2, column=3, **pad)
+    gr_spin = ttk.Spinbox(axf, from_=0.001, to=1000.0, increment=0.01,
+                          textvariable=app.axis_gr_var[axis], width=8, format="%.2f",
+                          command=lambda a=axis: app._on_axis_param_change(a))
+    attach_numeric_input(gr_spin, app.axis_gr_var[axis])
+    gr_spin.grid(row=2, column=3, **pad)
     sw['lead_label'] = ttk.Label(axf, text="导程(mm/转):")
     sw['lead_label'].grid(row=2, column=4, sticky="w", padx=(16, 0))
     sw['lead_spin'] = ttk.Spinbox(axf, from_=0.01, to=100.0, increment=0.1,
                                   textvariable=app.axis_lead_var[axis], width=8, format="%.3f",
                                   command=lambda a=axis: app._on_axis_param_change(a))
+    attach_numeric_input(sw['lead_spin'], app.axis_lead_var[axis])
     sw['lead_spin'].grid(row=2, column=5, **pad)
     app._apply_axis_param_ui(axis)
 
     pf = ttk.LabelFrame(parent, text=f"运动参数 — 轴 {AXIS_LABEL[axis]}")
     pf.grid(row=1, column=0, sticky="nsew", **pad)
-    sw['dist_label'] = ttk.Label(pf, text=f"距离 ({unit}):")
+    dist_noun = "角度" if app.axis_profiles[axis].mode == MODE_ROTARY else "距离"
+    sw['dist_label'] = ttk.Label(pf, text=f"{dist_noun} ({unit}):")
     sw['dist_label'].grid(row=0, column=0, sticky="w", **pad)
-    ttk.Spinbox(pf, from_=0.2, to=500.0, increment=1.0,
-                textvariable=app.v_dist[axis], width=10, format="%.1f").grid(row=0, column=1, **pad)
+    dist_spin = ttk.Spinbox(pf, from_=0.2, to=500.0, increment=1.0,
+                            textvariable=app.v_dist[axis], width=10, format="%.1f")
+    attach_numeric_input(dist_spin, app.v_dist[axis])
+    dist_spin.grid(row=0, column=1, **pad)
     ttk.Label(pf, text="快捷:").grid(row=1, column=0, sticky="w", **pad)
     qbf = ttk.Frame(pf)
-    qbf.grid(row=1, column=1, sticky="w", pady=5)
+    qbf.grid(row=1, column=1, sticky="w", pady=2)
     for label, val in [("1", 1), ("10", 10), ("50", 50), ("100", 100)]:
         ttk.Button(qbf, text=label, width=6,
                    command=lambda d=val, a=axis: app.v_dist[a].set(d)).pack(side="left", padx=2)
@@ -62,7 +71,7 @@ def build_stepper_tab(app, parent, axis, speed_presets, dir_outward, dir_inward)
     ttk.Radiobutton(df, text="◀ 反向", variable=app.v_dir[axis], value=dir_inward).pack(side="left", padx=4)
     ttk.Label(pf, text="速度档位:").grid(row=3, column=0, sticky="w", **pad)
     sf = ttk.Frame(pf)
-    sf.grid(row=3, column=1, sticky="w", pady=5)
+    sf.grid(row=3, column=1, sticky="w", pady=2)
     sw['speed_combo'] = ttk.Combobox(sf, textvariable=app.v_speed_str[axis],
                                      values=[str(s) for s in speed_presets],
                                      width=6, state="readonly")
@@ -78,7 +87,7 @@ def build_stepper_tab(app, parent, axis, speed_presets, dir_outward, dir_inward)
     cf.grid(row=1, column=1, sticky="nsew", **pad)
     sw['move_btn'] = ttk.Button(cf, text="执行运动",
                                 command=lambda a=axis: app.send_move(a), state="disabled")
-    sw['move_btn'].grid(row=0, column=0, columnspan=2, padx=10, pady=10, ipadx=10, ipady=8)
+    sw['move_btn'].grid(row=0, column=0, columnspan=2, padx=6, pady=4, ipadx=8, ipady=4)
     sw['jog_out_btn'] = ttk.Button(cf, text="正向 1 ▶",
                                    command=lambda a=axis: app._quick_move(a, 1.0, dir_outward),
                                    state="disabled")
@@ -101,7 +110,7 @@ def build_stepper_tab(app, parent, axis, speed_presets, dir_outward, dir_inward)
                                 command=lambda a=axis: app.stop_continuous(a), state="disabled")
     sw['stop_btn'].grid(row=3, column=0, columnspan=2, **pad, ipadx=10)
     sw['progress'] = ttk.Progressbar(cf, orient="horizontal", length=200, mode="determinate")
-    sw['progress'].grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 0))
+    sw['progress'].grid(row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=(4, 0))
     sw['progress_label'] = ttk.Label(cf, text="", font=("Consolas", 9))
     sw['progress_label'].grid(row=5, column=0, columnspan=2, sticky="w", padx=10)
 
@@ -118,8 +127,10 @@ def build_stepper_tab(app, parent, axis, speed_presets, dir_outward, dir_inward)
     sw['go_home_btn'].grid(row=0, column=3, **pad)
     sw['goto_label'] = ttk.Label(rf, text=f"前往位置 ({unit}):")
     sw['goto_label'].grid(row=1, column=0, sticky="w", **pad)
-    ttk.Spinbox(rf, from_=-1000.0, to=1000.0, increment=1.0,
-                textvariable=app.v_goto[axis], width=10, format="%.1f").grid(row=1, column=1, **pad)
+    goto_spin = ttk.Spinbox(rf, from_=-1000.0, to=1000.0, increment=1.0,
+                            textvariable=app.v_goto[axis], width=10, format="%.1f")
+    attach_numeric_input(goto_spin, app.v_goto[axis])
+    goto_spin.grid(row=1, column=1, **pad)
     sw['goto_btn'] = ttk.Button(rf, text="前往",
                                 command=lambda a=axis: app.goto_target_position(a), state="disabled")
     sw['goto_btn'].grid(row=1, column=2, **pad)

@@ -80,8 +80,11 @@ NUM_GEAR_AXES = NUM_MOTOR_AXES    # 向后兼容
 # ============== 步进标定 ==============
 # 兼容：默认 200 微步/圈 ÷ 1.0mm 导程 = 200 pulse/mm（28HD140GT81-200LR 贯通式步进）。
 PULSES_PER_MM = [DEFAULT_PULSE_PER_REV / DEFAULT_LEAD_MM] * NUM_STEPPER_AXES
-# 速度档位（单位/s：直线=mm/s, 旋转=°/s）
-SPEED_PRESETS = [0.3, 0.5, 0.6, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 10]
+# 速度档位（单位/s：直线=mm/s, 旋转=°/s）。
+# 2026-08-21 应用户要求扩充：低速加 0.05/0.1/0.2（减速箱微动），
+# 高速加 15/20/30（丝杆快移；>1000pps 仍会弹确认窗、>4000pps 钳位提醒）。
+SPEED_PRESETS = [0.05, 0.1, 0.2, 0.3, 0.5, 0.6, 1, 1.5, 2, 2.5, 3,
+                 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 10, 15, 20, 30]
 _speed_to_delay_ms = speed_to_delay_ms
 
 DELAY_DEFAULT_MS = [_speed_to_delay_ms(SPEED_DEFAULT, PULSES_PER_MM[a]) for a in range(NUM_STEPPER_AXES)]
@@ -670,7 +673,8 @@ class StepperGUI:
     def _refresh_axis_unit_labels(self, axis):
         unit = self._unit_label(axis)
         sw = self.sw[axis]
-        if 'dist_label' in sw: sw['dist_label'].config(text=f"距离 ({unit}):")
+        noun = "角度" if self.axis_profiles[axis].mode == MODE_ROTARY else "距离"
+        if 'dist_label' in sw: sw['dist_label'].config(text=f"{noun} ({unit}):")
         if 'speed_unit_label' in sw: sw['speed_unit_label'].config(text=self._unit_per_s(axis))
         if 'goto_label' in sw: sw['goto_label'].config(text=f"前往位置 ({unit}):")
         if 'set_home_btn' in sw: sw['set_home_btn'].config(text=f"⌂ 设为原点 (0 {unit})")

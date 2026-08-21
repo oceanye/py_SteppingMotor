@@ -9,11 +9,12 @@ from motor_control import (
     NUM_STEPPER_AXES,
     PICO_AXES_PER_NODE,
 )
+from motor_control.ui.common import PAD
 
 
 def build_ui(app, log_dir, num_motor_axes):
     """Build the application shell while keeping behavior on the controller."""
-    pad = dict(padx=10, pady=5)
+    pad = PAD
 
     conn_frame = ttk.LabelFrame(app.root, text="串口连接")
     conn_frame.grid(row=0, column=0, sticky="ew", **pad)
@@ -72,10 +73,10 @@ def build_ui(app, log_dir, num_motor_axes):
         text="流程：① 手机与台式机连接同一局域网  ② GUI 连接 ESP32 串口  "
              "③ 手机打开上方固定网址  ④ 页面显示“串口已连接”后控制电机",
         foreground="#555",
-    ).grid(row=4, column=0, columnspan=9, sticky="w", padx=8, pady=(1, 5))
+    ).grid(row=4, column=0, columnspan=9, sticky="w", padx=6, pady=(1, 2))
 
     app.notebook = ttk.Notebook(app.root)
-    app.notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+    app.notebook.grid(row=1, column=0, sticky="nsew", padx=6, pady=3)
     app.tab_index_step = [None] * NUM_STEPPER_AXES
     app.tab_index_foc = [None] * num_motor_axes
     app.tab_index_gear = [None] * num_motor_axes
@@ -84,7 +85,7 @@ def build_ui(app, log_dir, num_motor_axes):
     app.notebook.add(stepper_tab, text="🔩 步进轴 (30)")
     app.tab_index_step = [stepper_index] * NUM_STEPPER_AXES
     group_book = ttk.Notebook(stepper_tab)
-    group_book.pack(fill="both", expand=True, padx=5, pady=5)
+    group_book.pack(fill="both", expand=True, padx=3, pady=2)
     groups = [("ESP32 本地", list(range(NUM_LOCAL_STEPPER_AXES)))]
     for node in range(1, NUM_PICO_NODES + 1):
         start = NUM_LOCAL_STEPPER_AXES + (node - 1) * PICO_AXES_PER_NODE
@@ -119,8 +120,8 @@ def build_ui(app, log_dir, num_motor_axes):
     log_frame = ttk.LabelFrame(app.root,
                                text=f"日志（同时写到 {os.path.basename(log_dir)}/gui_<日期>.log）")
     log_frame.grid(row=2, column=0, sticky="ew", **pad)
-    app.log_text = tk.Text(log_frame, height=10, width=96, state="disabled", font=("Consolas", 9))
-    app.log_text.pack(side="left", fill="both", padx=5, pady=5)
+    app.log_text = tk.Text(log_frame, height=6, width=96, state="disabled", font=("Consolas", 9))
+    app.log_text.pack(side="left", fill="both", padx=4, pady=3)
     app.root.bind("<MouseWheel>", app._on_root_mousewheel, add="+")
     scroll = ttk.Scrollbar(log_frame, command=app.log_text.yview)
     scroll.pack(side="right", fill="y")
@@ -133,7 +134,7 @@ def build_ui(app, log_dir, num_motor_axes):
     app.log_text.tag_config("rx", foreground="#666")
 
     log_btn_frame = ttk.Frame(app.root)
-    log_btn_frame.grid(row=3, column=0, sticky="e", padx=10, pady=2)
+    log_btn_frame.grid(row=3, column=0, sticky="e", padx=6, pady=2)
     ttk.Button(log_btn_frame, text="清空", command=app.clear_log).pack(side="left", padx=2)
     ttk.Button(log_btn_frame, text="打开日志目录", command=app._open_log_dir).pack(side="left", padx=2)
     app.raw_log_var = tk.BooleanVar(value=False)
