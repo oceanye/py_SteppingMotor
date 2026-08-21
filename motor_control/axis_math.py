@@ -25,6 +25,9 @@ SPEED_DEFAULT: Final = 3.0
 DELAY_OVERHEAD_US: Final = 200.0
 MIN_DELAY_MS: Final = 0.05
 
+# 无加速曲线开环步进的安全参考脉冲率：超过后失步风险显著（尤其带减速箱的轴）。
+PULSE_RATE_WARN_PPS: Final = 1000.0
+
 
 def coerce_finite_in_range(
     value: object,
@@ -154,6 +157,26 @@ def speed_to_delay_ms(speed: object, pulses_per_unit_value: object) -> float:
     if target_us >= 2_000.0:
         return target_us / 1_000.0
     return max(MIN_DELAY_MS, (target_us - DELAY_OVERHEAD_US) / 1_000.0)
+
+
+def delay_ms_to_pulse_rate(delay_ms: object) -> float:
+    """Firmware delay (ms per pulse) → pulse rate (pulses per second)."""
+
+    return 1000.0 / _positive_finite(delay_ms, "delay_ms")
+
+
+def speed_clamps_delay(speed: object, pulses_per_unit_value: object) -> bool:
+    """True if the requested speed exceeds the firmware delay floor.
+
+    ``speed_to_delay_ms`` subtracts the 200 us overhead and clamps the command
+    at ``MIN_DELAY_MS`` (0.05 ms), so requested rates above
+    1e6 / (50 + 200) = 4000 pps silently execute slower than dialled in.
+    """
+
+    speed_value = _positive_finite(speed, "speed")
+    ppu = _positive_finite(pulses_per_unit_value, "pulses_per_unit")
+    target_us = 1_000_000.0 / (ppu * speed_value)
+    return target_us < MIN_DELAY_MS * 1_000.0 + DELAY_OVERHEAD_US
 
 
 def unit_label(mode: str) -> str:

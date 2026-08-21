@@ -31,7 +31,13 @@ from motor_control import (
     speed_to_delay_ms,
     stepper_axis_topology,
 )
-from motor_control.axis_math import coerce_finite_in_range
+from motor_control.axis_math import (
+    MIN_DELAY_MS,
+    PULSE_RATE_WARN_PPS,
+    coerce_finite_in_range,
+    delay_ms_to_pulse_rate,
+    speed_clamps_delay,
+)
 from motor_control.autotune import AutotuneRunner
 from motor_control.protocol import (
     HardwareEstopEvent,
@@ -220,6 +226,7 @@ class StepperGUI:
         self.axis_profiles = [AxisProfile() for _ in range(NUM_STEPPER_AXES)]
         self._axis_profile_load_fallback = set()
         self.axis_param_valid   = [True] * NUM_STEPPER_AXES
+        self._speed_clamp_warned = [False] * NUM_STEPPER_AXES
         self.axis_mode_var = [tk.StringVar(value=MODE_LINEAR) for _ in range(NUM_STEPPER_AXES)]
         self.axis_ppr_var  = [tk.DoubleVar(value=DEFAULT_PULSE_PER_REV) for _ in range(NUM_STEPPER_AXES)]
         self.axis_gr_var   = [tk.DoubleVar(value=DEFAULT_GEAR_RATIO) for _ in range(NUM_STEPPER_AXES)]
@@ -448,7 +455,7 @@ class StepperGUI:
         except ValueError:
             return
         if speed <= 0: return
-        self.v_delay[axis].set(_speed_to_delay_ms(speed, self._pulses_per_unit(axis)))
+        self._set_delay_from_speed(axis, speed)
         self._update_speed_label(axis)
 
     def _on_root_mousewheel(self, event):
@@ -600,7 +607,7 @@ class StepperGUI:
             speed = float(self.v_speed_str[axis].get())
         except (tk.TclError, ValueError):
             speed = SPEED_DEFAULT
-        self.v_delay[axis].set(_speed_to_delay_ms(speed, self._pulses_per_unit(axis)))
+        self._set_delay_from_speed(axis, speed)
         self._update_speed_label(axis)
         self._update_pos_label(axis)
         self._update_range_display(axis)
@@ -617,6 +624,41 @@ class StepperGUI:
         self.log(f"⛔ {message}")
         messagebox.showerror("轴参数无效", message)
         return False
+
+    def _speed_safety_ok(self, axis):
+        """仅从 UI 线程调用；换算脉冲率超过安全参考值时弹窗确认。"""
+        try:
+            delay_ms = float(self.v_delay[axis].get())
+        except (tk.TclError, TypeError, ValueError):
+            return True  # 数值异常交由参数校验/发送路径处理
+        if not math.isfinite(delay_ms) or delay_ms <= 0:
+            return True
+        pps = delay_ms_to_pulse_rate(delay_ms)
+        if pps <= PULSE_RATE_WARN_PPS:
+            return True
+        message = (
+            f"轴{AXIS_LABEL[axis]}当前速度折合约 {pps:,.0f} 脉冲/秒，"
+            f"超过安全参考值 {PULSE_RATE_WARN_PPS:.0f} 脉冲/秒。\n\n"
+            "无加速曲线的开环步进在此速率下极易失步（啸叫、行程远小于设定），\n"
+            "带减速箱的电机尤其如此。请检查该轴的模式/减速比/导程\n"
+            "是否与电机的实际机械结构匹配（例如减速旋转轴误用直线模式）。\n\n仍要执行吗？")
+        self.log(f"⚠️ 轴{AXIS_LABEL[axis]} 脉冲率 {pps:,.0f} pps 超过安全参考 "
+                 f"{PULSE_RATE_WARN_PPS:.0f} pps，已弹窗确认")
+        return messagebox.askokcancel("速度过高确认", message)
+
+    def _set_delay_from_speed(self, axis, speed):
+        """速度→固件延时；请求速度被固件上限钳位时给出一次性日志提醒。"""
+        if not math.isfinite(speed) or speed <= 0:
+            return
+        ppu = self._pulses_per_unit(axis)
+        self.v_delay[axis].set(_speed_to_delay_ms(speed, ppu))
+        clamped = speed_clamps_delay(speed, ppu)
+        if clamped and not self._speed_clamp_warned[axis]:
+            self.log(
+                f"⚠️ 轴{AXIS_LABEL[axis]} 速度 {speed:g} {self._unit_per_s(axis)} 折合 "
+                f"{speed * ppu:,.0f} pps，超出固件上限，实际将按 "
+                f"{delay_ms_to_pulse_rate(MIN_DELAY_MS):,.0f} pps 钳位执行（比设定更慢）")
+        self._speed_clamp_warned[axis] = clamped
 
     def _apply_axis_param_ui(self, axis):
         state = "normal" if self.axis_profiles[axis].mode == MODE_LINEAR else "disabled"
@@ -1513,6 +1555,8 @@ class StepperGUI:
     def send_move(self, axis):
         if not self._require_axis_params(axis):
             return
+        if not self._speed_safety_ok(axis):
+            return
         try:
             distance = float(self.v_dist[axis].get())
         except (tk.TclError, TypeError, ValueError, OverflowError):
@@ -1535,6 +1579,8 @@ class StepperGUI:
     def _quick_move(self, axis, distance_mm, direction):
         if not self._require_axis_params(axis):
             return
+        if not self._speed_safety_ok(axis):
+            return
         move = self._reserve_axis_move(axis)
         if move is None:
             self.log(f"轴{AXIS_LABEL[axis]} 正在运动，MOVE 未排队")
@@ -1552,6 +1598,14 @@ class StepperGUI:
         if not self._require_axis_params(axis):
             return
         delay_ms = self.v_delay[axis].get()
+        # 按住连发是重复手势，不适合每次弹窗；仅记录风险日志。
+        try:
+            pulse_rate = delay_ms_to_pulse_rate(delay_ms)
+        except (TypeError, ValueError):
+            pulse_rate = 0.0
+        if pulse_rate > PULSE_RATE_WARN_PPS:
+            self.log(f"⚠️ 轴{AXIS_LABEL[axis]} 连续模式脉冲率 {pulse_rate:,.0f} pps "
+                     f"超过安全参考 {PULSE_RATE_WARN_PPS:.0f} pps，注意失步风险")
         with self.state_lock:
             if self.running[axis]:
                 return
@@ -1664,6 +1718,8 @@ class StepperGUI:
             messagebox.showerror("输入无效", "目标位置必须是有限数值")
             return
         if not self._require_axis_params(axis):
+            return
+        if not self._speed_safety_ok(axis):
             return
         move = self._reserve_axis_move(axis)
         if move is None:
