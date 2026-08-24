@@ -4,6 +4,7 @@ from tkinter import ttk
 
 from motor_control import (
     AXIS_LABEL,
+    MOTOR_AXIS_LABELS,
     NUM_LOCAL_STEPPER_AXES,
     NUM_PICO_NODES,
     NUM_STEPPER_AXES,
@@ -104,12 +105,12 @@ def build_ui(app, log_dir, num_motor_axes):
     for axis in range(num_motor_axes):
         tab = ttk.Frame(app.notebook)
         app.tab_index_foc[axis] = app.notebook.index("end")
-        app.notebook.add(tab, text=f"🧲 FOC {AXIS_LABEL[axis]}")
+        app.notebook.add(tab, text=f"🧲 FOC {MOTOR_AXIS_LABELS[axis]}")
         app._build_foc_tab(tab, axis)
     for axis in range(num_motor_axes):
         tab = ttk.Frame(app.notebook)
         app.tab_index_gear[axis] = app.notebook.index("end")
-        app.notebook.add(tab, text=f"⚙ 减速 {AXIS_LABEL[axis]}")
+        app.notebook.add(tab, text=f"⚙ 减速 {MOTOR_AXIS_LABELS[axis]}")
         app._build_gear_tab(tab, axis)
 
     track_tab = ttk.Frame(app.notebook)

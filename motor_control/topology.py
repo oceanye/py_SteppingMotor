@@ -29,12 +29,20 @@ STEPPER_PINS: tuple[tuple[int, int], ...] = (
     (9, 10),
     (38, 39),
 )
-LOCAL_AXIS_LABELS: tuple[str, ...] = ("L", "R", "A", "B", "C", "D")
+# 本地 6 轴按 2026-08-24 实际用途命名（用户指定；硬件接线由现场对应）：
+# 左/右侧上下运动（直线）、左/右侧旋转、左/右开合。GPIO 分配不变。
+LOCAL_AXIS_LABELS: tuple[str, ...] = (
+    "左侧直", "右侧直", "左侧转", "右侧转", "左开合", "右开合",
+)
 AXIS_LABEL: tuple[str, ...] = LOCAL_AXIS_LABELS + tuple(
     f"P{node}-{local_axis}"
     for node in range(1, NUM_PICO_NODES + 1)
     for local_axis in range(1, PICO_AXES_PER_NODE + 1)
 )
+
+# FOC/GEAR 闭环电机轴（数量上与步进轴无关，编号与手机网页"闭环轴 N"一致），
+# 不复用 AXIS_LABEL——步进本地轴改为功能命名后会误导闭环轴显示。
+MOTOR_AXIS_LABELS: tuple[str, ...] = ("1", "2")
 
 ControllerKind = Literal["esp32", "pico"]
 

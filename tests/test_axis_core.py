@@ -33,7 +33,7 @@ class StepperTopologyTests(unittest.TestCase):
             stepper_axis_topology(0),
             {
                 "axis": 0,
-                "label": "L",
+                "label": "左侧直",  # 2026-08-24 起本地轴按功能命名
                 "controller": "esp32",
                 "node": None,
                 "local_axis": 0,
@@ -41,7 +41,7 @@ class StepperTopologyTests(unittest.TestCase):
             },
         )
         axis_5 = get_stepper_axis_topology(5)
-        self.assertEqual(axis_5.label, "D")
+        self.assertEqual(axis_5.label, "右开合")
         self.assertEqual((axis_5.pulse_pin, axis_5.direction_pin), (38, 39))
 
     def test_remote_boundary_axes_match_pico_mapping(self):

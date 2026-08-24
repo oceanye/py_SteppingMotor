@@ -18,6 +18,7 @@ from motor_control import (
     DEFAULT_PULSE_PER_REV,
     MODE_LINEAR,
     MODE_ROTARY,
+    MOTOR_AXIS_LABELS,
     NUM_LOCAL_STEPPER_AXES,
     NUM_PICO_NODES,
     NUM_STEPPER_AXES,
@@ -2189,7 +2190,7 @@ class StepperGUI:
         def worker():
             t0 = time.time()
             last_log = 0.0
-            self.log(f"→ 轴{AXIS_LABEL[axis]} 前往 {target_deg:.1f}°")
+            self.log(f"→ 闭环{MOTOR_AXIS_LABELS[axis]} 前往 {target_deg:.1f}°")
             while self.ser and self.ser.is_open:
                 # 1. 被新 goto 取代 → 退出（不打日志）
                 if self._goto_watcher_gen[axis] != my_gen:
@@ -2198,7 +2199,7 @@ class StepperGUI:
                 with self.state_lock:
                     motor = dict(self._motor_status[axis])
                 if motor["state"] != "2":
-                    self.log(f"  轴{AXIS_LABEL[axis]} watcher 退出（PID 状态={motor['state']}）")
+                    self.log(f"  闭环{MOTOR_AXIS_LABELS[axis]} watcher 退出（PID 状态={motor['state']}）")
                     return
                 # 3. 读当前角度
                 cur = motor["current_deg"]
@@ -2208,16 +2209,16 @@ class StepperGUI:
                 dt = time.time() - t0
                 # 4. 到位
                 if abs(err) < tol_deg:
-                    self.log(f"✓ 轴{AXIS_LABEL[axis]} 到位 cur={cur:.1f}° (用时 {dt:.1f}s)")
+                    self.log(f"✓ 闭环{MOTOR_AXIS_LABELS[axis]} 到位 cur={cur:.1f}° (用时 {dt:.1f}s)")
                     return
                 # 5. 超时
                 if dt > timeout_s:
-                    self.log(f"⚠️ 轴{AXIS_LABEL[axis]} {timeout_s:.0f}s 未到位 "
+                    self.log(f"⚠️ 闭环{MOTOR_AXIS_LABELS[axis]} {timeout_s:.0f}s 未到位 "
                              f"cur={cur:.1f}° 差 {err:+.1f}° (Kp 太小？发 DIAG,0 看 PWM)")
                     return
                 # 6. 周期进度
                 if time.time() - last_log > 1.5:
-                    self.log(f"  轴{AXIS_LABEL[axis]} cur={cur:.1f}° 差 {err:+.1f}° (t={dt:.1f}s)")
+                    self.log(f"  闭环{MOTOR_AXIS_LABELS[axis]} cur={cur:.1f}° 差 {err:+.1f}° (t={dt:.1f}s)")
                     last_log = time.time()
                 time.sleep(0.3)
         threading.Thread(target=worker, daemon=True).start()
@@ -2587,7 +2588,7 @@ class StepperGUI:
             messagebox.showerror("未连接", "请先连接串口"); return
         if not messagebox.askokcancel(
             "自动调参确认",
-            f"轴 {AXIS_LABEL[axis]} 两阶段扫描 PA + VP，约 2 分钟。\n电机会来回转动，请先固定好。"):
+            f"闭环 {MOTOR_AXIS_LABELS[axis]} 两阶段扫描 PA + VP，约 2 分钟。\n电机会来回转动，请先固定好。"):
             return
         self.fw[axis]['autotune_btn'].config(state="disabled")
         if self._start_control_worker(self._foc_autotune_worker, axis) is None:
@@ -2639,7 +2640,7 @@ class StepperGUI:
             messagebox.showerror("未连接", "请先连接串口"); return
         if not messagebox.askokcancel(
             "GEAR 自动调参",
-            f"轴 {AXIS_LABEL[axis]} 三阶段扫描 Kp → Kd → Ki，约 3 分钟。\n"
+            f"闭环 {MOTOR_AXIS_LABELS[axis]} 三阶段扫描 Kp → Kd → Ki，约 3 分钟。\n"
             f"电机会反复在 0° ↔ 60° 之间走，请确认机械空间够。"):
             return
         self.gw[axis]['autotune_btn'].config(state="disabled")

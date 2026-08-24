@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk
 
-from motor_control import AXIS_LABEL
+from motor_control import MOTOR_AXIS_LABELS
 from motor_control.ui.common import PAD, attach_numeric_input
 
 
@@ -9,7 +9,7 @@ def build_foc_tab(app, parent, axis):
     pad = PAD
     fw = app.fw[axis]
 
-    sf = ttk.LabelFrame(parent, text=f"状态 — 轴 {AXIS_LABEL[axis]} (100ms 轮询)")
+    sf = ttk.LabelFrame(parent, text=f"状态 — 闭环 {MOTOR_AXIS_LABELS[axis]} (100ms 轮询)")
     sf.grid(row=0, column=0, sticky="ew", **pad)
     ttk.Label(sf, text="状态:").grid(row=0, column=0, sticky="w", **pad)
     ttk.Label(sf, textvariable=app.v_focstate[axis], width=10,
@@ -127,7 +127,7 @@ def build_gear_tab(app, parent, axis):
     pad = PAD
     gw = app.gw[axis]
 
-    sf = ttk.LabelFrame(parent, text=f"状态 — 减速 {AXIS_LABEL[axis]} (100ms 轮询)")
+    sf = ttk.LabelFrame(parent, text=f"状态 — 减速 {MOTOR_AXIS_LABELS[axis]} (100ms 轮询)")
     sf.grid(row=0, column=0, sticky="ew", **pad)
     ttk.Label(sf, text="状态:").grid(row=0, column=0, sticky="w", **pad)
     ttk.Label(sf, textvariable=app.v_focstate[axis], width=10,

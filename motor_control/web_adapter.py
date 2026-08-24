@@ -21,6 +21,7 @@ from .axis_math import (
 )
 from .topology import (
     AXIS_LABEL,
+    MOTOR_AXIS_LABELS,
     NUM_LOCAL_STEPPER_AXES,
     NUM_PICO_NODES,
     NUM_STEPPER_AXES,
@@ -138,7 +139,7 @@ class DesktopWebController:
                 for axis in range(NUM_STEPPER_AXES)
             ]
             motors = [
-                dict(axis=axis, label=AXIS_LABEL[axis], **app._motor_status[axis])
+                dict(axis=axis, label=MOTOR_AXIS_LABELS[axis], **app._motor_status[axis])
                 for axis in range(NUM_MOTOR_AXES)
             ]
             track = {

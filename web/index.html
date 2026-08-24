@@ -51,7 +51,7 @@
 
     const steppers=document.getElementById('steppers'),stepperGroup=document.getElementById('stepperGroup');
     let stepperTopology=[];
-    function fallbackTopology(){return Array.from({length:30},(_v,axis)=>axis<6?{axis,label:['L','R','A','B','C','D'][axis],controller:'esp32',node:null,local_axis:axis,pins:null}:{axis,label:`P${Math.floor((axis-6)/4)+1}-${(axis-6)%4+1}`,controller:'pico',node:Math.floor((axis-6)/4)+1,local_axis:(axis-6)%4,pins:null});}
+    function fallbackTopology(){return Array.from({length:30},(_v,axis)=>axis<6?{axis,label:['左侧直','右侧直','左侧转','右侧转','左开合','右开合'][axis],controller:'esp32',node:null,local_axis:axis,pins:null}:{axis,label:`P${Math.floor((axis-6)/4)+1}-${(axis-6)%4+1}`,controller:'pico',node:Math.floor((axis-6)/4)+1,local_axis:(axis-6)%4,pins:null});}
     function groupKey(t){return t.controller==='esp32'?'esp32':`pico-${t.node}`;}
     function groupLabel(t){return t.controller==='esp32'?'ESP32 本地（6 轴）':`Pico ${t.node}（4 轴）`;}
     function routeLabel(t){if(t.controller==='esp32'){const p=t.pins;return p?`本地 · PUL GPIO${p.pulse} / DIR GPIO${p.direction}`:'ESP32 本地';}return `RS485 · Pico ${t.node} · 本地轴 ${Number(t.local_axis)+1}`;}
