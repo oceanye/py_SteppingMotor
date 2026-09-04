@@ -143,7 +143,13 @@ def steps_to_units(steps: object, pulses_per_unit_value: object) -> float:
     )
 
 
-def speed_to_delay_ms(speed: object, pulses_per_unit_value: object) -> float:
+def speed_to_delay_ms(
+    speed: object,
+    pulses_per_unit_value: object,
+    *,
+    delay_overhead_us: object = DELAY_OVERHEAD_US,
+    minimum_delay_ms: object = MIN_DELAY_MS,
+) -> float:
     """Convert units/s to the compensated firmware pulse delay in milliseconds.
 
     This preserves the existing ESP32 timing rule: delays of at least 2 ms are
@@ -153,19 +159,47 @@ def speed_to_delay_ms(speed: object, pulses_per_unit_value: object) -> float:
 
     speed_value = _positive_finite(speed, "speed")
     ppu = _positive_finite(pulses_per_unit_value, "pulses_per_unit")
+    overhead_us = _finite(delay_overhead_us, "delay_overhead_us")
+    if overhead_us < 0:
+        raise ValueError("delay_overhead_us must not be negative")
+    minimum_ms = _positive_finite(minimum_delay_ms, "minimum_delay_ms")
     target_us = 1_000_000.0 / (ppu * speed_value)
-    if target_us >= 2_000.0:
-        return target_us / 1_000.0
-    return max(MIN_DELAY_MS, (target_us - DELAY_OVERHEAD_US) / 1_000.0)
+    if target_us >= 2_000.0 or overhead_us == 0:
+        return max(minimum_ms, target_us / 1_000.0)
+    return max(minimum_ms, (target_us - overhead_us) / 1_000.0)
 
 
-def delay_ms_to_pulse_rate(delay_ms: object) -> float:
-    """Firmware delay (ms per pulse) → pulse rate (pulses per second)."""
+def delay_ms_to_pulse_rate(
+    delay_ms: object,
+    *,
+    delay_overhead_us: object = DELAY_OVERHEAD_US,
+) -> float:
+    """Firmware delay → effective pulse rate under the timing model.
 
-    return 1000.0 / _positive_finite(delay_ms, "delay_ms")
+    ESP32 fast moves store the requested period minus the measured execution
+    overhead.  Passing ``delay_overhead_us=0`` selects controllers such as the
+    RP2040 PIO node, where the command already represents the complete period.
+    """
+
+    command_us = _positive_finite(delay_ms, "delay_ms") * 1_000.0
+    overhead_us = _finite(delay_overhead_us, "delay_overhead_us")
+    if overhead_us < 0:
+        raise ValueError("delay_overhead_us must not be negative")
+    effective_us = (
+        command_us + overhead_us
+        if command_us < 2_000.0 and overhead_us > 0
+        else command_us
+    )
+    return 1_000_000.0 / effective_us
 
 
-def speed_clamps_delay(speed: object, pulses_per_unit_value: object) -> bool:
+def speed_clamps_delay(
+    speed: object,
+    pulses_per_unit_value: object,
+    *,
+    delay_overhead_us: object = DELAY_OVERHEAD_US,
+    minimum_delay_ms: object = MIN_DELAY_MS,
+) -> bool:
     """True if the requested speed exceeds the firmware delay floor.
 
     ``speed_to_delay_ms`` subtracts the 200 us overhead and clamps the command
@@ -175,8 +209,17 @@ def speed_clamps_delay(speed: object, pulses_per_unit_value: object) -> bool:
 
     speed_value = _positive_finite(speed, "speed")
     ppu = _positive_finite(pulses_per_unit_value, "pulses_per_unit")
+    overhead_us = _finite(delay_overhead_us, "delay_overhead_us")
+    if overhead_us < 0:
+        raise ValueError("delay_overhead_us must not be negative")
+    minimum_ms = _positive_finite(minimum_delay_ms, "minimum_delay_ms")
     target_us = 1_000_000.0 / (ppu * speed_value)
-    return target_us < MIN_DELAY_MS * 1_000.0 + DELAY_OVERHEAD_US
+    requested_delay_us = (
+        target_us
+        if target_us >= 2_000.0 or overhead_us == 0
+        else target_us - overhead_us
+    )
+    return requested_delay_us < minimum_ms * 1_000.0
 
 
 def unit_label(mode: str) -> str:

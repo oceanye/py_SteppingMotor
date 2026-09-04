@@ -23,6 +23,9 @@ from motor_control.topology import (
     clamp_step_delay_us,
     get_stepper_axis_topology,
     pico_axis_to_global,
+    step_delay_ms_to_pulse_rate,
+    step_speed_clamps_delay,
+    step_speed_to_delay_ms,
     stepper_axis_topology,
 )
 
@@ -72,6 +75,16 @@ class StepperTopologyTests(unittest.TestCase):
         self.assertEqual(clamp_step_delay_us(5, 1), 1)
         self.assertEqual(clamp_step_delay_us(6, 1), 100)
         self.assertEqual(clamp_step_delay_us(29, 250), 250)
+
+    def test_controller_specific_speed_timing(self):
+        self.assertAlmostEqual(step_speed_to_delay_ms(0, 1000, 1), 0.8)
+        self.assertAlmostEqual(step_delay_ms_to_pulse_rate(0, 0.8), 1000.0)
+        self.assertAlmostEqual(step_speed_to_delay_ms(6, 1000, 1), 1.0)
+        self.assertAlmostEqual(step_delay_ms_to_pulse_rate(6, 1.0), 1000.0)
+        self.assertFalse(step_speed_clamps_delay(0, 4000, 1))
+        self.assertTrue(step_speed_clamps_delay(0, 4001, 1))
+        self.assertFalse(step_speed_clamps_delay(6, 10000, 1))
+        self.assertTrue(step_speed_clamps_delay(6, 10001, 1))
 
 
 class AxisMathTests(unittest.TestCase):

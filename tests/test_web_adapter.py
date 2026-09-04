@@ -4,9 +4,19 @@ import time
 import unittest
 from unittest.mock import patch
 
-from motor_control.axis_math import MODE_ROTARY
+from motor_control.axis_math import (
+    MODE_ROTARY,
+    PULSE_RATE_WARN_PPS,
+    delay_ms_to_pulse_rate,
+    speed_clamps_delay,
+    speed_to_delay_ms,
+)
 from motor_control.axis_model import AxisProfile, AxisRuntime
-from motor_control.topology import NUM_STEPPER_AXES
+from motor_control.topology import (
+    NUM_STEPPER_AXES,
+    step_delay_ms_to_pulse_rate,
+    step_speed_to_delay_ms,
+)
 from motor_control.ui_dispatch import UiDispatchTimeout
 from motor_control.web_adapter import (
     DIR_INWARD,
@@ -348,10 +358,24 @@ class DesktopWebControllerTests(unittest.TestCase):
         )
         self.assertFalse(self.app._estop_unconfirmed)
 
-    def test_stepper_move_keeps_generation_guard_and_response_shape(self):
+    def test_normal_rate_move_needs_no_confirmation_and_reports_metadata(self):
         result = self.controller.web_stepper_move(0, "FWD", 2.5, 3.0)
 
-        self.assertEqual(result, {"ok": True, "accepted": True, "axis": 0})
+        profile = self.app.axis_profiles[0]
+        requested_rate = 3.0 * profile.pulses_per_unit
+        expected_delay = speed_to_delay_ms(3.0, profile.pulses_per_unit)
+        self.assertLessEqual(requested_rate, PULSE_RATE_WARN_PPS)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["axis"], 0)
+        self.assertAlmostEqual(
+            result["requested_pulse_rate_pps"], requested_rate
+        )
+        self.assertAlmostEqual(
+            result["effective_pulse_rate_pps"],
+            delay_ms_to_pulse_rate(expected_delay),
+        )
+        self.assertFalse(result["speed_clamped"])
         self.assertTrue(self.app.move_called.wait(1.0))
         axis, distance, direction, delay_ms, profile, guard_result = (
             self.app.stepper_moves[0]
@@ -360,6 +384,96 @@ class DesktopWebControllerTests(unittest.TestCase):
         self.assertAlmostEqual(delay_ms, 1.4666666666666666)
         self.assertIs(profile, self.app.axis_profiles[0])
         self.assertTrue(guard_result)
+
+    def test_remote_move_uses_complete_rp2040_pulse_period(self):
+        axis = 6
+        speed = 3.0
+        profile = self.app.axis_profiles[axis]
+
+        result = self.controller.web_stepper_move(
+            axis, "FWD", 2.5, speed
+        )
+
+        expected_delay = step_speed_to_delay_ms(
+            axis, speed, profile.pulses_per_unit
+        )
+        self.assertAlmostEqual(expected_delay, 1000.0 / 600.0)
+        self.assertAlmostEqual(
+            result["effective_pulse_rate_pps"],
+            step_delay_ms_to_pulse_rate(axis, expected_delay),
+        )
+        self.assertAlmostEqual(result["effective_pulse_rate_pps"], 600.0)
+        self.assertTrue(self.app.move_called.wait(1.0))
+        move_axis, _distance, _direction, delay_ms, _profile, _guard = (
+            self.app.stepper_moves[0]
+        )
+        self.assertEqual(move_axis, axis)
+        self.assertAlmostEqual(delay_ms, expected_delay)
+
+    def test_high_rate_move_requires_explicit_confirmation(self):
+        profile = self.app.axis_profiles[0]
+        speed = 6.0
+        self.assertGreater(
+            speed * profile.pulses_per_unit, PULSE_RATE_WARN_PPS
+        )
+        self.assertFalse(speed_clamps_delay(speed, profile.pulses_per_unit))
+
+        with self.assertRaises(RuntimeError):
+            self.controller.web_stepper_move(0, "FWD", 1.0, speed)
+
+        self.assertIsNone(self.app._move_reservation[0])
+        self.assertIsNone(self.app._web_step_pending[0])
+        self.assertFalse(self.app.move_called.is_set())
+
+    def test_confirmed_clamped_move_reports_requested_and_effective_rates(self):
+        self.app.axis_profiles[0] = AxisProfile(
+            pulse_per_rev=200.0,
+            gear_ratio=21.5,
+            lead_mm=1.0,
+        )
+        profile = self.app.axis_profiles[0]
+        speed = 3.0
+        requested_rate = speed * profile.pulses_per_unit
+        expected_delay = speed_to_delay_ms(speed, profile.pulses_per_unit)
+        self.assertGreater(requested_rate, PULSE_RATE_WARN_PPS)
+        self.assertTrue(speed_clamps_delay(speed, profile.pulses_per_unit))
+
+        result = self.controller.web_stepper_move(
+            0,
+            "FWD",
+            1.0,
+            speed,
+            confirm_high_rate=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["axis"], 0)
+        self.assertAlmostEqual(
+            result["requested_pulse_rate_pps"], requested_rate
+        )
+        self.assertAlmostEqual(
+            result["effective_pulse_rate_pps"],
+            delay_ms_to_pulse_rate(expected_delay),
+        )
+        self.assertTrue(result["speed_clamped"])
+        self.assertTrue(self.app.move_called.wait(1.0))
+
+    def test_move_rejects_non_boolean_high_rate_confirmation(self):
+        for value in (0, 1, "true", None, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.controller.web_stepper_move(
+                        0,
+                        "FWD",
+                        1.0,
+                        3.0,
+                        confirm_high_rate=value,
+                    )
+
+        self.assertIsNone(self.app._move_reservation[0])
+        self.assertIsNone(self.app._web_step_pending[0])
+        self.assertFalse(self.app.move_called.is_set())
 
     def test_stepper_move_rejects_continuous_or_unsettled_axis(self):
         self.app.running[0] = True

@@ -20,6 +20,7 @@ class WebController(Protocol):
         direction: str | int,
         distance_mm: float,
         speed_mm_s: float = 3.0,
+        confirm_high_rate: bool = False,
     ) -> dict[str, Any]: ...
 
     def web_stepper_stop(self, axis: int) -> dict[str, Any]: ...

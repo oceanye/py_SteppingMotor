@@ -15,9 +15,9 @@ from typing import Any
 from .axis_math import (
     MODE_LINEAR,
     MODE_ROTARY,
+    PULSE_RATE_WARN_PPS,
     SPEED_DEFAULT,
     coerce_finite_in_range,
-    speed_to_delay_ms,
 )
 from .topology import (
     AXIS_LABEL,
@@ -26,6 +26,9 @@ from .topology import (
     NUM_PICO_NODES,
     NUM_STEPPER_AXES,
     PICO_AXES_PER_NODE,
+    step_delay_ms_to_pulse_rate,
+    step_speed_clamps_delay,
+    step_speed_to_delay_ms,
     stepper_axis_topology,
 )
 from .protocol import (
@@ -189,10 +192,13 @@ class DesktopWebController:
         direction: str | int,
         distance_mm: float,
         speed_mm_s: float = SPEED_DEFAULT,
+        confirm_high_rate: bool = False,
     ) -> dict[str, Any]:
         """Asynchronously move a stepper without touching Tk on this thread."""
 
         app = self._app
+        if not isinstance(confirm_high_rate, bool):
+            raise ValueError("confirm_high_rate 必须是布尔值")
         generation = app._ensure_web_control_available()
         try:
             axis = int(axis)
@@ -239,16 +245,35 @@ class DesktopWebController:
                 and target_steps > runtime.max_steps + tolerance_steps
             ):
                 raise RuntimeError("目标超出软件上限")
-            delay_ms = speed_to_delay_ms(speed_mm_s, profile.pulses_per_unit)
+            pulses_per_unit = profile.pulses_per_unit
+            requested_pulse_rate_pps = speed_mm_s * pulses_per_unit
+            if (
+                requested_pulse_rate_pps > PULSE_RATE_WARN_PPS
+                and not confirm_high_rate
+            ):
+                raise RuntimeError(
+                    f"当前速度折合约 {requested_pulse_rate_pps:,.0f} 脉冲/秒，"
+                    f"超过安全参考值 {PULSE_RATE_WARN_PPS:.0f} 脉冲/秒；"
+                    "确认失步风险后请用 confirm_high_rate=true 重试"
+                )
+            delay_ms = step_speed_to_delay_ms(
+                axis, speed_mm_s, pulses_per_unit
+            )
             if round(delay_ms * 1_000) > MAX_STEP_DELAY_US:
                 minimum_speed = (
                     1_000_000.0
-                    / (profile.pulses_per_unit * MAX_STEP_DELAY_US)
+                    / (pulses_per_unit * MAX_STEP_DELAY_US)
                 )
                 raise ValueError(
                     f"速度过低；当前轴最小可达约 {minimum_speed:g} "
                     f"{profile.speed_unit}"
                 )
+            speed_clamped = step_speed_clamps_delay(
+                axis, speed_mm_s, pulses_per_unit
+            )
+            effective_pulse_rate_pps = step_delay_ms_to_pulse_rate(
+                axis, delay_ms
+            )
             reservation = object()
             motion_generation = app._axis_motion_generation[axis]
             app._move_reservation[axis] = reservation
@@ -274,7 +299,14 @@ class DesktopWebController:
                         app._web_step_pending[axis] = None
 
         threading.Thread(target=worker, daemon=True).start()
-        return {"ok": True, "accepted": True, "axis": axis}
+        return {
+            "ok": True,
+            "accepted": True,
+            "axis": axis,
+            "requested_pulse_rate_pps": requested_pulse_rate_pps,
+            "effective_pulse_rate_pps": effective_pulse_rate_pps,
+            "speed_clamped": speed_clamped,
+        }
 
     def web_stepper_stop(self, axis: int) -> dict[str, Any]:
         app = self._app

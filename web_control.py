@@ -4,7 +4,9 @@ The server deliberately knows nothing about Tk or the serial protocol.  The GUI
 passes a controller object implementing these methods::
 
     web_get_status()
-    web_stepper_move(axis, direction, distance_mm, speed_mm_s)
+    web_stepper_move(
+        axis, direction, distance_mm, speed_mm_s, confirm_high_rate=False
+    )
     web_stepper_stop(axis)
     web_stepper_config(axis, mode=None, pulse_per_rev=None, gear_ratio=None, lead_mm=None)
     web_motor_command(mode, axis, action, target_deg=None)
@@ -163,20 +165,34 @@ class _RequestHandler(BaseHTTPRequestHandler):
             raise ValueError(f"{name} 必须在 {low:g}..{high:g} 范围内")
         return result
 
+    @staticmethod
+    def _boolean(value: Any, name: str) -> bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} 必须是布尔值")
+        return value
+
     def _stepper_move(self, body: dict[str, Any]) -> None:
-        self._keys(body, {"axis", "direction", "distance_mm", "speed_mm_s"})
+        self._keys(
+            body,
+            {"axis", "direction", "distance_mm", "speed_mm_s"},
+            {"confirm_high_rate"},
+        )
         axis = self._integer(body["axis"], "axis", 0, MAX_STEPPER_AXIS)
         direction = body["direction"]
         if direction not in ("forward", "reverse"):
             raise ValueError("direction 必须是 forward 或 reverse")
         distance = self._number(body["distance_mm"], "distance_mm", 0.001, 100000.0)
         speed = self._number(body["speed_mm_s"], "speed_mm_s", 0.001, 10000.0)
+        confirm_high_rate = self._boolean(
+            body.get("confirm_high_rate", False), "confirm_high_rate"
+        )
         self._invoke(
             self.server.owner.controller.web_stepper_move,
             axis,
             direction,
             distance,
             speed,
+            confirm_high_rate=confirm_high_rate,
         )
 
     def _stepper_stop(self, body: dict[str, Any]) -> None:
