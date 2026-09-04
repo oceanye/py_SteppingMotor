@@ -30,14 +30,14 @@ from motor_control import (
     clamp_step_delay_us,
     convert_axis_value,
     speed_to_delay_ms,
+    step_delay_ms_to_pulse_rate,
+    step_speed_clamps_delay,
+    step_speed_to_delay_ms,
     stepper_axis_topology,
 )
 from motor_control.axis_math import (
-    MIN_DELAY_MS,
     PULSE_RATE_WARN_PPS,
     coerce_finite_in_range,
-    delay_ms_to_pulse_rate,
-    speed_clamps_delay,
 )
 from motor_control.autotune import AutotuneRunner
 from motor_control.protocol import (
@@ -88,7 +88,10 @@ SPEED_PRESETS = [0.05, 0.1, 0.2, 0.3, 0.5, 0.6, 1, 1.5, 2, 2.5, 3,
                  3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 10, 15, 20, 30]
 _speed_to_delay_ms = speed_to_delay_ms
 
-DELAY_DEFAULT_MS = [_speed_to_delay_ms(SPEED_DEFAULT, PULSES_PER_MM[a]) for a in range(NUM_STEPPER_AXES)]
+DELAY_DEFAULT_MS = [
+    step_speed_to_delay_ms(a, SPEED_DEFAULT, PULSES_PER_MM[a])
+    for a in range(NUM_STEPPER_AXES)
+]
 DIR_OUTWARD = 1
 DIR_INWARD  = 0
 # 每轴方向翻转标志（电机安装方向不同时用）
@@ -637,7 +640,7 @@ class StepperGUI:
             return True  # 数值异常交由参数校验/发送路径处理
         if not math.isfinite(delay_ms) or delay_ms <= 0:
             return True
-        pps = delay_ms_to_pulse_rate(delay_ms)
+        pps = step_delay_ms_to_pulse_rate(axis, delay_ms)
         if pps <= PULSE_RATE_WARN_PPS:
             return True
         message = (
@@ -655,13 +658,15 @@ class StepperGUI:
         if not math.isfinite(speed) or speed <= 0:
             return
         ppu = self._pulses_per_unit(axis)
-        self.v_delay[axis].set(_speed_to_delay_ms(speed, ppu))
-        clamped = speed_clamps_delay(speed, ppu)
+        delay_ms = step_speed_to_delay_ms(axis, speed, ppu)
+        self.v_delay[axis].set(delay_ms)
+        clamped = step_speed_clamps_delay(axis, speed, ppu)
         if clamped and not self._speed_clamp_warned[axis]:
             self.log(
                 f"⚠️ 轴{AXIS_LABEL[axis]} 速度 {speed:g} {self._unit_per_s(axis)} 折合 "
                 f"{speed * ppu:,.0f} pps，超出固件上限，实际将按 "
-                f"{delay_ms_to_pulse_rate(MIN_DELAY_MS):,.0f} pps 钳位执行（比设定更慢）")
+                f"{step_delay_ms_to_pulse_rate(axis, delay_ms):,.0f} pps "
+                "钳位执行（比设定更慢）")
         self._speed_clamp_warned[axis] = clamped
 
     def _apply_axis_param_ui(self, axis):
@@ -1220,7 +1225,10 @@ class StepperGUI:
         dist_mm = profile.units_from_steps(steps)
         dir_txt = "正向" if direction == DIR_OUTWARD else "反向"
         effective_delay_ms = delay_us / 1000.0
-        mm_s = 1000.0 / (profile.pulses_per_unit * effective_delay_ms)
+        mm_s = (
+            step_delay_ms_to_pulse_rate(axis, effective_delay_ms)
+            / profile.pulses_per_unit
+        )
         self.log(f"轴{AXIS_LABEL[axis]} {dist_mm:.1f}{profile.unit} {dir_txt} "
                  f"@ {effective_delay_ms:.2f}ms ({mm_s:.1f}{profile.speed_unit}) → {resp}")
         with self.state_lock:
@@ -1605,7 +1613,7 @@ class StepperGUI:
         delay_ms = self.v_delay[axis].get()
         # 按住连发是重复手势，不适合每次弹窗；仅记录风险日志。
         try:
-            pulse_rate = delay_ms_to_pulse_rate(delay_ms)
+            pulse_rate = step_delay_ms_to_pulse_rate(axis, delay_ms)
         except (TypeError, ValueError):
             pulse_rate = 0.0
         if pulse_rate > PULSE_RATE_WARN_PPS:

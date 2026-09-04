@@ -22,8 +22,11 @@ from motor_control.axis_math import (
 
 class DelayPulseRateTests(unittest.TestCase):
     def test_basic_conversion(self):
-        self.assertAlmostEqual(delay_ms_to_pulse_rate(1.0), 1000.0)
-        self.assertAlmostEqual(delay_ms_to_pulse_rate(0.05), 20000.0)
+        self.assertAlmostEqual(delay_ms_to_pulse_rate(1.0), 1000.0 / 1.2)
+        self.assertAlmostEqual(delay_ms_to_pulse_rate(0.05), 4000.0)
+        self.assertAlmostEqual(
+            delay_ms_to_pulse_rate(0.1, delay_overhead_us=0), 10000.0
+        )
 
     def test_rejects_non_positive(self):
         for bad in (0, -1, "x", None):

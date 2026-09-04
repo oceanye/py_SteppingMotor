@@ -11,6 +11,14 @@ from dataclasses import dataclass
 import operator
 from typing import Literal, TypedDict
 
+from .axis_math import (
+    DELAY_OVERHEAD_US,
+    MIN_DELAY_MS,
+    delay_ms_to_pulse_rate,
+    speed_clamps_delay,
+    speed_to_delay_ms,
+)
+
 
 NUM_LOCAL_STEPPER_AXES = 6
 NUM_PICO_NODES = 6
@@ -163,3 +171,58 @@ def clamp_step_delay_us(axis: int, requested_delay_us: int) -> int:
         raise TypeError("requested delay must be an integer")
     minimum = LOCAL_MIN_DELAY_US if topology.is_local else REMOTE_MIN_DELAY_US
     return max(minimum, requested_delay_us)
+
+
+def step_speed_to_delay_ms(
+    axis: int, speed: object, pulses_per_unit_value: object
+) -> float:
+    """Convert requested physical speed using the selected controller timing.
+
+    ESP32's bit-banged step task uses the historical execution-overhead
+    compensation.  A Pico PIO command is already the complete pulse period and
+    must not receive that subtraction; applying it there can make a remote axis
+    run faster than requested.
+    """
+
+    topology = get_stepper_axis_topology(axis)
+    if topology.is_remote:
+        return speed_to_delay_ms(
+            speed,
+            pulses_per_unit_value,
+            delay_overhead_us=0,
+            minimum_delay_ms=REMOTE_MIN_DELAY_US / 1_000.0,
+        )
+    return speed_to_delay_ms(
+        speed,
+        pulses_per_unit_value,
+        delay_overhead_us=DELAY_OVERHEAD_US,
+        minimum_delay_ms=MIN_DELAY_MS,
+    )
+
+
+def step_delay_ms_to_pulse_rate(axis: int, delay_ms: object) -> float:
+    """Return effective pps for a controller-specific delay command."""
+
+    topology = get_stepper_axis_topology(axis)
+    return delay_ms_to_pulse_rate(
+        delay_ms,
+        delay_overhead_us=0 if topology.is_remote else DELAY_OVERHEAD_US,
+    )
+
+
+def step_speed_clamps_delay(
+    axis: int, speed: object, pulses_per_unit_value: object
+) -> bool:
+    """Whether controller-specific minimum timing clamps requested speed."""
+
+    topology = get_stepper_axis_topology(axis)
+    return speed_clamps_delay(
+        speed,
+        pulses_per_unit_value,
+        delay_overhead_us=0 if topology.is_remote else DELAY_OVERHEAD_US,
+        minimum_delay_ms=(
+            REMOTE_MIN_DELAY_US / 1_000.0
+            if topology.is_remote
+            else MIN_DELAY_MS
+        ),
+    )
