@@ -23,6 +23,10 @@
 > 2026-09-04 更新：手机网页已补齐 PPR/GR/导程、轴状态和高脉冲率确认，并修正
 > RP2040 远端轴误套用 ESP32 周期开销补偿的问题。离线结果、功能边界和远端验收清单
 > 见 `docs/HANDOFF_2026-09-04_WEB_PARITY.md`。
+>
+> 2026-09-06 待合并分支更新：已增加 `Mup1/Mr1/Mup2/Mr2` 到实际步进轴的安全绑定页，
+> 桌面与网页共享只读位置/进度状态，且明确保持自动协调运动关闭。实现边界、离线结果和
+> 现场验收清单见 `docs/HANDOFF_2026-09-06_LOGICAL_MOTOR_BINDING.md`。
 
 本文是后续迁移到开发机、真实控制柜和实物机构时的执行基线。2026-08-20 分支已完成
 Python 离线回归及 ESP32/RP2040 PlatformIO 交叉编译；**没有宣称烧录、KiCad DRC 或
@@ -269,13 +273,14 @@ PCB 的固定实现路线是“完整成品模块载板”：默认用排针/排
 
 ## 8. 交接时优先阅读
 
-1. `docs/HANDOFF_2026-09-04_WEB_PARITY.md`：最新网页配套、时序修正与远端验收项
-2. `docs/HANDOFF_2026-08-24.md`：轴功能改名与轨道 D 实机结论
-3. `docs/HANDOFF_2026-08-21.md`：硬件悬案收官、脉冲率护栏与现场状态
-4. 本文 `docs/HANDOFF.md`
-5. `MD422_20K-2M.md`：当前系统与串口协议
-6. `docs/WEB_CONTROL.md`：局域网网页和 HTTP API
-7. `pcb/README.md`：模块载板、电源边界与打样前检查
-8. `docs/wiring_check.html`：现场接线核对页
-9. `docs/PROJECT_MEMORY.md`：历史决策与调试背景
-10. `docs/HANDOFF_2026-08-12_RP2040_STEPPERS.md`：24 路 RP2040 步进扩展与远端验收
+1. `docs/HANDOFF_2026-09-06_LOGICAL_MOTOR_BINDING.md`：四逻辑电机绑定、位置语义与现场验收
+2. `docs/HANDOFF_2026-09-04_WEB_PARITY.md`：网页配套、时序修正与远端验收项
+3. `docs/HANDOFF_2026-08-24.md`：轴功能改名与轨道 D 实机结论
+4. `docs/HANDOFF_2026-08-21.md`：硬件悬案收官、脉冲率护栏与现场状态
+5. 本文 `docs/HANDOFF.md`
+6. `MD422_20K-2M.md`：当前系统与串口协议
+7. `docs/WEB_CONTROL.md`：局域网网页和 HTTP API
+8. `pcb/README.md`：模块载板、电源边界与打样前检查
+9. `docs/wiring_check.html`：现场接线核对页
+10. `docs/PROJECT_MEMORY.md`：历史决策与调试背景
+11. `docs/HANDOFF_2026-08-12_RP2040_STEPPERS.md`：24 路 RP2040 步进扩展与远端验收

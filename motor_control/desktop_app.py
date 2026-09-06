@@ -27,6 +27,13 @@ from motor_control import (
     STEPPER_PINS,
     AxisProfile,
     AxisRuntime,
+    AxisMotionTelemetry,
+    BindingSet,
+    BindingValidationError,
+    LOGICAL_ROLE_ORDER,
+    ROLE_SPECS,
+    binding_compatibility_issues,
+    build_coordinated_snapshot,
     clamp_step_delay_us,
     convert_axis_value,
     speed_to_delay_ms,
@@ -34,6 +41,7 @@ from motor_control import (
     step_speed_clamps_delay,
     step_speed_to_delay_ms,
     stepper_axis_topology,
+    parse_binding_document,
 )
 from motor_control.axis_math import (
     PULSE_RATE_WARN_PPS,
@@ -64,11 +72,14 @@ from motor_control.serial_session import (
 from motor_control.state_store import StateStore, StateStoreError
 from motor_control.ui_dispatch import UiDispatcher
 from motor_control.ui import (
+    build_coordinated_tab as build_coordinated_tab_view,
     build_foc_tab as build_foc_tab_view,
     build_gear_tab as build_gear_tab_view,
     build_stepper_tab as build_stepper_tab_view,
     build_track_tab as build_track_tab_view,
     build_ui as build_main_ui,
+    refresh_coordinated_tab as refresh_coordinated_tab_view,
+    sync_binding_editor as sync_binding_editor_view,
 )
 from motor_control.web_adapter import DesktopWebController
 
@@ -155,7 +166,7 @@ class StepperGUI:
         self.running            = [False] * NUM_STEPPER_AXES  # 连续运动 flag
         # 位置与限位使用与显示模式无关的脉冲坐标；mm/° 只在边界换算。
         self.axis_runtime = [
-            AxisRuntime(position_trusted=True) for _ in range(NUM_STEPPER_AXES)
+            AxisRuntime(position_trusted=False) for _ in range(NUM_STEPPER_AXES)
         ]
         self.stepper_in_progress= [False] * NUM_STEPPER_AXES
         self._pending_step      = [None]  * NUM_STEPPER_AXES
@@ -163,6 +174,16 @@ class StepperGUI:
         self._move_reservation  = [None]  * NUM_STEPPER_AXES
         self._web_step_pending  = [None]  * NUM_STEPPER_AXES
         self._axis_motion_generation = [0] * NUM_STEPPER_AXES
+        self.axis_motion_telemetry = [
+            AxisMotionTelemetry() for _ in range(NUM_STEPPER_AXES)
+        ]
+        self.control_bindings = BindingSet.empty()
+        self.pico_node_health = {
+            node: "unknown" for node in range(1, NUM_PICO_NODES + 1)
+        }
+        self._binding_editor_dirty = False
+        self._binding_editor_revision = 0
+        self._coordinated_refresh_after = None
         self._foc_enabled_ui    = [False] * NUM_MOTOR_AXES
         self.foc_trace_buf      = [[] for _ in range(NUM_MOTOR_AXES)]
         self._motor_status      = [
@@ -239,6 +260,7 @@ class StepperGUI:
         self.axis_gr_var   = [tk.DoubleVar(value=DEFAULT_GEAR_RATIO) for _ in range(NUM_STEPPER_AXES)]
         self.axis_lead_var = [tk.DoubleVar(value=DEFAULT_LEAD_MM) for _ in range(NUM_STEPPER_AXES)]
         self._load_axis_config()
+        self._load_control_bindings()
 
         self._build_ui()
         for warning in self._startup_warnings:
@@ -255,6 +277,7 @@ class StepperGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(25, self._drain_ui_actions)
         self._load_calib()
+        self._refresh_coordinated_ui()
         self._load_foc_tune()
         self._load_gear_tune()
         if web_server_factory is not None:
@@ -268,6 +291,226 @@ class StepperGUI:
     def _build_stepper_tab(self, parent, axis):
         build_stepper_tab_view(
             self, parent, axis, SPEED_PRESETS, DIR_OUTWARD, DIR_INWARD)
+
+    def _build_coordinated_tab(self, parent):
+        build_coordinated_tab_view(self, parent)
+
+    # ═════════════ 四逻辑电机：绑定与只读状态 ══════════════
+    def _load_control_bindings(self):
+        """Load one complete binding snapshot; malformed data fails safe."""
+
+        try:
+            data = self.state_store.load_coordinated_bindings()
+        except StateStoreError as exc:
+            self._startup_warnings.append(f"⚠️ 逻辑电机绑定读取失败: {exc}")
+            self.control_bindings = BindingSet.empty()
+            return
+        if data is None:
+            self.control_bindings = BindingSet.empty()
+            return
+        try:
+            self.control_bindings = parse_binding_document(data)
+        except BindingValidationError as exc:
+            self.control_bindings = BindingSet.empty()
+            self._startup_warnings.append(
+                f"⚠️ 逻辑电机绑定配置无效（{exc.code}）: {exc}；已安全回退为未绑定"
+            )
+
+    def _safety_state_locked(self):
+        if self._hardware_estop_active:
+            return "hardware_estop"
+        if self._estop_in_progress:
+            return "software_estop"
+        if self._estop_unconfirmed:
+            return "estop_unconfirmed"
+        return "normal"
+
+    def _snapshot_coordinated_control_locked(self, *, now=None):
+        """Build the desktop/Web shared snapshot while ``state_lock`` is held."""
+
+        return build_coordinated_snapshot(
+            bindings=self.control_bindings,
+            profiles=self.axis_profiles,
+            runtimes=self.axis_runtime,
+            axis_param_valid=self.axis_param_valid,
+            running=self.running,
+            stepper_in_progress=self.stepper_in_progress,
+            move_dispatching=self._move_dispatching,
+            move_reservations=self._move_reservation,
+            web_step_pending=self._web_step_pending,
+            pending_steps=self._pending_step,
+            telemetry=self.axis_motion_telemetry,
+            connected=self._is_serial_connected(),
+            safety_state=self._safety_state_locked(),
+            pico_node_health=self.pico_node_health,
+            now=now,
+        )
+
+    def _apply_control_bindings(self, candidate):
+        """Atomically validate, persist and publish a complete binding set."""
+
+        if not isinstance(candidate, BindingSet):
+            candidate = BindingSet.from_axis_mapping(candidate)
+        with self.state_lock:
+            if candidate.assignments == self.control_bindings.assignments:
+                return self.control_bindings
+            issues = binding_compatibility_issues(
+                candidate, self.axis_profiles, self.axis_param_valid
+            )
+            if issues:
+                raise BindingValidationError(issues[0].code, issues[0].message)
+            affected_axes = set(self.control_bindings.bound_axes)
+            affected_axes.update(candidate.bound_axes)
+            active = [
+                axis for axis in sorted(affected_axes)
+                if self._axis_motion_active_locked(axis)
+            ]
+            if active:
+                labels = ", ".join(
+                    f"步进轴 {axis}（{AXIS_LABEL[axis]}）" for axis in active
+                )
+                raise RuntimeError(f"{labels} 正在运动或已预约，停止后才能换绑")
+
+            # The binding file is tiny and local.  Keep the same RLock held
+            # through os.replace so no MOVE/config path can enter between the
+            # idle check, persistence and in-memory publication.
+            reservation = object()
+            for axis in affected_axes:
+                self._move_reservation[axis] = reservation
+            applied = candidate.with_revision(self.control_bindings.revision + 1)
+            try:
+                self.state_store.save_coordinated_bindings(applied.as_document())
+                self.control_bindings = applied
+            finally:
+                for axis in affected_axes:
+                    if self._move_reservation[axis] is reservation:
+                        self._move_reservation[axis] = None
+        return applied
+
+    def _binding_draft(self):
+        values = {}
+        for role in LOGICAL_ROLE_ORDER:
+            selected = self.control_binding_vars[role.value].get()
+            if selected == "未绑定":
+                values[role.value] = None
+                continue
+            if selected not in self._binding_axis_by_option:
+                raise BindingValidationError(
+                    "invalid_axis_option", f"{role.value} 选择了未知物理轴"
+                )
+            values[role.value] = self._binding_axis_by_option[selected]
+        return BindingSet.from_axis_mapping(values)
+
+    def _show_binding_draft_validation(self):
+        statuses = self.coordinated_widgets.get("binding_status", {})
+        try:
+            candidate = self._binding_draft()
+            issues = binding_compatibility_issues(
+                candidate, self.axis_profiles, self.axis_param_valid
+            )
+            issue_by_role = {
+                issue.role.value: issue for issue in issues if issue.role is not None
+            }
+            for role in LOGICAL_ROLE_ORDER:
+                binding = candidate.for_role(role)
+                issue = issue_by_role.get(role.value)
+                if issue is not None:
+                    message, color = issue.message, "#b42318"
+                elif binding is None:
+                    message, color = "未绑定", "#b26a00"
+                else:
+                    message, color = "草稿有效", "#1565c0"
+                statuses[role.value].configure(text=message, foreground=color)
+        except BindingValidationError as exc:
+            for widget in statuses.values():
+                widget.configure(text=str(exc), foreground="#b42318")
+
+    def _on_binding_editor_change(self, _event=None):
+        self._binding_editor_dirty = True
+        dirty = self.coordinated_widgets.get("dirty_label")
+        if dirty is not None:
+            dirty.configure(text="草稿未应用", foreground="#b26a00")
+        self._show_binding_draft_validation()
+
+    def _fill_suggested_bindings(self):
+        suggested = BindingSet.suggested()
+        for role in LOGICAL_ROLE_ORDER:
+            binding = suggested.for_role(role)
+            self.control_binding_vars[role.value].set(
+                self._binding_option_by_axis[binding.axis]
+            )
+        self._on_binding_editor_change()
+
+    def _clear_binding_editor(self):
+        if not messagebox.askyesno(
+            "解除逻辑绑定",
+            "将解除 Mup1/Mr1/Mup2/Mr2 的全部物理步进轴绑定。\n"
+            "此操作不会移动电机，也不会清除轴校准。是否继续？",
+            icon="warning",
+        ):
+            return
+        for role in LOGICAL_ROLE_ORDER:
+            self.control_binding_vars[role.value].set("未绑定")
+        self._on_binding_editor_change()
+        self._save_binding_editor()
+
+    def _save_binding_editor(self):
+        try:
+            candidate = self._binding_draft()
+            applied = self._apply_control_bindings(candidate)
+        except (BindingValidationError, RuntimeError, StateStoreError) as exc:
+            self.log(f"⛔ 逻辑电机绑定未保存: {exc}")
+            messagebox.showerror("绑定未保存", str(exc))
+            self._show_binding_draft_validation()
+            return False
+        sync_binding_editor_view(self, applied)
+        self.log(
+            "✓ 逻辑电机绑定已保存: "
+            + ", ".join(
+                f"{role.value}→"
+                + (
+                    "未绑定"
+                    if applied.for_role(role) is None
+                    else f"步进轴 {applied.for_role(role).axis}"
+                )
+                for role in LOGICAL_ROLE_ORDER
+            )
+        )
+        self._refresh_coordinated_ui(reschedule=False)
+        return True
+
+    def _jump_to_binding_axis(self, role=None):
+        if role is None:
+            roles = LOGICAL_ROLE_ORDER
+        else:
+            roles = (role,)
+        selected_axis = None
+        for selected_role in roles:
+            option = self.control_binding_vars[selected_role.value].get()
+            if option in self._binding_axis_by_option:
+                selected_axis = self._binding_axis_by_option[option]
+                break
+        if selected_axis is None:
+            messagebox.showinfo("未选择物理轴", "请先在任意角色行选择一个物理步进轴")
+            return
+        self.notebook.select(self.tab_index_step[selected_axis])
+        group_index = self.stepper_axis_group_indices[selected_axis]
+        self.stepper_group_book.select(group_index)
+        axis_book = self.stepper_axis_books[selected_axis]
+        axis_book.select(self.stepper_axis_tabs[selected_axis])
+
+    def _refresh_coordinated_ui(self, *, reschedule=True):
+        if self._closing or not getattr(self, "coordinated_widgets", None):
+            return
+        with self.state_lock:
+            control, snapshots = self._snapshot_coordinated_control_locked()
+        refresh_coordinated_tab_view(self, control, snapshots)
+        if self._binding_editor_dirty:
+            self._show_binding_draft_validation()
+        if reschedule and not self._closing:
+            self._coordinated_refresh_after = self.root.after(
+                200, self._refresh_coordinated_ui
+            )
 
     # ═════════════ FOC Tab（参数化）═════════════
     def _build_foc_tab(self, parent, axis):
@@ -482,6 +725,18 @@ class StepperGUI:
         self.sw[axis]['delay_label'].config(text=f"({d:.2f} ms/脉冲)")
 
     def _on_step_progress(self, axis, done, total):
+        if not 0 <= axis < NUM_STEPPER_AXES:
+            return
+        with self.state_lock:
+            pending = self._pending_step[axis]
+            if (
+                pending is not None
+                and total > 0
+                and total == int(abs(pending))
+            ):
+                self.axis_motion_telemetry[axis] = (
+                    self.axis_motion_telemetry[axis].with_progress(done, total)
+                )
         if 0 <= axis < len(self.sw) and 'progress' in self.sw[axis]:
             pct = int(done * 100 / total) if total > 0 else 0
             self.sw[axis]['progress']['value'] = pct
@@ -516,6 +771,25 @@ class StepperGUI:
             return False
         if mode == old_mode:
             return True
+
+        with self.state_lock:
+            bindings = getattr(self, "control_bindings", BindingSet.empty())
+            bound_role = bindings.role_for_axis(axis)
+        if (
+            bound_role is not None
+            and mode != ROLE_SPECS[bound_role].required_mode
+        ):
+            self.axis_mode_var[axis].set(old_mode)
+            required = (
+                "直线" if ROLE_SPECS[bound_role].required_mode == MODE_LINEAR else "旋转"
+            )
+            message = (
+                f"步进轴 {axis} 已绑定 {bound_role.value}，必须保持{required}模式；"
+                "请先在“电机绑定与状态”页解除绑定"
+            )
+            self.log(f"⛔ {message}")
+            messagebox.showwarning("绑定模式受保护", message)
+            return False
 
         with self.state_lock:
             moving = (self.running[axis] or self.stepper_in_progress[axis]
@@ -816,6 +1090,9 @@ class StepperGUI:
                 self._disconnecting = False
                 self._hardware_estop_active = False
                 self._estop_unconfirmed = True
+                self.pico_node_health = {
+                    node: "unknown" for node in range(1, NUM_PICO_NODES + 1)
+                }
             opened_serial = serial.Serial(
                 self.port_var.get(), int(self.baud_var.get()), timeout=0.2
             )
@@ -926,6 +1203,11 @@ class StepperGUI:
                     self._move_reservation[axis] = None
                     self._web_step_pending[axis] = None
                     self._pending_step[axis] = None
+                    self.axis_motion_telemetry[axis] = (
+                        self.axis_motion_telemetry[axis].reset(
+                            result="DISCONNECTED"
+                        )
+                    )
                 session, self.serial_session = self.serial_session, None
                 ser, self.ser = self.ser, None
 
@@ -1064,6 +1346,10 @@ class StepperGUI:
                     self._track_direction = "STOP"
                     self._track_last_response = event.raw
                     for axis in range(NUM_STEPPER_AXES):
+                        if self._axis_motion_active_locked(axis):
+                            self.axis_motion_telemetry[axis] = (
+                                self.axis_motion_telemetry[axis].stopping()
+                            )
                         self.running[axis] = False
                     for axis in range(NUM_MOTOR_AXES):
                         self._foc_enabled_ui[axis] = False
@@ -1086,6 +1372,11 @@ class StepperGUI:
                     f"⚠️ 轴{AXIS_LABEL[e.axis]}: {e.raw}"))
             return
         if isinstance(event, NodeOfflineEvent):
+            with self.state_lock:
+                if not self._serial_source_is_current(generation, session):
+                    return
+                if 1 <= event.node <= NUM_PICO_NODES:
+                    self.pico_node_health[event.node] = "offline"
             post_ui(lambda e=event: self.log(
                 f"⚠️ Pico 节点 {e.node} 离线；对应远端轴暂不可用"))
             return
@@ -1201,6 +1492,9 @@ class StepperGUI:
             # terminal 事件即可立即、且只结算一次。
             self._pending_step[axis] = signed_steps
             self.stepper_in_progress[axis] = True
+            self.axis_motion_telemetry[axis] = AxisMotionTelemetry.starting(
+                self._axis_motion_generation[axis], steps
+            )
         try:
             command = build_move_command(axis, steps, actual_dir, delay_us)
         except ProtocolEncodingError as exc:
@@ -1209,6 +1503,9 @@ class StepperGUI:
                 if self._pending_step[axis] == signed_steps:
                     self._pending_step[axis] = None
                     self.stepper_in_progress[axis] = False
+                    self.axis_motion_telemetry[axis] = (
+                        self.axis_motion_telemetry[axis].reset(result="REJECTED")
+                    )
             self.log(f"⛔ 轴{AXIS_LABEL[axis]} MOVE 参数无效: {exc}")
             return False
         request_error = None
@@ -1238,6 +1535,15 @@ class StepperGUI:
             if not accepted and not terminal_already_settled:
                 self._pending_step[axis] = None
                 self.stepper_in_progress[axis] = False
+                result = (
+                    "UNKNOWN"
+                    if request_error is not None
+                    and not isinstance(request_error, RequestCancelled)
+                    else "REJECTED"
+                )
+                self.axis_motion_telemetry[axis] = (
+                    self.axis_motion_telemetry[axis].reset(result=result)
+                )
                 if request_error is not None and not isinstance(
                     request_error, RequestCancelled
                 ):
@@ -1298,6 +1604,9 @@ class StepperGUI:
             # A Web MOVE worker holding the previous token will observe the
             # generation/reservation mismatch before SerialSession writes it.
             self._web_step_pending[axis] = None
+            self.axis_motion_telemetry[axis] = (
+                self.axis_motion_telemetry[axis].stopping()
+            )
         return stop_reservation
 
     def _send_axis_stop(self, axis, stop_reservation=None, guard=None):
@@ -1530,6 +1839,9 @@ class StepperGUI:
                     pending_step * fraction
                 )
                 self._pending_step[axis] = None
+                self.axis_motion_telemetry[axis] = self.axis_motion_telemetry[
+                    axis
+                ].terminal("DONE", executed_steps, requested_steps)
             self.stepper_in_progress[axis] = False
         if pending_step is not None:
             self._update_pos_label(axis)
@@ -1553,6 +1865,9 @@ class StepperGUI:
             self.stepper_in_progress[axis] = False
             self.running[axis] = False
             self.axis_runtime[axis].position_trusted = False
+            self.axis_motion_telemetry[axis] = self.axis_motion_telemetry[
+                axis
+            ].terminal("ABORTED", executed_steps, requested_steps)
             profile = self.axis_profiles[axis]
         self._update_pos_label(axis)
         if 'progress' in self.sw[axis]:
@@ -2473,11 +2788,14 @@ class StepperGUI:
             self._closing = True
             active_axes = [
                 axis for axis in range(NUM_STEPPER_AXES)
-                if (self.running[axis] or self.stepper_in_progress[axis]
-                    or self._move_dispatching[axis]
-                    or self._move_reservation[axis] is not None
-                    or self._pending_step[axis] is not None)
+                if self._axis_motion_active_locked(axis)
             ]
+        if self._coordinated_refresh_after is not None:
+            try:
+                self.root.after_cancel(self._coordinated_refresh_after)
+            except tk.TclError:
+                pass
+            self._coordinated_refresh_after = None
         if self._is_serial_connected():
             confirmed = self._stop_all_outputs(allow_closing=True)
             if not confirmed and not messagebox.askyesno(
@@ -2488,6 +2806,7 @@ class StepperGUI:
             ):
                 with self.state_lock:
                     self._closing = False
+                self._refresh_coordinated_ui()
                 return
         # 确认停车或操作者明确选择强制退出后，再关闭 HTTP 入口。
         if self.web_server is not None:
@@ -2507,6 +2826,9 @@ class StepperGUI:
                 self._move_dispatching[axis] = False
                 self._move_reservation[axis] = None
                 self._pending_step[axis] = None
+                self.axis_motion_telemetry[axis] = (
+                    self.axis_motion_telemetry[axis].reset(result="CLOSED")
+                )
         self._save_calib()
         self.root.destroy()
 
@@ -2536,6 +2858,10 @@ class StepperGUI:
             self._track_lease_generation += 1
             for axis in range(NUM_STEPPER_AXES):
                 self._axis_motion_generation[axis] += 1
+                if self._axis_motion_active_locked(axis):
+                    self.axis_motion_telemetry[axis] = (
+                        self.axis_motion_telemetry[axis].stopping()
+                    )
                 self.running[axis] = False
                 self._move_reservation[axis] = None
                 self._web_step_pending[axis] = None

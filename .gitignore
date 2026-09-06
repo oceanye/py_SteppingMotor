@@ -7,6 +7,7 @@ __pycache__/
 .stepper_axis.json
 .foc_tune.json
 .gear_tune.json
+.coordinated_bindings.json
 logs/
 build_upload*.log
 

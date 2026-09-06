@@ -25,6 +25,7 @@ class StatePaths:
     calibration: Path
     foc_tune: Path
     gear_tune: Path
+    coordinated_bindings: Path
 
     @classmethod
     def under(cls, base_dir: str | os.PathLike[str]) -> "StatePaths":
@@ -34,6 +35,7 @@ class StatePaths:
             calibration=root / ".stepper_calib.json",
             foc_tune=root / ".foc_tune.json",
             gear_tune=root / ".gear_tune.json",
+            coordinated_bindings=root / ".coordinated_bindings.json",
         )
 
 
@@ -75,6 +77,12 @@ class StateStore:
 
     def save_gear_tune(self, data: Mapping[str, Any]) -> None:
         self._save_object(self.paths.gear_tune, data)
+
+    def load_coordinated_bindings(self) -> dict[str, Any] | None:
+        return self._load_object(self.paths.coordinated_bindings)
+
+    def save_coordinated_bindings(self, data: Mapping[str, Any]) -> None:
+        self._save_object(self.paths.coordinated_bindings, data)
 
     @staticmethod
     def _load_object(path: Path) -> dict[str, Any] | None:

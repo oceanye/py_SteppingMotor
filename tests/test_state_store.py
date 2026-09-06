@@ -21,6 +21,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.load_calibration())
         self.assertIsNone(self.store.load_foc_tune())
         self.assertIsNone(self.store.load_gear_tune())
+        self.assertIsNone(self.store.load_coordinated_bindings())
 
     def test_legacy_axis_config_round_trip_keeps_schema(self):
         expected = {
@@ -46,6 +47,20 @@ class StateStoreTests(unittest.TestCase):
         self.store.paths.foc_tune.write_text("{broken", encoding="utf-8")
         with self.assertRaises(StateStoreError):
             self.store.load_foc_tune()
+
+    def test_coordinated_bindings_round_trip(self):
+        expected = {
+            "schema_version": 1,
+            "revision": 2,
+            "bindings": {
+                "Mup1": {"kind": "stepper", "axis": 0},
+                "Mr1": {"kind": "stepper", "axis": 2},
+                "Mup2": None,
+                "Mr2": {"kind": "stepper", "axis": 3},
+            },
+        }
+        self.store.save_coordinated_bindings(expected)
+        self.assertEqual(self.store.load_coordinated_bindings(), expected)
 
     def test_non_object_top_level_is_rejected(self):
         self.store.paths.gear_tune.write_text("[]", encoding="utf-8")

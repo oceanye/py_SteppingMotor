@@ -81,18 +81,27 @@ def build_ui(app, log_dir, num_motor_axes):
     app.tab_index_step = [None] * NUM_STEPPER_AXES
     app.tab_index_foc = [None] * num_motor_axes
     app.tab_index_gear = [None] * num_motor_axes
+
+    coordinated_tab = ttk.Frame(app.notebook)
+    app.tab_index_coordinated = app.notebook.index("end")
+    app.notebook.add(coordinated_tab, text="🧭 电机绑定与状态")
+    app._build_coordinated_tab(coordinated_tab)
+
     stepper_tab = ttk.Frame(app.notebook)
     stepper_index = app.notebook.index("end")
     app.notebook.add(stepper_tab, text="🔩 步进轴 (30)")
     app.tab_index_step = [stepper_index] * NUM_STEPPER_AXES
     group_book = ttk.Notebook(stepper_tab)
     group_book.pack(fill="both", expand=True, padx=3, pady=2)
+    app.stepper_group_book = group_book
     groups = [("ESP32 本地", list(range(NUM_LOCAL_STEPPER_AXES)))]
     for node in range(1, NUM_PICO_NODES + 1):
         start = NUM_LOCAL_STEPPER_AXES + (node - 1) * PICO_AXES_PER_NODE
         groups.append((f"Pico {node}", list(range(start, start + PICO_AXES_PER_NODE))))
     app.stepper_axis_tabs = [None] * NUM_STEPPER_AXES
-    for group_label, axes in groups:
+    app.stepper_axis_books = [None] * NUM_STEPPER_AXES
+    app.stepper_axis_group_indices = [None] * NUM_STEPPER_AXES
+    for group_index, (group_label, axes) in enumerate(groups):
         group = ttk.Frame(group_book)
         group_book.add(group, text=group_label)
         axis_book = ttk.Notebook(group)
@@ -101,6 +110,8 @@ def build_ui(app, log_dir, num_motor_axes):
             tab = ttk.Frame(axis_book)
             axis_book.add(tab, text=f"轴 {AXIS_LABEL[axis]}")
             app.stepper_axis_tabs[axis] = tab
+            app.stepper_axis_books[axis] = axis_book
+            app.stepper_axis_group_indices[axis] = group_index
             app._build_stepper_tab(tab, axis)
     for axis in range(num_motor_axes):
         tab = ttk.Frame(app.notebook)

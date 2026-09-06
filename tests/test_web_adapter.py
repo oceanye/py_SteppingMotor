@@ -12,6 +12,7 @@ from motor_control.axis_math import (
     speed_to_delay_ms,
 )
 from motor_control.axis_model import AxisProfile, AxisRuntime
+from motor_control.coordinated_control import AxisMotionTelemetry, BindingSet
 from motor_control.topology import (
     NUM_STEPPER_AXES,
     step_delay_ms_to_pulse_rate,
@@ -61,6 +62,11 @@ class FakeDesktopApplication:
         self._web_step_pending = [None] * NUM_STEPPER_AXES
         self._axis_motion_generation = [0] * NUM_STEPPER_AXES
         self._pending_step = [None] * NUM_STEPPER_AXES
+        self.axis_motion_telemetry = [
+            AxisMotionTelemetry() for _ in range(NUM_STEPPER_AXES)
+        ]
+        self.control_bindings = BindingSet.empty()
+        self.pico_node_health = {node: "unknown" for node in range(1, 7)}
         self.axis_param_valid = [True] * NUM_STEPPER_AXES
         self.axis_profiles = [AxisProfile() for _ in range(NUM_STEPPER_AXES)]
         self.axis_runtime = [
@@ -333,6 +339,45 @@ class DesktopWebControllerTests(unittest.TestCase):
         self.assertEqual(status["stepper_axes"][29]["node"], 6)
         self.assertIn("position_mm", status["stepper_axes"][0])
         self.assertIn("travel_min_mm", status["stepper_axes"][0])
+        self.assertEqual(status["stepper_axes"][0]["position"], 2.5)
+        self.assertEqual(
+            status["stepper_axes"][0]["position_source"],
+            "host_pulse_accounting",
+        )
+        self.assertFalse(status["stepper_axes"][0]["measured"])
+
+    def test_status_projects_four_bound_logical_motors(self):
+        self.app.control_bindings = BindingSet.suggested().with_revision(3)
+        self.app.axis_profiles[2] = AxisProfile(mode=MODE_ROTARY)
+        self.app.axis_profiles[3] = AxisProfile(mode=MODE_ROTARY)
+        self.app.axis_runtime[0].position_steps = 1_000
+        self.app._pending_step[0] = 200
+        self.app.stepper_in_progress[0] = True
+        self.app.axis_motion_telemetry[0] = AxisMotionTelemetry.starting(
+            0, 200, now=10.0
+        ).with_progress(50, 200, now=10.25)
+
+        status = self.controller.web_get_status()
+
+        self.assertEqual(
+            [item["role"] for item in status["logical_motors"]],
+            ["Mup1", "Mr1", "Mup2", "Mr2"],
+        )
+        self.assertTrue(status["coordinated_control"]["configuration_valid"])
+        self.assertFalse(status["coordinated_control"]["automation_ready"])
+        self.assertEqual(status["logical_motors"][0]["axis"], 0)
+        self.assertEqual(status["logical_motors"][0]["projected_position"], 5.25)
+        self.assertFalse(status["logical_motors"][0]["measured"])
+
+    def test_bound_axis_mode_cannot_be_changed_to_incompatible_mode(self):
+        self.app.control_bindings = BindingSet.from_axis_mapping(
+            {"Mup1": 0, "Mr1": None, "Mup2": None, "Mr2": None}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "必须保持 linear"):
+            self.controller.web_stepper_config(0, mode=MODE_ROTARY)
+
+        self.assertEqual(self.app.axis_profiles[0].mode, "linear")
 
     def test_estop_invalidates_prior_generation_and_clears_busy_flag(self):
         result = self.controller.web_emergency_stop()

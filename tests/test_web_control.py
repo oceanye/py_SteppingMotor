@@ -104,6 +104,19 @@ class WebControlTests(unittest.TestCase):
         self.assertIn('id="slead${a}"', page)
         self.assertIn("confirm_high_rate:highRate", page)
         self.assertIn("axisConfigIsDirty(axis)", page)
+        self.assertIn('id="logicalMotors"', page)
+        self.assertIn("只读监控", page)
+        self.assertIn("host_pulse_accounting", page)
+        self.assertIn("refreshInFlight", page)
+        self.assertIn("typeof position==='number'", page)
+        self.assertIn("item.target_position", page)
+
+    def test_logical_binding_write_and_auto_start_routes_do_not_exist(self):
+        for path in ("/api/logical-motors/bindings", "/api/coordinated/start"):
+            with self.subTest(path=path):
+                status, data = self.request_json("POST", path, {})
+                self.assertEqual(status, 404)
+                self.assertIn("未知路径", data["error"])
 
     def test_status_exposes_current_30_axis_topology(self):
         status, data = self.request_json("GET", "/api/status")

@@ -1,6 +1,29 @@
 """ui.common 数值输入工具：全角规范化与半成品校验（纯函数，无 Tk）。"""
 
+import sys
+import types
 import unittest
+
+
+try:
+    import tkinter  # noqa: F401
+except ImportError:
+    tkinter_module = types.ModuleType("tkinter")
+    tkinter_module.__path__ = []
+
+    class TclError(Exception):
+        pass
+
+    tkinter_module.TclError = TclError
+    ttk_module = types.ModuleType("tkinter.ttk")
+    messagebox_module = types.ModuleType("tkinter.messagebox")
+    for name in ("showerror", "showwarning", "showinfo", "askyesno", "askokcancel"):
+        setattr(messagebox_module, name, lambda *_args, **_kwargs: None)
+    tkinter_module.ttk = ttk_module
+    tkinter_module.messagebox = messagebox_module
+    sys.modules["tkinter"] = tkinter_module
+    sys.modules["tkinter.ttk"] = ttk_module
+    sys.modules["tkinter.messagebox"] = messagebox_module
 
 from motor_control.ui.common import (
     is_complete_number,
