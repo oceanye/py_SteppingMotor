@@ -19,6 +19,12 @@ from .axis_math import (
     SPEED_DEFAULT,
     coerce_finite_in_range,
 )
+from .coordinated_control import (
+    AxisMotionTelemetry,
+    BindingSet,
+    ROLE_SPECS,
+    build_coordinated_snapshot,
+)
 from .topology import (
     AXIS_LABEL,
     MOTOR_AXIS_LABELS,
@@ -106,6 +112,7 @@ class DesktopWebController:
             stepper_axis_topology(axis) for axis in range(NUM_STEPPER_AXES)
         ]
         with app.state_lock:
+            connected = app._is_serial_connected()
             steppers = [
                 {
                     "axis": axis,
@@ -114,6 +121,11 @@ class DesktopWebController:
                         app.axis_profiles[axis]
                     ),
                     "position_trusted": app.axis_runtime[axis].position_trusted,
+                    "position": app.axis_runtime[axis].position_in(
+                        app.axis_profiles[axis]
+                    ),
+                    "position_source": "host_pulse_accounting",
+                    "measured": False,
                     "in_progress": (
                         app.running[axis]
                         or app.stepper_in_progress[axis]
@@ -129,11 +141,18 @@ class DesktopWebController:
                     "travel_max_mm": app.axis_runtime[axis].limits_in(
                         app.axis_profiles[axis]
                     )[1],
+                    "travel_min": app.axis_runtime[axis].limits_in(
+                        app.axis_profiles[axis]
+                    )[0],
+                    "travel_max": app.axis_runtime[axis].limits_in(
+                        app.axis_profiles[axis]
+                    )[1],
                     "mode": app.axis_profiles[axis].mode,
                     "unit": app.axis_profiles[axis].unit,
                     "pulse_per_rev": app.axis_profiles[axis].pulse_per_rev,
                     "gear_ratio": app.axis_profiles[axis].gear_ratio,
                     "lead_mm": app.axis_profiles[axis].lead_mm,
+                    "config_valid": bool(app.axis_param_valid[axis]),
                     "controller": topology_axes[axis]["controller"],
                     "node": topology_axes[axis]["node"],
                     "local_axis": topology_axes[axis]["local_axis"],
@@ -152,8 +171,41 @@ class DesktopWebController:
                 "lease_ms": app._track_lease_ms,
             }
             mode = app._fw_mode_cache
+            if hasattr(app, "_snapshot_coordinated_control_locked"):
+                coordinated_control, logical_motors = (
+                    app._snapshot_coordinated_control_locked()
+                )
+            else:
+                telemetry = getattr(app, "axis_motion_telemetry", None)
+                if telemetry is None:
+                    telemetry = [
+                        AxisMotionTelemetry() for _ in range(NUM_STEPPER_AXES)
+                    ]
+                safety_state = "normal"
+                if getattr(app, "_hardware_estop_active", False):
+                    safety_state = "hardware_estop"
+                elif getattr(app, "_estop_in_progress", False):
+                    safety_state = "software_estop"
+                elif getattr(app, "_estop_unconfirmed", False):
+                    safety_state = "estop_unconfirmed"
+                coordinated_control, logical_motors = build_coordinated_snapshot(
+                    bindings=getattr(app, "control_bindings", BindingSet.empty()),
+                    profiles=app.axis_profiles,
+                    runtimes=app.axis_runtime,
+                    axis_param_valid=app.axis_param_valid,
+                    running=app.running,
+                    stepper_in_progress=app.stepper_in_progress,
+                    move_dispatching=app._move_dispatching,
+                    move_reservations=app._move_reservation,
+                    web_step_pending=app._web_step_pending,
+                    pending_steps=app._pending_step,
+                    telemetry=telemetry,
+                    connected=connected,
+                    safety_state=safety_state,
+                    pico_node_health=getattr(app, "pico_node_health", {}),
+                )
         return {
-            "connected": app._is_serial_connected(),
+            "connected": connected,
             "mode": mode,
             "steppers": [
                 (
@@ -177,6 +229,8 @@ class DesktopWebController:
             "stepper_axes": steppers,
             "motor_axes": motors,
             "track_detail": track,
+            "coordinated_control": coordinated_control,
+            "logical_motors": logical_motors,
             "topology": {
                 "total_axes": NUM_STEPPER_AXES,
                 "local_axes": NUM_LOCAL_STEPPER_AXES,
@@ -372,6 +426,22 @@ class DesktopWebController:
                     or app._pending_step[axis] is not None
                 )
                 current = app.axis_profiles[axis]
+                bindings = getattr(app, "control_bindings", BindingSet.empty())
+                bound_role = bindings.role_for_axis(axis)
+                if (
+                    mode is not None
+                    and bound_role is not None
+                    and mode != ROLE_SPECS[bound_role].required_mode
+                ):
+                    required = (
+                        "linear"
+                        if ROLE_SPECS[bound_role].required_mode == MODE_LINEAR
+                        else "rotary"
+                    )
+                    raise RuntimeError(
+                        f"步进轴 {axis} 已绑定 {bound_role.value}，"
+                        f"必须保持 {required} 模式；请先在桌面 GUI 解除绑定"
+                    )
                 changes_profile = (
                     (mode is not None and mode != current.mode)
                     or (

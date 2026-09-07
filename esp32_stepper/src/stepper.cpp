@@ -37,10 +37,11 @@ static bool valid_axis(int axis) { return axis >= 0 && axis < NUM_AXES; }
 // ── 加减速曲线参数 ──
 #define STEP_RAMP_START_US    5000   // 启动延时(us)，安全慢速 ~60 RPM @200微步
 #define STEP_RAMP_FACTOR      0.02f  // 每步延时缩减比例（越大加速越猛）
+#define STEP_PROGRESS_INTERVAL_MS 250  // 与 Pico 节点一致；限制多轴串口进度流量
 
 // 单脉冲输出：50us HIGH + 指定 LOW 延时，含周期性 yield 防饿死其他任务
 static inline void emit_pulse(int pul, int delay_us, int* step_count, uint32_t* last_yield_ms,
-                              int axis, int total_steps) {
+                              uint32_t* last_progress_ms, int axis, int total_steps) {
   digitalWrite(pul, HIGH);
   delayMicroseconds(50);
   digitalWrite(pul, LOW);
@@ -56,8 +57,11 @@ static inline void emit_pulse(int pul, int delay_us, int* step_count, uint32_t* 
     }
   }
   (*step_count)++;
-  if (total_steps > 500 && (*step_count % 500) == 0) {
+  uint32_t now_ms = millis();
+  if (*step_count < total_steps &&
+      (uint32_t)(now_ms - *last_progress_ms) >= STEP_PROGRESS_INTERVAL_MS) {
     serial_tx_printf("STEP,%d,P,%d,%d", axis, *step_count, total_steps);
+    *last_progress_ms = now_ms;
   }
 }
 
@@ -102,25 +106,29 @@ static void stepper_task(void* arg) {
     float current_delay = start_delay;
     int step_count = 0;
     uint32_t last_yield_ms = millis();
+    uint32_t last_progress_ms = last_yield_ms;
     bool aborted = s_state[axis].load() == STEP_ABORTING;
 
     // 加速阶段：逐步缩短延时
     for (int i = 0; i < accel_steps && !aborted; i++) {
-      emit_pulse(pul, (int)current_delay, &step_count, &last_yield_ms, axis, steps);
+      emit_pulse(pul, (int)current_delay, &step_count, &last_yield_ms,
+                 &last_progress_ms, axis, steps);
       current_delay *= (1.0f - STEP_RAMP_FACTOR);
       if (current_delay < cruise_delay) current_delay = cruise_delay;
       if (s_state[axis].load() == STEP_ABORTING) aborted = true;
     }
     // 巡航阶段：恒速
     for (int i = 0; i < cruise_steps && !aborted; i++) {
-      emit_pulse(pul, (int)cruise_delay, &step_count, &last_yield_ms, axis, steps);
+      emit_pulse(pul, (int)cruise_delay, &step_count, &last_yield_ms,
+                 &last_progress_ms, axis, steps);
       if (s_state[axis].load() == STEP_ABORTING) aborted = true;
     }
     // 减速阶段：逐步加长延时（镜像加速）
     for (int i = 0; i < decel_steps && !aborted; i++) {
       current_delay /= (1.0f - STEP_RAMP_FACTOR);
       if (current_delay > start_delay) current_delay = start_delay;
-      emit_pulse(pul, (int)current_delay, &step_count, &last_yield_ms, axis, steps);
+      emit_pulse(pul, (int)current_delay, &step_count, &last_yield_ms,
+                 &last_progress_ms, axis, steps);
       if (s_state[axis].load() == STEP_ABORTING) aborted = true;
     }
 

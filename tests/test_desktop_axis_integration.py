@@ -7,6 +7,30 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+def _ensure_tkinter_import_surface():
+    try:
+        import tkinter  # noqa: F401
+        return
+    except ImportError:
+        pass
+    tkinter_module = types.ModuleType("tkinter")
+    tkinter_module.__path__ = []
+
+    class TclError(Exception):
+        pass
+
+    tkinter_module.TclError = TclError
+    ttk_module = types.ModuleType("tkinter.ttk")
+    messagebox_module = types.ModuleType("tkinter.messagebox")
+    for name in ("showerror", "showwarning", "showinfo", "askyesno", "askokcancel"):
+        setattr(messagebox_module, name, lambda *_args, **_kwargs: None)
+    tkinter_module.ttk = ttk_module
+    tkinter_module.messagebox = messagebox_module
+    sys.modules["tkinter"] = tkinter_module
+    sys.modules["tkinter.ttk"] = ttk_module
+    sys.modules["tkinter.messagebox"] = messagebox_module
+
+
 def _ensure_serial_import_surface():
     try:
         import serial.tools.list_ports  # noqa: F401
@@ -27,9 +51,13 @@ def _ensure_serial_import_surface():
     sys.modules["serial.tools.list_ports"] = ports_module
 
 
+_ensure_tkinter_import_surface()
 _ensure_serial_import_surface()
 
 from motor_control import (
+    AxisMotionTelemetry,
+    BindingSet,
+    BindingValidationError,
     MODE_ROTARY,
     AxisProfile,
     AxisRuntime,
@@ -58,6 +86,12 @@ def _headless_app():
     app._web_step_pending = [None] * NUM_STEPPER_AXES
     app._axis_motion_generation = [0] * NUM_STEPPER_AXES
     app._pending_step = [None] * NUM_STEPPER_AXES
+    app.axis_motion_telemetry = [
+        AxisMotionTelemetry() for _ in range(NUM_STEPPER_AXES)
+    ]
+    app.control_bindings = BindingSet.empty()
+    app.pico_node_health = {node: "unknown" for node in range(1, 7)}
+    app.axis_param_valid = [True] * NUM_STEPPER_AXES
     app.state_lock = threading.RLock()
     app.sw = [{} for _ in range(NUM_STEPPER_AXES)]
     app._logs = []
@@ -328,6 +362,60 @@ class DesktopAxisIntegrationTests(unittest.TestCase):
         self.assertIsNone(app._pending_step[0])
         self.assertFalse(app.stepper_in_progress[0])
 
+    def test_progress_projects_without_committing_position(self):
+        app = _headless_app()
+        app._pending_step[0] = 200
+        app.stepper_in_progress[0] = True
+        app.axis_motion_telemetry[0] = AxisMotionTelemetry.starting(
+            0, 200, now=10.0
+        )
+
+        StepperGUI._on_step_progress(app, 0, 50, 200)
+
+        self.assertEqual(app.axis_runtime[0].position_steps, 0)
+        self.assertEqual(app.axis_motion_telemetry[0].executed_steps, 50)
+        self.assertEqual(app.axis_motion_telemetry[0].requested_steps, 200)
+
+    def test_binding_save_is_atomic_and_releases_all_axis_reservations(self):
+        app = _headless_app()
+        app.axis_profiles[2] = AxisProfile(mode=MODE_ROTARY)
+        app.axis_profiles[3] = AxisProfile(mode=MODE_ROTARY)
+        saved = []
+
+        class Store:
+            def save_coordinated_bindings(self, document):
+                saved.append(document)
+
+        app.state_store = Store()
+        applied = StepperGUI._apply_control_bindings(
+            app, BindingSet.suggested()
+        )
+
+        self.assertEqual(applied.revision, 1)
+        self.assertIs(app.control_bindings, applied)
+        self.assertEqual(saved, [applied.as_document()])
+        self.assertTrue(
+            all(app._move_reservation[axis] is None for axis in (0, 1, 2, 3))
+        )
+
+    def test_binding_save_rejects_busy_or_mode_mismatched_axis(self):
+        app = _headless_app()
+        app.axis_profiles[2] = AxisProfile(mode=MODE_ROTARY)
+        app.axis_profiles[3] = AxisProfile(mode=MODE_ROTARY)
+
+        class Store:
+            def save_coordinated_bindings(self, _document):
+                raise AssertionError("invalid binding must not be persisted")
+
+        app.state_store = Store()
+        app.running[0] = True
+        with self.assertRaisesRegex(RuntimeError, "正在运动或已预约"):
+            StepperGUI._apply_control_bindings(app, BindingSet.suggested())
+        app.running[0] = False
+        app.axis_profiles[2] = AxisProfile()
+        with self.assertRaises(BindingValidationError):
+            StepperGUI._apply_control_bindings(app, BindingSet.suggested())
+
     def test_abort_applies_partial_steps_and_marks_position_untrusted(self):
         app = _headless_app()
         app._pending_step[0] = -200
@@ -360,6 +448,34 @@ class DesktopAxisIntegrationTests(unittest.TestCase):
         self.assertEqual(app.axis_runtime[0].position_steps, 100)
         self.assertIsNone(app._pending_step[0])
         self.assertFalse(app.stepper_in_progress[0])
+
+    def test_progress_is_projected_but_done_commits_position_only_once(self):
+        app = _headless_app()
+        app.root = types.SimpleNamespace(after=lambda *_args, **_kwargs: None)
+        app._pending_step[0] = 200
+        app.stepper_in_progress[0] = True
+        app.axis_motion_telemetry[0] = AxisMotionTelemetry.starting(1, 200)
+
+        StepperGUI._on_step_progress(app, 0, 50, 200)
+        self.assertEqual(app.axis_runtime[0].position_steps, 0)
+        self.assertEqual(app.axis_motion_telemetry[0].executed_steps, 50)
+
+        StepperGUI._on_step_done(app, 0, executed_steps=200, requested_steps=200)
+        StepperGUI._on_step_done(app, 0, executed_steps=200, requested_steps=200)
+
+        self.assertEqual(app.axis_runtime[0].position_steps, 200)
+        self.assertEqual(app.axis_motion_telemetry[0].state, "IDLE")
+        self.assertEqual(app.axis_motion_telemetry[0].last_result, "DONE")
+        self.assertIsNone(app._pending_step[0])
+
+    def test_out_of_range_progress_event_is_ignored(self):
+        app = _headless_app()
+
+        StepperGUI._on_step_progress(app, NUM_STEPPER_AXES, 10, 100)
+
+        self.assertTrue(
+            all(item == AxisMotionTelemetry() for item in app.axis_motion_telemetry)
+        )
 
     def test_move_timeout_marks_position_untrusted(self):
         app = _headless_app()

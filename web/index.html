@@ -17,6 +17,7 @@
     .estop{width:100%;min-height:58px;background:var(--red);border:2px solid #ff8995;font-size:20px;box-shadow:0 0 18px #e33f4f55}.track-hold{min-height:64px;font-size:17px}.hint{font-size:12px;color:var(--muted);margin:8px 0 0}.toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:10;max-width:90%;padding:10px 15px;border-radius:9px;background:#25344d;box-shadow:0 6px 25px #0008;display:none}.toast.show{display:block}.toast.bad{background:#7b2230}
     .axis-toolbar{display:flex;gap:10px;align-items:end;margin-bottom:12px}.axis-toolbar label{flex:1;max-width:300px}.topology-note{color:var(--muted);font-size:12px}.route{display:inline-block;margin-top:3px;padding:2px 7px;border:1px solid #475569;border-radius:999px;color:#b9c7dc;font-size:11px}
     .axis-summary{margin:10px 0;padding:9px;border-radius:8px;background:#101a2b;color:#cbd5e1;font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-line}.dirty-badge{display:none;margin-left:6px;color:#fbbf24;font-size:11px}.card.config-dirty{border-color:#a97818}.card.config-dirty .dirty-badge{display:inline}.card.config-dirty button[data-step="applycfg"]{box-shadow:0 0 0 2px #fbbf2466}
+    .logical-card{display:grid;grid-template-columns:92px 1fr;gap:10px}.logical-card .title{grid-column:1/-1;margin-bottom:2px}.logical-visual{height:112px;display:flex;align-items:center;justify-content:center}.linear-track{position:relative;width:24px;height:96px;border:2px solid #64748b;border-radius:8px;background:#0f172a;overflow:hidden}.linear-fill{position:absolute;left:2px;right:2px;bottom:2px;height:0;background:var(--blue);border-radius:4px;transition:height .2s}.linear-marker{position:absolute;left:-9px;right:-9px;bottom:0;border-top:2px solid #7bb3ff;transition:bottom .2s}.dial{position:relative;width:82px;height:82px;border:2px solid #64748b;border-radius:50%;background:radial-gradient(circle,#25344d 0 5px,transparent 6px)}.dial::before{content:'0°';position:absolute;left:50%;top:-18px;transform:translateX(-50%);font-size:10px;color:var(--muted)}.needle{position:absolute;left:38px;bottom:40px;width:4px;height:31px;border-radius:3px;background:#7bb3ff;transform-origin:50% 100%;transform:rotate(0deg);transition:transform .2s}.logical-position{font:700 19px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;margin:4px 0}.logical-detail{white-space:pre-line;color:#cbd5e1;font-size:12px;line-height:1.55}.logical-badge{padding:2px 7px;border-radius:999px;background:#334155;font-size:11px}.logical-badge.good{background:#125b49;color:#b8ffeb}.logical-badge.moving{background:#174d87;color:#d4e8ff}.logical-badge.warn{background:#6d4a0c;color:#ffdf9b}.logical-badge.bad{background:#752231;color:#ffd2d8}.readiness{margin:10px 0;padding:10px;border:1px solid #7c5513;border-radius:9px;background:#32230c;color:#ffe0a3;white-space:pre-line}
   </style>
 </head>
 <body>
@@ -24,6 +25,8 @@
   <main>
     <div class="warning show">此控制页未设置登录或令牌，仅限可信局域网使用。</div>
     <button id="estop" class="estop">紧急停止全部电机</button>
+
+    <section><h2>四逻辑电机绑定与状态</h2><p class="hint">只读监控。绑定请在桌面 GUI 的“电机绑定与状态”页修改。本页位置是主机脉冲软件估算，并非编码器实测；当前不提供自动 A↔C / S0–S7 控制。</p><div id="coordinatedReadiness" class="readiness">正在读取绑定状态…</div><div id="logicalMotors" class="grid"></div></section>
 
     <section><h2>30 路步进电机</h2><div class="axis-toolbar"><label>控制器分组<select id="stepperGroup"></select></label><span id="topologyNote" class="topology-note">正在读取拓扑…</span></div><p class="hint">网页支持轴配置、定距运动与停止；设置原点、软限位、绝对位置和连续运动请在桌面 GUI 完成。远端轴 6–29 还要求 ESP32 使用 remote 固件且对应 Pico 节点在线。</p><div id="steppers" class="grid"></div></section>
     <section><h2>闭环电机</h2><div id="motors" class="grid"></div></section>
@@ -41,6 +44,7 @@
     'use strict';
     const SPEED_PRESETS=[0.05,0.1,0.2,0.3,0.5,0.6,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6,6.5,7,8,10,15,20,30];
     const PULSE_RATE_WARN_PPS=1000;
+    const POSITION_SOURCE='host_pulse_accounting';
     const speedPresetList=document.getElementById('speedPresets');
     for(const value of SPEED_PRESETS){const option=document.createElement('option');option.value=String(value);speedPresetList.appendChild(option);}
     const toast = document.getElementById('toast');
@@ -54,6 +58,46 @@
     }
     function num(id,min,max){const v=Number(document.getElementById(id).value);if(!Number.isFinite(v)||v<min||v>max)throw new Error(`请输入 ${min}–${max} 的有效数值`);return v;}
     function act(job,ok,onSuccess){return Promise.resolve().then(job).then(data=>{if(onSuccess)onSuccess(data);const message=typeof ok==='function'?ok(data):ok;if(message)notice(message);return data;}).catch(e=>notice(e.message,true,4200));}
+
+    const LOGICAL_ROLES=[['Mup1','左侧升降','linear'],['Mr1','左侧旋转','rotary'],['Mup2','右侧升降','linear'],['Mr2','右侧旋转','rotary']];
+    const LOGICAL_STATE_TEXT={UNBOUND:'未绑定',INVALID:'配置无效',DISCONNECTED:'串口未连接',NODE_OFFLINE:'Pico 离线',NODE_UNKNOWN:'Pico 状态未知',HARDWARE_ESTOP:'硬件急停',SOFTWARE_ESTOP:'软件急停',ESTOP_UNCONFIRMED:'急停未确认',STOPPING:'停止中',STARTING:'启动中',CONTINUOUS:'连续运动',MOVING:'运动中',ABORTED_UNTRUSTED:'已中止/需校准',IDLE_UNTRUSTED:'空闲/需校准',IDLE:'空闲'};
+    const BLOCKER_TEXT={logical_motor_bindings_incomplete_or_invalid:'四个逻辑角色尚未全部正确绑定',direction_and_zero_unverified:'方向与机械零位尚未实机确认',contact_feedback_unavailable:'接触状态反馈不可用',support_load_feedback_unavailable:'支撑载荷/电流反馈不可用',collision_model_unverified:'碰撞包络尚未验证',hardware_limit_chain_incomplete:'硬限位链不完整',coordinated_start_protocol_unavailable:'四轴协调启动协议尚未实现',pico_node_health_incomplete:'Pico 节点在线状态尚未完整缓存'};
+    const logicalMotors=document.getElementById('logicalMotors');
+    function buildLogicalMotors(){
+      logicalMotors.textContent='';
+      for(const [role,name,mode] of LOGICAL_ROLES){
+        const visual=mode==='linear'?'<div class="linear-track"><span class="linear-fill"></span><span class="linear-marker"></span></div>':'<div class="dial"><span class="needle"></span></div>';
+        logicalMotors.insertAdjacentHTML('beforeend',`<div class="card logical-card" data-logical-role="${role}"><div class="title"><span>${role} · ${name}</span><span class="logical-badge warn">未绑定</span></div><div class="logical-visual">${visual}</div><div><div class="logical-position">--</div><div class="logical-detail">未绑定物理步进轴</div></div></div>`);
+      }
+    }
+    function logicalBadgeClass(state){if(state==='IDLE')return 'good';if(['MOVING','CONTINUOUS','STARTING'].includes(state))return 'moving';if(['UNBOUND','NODE_UNKNOWN','IDLE_UNTRUSTED','ABORTED_UNTRUSTED','STOPPING'].includes(state))return 'warn';return 'bad';}
+    function updateLogicalMotor(item){
+      const card=logicalMotors.querySelector(`[data-logical-role="${item.role}"]`);if(!card)return;
+      const badge=card.querySelector('.logical-badge'),positionNode=card.querySelector('.logical-position'),detail=card.querySelector('.logical-detail');
+      const state=item.state||'INVALID';badge.textContent=LOGICAL_STATE_TEXT[state]||state;badge.className=`logical-badge ${logicalBadgeClass(state)}`;
+      const position=item.position,hasPosition=typeof position==='number'&&Number.isFinite(position),unit=item.unit||(item.required_mode==='rotary'?'°':'mm');
+      positionNode.textContent=hasPosition?`${item.position_trusted?'':'≈ '}${formatNumber(position)} ${unit}`:'--';
+      const binding=item.binding,physical=binding?`步进轴 ${binding.axis} · ${item.physical_label||'--'} · ${item.controller==='pico'?`Pico ${item.node}`:'ESP32 本地'}`:'未绑定物理步进轴';
+      let progress=item.progress_percent==null?(item.in_progress?'运动中，暂无中间进度帧':'空闲'):`进度 ${formatNumber(item.progress_percent,1)}% · ${item.executed_steps}/${item.requested_steps} 脉冲`;
+      if(typeof item.target_position==='number'&&Number.isFinite(item.target_position))progress+=` · 目标 ${formatNumber(item.target_position)} ${unit}`;
+      const trust=item.position_trusted?'软件位置账本可信':'软件位置需校准';
+      detail.textContent=`${physical}\n${item.mode||item.required_mode} · ${trust} · 非实测\n${item.binding_error||progress}${item.stale?' · 数据陈旧':''}`;
+      if(item.required_mode==='linear'){
+        const fill=card.querySelector('.linear-fill'),marker=card.querySelector('.linear-marker'),minimum=item.travel_min,maximum=item.travel_max;
+        const ranged=hasPosition&&typeof minimum==='number'&&Number.isFinite(minimum)&&typeof maximum==='number'&&Number.isFinite(maximum)&&maximum>minimum;
+        const pct=ranged?Math.max(0,Math.min(100,100*(position-minimum)/(maximum-minimum))):0;
+        fill.style.height=ranged?`${pct}%`:'0';marker.style.bottom=ranged?`${pct}%`:'0';marker.style.display=ranged?'block':'none';
+      }else{
+        const needle=card.querySelector('.needle');needle.style.transform=hasPosition?`rotate(${((position%360)+360)%360}deg)`:'rotate(0deg)';needle.style.opacity=hasPosition?'1':'.25';
+      }
+    }
+    function updateCoordinated(control,motors){
+      const ready=document.getElementById('coordinatedReadiness'),valid=!!control?.configuration_valid;
+      const blockers=(control?.blockers||[]).map(code=>BLOCKER_TEXT[code]||code);
+      ready.textContent=`绑定配置：${valid?'有效':'未完成或无效'} · 自动协调：未就绪 · 编辑范围：桌面 GUI\n${blockers.join('；')}`;
+      for(const item of motors||[])updateLogicalMotor(item);
+    }
+    buildLogicalMotors();
 
     const steppers=document.getElementById('steppers'),stepperGroup=document.getElementById('stepperGroup');
     const dirtyAxes=new Set();
@@ -192,7 +236,9 @@
     document.getElementById('estop').addEventListener('click',()=>{holding=null;clearInterval(leaseTimer);leaseTimer=null;act(()=>api('/api/estop',{}),'固件已确认全部软件停车命令');});
 
     function stateText(v){if(v==null)return '--';if(typeof v==='string'||typeof v==='number')return String(v);if(typeof v==='boolean')return v?'运行':'停止';return JSON.stringify(v);}
+    let refreshInFlight=false;
     async function refresh(){
+      if(refreshInFlight)return;refreshInFlight=true;
       try{
         const s=await api('/api/status');
         document.getElementById('dot').classList.toggle('ok',!!s.connected);
@@ -212,9 +258,12 @@
         for(let i=0;i<2;i++)document.getElementById(`mstate${i}`).textContent=stateText(ms[i]);
         if(s.mode==='FOC'||s.mode==='GEAR')for(let i=0;i<2;i++)document.getElementById(`mode${i}`).value=s.mode;
         if(s.track!==undefined&&!holding)document.getElementById('trackState').textContent=stateText(s.track);
+        updateCoordinated(s.coordinated_control||{},s.logical_motors||[]);
       }catch(_e){
         document.getElementById('dot').classList.remove('ok');
         document.getElementById('conn').textContent='网页服务连接中断';
+      }finally{
+        refreshInFlight=false;
       }
     }
     refresh();setInterval(refresh,1000);
