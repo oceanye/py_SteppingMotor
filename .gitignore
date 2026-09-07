@@ -8,6 +8,7 @@ __pycache__/
 .foc_tune.json
 .gear_tune.json
 .coordinated_bindings.json
+.gait_params.json
 logs/
 build_upload*.log
 

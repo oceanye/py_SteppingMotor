@@ -1,0 +1,372 @@
+关键点是：**高点避让不能只靠 Mup 抬高，还必须让抬起三足在公转过程中同步自转，使爪臂间隙始终朝向高点。**
+
+下面按一次左三足 **A→C、右三足锁定 B** 规划。
+
+### 1. 电机分工
+
+* **Mr1**：左三足绕自身竖直轴转动，负责左三足的自转相位，并参与左足公转换位；
+* **Mr2**：右三足绕自身竖直轴转动，负责右三足自转和 B 点姿态保持；
+* **Mup1**：抬起或放下左三足；
+* **Mup2**：抬起或放下右三足。
+
+在一次 A→C 动作中：
+
+```text
+Mup1：抬起左三足
+Mr1 ：调整左三足姿态并驱动公转换位
+Mup2：保持右三足落地
+Mr2 ：保持 B 点支撑姿态
+```
+
+需要保证 Mr 电机的定子与横梁、转子与三足之间形成反力闭合。否则 Mr1 只能让三足自转，不能有效带动横梁公转。
+
+### 2. 几何定义
+
+俯视平面内设：
+
+* A：左下固定六边形中心；
+* B：右下固定六边形中心；
+* C：上部固定六边形中心；
+* \(d=AB=BC\)。
+
+初始时：
+
+$$
+O_1=A,\qquad O_2=B
+$$
+
+其中 \(O_1\) 是左三足中心，\(O_2\) 是右三足中心。
+
+右三足 B 锁定后，左三足中心沿圆弧运动：
+
+$$
+O_1(\varphi)
+=
+B+d
+\begin{bmatrix}
+\cos(180^\circ-\varphi)\\
+\sin(180^\circ-\varphi)
+\end{bmatrix}
+$$
+
+其中：
+
+$$
+0^\circ\leq\varphi\leq60^\circ
+$$
+
+* \(\varphi=0^\circ\)：左三足在 A；
+* \(\varphi=60^\circ\)：左三足到达 C；
+* 公转中心：B；
+* 公转半径：\(d\)；
+* 公转角：60°。
+
+横梁角度随 \(\varphi\) 改变，由 AB 方向转为 CB 方向。
+
+### 3. 为什么必须同步自转
+
+假定每个六边形的低节点为三个间隔节点，高节点位于另外三个间隔位置。
+
+以左三足从 A 向 C 公转为例，公转过程中最危险的是靠近 A、C 之间的高节点。若左三足保持地面绝对姿态不变，则在公转中段，其中一根爪臂可能正好指向高节点。
+
+因此不能采用：
+
+```text
+φ 增加，Mr1 不自转
+```
+
+而应采用一条同步自转轨迹：
+
+$$
+\psi_1(\varphi)=\psi_{10}+2\varphi
+$$
+
+若初始低节点相位为：
+
+$$
+\psi_{10}=30^\circ
+$$
+
+则：
+
+* 起点：\(\psi_1=30^\circ\)；
+* 中点 \(\varphi=30^\circ\)：\(\psi_1=90^\circ\)；
+* 终点：\(\psi_1=150^\circ\)。
+
+终点 150° 对应 C 六边形的另一组低节点，因此左三足能够在 C 重新落脚。
+
+在公转中点：
+
+* 高点方向约为 150°；
+* 三根爪臂方向为 90°、210°、330°；
+* 高点处于两根爪臂之间，而不是正对某一根爪臂。
+
+这就是通过自转将“爪臂实体”转移到高点间隙中的原因。
+
+### 4. Mr1、Mr2 的角度关系
+
+应区分：
+
+* 三足相对于地面的绝对姿态角 \(\psi\)；
+* 电机相对于横梁的关节角 \(q\)；
+* 横梁相对于地面的角度 \(\beta\)。
+
+可定义：
+
+$$
+q_i=\psi_i-\beta+c_i
+$$
+
+其中 \(c_i\) 是安装零位补偿。
+
+对于左三足 A→C：
+
+$$
+\Delta\beta=-60^\circ
+$$
+
+$$
+\Delta\psi_1=+120^\circ
+$$
+
+所以：
+
+$$
+\Delta q_1
+=
+\Delta\psi_1-\Delta\beta
+=
+180^\circ
+$$
+
+也就是说，在“电机角度相对于横梁”的定义下，Mr1 可能需要转动约 180°，而横梁只公转 60°。
+
+右三足 B 必须保持地面姿态不变：
+
+$$
+\Delta\psi_2=0
+$$
+
+因此：
+
+$$
+\Delta q_2
+=
+0-(-60^\circ)
+=
++60^\circ
+$$
+
+所以 Mr2 不一定是编码器角度完全不动，而是要根据编码器安装参考系补偿横梁转角。
+
+如果电机编码器是相对于固定支座测量，则 Mr2 可能保持不动；如果编码器是相对于横梁测量，则 Mr2 需要同步补偿 60°。这个方向必须通过实机标定确定。
+
+### 5. 一次完整动作时序
+
+| 阶段        | Mup1      | Mr1             | Mup2      | Mr2         | 运动含义          |
+| --------- | --------- | --------------- | --------- | ----------- | ------------- |
+| S0 初始锁定   | DOWN/HOLD | HOLD            | DOWN/HOLD | HOLD        | 左 A、右 B 均踩低节点 |
+| S1 锁定 B   | DOWN      | HOLD            | DOWN/HOLD | TORQUE_HOLD | 右三足建立公转支点     |
+| S2 抬起左足   | UP        | HOLD            | DOWN      | HOLD        | 左三足解除 A 点约束   |
+| S3 左足相位调整 | UP        | 按 \(\psi_1\) 调整 | DOWN      | HOLD        | 爪臂避开高点方向      |
+| S4 左足公转   | UP        | 主要驱动            | DOWN      | 保持 B 姿态     | 左足 A→C 绕 B 公转 |
+| S5 接近 C   | UP        | 低速跟踪            | DOWN      | HOLD        | 检查 C 点低节点对应关系 |
+| S6 左足落脚   | DOWN      | 柔顺/限矩           | DOWN      | HOLD        | 左三足接触 C 的低节点  |
+| S7 锁定完成   | DOWN/HOLD | HOLD            | DOWN/HOLD | HOLD        | 状态变为 C/B      |
+
+### 6. Mup1 与 Mr1 的配合
+
+Mup1 不能简单地“抬起后一直保持不动”。推荐分为四段：
+
+#### 抬起段
+
+```text
+Mup1：快速上升到预抬高度
+Mr1 ：保持当前姿态
+```
+
+确认：
+
+* 左三足三个接触点均解除；
+* 左三足与高节点有足够垂向间隙；
+* 右三足 B 点支撑力没有异常增加。
+
+#### 自转避让段
+
+```text
+Mup1：保持 UP
+Mr1 ：按照 ψ1 = ψ10 + 2φ 调整
+```
+
+此时三足爪臂处于扫掠状态，不能让任何爪臂中心线或外轮廓进入高点安全包络。
+
+#### 公转段
+
+```text
+Mup1：保持 UP
+Mr1 ：随 φ 连续调整
+Mr2 ：保持 B 点支撑姿态
+```
+
+Mr1 的目标不应只写成“转 180°”，而应写成：
+
+```text
+根据实时公转角 φ，计算目标自转角 ψ1
+再根据横梁角 β 换算为 Mr1 目标角 q1
+```
+
+#### 落脚段
+
+```text
+Mr1 ：先到达 C 低节点相位
+Mup1：低速 DOWN
+```
+
+只有在三个低节点接触均有效后，才允许进入锁定。
+
+### 7. 高点避让的计算方法
+
+将每个高节点建模为一个带半径的障碍区域，将三足爪臂建模为线段或胶囊体。
+
+对每个公转角 \(\varphi\) 和自转角 \(\psi_1\)，计算：
+
+$$
+D_{jk}
+=
+\operatorname{dist}
+\left(
+\text{爪臂 }j,
+\text{高节点 }k
+\right)
+-
+r_{\text{爪}}
+-
+r_{\text{高点}}
+-
+\delta
+$$
+
+要求：
+
+$$
+D_{jk}>0
+$$
+
+其中：
+
+* \(r_{\text{爪}}\)：爪臂等效半径；
+* \(r_{\text{高点}}\)：高节点等效半径；
+* \(\delta\)：安全间隙。
+
+同时还要检查：
+
+* 三足中心壳体；
+* 电机外壳；
+* 横梁端部；
+* 连接轴承；
+* 其他固定高点。
+
+不能只检查起点和终点，必须检查整个 \(\varphi:0^\circ\to60^\circ\) 的连续轨迹。把 \((\varphi,\psi_1)\) 作为配置空间并标出不可行区域，是标准的运动规划方法；连续路径验证可参考 [Modern Robotics 的 C-space 障碍说明](https://modernrobotics.northwestern.edu/nu-gm-book-resource/10-2-c-space-obstacles/) 和 [OMPL 的连续运动验证接口](https://ompl.kavrakilab.org/classompl_1_1app_1_1FCLContinuousMotionValidator.html)。
+
+### 8. 推荐的轨迹表达
+
+采用归一化进度 \(s\in[0,1]\)，用五次平滑曲线：
+
+$$
+S(s)=10s^3-15s^4+6s^5
+$$
+
+公转阶段：
+
+$$
+\varphi(s)=60^\circ S(s)
+$$
+
+左三足自转：
+
+$$
+\psi_1(s)=30^\circ+120^\circ S(s)
+$$
+
+因此：
+
+$$
+\beta(s)=180^\circ-60^\circ S(s)
+$$
+
+如果 Mr1、Mr2 的编码器均以横梁为参考：
+
+$$
+q_1(s)=q_{10}+180^\circ S(s)
+$$
+
+$$
+q_2(s)=q_{20}+60^\circ S(s)
+$$
+
+实际正负号根据电机安装方向修正。
+
+### 9. 控制逻辑示例
+
+```text
+step_A_to_C():
+
+    assert left_contact(A)
+    assert right_contact(B)
+
+    # 1. 锁定右足 B
+    Mup2.DOWN()
+    Mr2.HOLD_SUPPORT(B)
+    wait right_contact(B) == VALID
+
+    # 2. 抬起左足
+    Mup1.UP_TO(z_clear)
+    wait left_contact(A) == RELEASED
+
+    # 3. 左足自转相位初始化
+    Mr1.move_to(q1_start)
+    wait abs(q1 - q1_start) < angle_tol
+
+    # 4. 公转与自转同步
+    for s from 0 to 1:
+        S = smoothstep5(s)
+
+        phi    = 60° * S
+        beta   = 180° - 60° * S
+        psi1   = 30° + 120° * S
+        q1_cmd = convert_to_Mr1_angle(beta, psi1)
+        q2_cmd = maintain_Mr2_support(beta)
+
+        Mr1.position_or_torque_control(q1_cmd)
+        Mr2.hold(q2_cmd)
+
+        if collision_margin(phi, psi1) <= safety_margin:
+            stop_all()
+
+        if motor_overcurrent() or unexpected_contact():
+            stop_all()
+
+    # 5. 左足落到 C
+    Mr1.move_to(C_low_phase)
+    Mup1.DOWN_SLOW()
+
+    wait left_contact(C) == THREE_LOW_NODES_VALID
+
+    # 6. 锁定
+    Mr1.HOLD()
+    Mup1.HOLD_DOWN()
+    Mr2.HOLD()
+    Mup2.HOLD_DOWN()
+```
+
+下一步执行镜像动作：
+
+```text
+左三足锁定 C
+Mup2 抬起右三足
+Mr2 调整右三足相位
+右三足绕 C 公转 B→A
+Mup2 落到 A 的低节点
+```
+
+对应的高点扫掠验证图：

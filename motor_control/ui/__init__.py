@@ -7,6 +7,13 @@ from .coordinated_tab import (
     sync_binding_editor,
 )
 from .motor_tabs import build_foc_tab, build_gear_tab
+from .gait_tab import (
+    build_gait_tab,
+    collect_gait_params,
+    draw_gait_preview,
+    load_gait_fields,
+    refresh_gait_panel,
+)
 from .stepper_tab import build_stepper_tab
 from .track_tab import build_track_tab
 
@@ -17,6 +24,11 @@ __all__ = [
     "build_foc_tab",
     "build_track_tab",
     "build_gear_tab",
+    "build_gait_tab",
+    "collect_gait_params",
+    "draw_gait_preview",
+    "load_gait_fields",
+    "refresh_gait_panel",
     "refresh_coordinated_tab",
     "sync_binding_editor",
 ]

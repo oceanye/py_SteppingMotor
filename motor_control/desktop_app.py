@@ -10,6 +10,7 @@ import socket
 import webbrowser
 import sys
 import traceback
+from dataclasses import replace
 
 from motor_control import (
     AXIS_LABEL,
@@ -31,6 +32,7 @@ from motor_control import (
     BindingSet,
     BindingValidationError,
     LOGICAL_ROLE_ORDER,
+    LogicalRole,
     ROLE_SPECS,
     binding_compatibility_issues,
     build_coordinated_snapshot,
@@ -70,15 +72,28 @@ from motor_control.serial_session import (
     SerialSessionError,
 )
 from motor_control.state_store import StateStore, StateStoreError
+from motor_control.gait_executor import GaitExecutor, GaitExecutorError
+from motor_control.gait_planner import (
+    LOW_NODE_PHASE_DEG,
+    GaitParams,
+    parse_gait_params,
+    plan_gait_stages,
+    plan_swing_trajectory,
+)
 from motor_control.ui_dispatch import UiDispatcher
 from motor_control.ui import (
     build_coordinated_tab as build_coordinated_tab_view,
     build_foc_tab as build_foc_tab_view,
+    build_gait_tab as build_gait_tab_view,
     build_gear_tab as build_gear_tab_view,
     build_stepper_tab as build_stepper_tab_view,
     build_track_tab as build_track_tab_view,
     build_ui as build_main_ui,
+    collect_gait_params,
+    draw_gait_preview,
+    load_gait_fields,
     refresh_coordinated_tab as refresh_coordinated_tab_view,
+    refresh_gait_panel as refresh_gait_panel_view,
     sync_binding_editor as sync_binding_editor_view,
 )
 from motor_control.web_adapter import DesktopWebController
@@ -132,6 +147,31 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 def _empty_axis_dict():
     return {i: None for i in range(NUM_STEPPER_AXES)}
+
+
+class _GaitHostAdapter:
+    """把 StepperGUI 的运动链路适配成 GaitExecutor 需要的宿主协议。"""
+
+    def __init__(self, app):
+        self._app = app
+
+    def role_axis(self, role_name):
+        return self._app._gait_role_axis(role_name)
+
+    def send_relative(self, axis, delta, speed):
+        return self._app._gait_send_relative(axis, delta, speed)
+
+    def wait_terminal(self, axis, timeout_s):
+        return self._app._gait_wait_terminal(axis, timeout_s)
+
+    def stop_axes(self, axes):
+        self._app._gait_stop_axes(axes)
+
+    def cancelled(self):
+        return self._app._control_worker_cancelled()
+
+    def log(self, message):
+        self._app.log(message)
 
 
 class StepperGUI:
@@ -261,6 +301,11 @@ class StepperGUI:
         self.axis_lead_var = [tk.DoubleVar(value=DEFAULT_LEAD_MM) for _ in range(NUM_STEPPER_AXES)]
         self._load_axis_config()
         self._load_control_bindings()
+
+        # ── 三足轮换步态：参数（标定向导写入 .gait_params.json）+ 当前执行实例 ──
+        self.gait_params = GaitParams()
+        self._gait_run: GaitExecutor | None = None
+        self._load_gait_params()
 
         self._build_ui()
         for warning in self._startup_warnings:
@@ -511,6 +556,355 @@ class StepperGUI:
             self._coordinated_refresh_after = self.root.after(
                 200, self._refresh_coordinated_ui
             )
+
+    # ═════════════ 三足轮换步态：参数 / 标定 / 分阶段执行 ═════════════
+    def _load_gait_params(self):
+        """启动时读 .gait_params.json；坏数据安全回退为占位默认。"""
+
+        try:
+            data = self.state_store.load_gait_params()
+        except StateStoreError as exc:
+            self._startup_warnings.append(f"⚠️ 步态参数读取失败: {exc}")
+            return
+        if data is None:
+            return
+        try:
+            self.gait_params = parse_gait_params(data)
+        except ValueError as exc:
+            self._startup_warnings.append(
+                f"⚠️ 步态参数无效（{exc}）；已回退为默认占位参数")
+            self.gait_params = GaitParams()
+
+    def _save_gait_params(self, params):
+        """校验、原子写盘并发布到内存（UI 线程调用）。"""
+
+        params = params.validated()
+        self.state_store.save_gait_params(params.as_document())
+        self.gait_params = params
+        return params
+
+    def _gait_role_axis(self, role_name):
+        """逻辑角色 → 物理轴；未绑定/模式不符抛 GaitExecutorError。"""
+
+        try:
+            role = LogicalRole(role_name)
+        except ValueError as exc:
+            raise GaitExecutorError(f"未知逻辑角色 {role_name}") from exc
+        binding = self.control_bindings.for_role(role)
+        if binding is None:
+            raise GaitExecutorError(f"{role_name} 未绑定物理步进轴")
+        axis = binding.axis
+        spec = ROLE_SPECS[role]
+        with self.state_lock:
+            mode = self.axis_profiles[axis].mode
+            param_valid = self.axis_param_valid[axis]
+        if mode != spec.required_mode:
+            required = "旋转" if spec.required_mode == MODE_ROTARY else "直线"
+            actual = "旋转" if mode == MODE_ROTARY else "直线"
+            raise GaitExecutorError(
+                f"{role_name} 需要{required}模式，"
+                f"轴{AXIS_LABEL[axis]} 当前为{actual}模式")
+        if not param_valid:
+            raise GaitExecutorError(
+                f"{role_name} 绑定的轴{AXIS_LABEL[axis]} 参数无效")
+        return axis
+
+    def _gait_record_role_zero(self, role_name):
+        """UI 线程：把绑定 Mr 轴当前软件位置记为 ψ=30° 基准零位。"""
+
+        if role_name not in ("Mr1", "Mr2"):
+            raise GaitExecutorError(f"{role_name} 不是旋转角色，无零位标定")
+        axis = self._gait_role_axis(role_name)
+        with self.state_lock:
+            if self._axis_motion_active_locked(axis):
+                raise GaitExecutorError(f"{role_name} 正在运动，不能记零")
+            runtime = self.axis_runtime[axis]
+            if not runtime.position_trusted:
+                raise GaitExecutorError(
+                    f"{role_name} 位置不可信；先设原点或校准后再记零")
+            position = self.axis_profiles[axis].units_from_steps(
+                runtime.position_steps)
+        updates = {}
+        if role_name == "Mr1":
+            updates["mr1_zero_deg"] = position
+        else:
+            updates["mr2_zero_deg"] = position
+        self._save_gait_params(replace(self.gait_params, **updates))
+        self.log(f"✓ {role_name} 零位已记录：轴坐标 {position:+.3f}"
+                 f"（对应 ψ 基准 {LOW_NODE_PHASE_DEG:g}°）")
+        return position
+
+    def _gait_begin_run(self, side, params=None):
+        """UI 线程：前置检查 + 干跑 + 按当前相位建立执行器。
+
+        返回 (executor, dry_run_report)；任何门槛不满足抛 GaitExecutorError。
+        """
+
+        params = (params if params is not None else self.gait_params).validated()
+        if side not in ("left", "right"):
+            raise GaitExecutorError("side 必须是 left 或 right")
+        if not self._is_serial_connected():
+            raise GaitExecutorError("串口未连接")
+        # 1. 四个逻辑角色全部绑定且模式正确
+        role_axes = {}
+        for role in LOGICAL_ROLE_ORDER:
+            role_axes[role.value] = self._gait_role_axis(role.value)
+        # 2. 两侧旋转轴都已记零（相位换算的基准）
+        for role_name, zero in (("Mr1", params.mr1_zero_deg),
+                                ("Mr2", params.mr2_zero_deg)):
+            if zero is None:
+                raise GaitExecutorError(
+                    f"{role_name} 尚未做零位标定；请先把三足摆到基准位"
+                    f"（ψ=30°）并【记零】")
+        # 3. 干跑校验必须可行
+        report = plan_swing_trajectory(params, side=side)
+        self.log(f"步态干跑（{side}）：{report.message}")
+        if not report.feasible:
+            raise GaitExecutorError(f"干跑不可行，拒绝开始：{report.message}")
+        # 4. 摆动侧旋转轴当前相位（决定 S3 是否需要相位调整）
+        swing_role = "Mr1" if side == "left" else "Mr2"
+        axis = role_axes[swing_role]
+        with self.state_lock:
+            if self._axis_motion_active_locked(axis):
+                raise GaitExecutorError(
+                    f"{swing_role}（轴{AXIS_LABEL[axis]}）正在运动")
+            runtime = self.axis_runtime[axis]
+            if not runtime.position_trusted:
+                raise GaitExecutorError(
+                    f"{swing_role} 位置不可信；请先重新校准")
+            position = self.axis_profiles[axis].units_from_steps(
+                runtime.position_steps)
+        sign = params.mr1_sign if swing_role == "Mr1" else params.mr2_sign
+        zero = params.mr1_zero_deg if swing_role == "Mr1" else params.mr2_zero_deg
+        psi_now = LOW_NODE_PHASE_DEG + sign * (position - zero)
+        stages = plan_gait_stages(params, side=side, swing_psi_start_deg=psi_now)
+        self._gait_run = GaitExecutor(
+            _GaitHostAdapter(self), params, stages, side=side)
+        self.log(f"步态执行器就绪（{side}）：{len(stages)} 个阶段，"
+                 f"当前 ψ={psi_now:.1f}°")
+        return self._gait_run, report
+
+    def _gait_execute_stage(self):
+        """UI 线程：启动控制工作线程执行当前运动阶段。"""
+
+        run = self._gait_run
+        if run is None:
+            messagebox.showwarning("步态未开始", "请先选择方向并【开始】一次摆动")
+            return
+        stage = run.current_stage()
+        if stage is None:
+            return
+        if not stage.is_motion_stage:
+            # 确认型阶段由 UI 层直接 advance；这里只处理运动阶段。
+            return
+        run.begin_stage_execution()   # 抢占状态，防重复点击
+        worker = self._start_control_worker(self._gait_stage_worker)
+        if worker is None:
+            run.revert_stage_execution()
+            self.log("⛔ 控制器正在停止或急停，阶段未执行")
+        self._refresh_gait_ui()
+
+    def _gait_stage_worker(self):
+        run = self._gait_run
+        if run is None:
+            return
+
+        def progress(stage_id, done_groups, total_groups):
+            self._post_ui(
+                lambda: self._refresh_gait_ui(
+                    f"{stage_id} 第 {done_groups}/{total_groups} 组"))
+
+        try:
+            run.execute_current_stage(progress)
+        except GaitExecutorError as exc:
+            self.log(f"⛔ 步态阶段未执行：{exc}")
+        finally:
+            self._post_ui(lambda: self._refresh_gait_ui())
+
+    def _gait_abort_run(self):
+        """UI 线程：中止按钮——请求退出 + 立即停掉四个绑定轴。"""
+
+        run = self._gait_run
+        if run is None:
+            return
+        run.request_stop()
+        axes = []
+        for role in LOGICAL_ROLE_ORDER:
+            try:
+                axes.append(self._gait_role_axis(role.value))
+            except GaitExecutorError:
+                continue
+        self._gait_stop_axes(axes)
+        self.log("⛔ 步态已中止：四个逻辑轴都已发 STOP；"
+                 "如有轴被 ABORT，位置不可信，需重新校准后才能继续")
+
+    def _refresh_gait_ui(self, progress_text=None):
+        """刷新步态面板（面板在协调页构建后存在）。"""
+
+        if self._closing:
+            return
+        refresh = getattr(self, "_refresh_gait_panel", None)
+        if refresh is not None:
+            refresh(progress_text)
+
+    # ── GaitExecutor 宿主协议的实现（控制工作线程调用） ──
+    def _gait_send_relative(self, axis, delta, speed):
+        """下发一段相对运动（ACK 即返回）；sent / noop / failed。"""
+
+        with self.state_lock:
+            profile = self.axis_profiles[axis]
+        try:
+            steps = profile.command_steps_from_units(abs(delta))
+        except (TypeError, ValueError, OverflowError):
+            return "failed"
+        if steps <= 0:
+            return "noop"
+        ppu = profile.pulses_per_unit
+        pps = abs(speed) * ppu
+        if pps > PULSE_RATE_WARN_PPS:
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]} 步态速度 {speed:g}"
+                     f"{profile.speed_unit} 折合 {pps:,.0f} pps，超过安全参考 "
+                     f"{PULSE_RATE_WARN_PPS:.0f} pps，已拒绝；请调低步态速度")
+            return "failed"
+        delay_ms = step_speed_to_delay_ms(axis, abs(speed), ppu)
+        direction = DIR_OUTWARD if delta > 0 else DIR_INWARD
+        return "sent" if self._send_mm(
+            axis, abs(delta), direction, delay_ms) else "failed"
+
+    def _gait_wait_terminal(self, axis, timeout_s):
+        """轮询等待一轴到达终态；DONE / ABORTED / TIMEOUT / CANCELLED。"""
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if self._control_worker_cancelled():
+                return "CANCELLED"
+            with self.state_lock:
+                busy = (
+                    self.stepper_in_progress[axis]
+                    or self._pending_step[axis] is not None
+                    or self._move_dispatching[axis]
+                )
+                result = self.axis_motion_telemetry[axis].last_result
+            if not busy:
+                return result if result in ("DONE", "ABORTED") else "TIMEOUT"
+            if time.monotonic() >= deadline:
+                return "TIMEOUT"
+            time.sleep(0.02)
+
+    def _gait_stop_axes(self, axes):
+        """立即失效并停轴（UI/工作线程都可调用；发送放独立线程）。"""
+
+        for axis in sorted(set(axes)):
+            stop_reservation = self._begin_axis_stop(axis)
+            if self._is_serial_connected():
+                threading.Thread(
+                    target=self._send_axis_stop,
+                    args=(axis, stop_reservation),
+                    daemon=True,
+                ).start()
+            else:
+                with self.state_lock:
+                    if self._move_reservation[axis] is stop_reservation:
+                        self._move_reservation[axis] = None
+            self.log(f"⛔ 轴{AXIS_LABEL[axis]} 步态中止停止")
+
+    # ── 步态页 UI 回调（Tk 线程） ──
+    def _build_gait_tab(self, parent):
+        build_gait_tab_view(self, parent)
+
+    def _refresh_gait_panel(self, progress_text=None):
+        if self._closing:
+            return
+        refresh_gait_panel_view(self, progress_text)
+
+    def _gait_params_from_ui(self):
+        """收集输入框 → 校验后的 GaitParams；非法时弹窗并返回 None。"""
+
+        try:
+            return collect_gait_params(self, self.gait_params)
+        except ValueError as exc:
+            messagebox.showerror("步态参数无效", str(exc))
+            return None
+
+    def _gait_save_params_clicked(self):
+        params = self._gait_params_from_ui()
+        if params is None:
+            return
+        self._save_gait_params(params)
+        self.log("✓ 步态参数已保存到 .gait_params.json")
+        self._refresh_gait_ui()
+
+    def _gait_reload_params_clicked(self):
+        load_gait_fields(self)
+        self.log("步态输入框已重置为已保存值")
+        self._refresh_gait_ui()
+
+    def _gait_record_zero_clicked(self, role_name):
+        try:
+            self._gait_record_role_zero(role_name)
+        except GaitExecutorError as exc:
+            messagebox.showerror("记零失败", str(exc))
+            return
+        self._refresh_gait_ui()
+
+    def _gait_run_dry_run(self):
+        params = self._gait_params_from_ui()
+        if params is None:
+            return
+        self._save_gait_params(params)
+        side = self.gait_side_var.get()
+        report = plan_swing_trajectory(params, side=side)
+        self._gait_last_report = report
+        self.gait_report_var.set(report.message)
+        self.log(f"步态干跑（{side}）：{report.message}")
+        draw_gait_preview(self)
+        if not report.feasible:
+            messagebox.showwarning(
+                "干跑不可行",
+                report.message + "\n\n请修正几何/半径/间隙参数后再试。")
+
+    def _gait_start_run_clicked(self, side):
+        params = self._gait_params_from_ui()
+        if params is None:
+            return
+        self._save_gait_params(params)
+        try:
+            _run, report = self._gait_begin_run(side, params)
+        except GaitExecutorError as exc:
+            messagebox.showerror("不能开始步态", str(exc))
+            return
+        self._gait_last_report = report
+        self.gait_report_var.set(report.message)
+        draw_gait_preview(self)
+        self._refresh_gait_ui()
+
+    def _gait_stage_confirmed(self):
+        run = self._gait_run
+        if run is None:
+            return
+        stage = run.current_stage()
+        if stage is None:
+            self._refresh_gait_ui()
+            return
+        verb = "执行" if stage.is_motion_stage else "确认完成"
+        if not messagebox.askokcancel(
+                f"{stage.stage_id} {stage.title}",
+                stage.confirm_text + f"\n\n确定{verb}本阶段？"):
+            return
+        if stage.is_motion_stage:
+            self._gait_execute_stage()
+        elif run.advance_confirm():
+            self.log(f"✓ {stage.stage_id} {stage.title} 人工确认通过")
+        self._refresh_gait_ui()
+
+    def _gait_abort_clicked(self):
+        self._gait_abort_run()
+        self._refresh_gait_ui()
+
+    def _gait_reset_run(self):
+        self._gait_run = None
+        self.log("步态流程已重置（执行器丢弃，重新开始前会重新干跑）")
+        self._refresh_gait_ui()
 
     # ═════════════ FOC Tab（参数化）═════════════
     def _build_foc_tab(self, parent, axis):

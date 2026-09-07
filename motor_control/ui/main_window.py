@@ -129,6 +129,11 @@ def build_ui(app, log_dir, num_motor_axes):
     app.notebook.add(track_tab, text="↔ 轨道 D")
     app._build_track_tab(track_tab)
 
+    gait_tab = ttk.Frame(app.notebook)
+    app.tab_index_gait = app.notebook.index("end")
+    app.notebook.add(gait_tab, text="🦶 三足步态")
+    app._build_gait_tab(gait_tab)
+
     log_frame = ttk.LabelFrame(app.root,
                                text=f"日志（同时写到 {os.path.basename(log_dir)}/gui_<日期>.log）")
     log_frame.grid(row=2, column=0, sticky="ew", **pad)
