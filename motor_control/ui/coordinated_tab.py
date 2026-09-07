@@ -8,6 +8,7 @@ from tkinter import ttk
 
 from motor_control import (
     LOGICAL_ROLE_ORDER,
+    LogicalRole,
     MODE_LINEAR,
     ROLE_SPECS,
     stepper_axis_topology,
