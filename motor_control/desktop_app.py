@@ -38,6 +38,8 @@ from motor_control import (
     build_coordinated_snapshot,
     clamp_step_delay_us,
     convert_axis_value,
+    direction_label_parts,
+    outward_position_sign,
     speed_to_delay_ms,
     step_delay_ms_to_pulse_rate,
     step_speed_clamps_delay,
@@ -767,7 +769,11 @@ class StepperGUI:
                      f"{PULSE_RATE_WARN_PPS:.0f} pps，已拒绝；请调低步态速度")
             return "failed"
         delay_ms = step_speed_to_delay_ms(axis, abs(speed), ppu)
-        direction = DIR_OUTWARD if delta > 0 else DIR_INWARD
+        direction = (
+            DIR_OUTWARD
+            if delta * outward_position_sign(axis) > 0
+            else DIR_INWARD
+        )
         return "sent" if self._send_mm(
             axis, abs(delta), direction, delay_ms) else "failed"
 
@@ -1875,7 +1881,8 @@ class StepperGUI:
         # RP2040 远端节点的 PIO/RS485 契约要求至少 100 us。
         delay_us = clamp_step_delay_us(axis, delay_us)
         actual_dir = direction ^ DIR_INVERT[axis]   # 按轴翻转DIR信号
-        sign = +1 if direction == DIR_OUTWARD else -1
+        outward_sign = outward_position_sign(axis)
+        sign = outward_sign if direction == DIR_OUTWARD else -outward_sign
         signed_steps = sign * steps
         with self.state_lock:
             if self._pending_step[axis] is not None:
@@ -1914,7 +1921,8 @@ class StepperGUI:
             request_error = exc
             resp = ""
         dist_mm = profile.units_from_steps(steps)
-        dir_txt = "正向" if direction == DIR_OUTWARD else "反向"
+        out_txt, in_txt, _out_arrow, _in_arrow = direction_label_parts(axis)
+        dir_txt = out_txt if direction == DIR_OUTWARD else in_txt
         effective_delay_ms = delay_us / 1000.0
         mm_s = (
             step_delay_ms_to_pulse_rate(axis, effective_delay_ms)
@@ -2087,7 +2095,8 @@ class StepperGUI:
         if steps <= 0:
             self.log(f"轴{AXIS_LABEL[axis]}: 忽略距离过小 ({distance_mm})")
             return False
-        sign = +1.0 if direction == DIR_OUTWARD else -1.0
+        outward_sign = float(outward_position_sign(axis))
+        sign = outward_sign if direction == DIR_OUTWARD else -outward_sign
         target_steps = position_steps + sign * steps
         tolerance_steps = profile.exact_steps_from_units(0.05)
         target = profile.units_from_steps(target_steps)
@@ -2196,7 +2205,11 @@ class StepperGUI:
             if abs(delta_steps) < 1.0:
                 self.log(f"轴{AXIS_LABEL[axis]} 已在目标附近")
                 return False
-            direction = DIR_OUTWARD if delta_steps > 0 else DIR_INWARD
+            direction = (
+                DIR_OUTWARD
+                if delta_steps * outward_position_sign(axis) > 0
+                else DIR_INWARD
+            )
             distance = abs(profile.units_from_steps(delta_steps))
             self.log(
                 f"轴{AXIS_LABEL[axis]} 前往 {target_units:.1f}{profile.unit} "
@@ -2335,7 +2348,8 @@ class StepperGUI:
             profile = self.axis_profiles[axis]
             motion_generation = self._axis_motion_generation[axis]
         burst_units = _continuous_burst_units(profile)
-        dir_txt = "向上" if direction == DIR_OUTWARD else "向下"
+        out_txt, in_txt, _out_arrow, _in_arrow = direction_label_parts(axis)
+        dir_txt = out_txt if direction == DIR_OUTWARD else in_txt
         self.log(f"轴{AXIS_LABEL[axis]} 按住连续{dir_txt}")
         def worker():
             while self.running[axis]:

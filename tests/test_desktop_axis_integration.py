@@ -136,7 +136,8 @@ class DesktopAxisIntegrationTests(unittest.TestCase):
         accepted = target(*args, **kwargs)
 
         self.assertTrue(accepted)
-        self.assertEqual(commands, ["MOVE,0,1000,1,1000"])
+        # 轴0=左侧直：向上(INWARD)为正 → 目标 +15 用 DIR=0
+        self.assertEqual(commands, ["MOVE,0,1000,0,1000"])
 
     def test_scheduled_gui_move_pins_profile_until_worker_send(self):
         app = _headless_app()
@@ -445,7 +446,8 @@ class DesktopAxisIntegrationTests(unittest.TestCase):
         )
 
         self.assertTrue(accepted)
-        self.assertEqual(app.axis_runtime[0].position_steps, 100)
+        # 轴0=左侧直：向下(OUTWARD)为负 → +100 步记为 -100
+        self.assertEqual(app.axis_runtime[0].position_steps, -100)
         self.assertIsNone(app._pending_step[0])
         self.assertFalse(app.stepper_in_progress[0])
 

@@ -32,6 +32,7 @@ from .topology import (
     NUM_PICO_NODES,
     NUM_STEPPER_AXES,
     PICO_AXES_PER_NODE,
+    outward_position_sign,
     step_delay_ms_to_pulse_rate,
     step_speed_clamps_delay,
     step_speed_to_delay_ms,
@@ -286,7 +287,8 @@ class DesktopWebController:
                 or app._pending_step[axis] is not None
             ):
                 raise RuntimeError("该轴正在运动")
-            sign = 1.0 if direction == DIR_OUTWARD else -1.0
+            outward_sign = float(outward_position_sign(axis))
+            sign = outward_sign if direction == DIR_OUTWARD else -outward_sign
             target_steps = runtime.target_steps(profile, sign * distance_mm)
             tolerance_steps = profile.exact_steps_from_units(0.05)
             if (

@@ -48,6 +48,33 @@ AXIS_LABEL: tuple[str, ...] = LOCAL_AXIS_LABELS + tuple(
     for local_axis in range(1, PICO_AXES_PER_NODE + 1)
 )
 
+
+def direction_label_parts(axis: int) -> tuple[str, str, str, str]:
+    """方向按钮/日志文案，返回 (正向词, 反向词, 正向箭头, 反向箭头)。
+
+    用户指定（2026-09-07）：直线轴叫 向下/向上，旋转轴叫 逆时针/顺时针，
+    其余轴保持 正向/反向。"正向"恒指 DIR_OUTWARD。
+    """
+    label = AXIS_LABEL[axis]
+    if "直" in label:
+        return ("向下", "向上", "▼", "▲")
+    if "转" in label:
+        return ("逆时针", "顺时针", "⟲", "⟳")
+    return ("正向", "反向", "▶", "◀")
+
+
+def outward_position_sign(axis: int) -> int:
+    """DIR_OUTWARD 运动对该轴软件位置的符号（+1 或 -1），与文案配套。
+
+    用户指定（2026-09-07）：直线轴 向上（INWARD）为正、向下为负——最低点
+    归零后向上为正，顶死/失步时读到负值即异常指示；旋转轴 逆时针
+    （OUTWARD）为正、顺时针为负；其余轴保持 OUTWARD 为正的旧约定。
+    """
+    label = AXIS_LABEL[axis]
+    if "直" in label:
+        return -1
+    return +1
+
 # FOC/GEAR 闭环电机轴（数量上与步进轴无关，编号与手机网页"闭环轴 N"一致），
 # 不复用 AXIS_LABEL——步进本地轴改为功能命名后会误导闭环轴显示。
 MOTOR_AXIS_LABELS: tuple[str, ...] = ("1", "2")

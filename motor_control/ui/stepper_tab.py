@@ -1,6 +1,12 @@
 from tkinter import ttk
 
-from motor_control import AXIS_LABEL, MODE_LINEAR, MODE_ROTARY, stepper_axis_topology
+from motor_control import (
+    AXIS_LABEL,
+    MODE_LINEAR,
+    MODE_ROTARY,
+    direction_label_parts,
+    stepper_axis_topology,
+)
 from motor_control.ui.common import PAD, attach_numeric_input
 
 
@@ -64,11 +70,12 @@ def build_stepper_tab(app, parent, axis, speed_presets, dir_outward, dir_inward)
     for label, val in [("1", 1), ("10", 10), ("50", 50), ("100", 100)]:
         ttk.Button(qbf, text=label, width=6,
                    command=lambda d=val, a=axis: app.v_dist[a].set(d)).pack(side="left", padx=2)
+    out_txt, in_txt, out_arrow, in_arrow = direction_label_parts(axis)
     ttk.Label(pf, text="方向:").grid(row=2, column=0, sticky="w", **pad)
     df = ttk.Frame(pf)
     df.grid(row=2, column=1, sticky="w")
-    ttk.Radiobutton(df, text="正向 ▶", variable=app.v_dir[axis], value=dir_outward).pack(side="left", padx=4)
-    ttk.Radiobutton(df, text="◀ 反向", variable=app.v_dir[axis], value=dir_inward).pack(side="left", padx=4)
+    ttk.Radiobutton(df, text=f"{out_txt} {out_arrow}", variable=app.v_dir[axis], value=dir_outward).pack(side="left", padx=4)
+    ttk.Radiobutton(df, text=f"{in_arrow} {in_txt}", variable=app.v_dir[axis], value=dir_inward).pack(side="left", padx=4)
     ttk.Label(pf, text="速度档位:").grid(row=3, column=0, sticky="w", **pad)
     sf = ttk.Frame(pf)
     sf.grid(row=3, column=1, sticky="w", pady=2)
@@ -88,20 +95,20 @@ def build_stepper_tab(app, parent, axis, speed_presets, dir_outward, dir_inward)
     sw['move_btn'] = ttk.Button(cf, text="执行运动",
                                 command=lambda a=axis: app.send_move(a), state="disabled")
     sw['move_btn'].grid(row=0, column=0, columnspan=2, padx=6, pady=4, ipadx=8, ipady=4)
-    sw['jog_out_btn'] = ttk.Button(cf, text="正向 1 ▶",
+    sw['jog_out_btn'] = ttk.Button(cf, text=f"{out_txt} 1 {out_arrow}",
                                    command=lambda a=axis: app._quick_move(a, 1.0, dir_outward),
                                    state="disabled")
     sw['jog_out_btn'].grid(row=1, column=0, **pad)
-    sw['jog_in_btn'] = ttk.Button(cf, text="◀ 反向 1",
+    sw['jog_in_btn'] = ttk.Button(cf, text=f"{in_arrow} {in_txt} 1",
                                   command=lambda a=axis: app._quick_move(a, 1.0, dir_inward),
                                   state="disabled")
     sw['jog_in_btn'].grid(row=1, column=1, **pad)
-    sw['cont_out_btn'] = ttk.Button(cf, text="正向 (按住) ▶▶", state="disabled")
+    sw['cont_out_btn'] = ttk.Button(cf, text=f"{out_txt} (按住) {out_arrow}{out_arrow}", state="disabled")
     sw['cont_out_btn'].grid(row=2, column=0, **pad)
     sw['cont_out_btn'].bind("<ButtonPress-1>", lambda e, a=axis: app._press_continuous(a, dir_outward))
     sw['cont_out_btn'].bind("<ButtonRelease-1>", lambda e, a=axis: app._release_continuous(a))
     sw['cont_out_btn'].bind("<Leave>", lambda e, a=axis: app._release_continuous(a))
-    sw['cont_in_btn'] = ttk.Button(cf, text="◀◀ 反向 (按住)", state="disabled")
+    sw['cont_in_btn'] = ttk.Button(cf, text=f"{in_arrow}{in_arrow} {in_txt} (按住)", state="disabled")
     sw['cont_in_btn'].grid(row=2, column=1, **pad)
     sw['cont_in_btn'].bind("<ButtonPress-1>", lambda e, a=axis: app._press_continuous(a, dir_inward))
     sw['cont_in_btn'].bind("<ButtonRelease-1>", lambda e, a=axis: app._release_continuous(a))
