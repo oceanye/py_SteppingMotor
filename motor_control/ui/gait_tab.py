@@ -30,6 +30,7 @@ BEAT_FIELDS = (
     ("lift_speed_mm_s", "抬足速度"),
     ("settle_speed_mm_s", "落足速度"),
     ("feasibility_samples", "干跑采样密度"),
+    ("rotation_limit_deg", "旋转解绕窗口 ±(°)"),
 )
 SIGN_FIELDS = (
     ("mr1_sign", "Mr1 旋转方向", "轴坐标增大 = ψ 增大"),

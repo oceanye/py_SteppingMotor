@@ -81,6 +81,7 @@ from motor_control.gait_planner import (
     parse_gait_params,
     plan_gait_stages,
     plan_swing_trajectory,
+    unwrap_swing_joint_delta,
 )
 from motor_control.ui_dispatch import UiDispatcher
 from motor_control.ui import (
@@ -636,6 +637,27 @@ class StepperGUI:
                  f"（对应 ψ 基准 {LOW_NODE_PHASE_DEG:g}°）")
         return position
 
+    def _gait_swing_theta_deg(self, side, params):
+        """摆动侧 Mr 累计角 θ = 轴坐标 − 零位（≈线缆缠绕量，度）。
+
+        绑定缺失、零位未标或位置不可信时返回 None（调用方按基准位 0 处理）。
+        """
+
+        role = "Mr1" if side == "left" else "Mr2"
+        try:
+            axis = self._gait_role_axis(role)
+        except GaitExecutorError:
+            return None
+        zero = (params.mr1_zero_deg if role == "Mr1"
+                else params.mr2_zero_deg)
+        with self.state_lock:
+            runtime = self.axis_runtime[axis]
+            if not runtime.position_trusted:
+                return None
+            position = self.axis_profiles[axis].units_from_steps(
+                runtime.position_steps)
+        return position - (zero if zero is not None else 0.0)
+
     def _gait_begin_run(self, side, params=None):
         """UI 线程：前置检查 + 干跑 + 按当前相位建立执行器。
 
@@ -658,12 +680,7 @@ class StepperGUI:
                 raise GaitExecutorError(
                     f"{role_name} 尚未做零位标定；请先把三足摆到基准位"
                     f"（ψ=30°）并【记零】")
-        # 3. 干跑校验必须可行
-        report = plan_swing_trajectory(params, side=side)
-        self.log(f"步态干跑（{side}）：{report.message}")
-        if not report.feasible:
-            raise GaitExecutorError(f"干跑不可行，拒绝开始：{report.message}")
-        # 4. 摆动侧旋转轴当前相位（决定 S3 是否需要相位调整）
+        # 3. 摆动侧旋转轴当前相位与累计角（决定 S3 相位调整和解绕小步）
         swing_role = "Mr1" if side == "left" else "Mr2"
         axis = role_axes[swing_role]
         with self.state_lock:
@@ -678,7 +695,20 @@ class StepperGUI:
                 runtime.position_steps)
         sign = params.mr1_sign if swing_role == "Mr1" else params.mr2_sign
         zero = params.mr1_zero_deg if swing_role == "Mr1" else params.mr2_zero_deg
-        psi_now = LOW_NODE_PHASE_DEG + sign * (position - zero)
+        theta_now = position - zero
+        psi_now = LOW_NODE_PHASE_DEG + sign * theta_now
+        try:
+            swing_delta = unwrap_swing_joint_delta(
+                theta_now, params.rotation_limit_deg)
+        except ValueError as exc:
+            raise GaitExecutorError(str(exc)) from None
+        # 4. 干跑校验必须可行（用与执行一致的解绕 Δq 校验轨迹）
+        report = plan_swing_trajectory(
+            params, side=side, swing_joint_delta_deg=swing_delta)
+        self.log(f"步态干跑（{side}，解绕 Δq={swing_delta:+g}°）："
+                 f"{report.message}")
+        if not report.feasible:
+            raise GaitExecutorError(f"干跑不可行，拒绝开始：{report.message}")
         stages = plan_gait_stages(params, side=side, swing_psi_start_deg=psi_now)
         self._gait_run = GaitExecutor(
             _GaitHostAdapter(self), params, stages, side=side)
@@ -859,10 +889,25 @@ class StepperGUI:
             return
         self._save_gait_params(params)
         side = self.gait_side_var.get()
-        report = plan_swing_trajectory(params, side=side)
+        theta = self._gait_swing_theta_deg(side, params)
+        theta_known = theta is not None
+        if not theta_known:
+            theta = 0.0  # 绑定/零位不可用：按基准位展示
+        try:
+            swing_delta = unwrap_swing_joint_delta(
+                theta, params.rotation_limit_deg)
+        except ValueError as exc:
+            messagebox.showerror("累计角越窗", str(exc))
+            return
+        report = plan_swing_trajectory(
+            params, side=side, swing_joint_delta_deg=swing_delta)
         self._gait_last_report = report
         self.gait_report_var.set(report.message)
-        self.log(f"步态干跑（{side}）：{report.message}")
+        self.log(
+            f"步态干跑（{side}，解绕 Δq={swing_delta:+g}°"
+            + (f"，累计角 θ={theta:+.1f}°）" if theta_known else
+               "，按基准位 θ=0）")
+            + f"：{report.message}")
         draw_gait_preview(self)
         if not report.feasible:
             messagebox.showwarning(

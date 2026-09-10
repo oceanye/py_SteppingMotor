@@ -31,6 +31,52 @@ HIGH_NODE_PHASE_DEG = 90.0  # 高节点相位（与低节点相间 60°）
 
 SWING_JOINT_DELTA_DEG = 180.0  # 摆动侧电机关节角总变化 Δq = 120-(-60)
 SUPPORT_JOINT_DELTA_DEG = 60.0  # 支撑侧电机补偿角总变化 Δq = 0-(-60)
+# 三足盘三重对称：摆动 Δq 取 60+120·k（k∈Z）落地位形全部等效（爪臂照对
+# 低节点、公转照走 60°）。解绕即利用该自由度反向/缩短摆动增量。
+
+
+def unwrap_swing_joint_delta(
+    theta_deg: float,
+    rotation_limit_deg: float,
+    *,
+    support_delta_deg: float = SUPPORT_JOINT_DELTA_DEG,
+) -> float:
+    """按摆动侧累计角 θ 选位形等效的摆动关节增量 Δq（度）。
+
+    约束：摆动后 θ+Δq 与随后作支撑 θ+Δq+support 都必须落在
+    ±rotation_limit_deg 内（支撑侧着地不能解绕，必须在它自己悬空时
+    就留好余量）。候选 Δq = 60+120k 中取 |θ+Δq| 最小者（让累计角贴着
+    窗口中央徘徊，线缆缠绕量最小）；并列取 |Δq| 小、再并列取正。
+    θ 已在窗外时仍可一步拉回（Δq 无界），但 |Δq| 超过两圈即认为累计角
+    失真，拒绝并要求人工处理。
+    """
+
+    limit = float(rotation_limit_deg)
+    base = SWING_JOINT_DELTA_DEG - SWING_SPIN_DEG  # = 60
+    lo = -limit + support_delta_deg
+    hi = limit - support_delta_deg
+    if lo > hi:
+        raise ValueError("rotation_limit_deg 太小：摆动后无法留出支撑余量")
+    # Δq = base + SWING_SPIN_DEG·k 且 θ+Δq ∈ [lo, hi] 的整数 k 范围
+    k_lo = math.ceil((lo - theta_deg - base) / SWING_SPIN_DEG)
+    k_hi = math.floor((hi - theta_deg - base) / SWING_SPIN_DEG)
+    # 目标 |θ+Δq| 最小 → k* ≈ -(θ+base)/120；在合法范围内取最近的候选
+    target_k = round(-(theta_deg + base) / SWING_SPIN_DEG)
+    best = None
+    for k in sorted({max(k_lo, min(k_hi, target_k) + d) for d in (-1, 0, 1)}):
+        if not k_lo <= k <= k_hi:
+            continue
+        delta = base + SWING_SPIN_DEG * k
+        landed = theta_deg + delta
+        key = (abs(landed), abs(delta), -delta)
+        if best is None or key < best[0]:
+            best = (key, delta)
+    assert best is not None
+    if abs(best[1]) > 720.0:
+        raise ValueError(
+            f"摆动侧累计角 {theta_deg:.1f}° 偏离解绕窗口 ±{limit:g}° "
+            "超过两圈：请先把该侧手动转回窗口内（或重新记零）再开始")
+    return best[1]
 
 
 def smoothstep5(s: float) -> float:
@@ -120,6 +166,9 @@ class GaitParams:
     lift_speed_mm_s: float = 2.0      # 抬足速度
     settle_speed_mm_s: float = 1.0    # 落足速度（更慢）
     feasibility_samples: int = 120    # 干跑碰撞校验采样密度
+    # 每侧 Mr 累计角解绕窗口：摆动侧自动选等效小步（Δq=60+120k），使累计
+    # 角（≈线缆缠绕量）始终徘徊在 ±limit 内（2026-09-09 用户指定 ±180°）
+    rotation_limit_deg: float = 180.0
     # 标定：电机方向符号与基准零位（向导写入；+1 表示轴坐标增大 = q 增大）
     mr1_sign: int = 1
     mr2_sign: int = 1
@@ -142,6 +191,10 @@ class GaitParams:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"执行参数 {name} 必须是大于 0 的有限数值")
+        if (not math.isfinite(self.rotation_limit_deg)
+                or not 120.0 < self.rotation_limit_deg <= 720.0):
+            raise ValueError("rotation_limit_deg 必须在 (120, 720] 度"
+                             "（窗口小于 120 时摆动小步无处安放）")
         for name in ("mr1_sign", "mr2_sign", "mup1_lift_sign", "mup2_lift_sign"):
             if getattr(self, name) not in (1, -1):
                 raise ValueError(f"方向符号 {name} 必须是 +1 或 -1")
@@ -151,7 +204,8 @@ class GaitParams:
                 raise ValueError(f"零位 {name} 必须是有限数值")
         return self
 
-    # 摆动侧与支撑侧按 3:1 同步，保证每段两者同时完成。
+    # 传统摆动侧速度（3×支撑速度）。S4 解绕后按增量比另算段速；
+    # 此值现用于 S3 相位调整等单轴整段运动。
     @property
     def swing_side_speed_deg_s(self) -> float:
         return 3.0 * self.swing_speed_deg_s
@@ -174,6 +228,7 @@ class GaitParams:
             "lift_speed_mm_s": self.lift_speed_mm_s,
             "settle_speed_mm_s": self.settle_speed_mm_s,
             "feasibility_samples": int(self.feasibility_samples),
+            "rotation_limit_deg": self.rotation_limit_deg,
             "mr1_sign": self.mr1_sign,
             "mr2_sign": self.mr2_sign,
             "mup1_lift_sign": self.mup1_lift_sign,
@@ -247,6 +302,8 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
                                   GaitParams.settle_speed_mm_s),
         feasibility_samples=int(_number("feasibility_samples",
                                         GaitParams.feasibility_samples)),
+        rotation_limit_deg=_number("rotation_limit_deg",
+                                   GaitParams.rotation_limit_deg),
         mr1_sign=_sign("mr1_sign"),
         mr2_sign=_sign("mr2_sign"),
         mup1_lift_sign=_sign("mup1_lift_sign"),
@@ -432,16 +489,23 @@ def plan_swing_trajectory(
     *,
     side: str,
     extra_hexagons: Iterable[HexPad] = (),
+    swing_joint_delta_deg: float | None = None,
 ) -> DryRunReport:
     """干跑：生成整条摆动轨迹并做连续碰撞校验。
 
     ``side`` 是 "left"（A→C 绕 B）或 "right"（B→A 绕 C）。
+    ``swing_joint_delta_deg`` 是解绕后的摆动关节增量 Δq（None 用默认
+    +180°）；自转 Δψ = Δq − 公转 60°，爪臂扫掠轨迹随实际 Δq 变化，
+    干跑必须用与执行一致的值校验。
     """
 
     params = params.validated()
     geometry = params.geometry
     if side not in ("left", "right"):
         raise ValueError("side 必须是 left 或 right")
+    spin_deg = (
+        SWING_SPIN_DEG if swing_joint_delta_deg is None
+        else float(swing_joint_delta_deg) - SWING_ARC_DEG)
     _start, _target, pivot_name, start_bearing = (
         LEFT_SWING if side == "left" else RIGHT_SWING
     )
@@ -464,7 +528,7 @@ def plan_swing_trajectory(
         shaping = smoothstep5(s)
         phi_deg = SWING_ARC_DEG * shaping
         psi_deg = (LOW_NODE_PHASE_DEG
-                   + SWING_SPIN_DEG * shaping)
+                   + spin_deg * shaping)
         beta_deg = start_bearing - SWING_ARC_DEG * shaping
         center = swing_center(pivot, geometry.d_mm, phi_deg, start_bearing)
         for label, node in high_nodes:
@@ -519,7 +583,8 @@ class GaitStage:
     """一个阶段：说明 + 顺序的运动组序列；每组内并列下发、全部完成才进下一组。
 
     组序 = 时间序（S4 的第 k 段必须等第 k-1 段完成），组内 = 同时下发
-    （摆动侧与支撑侧按 3:1 速度比近似同步完成）。
+    （摆动侧与支撑侧速度按增量比设置：Δq=180° 时 3:1，解绕小步 Δq=±60°
+    时 1:1，保证每段两者同时完成）。
     """
 
     stage_id: str
@@ -600,11 +665,12 @@ def plan_gait_stages(
         )
     )
 
-    # S3 相位调整（目标 ψ=30° 基准；通常在基准位则跳过）
+    # S3 相位调整（目标 ψ≡30° (mod 120°) 基准；在基准位则跳过）
     if swing_psi_start_deg is not None:
         phase_delta = swing_psi_start_deg - LOW_NODE_PHASE_DEG
-        # 归一化到 (-180, 180]，走最短转向
-        phase_delta = (phase_delta + 180.0) % 360.0 - 180.0
+        # 三足 120° 对称：归一化到 (-60, 60]，按等效周期走最短转向
+        phase_delta = ((phase_delta + SWING_SPIN_DEG / 2) % SWING_SPIN_DEG
+                       - SWING_SPIN_DEG / 2)
         if abs(phase_delta) > 0.5:
             stages.append(
                 GaitStage(
@@ -619,17 +685,29 @@ def plan_gait_stages(
                 )
             )
 
-    # S4 公转 + 自转（段间顺序、段内并列：摆动侧与支撑侧按 3:1 速度同时完成）
+    # S4 公转 + 自转（段间顺序、段内并列；两轴速度按增量比设置，同时完成）。
+    # 解绕：按摆动侧累计角选等效小步 Δq=60+120k，使累计角（≈线缆缠绕）
+    # 保持在 ±rotation_limit_deg 内。θ=swing_sign·(ψ-30°) 是 Mr 轴坐标
+    # 相对零位的偏移，None（纯展示）按 0 处理。
+    swing_theta_deg = (
+        0.0 if swing_psi_start_deg is None
+        else swing_sign * (swing_psi_start_deg - LOW_NODE_PHASE_DEG))
+    swing_delta_total = unwrap_swing_joint_delta(
+        swing_theta_deg, params.rotation_limit_deg)
+    # 同步条件 |Δq|/v_swing = 60/v_support → v_swing = v_support·|Δq|/60
+    swing_segment_speed = (
+        params.swing_speed_deg_s
+        * abs(swing_delta_total) / SUPPORT_JOINT_DELTA_DEG)
     segment_groups: list[tuple[RoleMove, ...]] = []
     for index in range(int(params.swing_segments)):
         progress0, progress1 = _segment_progress(
             index, int(params.swing_segments))
-        swing_delta = (progress1 - progress0) * SWING_JOINT_DELTA_DEG
+        swing_delta = (progress1 - progress0) * swing_delta_total
         support_delta = (progress1 - progress0) * SUPPORT_JOINT_DELTA_DEG
         segment_groups.append(
             (
                 RoleMove(swing_role, swing_sign * swing_delta,
-                         params.swing_side_speed_deg_s),
+                         swing_segment_speed),
                 RoleMove(support_role, support_sign * support_delta,
                          params.swing_speed_deg_s),
             )
@@ -640,7 +718,13 @@ def plan_gait_stages(
             title="公转 + 同步自转",
             confirm_text=(
                 f"共 {int(params.swing_segments)} 段同步运动；观察爪臂始终从"
-                "高点间隙中扫过。任何异常立即点【中止】。"
+                "高点间隙中扫过。任何异常立即点【中止】。\n"
+                f"解绕小步：本次摆动 Δq={swing_delta_total:+g}°"
+                f"（等效 {SWING_JOINT_DELTA_DEG:g}° 位形），累计角 "
+                f"{swing_theta_deg:+.1f}° → "
+                f"{swing_theta_deg + swing_delta_total:+.1f}°"
+                f"（限 ±{params.rotation_limit_deg:g}°，支撑侧随后 "
+                f"{SUPPORT_JOINT_DELTA_DEG:g}°）。"
             ),
             move_groups=tuple(segment_groups),
         )
@@ -682,5 +766,6 @@ def swing_phase_correction_deg(
     if zero is None:
         raise ValueError(f"{role} 尚未做零位标定")
     psi = LOW_NODE_PHASE_DEG + sign * (current_axis_deg - zero)
-    # 修正角 = 目标 ψ − 当前 ψ（归一化到 (-180,180] 走最短路径）
-    return (LOW_NODE_PHASE_DEG - psi + 180.0) % 360.0 - 180.0
+    # 修正角 = 目标 ψ − 当前 ψ；三足 120° 对称，按等效周期归一到 (-60,60]
+    return ((LOW_NODE_PHASE_DEG - psi + SWING_SPIN_DEG / 2) % SWING_SPIN_DEG
+            - SWING_SPIN_DEG / 2)

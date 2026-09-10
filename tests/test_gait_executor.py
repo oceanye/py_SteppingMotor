@@ -103,12 +103,12 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(len(wait_indices), 6)
         # 第 1 组的两条 wait 都在第 2 组的两条 send 之前
         self.assertLess(max(wait_indices[:2]), min(send_indices[2:]))
-        # 摆动侧总量 +180°（sign=+1），支撑侧 +60°（sign=+1）
+        # 摆动侧总量 +60°（θ=0 解绕小步，sign=+1），支撑侧 +60°（sign=+1）
         swing_total = sum(e[2][0] for e in group_events
                           if e[0] == "send" and e[1] == host.role_axes["Mr1"])
         support_total = sum(e[2][0] for e in group_events
                             if e[0] == "send" and e[1] == host.role_axes["Mr2"])
-        self.assertAlmostEqual(swing_total, 180.0, places=6)
+        self.assertAlmostEqual(swing_total, 60.0, places=6)
         self.assertAlmostEqual(support_total, 60.0, places=6)
 
         # S5 确认、S6 落脚（速度为 settle）、S7 确认 → done
