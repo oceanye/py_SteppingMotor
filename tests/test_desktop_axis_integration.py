@@ -73,6 +73,17 @@ from motor_control.serial_session import SessionClosed
 from motor_control.protocol import StepResult, StepTerminal
 
 
+class _FakeTkVar:
+    def __init__(self, value):
+        self._value = value
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        self._value = value
+
+
 def _headless_app():
     app = StepperGUI.__new__(StepperGUI)
     app.axis_profiles = [AxisProfile() for _ in range(NUM_STEPPER_AXES)]
@@ -94,6 +105,14 @@ def _headless_app():
     app.axis_param_valid = [True] * NUM_STEPPER_AXES
     app.state_lock = threading.RLock()
     app.sw = [{} for _ in range(NUM_STEPPER_AXES)]
+    # 落地纠偏状态（本文件的老用例默认禁用，不干扰运动断言）
+    app.paired_axes = (0, 1)
+    app.paired_widgets = {}
+    app.pair_land_release_enabled = _FakeTkVar(False)
+    app.pair_land_release_threshold_mm = _FakeTkVar(3.0)
+    app._rot_release_active = False
+    app._rot_release_axes = ()
+    app._last_land_gap_mm = None
     app._logs = []
     app.log = app._logs.append
     app._save_calib = lambda: None

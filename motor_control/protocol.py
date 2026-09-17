@@ -98,6 +98,20 @@ def build_stop_command(axis: Union[int, str]) -> str:
     return command_line("STOP", _axis_token(axis, wildcard=True))
 
 
+def build_ena_command(axis: Union[int, str], locked: Optional[bool] = None) -> str:
+    """Build ``ENA,<axis>,<0|1>`` (release/lock driver) or ``ENA,<axis>,S`` query.
+
+    ``locked=False`` releases the driver coils (rotor free for manual/spring
+    correction), ``locked=True`` restores holding torque.  ``None`` queries.
+    Only local axes wired to the driver ENA input support this command.
+    """
+
+    axis_field = _axis_token(axis)
+    if locked is None:
+        return command_line("ENA", axis_field, "S")
+    return command_line("ENA", axis_field, 1 if locked else 0)
+
+
 def build_estop_command() -> str:
     return "ESTOP"
 
@@ -472,6 +486,12 @@ def reply_matcher_for(command: str) -> ReplyMatcher:
             return isinstance(reply, AckReply) and (tokens[1] == "*" or reply.axis == _parse_nonnegative(tokens[1]))
         if verb == "STOP" and len(tokens) >= 2:
             return _ok_has_axis(reply, tokens[1])
+        if verb == "ENA" and len(tokens) >= 2:
+            # OK,ENA,<axis>,<state>：族名 + 轴号都要对上，防止别的迟到行误配。
+            return (isinstance(reply, OkReply)
+                    and len(reply.values) >= 3
+                    and reply.values[0] == "ENA"
+                    and (tokens[1] == "*" or reply.values[1] == tokens[1]))
         if verb == "ESTOP":
             return isinstance(reply, OkReply) and reply.values == ("ESTOP",)
         if verb == "MODE":

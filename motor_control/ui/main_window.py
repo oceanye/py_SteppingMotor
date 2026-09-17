@@ -113,6 +113,10 @@ def build_ui(app, log_dir, num_motor_axes):
             app.stepper_axis_books[axis] = axis_book
             app.stepper_axis_group_indices[axis] = group_index
             app._build_stepper_tab(tab, axis)
+    # ESP32 本地组追加“左右直联动”页：左侧直+右侧直 同时执行同一命令
+    paired_tab = ttk.Frame(app.stepper_axis_books[0])
+    app.stepper_axis_books[0].add(paired_tab, text="轴 左右直联动")
+    app._build_paired_tab(paired_tab)
     for axis in range(num_motor_axes):
         tab = ttk.Frame(app.notebook)
         app.tab_index_foc[axis] = app.notebook.index("end")
