@@ -80,6 +80,26 @@
 #define PIN_STEP_PUL_5    38
 #define PIN_STEP_DIR_5    39
 
+// ── 步进驱动器 ENA(使能/释放)控制 ──
+// 2026-09-17 新增：仅两个旋转轴(2=左侧转, 3=右侧转)的 DM442 接了 ENA 线，
+// 供"悬空腿落地时释放旋转电机纠偏"使用。接法与 PUL/DIR 相同：
+//   ENA+ → GPIO，ENA- → GND。DM442：ENA 光耦导通 = 线圈断电(释放)，
+//   即 高电平=释放、低电平=锁定(保持力矩在)。
+// 引脚选择：WROOM-1 模组不引出 GPIO22-34，右转不能用 33；空闲脚只剩
+// 预留位(35=急停/42,47,48=编码器I2C或RS485/36,37=nFAULT)。选 36/37 中
+// 的 36：DRV8871 成品模块未引出 nFAULT，该预留保留价值最低。
+// ⚠ 若模组丝印为 N16R8(Octal PSRAM)，GPIO35-37 被 PSRAM 占用，
+//   须换 42/47/48 并放弃对应预留功能。
+// 其余轴未接线：引脚表填 -1，ENA 命令对它们回复 unsupported。
+#define STEPPER_ENA_LOCKED_LEVEL    LOW
+#define STEPPER_ENA_RELEASED_LEVEL  HIGH
+#define PIN_STEP_ENA_0  -1
+#define PIN_STEP_ENA_1  -1
+#define PIN_STEP_ENA_2   3   // 左侧转 DM442 ENA+
+#define PIN_STEP_ENA_3  36   // 右转 DM442 ENA+（占用 nFAULT_1 预留）
+#define PIN_STEP_ENA_4  -1
+#define PIN_STEP_ENA_5  -1
+
 // ── 减速电机 axis 0（已接好，2026-05-22 调通） ──
 // 物理上 ESP32 GPIO 11 → DRV8871 IN1，GPIO 16 → DRV8871 IN2。
 // 在固件里把 IN1/IN2 调换，PID 命令"正转"时其实驱动物理 IN2 → 电机反向，

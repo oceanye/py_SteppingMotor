@@ -108,10 +108,28 @@ static void handle_move(const String tok[], int n) {
     return;
   }
 #endif
+  if (!stepper_ena_locked(axis)) { reply_err("axis released"); return; }
   if (!stepper_move_async(axis, steps, direction, delay_us)) {
     reply_err("busy"); return;
   }
   serial_tx_printf("ACK,%d", axis);
+}
+
+// ENA,<axis>,<0|1>  设置驱动器释放(0)/锁定(1)；ENA,<axis>,S 查询当前状态。
+// 仅接了 ENA 线的本地轴支持(旋转轴)；释放正在运动的轴会被拒绝。
+static void handle_ena(const String tok[], int n) {
+  if (n != 3) { reply_err("bad format"); return; }
+  int axis = 0;
+  if (!parse_axis(tok[1], NUM_AXES, axis)) { reply_err("bad axis"); return; }
+  if (tok[2] == "S") {
+    serial_tx_printf("OK,ENA,%d,%d", axis, stepper_ena_locked(axis) ? 1 : 0);
+    return;
+  }
+  int value = 0;
+  if (!protocol_parse_int(tok[2].c_str(), 0, 1, value)) { reply_err("bad value"); return; }
+  if (value == 0 && stepper_is_busy(axis)) { reply_err("busy"); return; }
+  if (!stepper_set_ena(axis, value == 1)) { reply_err("unsupported"); return; }
+  serial_tx_printf("OK,ENA,%d,%d", axis, value);
 }
 
 static void handle_stop(const String tok[], int n) {
@@ -143,6 +161,8 @@ static void handle_stop(const String tok[], int n) {
 
 void system_estop() {
   for (int axis = 0; axis < NUM_AXES; ++axis) stepper_abort(axis);
+  // 急停后不留失能态：全部恢复锁定，机构不会长期处于可被外力扭动状态。
+  for (int axis = 0; axis < NUM_AXES; ++axis) stepper_set_ena(axis, true);
 #if defined(DRIVE_MODE_GEAR)
   #if REMOTE_STEPPER_ENABLED
   remote_stepper_estop();
@@ -411,6 +431,7 @@ void protocol_handle_line(const String& command) {
   } else if (tok[0] == "MOVE") handle_move(tok, n);
   else if (tok[0] == "STOP") handle_stop(tok, n);
   else if (tok[0] == "ESTOP") handle_estop(tok, n);
+  else if (tok[0] == "ENA") handle_ena(tok, n);
   else if (tok[0] == "STDIAG") handle_stdiag(tok, n);
   else if (tok[0] == "DIAG") handle_diag(tok, n);
   else if (tok[0] == "FOC") handle_foc(tok, n);

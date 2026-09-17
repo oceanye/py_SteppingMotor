@@ -9,6 +9,7 @@
 #if defined(DRIVE_MODE_FOC)
 static const int PIN_PUL[NUM_AXES] = {PIN_STEP_PUL_0, PIN_STEP_PUL_1};
 static const int PIN_DIR[NUM_AXES] = {PIN_STEP_DIR_0, PIN_STEP_DIR_1};
+static const int PIN_ENA[NUM_AXES] = {-1, -1};  // FOC 板未接 ENA 线
 #elif defined(DRIVE_MODE_GEAR)
 static const int PIN_PUL[NUM_AXES] = {
   PIN_STEP_PUL_0, PIN_STEP_PUL_1, PIN_STEP_PUL_2,
@@ -18,7 +19,29 @@ static const int PIN_DIR[NUM_AXES] = {
   PIN_STEP_DIR_0, PIN_STEP_DIR_1, PIN_STEP_DIR_2,
   PIN_STEP_DIR_3, PIN_STEP_DIR_4, PIN_STEP_DIR_5
 };
+static const int PIN_ENA[NUM_AXES] = {
+  PIN_STEP_ENA_0, PIN_STEP_ENA_1, PIN_STEP_ENA_2,
+  PIN_STEP_ENA_3, PIN_STEP_ENA_4, PIN_STEP_ENA_5
+};
 #endif
+
+// ── ENA(使能/释放)控制：仅接了 ENA 线的轴(引脚 >= 0)生效 ──
+bool stepper_ena_wire_present(int axis) {
+  return axis >= 0 && axis < NUM_AXES && PIN_ENA[axis] >= 0;
+}
+
+bool stepper_ena_locked(int axis) {
+  if (!stepper_ena_wire_present(axis)) return true;  // 未接线=驱动器恒使能
+  return digitalRead(PIN_ENA[axis]) == STEPPER_ENA_LOCKED_LEVEL;
+}
+
+bool stepper_set_ena(int axis, bool locked) {
+  if (!stepper_ena_wire_present(axis)) return false;
+  if (!locked && stepper_is_busy(axis)) return false;  // 运动中禁止释放
+  digitalWrite(PIN_ENA[axis],
+               locked ? STEPPER_ENA_LOCKED_LEVEL : STEPPER_ENA_RELEASED_LEVEL);
+  return true;
+}
 
 // 每轴异步任务状态
 static TaskHandle_t      s_task[NUM_AXES]      = {};
@@ -152,6 +175,11 @@ void stepper_init() {
     pinMode(PIN_DIR[axis], OUTPUT);
     digitalWrite(PIN_PUL[axis], LOW);
     digitalWrite(PIN_DIR[axis], LOW);
+    if (PIN_ENA[axis] >= 0) {
+      // 上电默认锁定(保持力矩在)；绝不带着释放态启动。
+      pinMode(PIN_ENA[axis], OUTPUT);
+      digitalWrite(PIN_ENA[axis], STEPPER_ENA_LOCKED_LEVEL);
+    }
     s_start_sem[axis] = xSemaphoreCreateBinary();
     s_state[axis].store(STEP_IDLE);
     char name[16]; snprintf(name, sizeof(name), "stepper%d", axis);
@@ -190,6 +218,8 @@ bool stepper_abort(int axis) {
 bool stepper_move_async(int axis, int steps, int direction, int delay_us) {
   if (!valid_axis(axis) || steps <= 0 || (direction != 0 && direction != 1) ||
       delay_us <= 0) return false;
+  // 释放(失能)状态下发脉冲没有保持力矩，脉冲计数也会失去意义。
+  if (!stepper_ena_locked(axis)) return false;
   uint8_t expected = STEP_IDLE;
   if (!s_state[axis].compare_exchange_strong(expected, STEP_RUNNING)) return false;
   s_steps[axis]    = steps;

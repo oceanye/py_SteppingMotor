@@ -21,3 +21,12 @@ bool stepper_abort(int axis);
 
 // 完整自检序列（DIAG,<axis> 指令）
 void stepper_run_diagnostics(int axis);
+
+// ── 驱动器 ENA(使能/释放)控制（仅接了 ENA 线的轴生效）──
+// locked=true → 保持力矩在(锁定)；false → 线圈断电(释放，转子可被外力转动)。
+// 释放正在运动的轴会令脉冲计数失去意义，busy 时拒绝释放。
+// 返回 true=已执行；false=该轴未接 ENA 线，或释放被 busy 拒绝。
+bool stepper_set_ena(int axis, bool locked);
+
+// 该轴当前是否处于锁定(使能)状态；未接 ENA 线的轴恒为 true。
+bool stepper_ena_locked(int axis);
