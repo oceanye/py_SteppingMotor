@@ -131,14 +131,14 @@
       return {
         axis,
         mode:document.getElementById(`smode${axis}`).value,
-        pulse_per_rev:num(`sppr${axis}`,1,10000),
+        pulse_per_rev:num(`sppr${axis}`,1,102400),
         gear_ratio:num(`sgr${axis}`,.001,1000),
         lead_mm:num(`slead${axis}`,.01,100)
       };
     }
     function requestedPulseRate(axis,speed){
       const mode=document.getElementById(`smode${axis}`).value;
-      const ppr=num(`sppr${axis}`,1,10000),ratio=num(`sgr${axis}`,.001,1000);
+      const ppr=num(`sppr${axis}`,1,102400),ratio=num(`sgr${axis}`,.001,1000);
       const pulsesPerUnit=mode==='rotary'?ppr*ratio/360:ppr*ratio/num(`slead${axis}`,.01,100);
       return speed*pulsesPerUnit;
     }
@@ -158,7 +158,7 @@
       const trust=axisStatus.position_trusted?'可信':'不可信，需校准';
       const motion=axisStatus.continuous?'连续运行':axisStatus.in_progress?'运动中':'停止';
       const mode=axisStatus.mode==='rotary'?'旋转':'直线';
-      node.textContent=`位置 ${formatNumber(position)} ${unit}（${trust}） · ${motion}\n限位 min ${formatNumber(minimum)} / max ${formatNumber(maximum)} ${unit}\n已应用参数 ${mode} · PPR ${formatNumber(axisStatus.pulse_per_rev)} · GR ${formatNumber(axisStatus.gear_ratio)} · 导程 ${formatNumber(axisStatus.lead_mm)} mm/转`;
+      node.textContent=`${axisStatus.driver_model||'MKS TMC2209 V2.0'} · STEP/DIR · 默认 1/${axisStatus.default_microsteps||8}\n位置 ${formatNumber(position)} ${unit}（${trust}） · ${motion}\n限位 min ${formatNumber(minimum)} / max ${formatNumber(maximum)} ${unit}\n已应用参数 ${mode} · PPR ${formatNumber(axisStatus.pulse_per_rev)} · GR ${formatNumber(axisStatus.gear_ratio)} · 导程 ${formatNumber(axisStatus.lead_mm)} mm/转`;
     }
     function moveResultNotice(result,label){
       const requested=formatNumber(result.requested_pulse_rate_pps,0);
@@ -176,7 +176,7 @@
       if(groups.some(group=>group.key===selectedGroup))stepperGroup.value=selectedGroup;
       for(const t of stepperTopology){
         const a=Number(t.axis);
-        steppers.insertAdjacentHTML('beforeend',`<div class="card" data-axis-card="${a}" data-group="${esc(groupKey(t))}"><div class="title"><span>轴 ${esc(t.label||a)}<span class="dirty-badge">配置未应用</span></span><span id="sstate${a}" class="state">--</span></div><span class="route">${esc(routeLabel(t))}</span><div id="sdetail${a}" class="axis-summary">正在读取轴状态…</div><div class="fields"><label>模式<select id="smode${a}" data-axis-config="${a}"><option value="linear">直线 (mm)</option><option value="rotary">旋转 (°)</option></select></label><label>脉冲/转<input id="sppr${a}" data-axis-config="${a}" type="number" value="200" min="1" max="10000" step="1"></label><label>减速比<input id="sgr${a}" data-axis-config="${a}" type="number" value="1" min="0.001" max="1000" step="0.01"></label><label>导程 (mm/转)<input id="slead${a}" data-axis-config="${a}" type="number" value="1" min="0.01" max="100" step="0.1"></label><label><span id="snoun${a}">距离</span> (<span id="sunit${a}">mm</span>)<input id="dist${a}" type="number" value="10" min="0.001" max="100000" step="0.1"></label><label>速度 (<span id="sunits${a}">mm/s</span>)<input id="speed${a}" type="number" value="3" min="0.001" max="10000" step="any" list="speedPresets"></label></div><div class="buttons"><button class="go" data-step="reverse" data-axis="${a}">反向</button><button class="stop" data-step="stop" data-axis="${a}">停止</button><button class="go" data-step="forward" data-axis="${a}">正向</button></div><button class="enable wide" data-step="applycfg" data-axis="${a}">应用轴配置</button></div>`);
+        steppers.insertAdjacentHTML('beforeend',`<div class="card" data-axis-card="${a}" data-group="${esc(groupKey(t))}"><div class="title"><span>轴 ${esc(t.label||a)}<span class="dirty-badge">配置未应用</span></span><span id="sstate${a}" class="state">--</span></div><span class="route">${esc(routeLabel(t))}</span><div id="sdetail${a}" class="axis-summary">正在读取轴状态…</div><div class="fields"><label>模式<select id="smode${a}" data-axis-config="${a}"><option value="linear">直线 (mm)</option><option value="rotary">旋转 (°)</option></select></label><label>脉冲/转<input id="sppr${a}" data-axis-config="${a}" type="number" value="1600" min="1" max="102400" step="1"></label><label>减速比<input id="sgr${a}" data-axis-config="${a}" type="number" value="1" min="0.001" max="1000" step="0.01"></label><label>导程 (mm/转)<input id="slead${a}" data-axis-config="${a}" type="number" value="1" min="0.01" max="100" step="0.1"></label><label><span id="snoun${a}">距离</span> (<span id="sunit${a}">mm</span>)<input id="dist${a}" type="number" value="10" min="0.001" max="100000" step="0.1"></label><label>速度 (<span id="sunits${a}">mm/s</span>)<input id="speed${a}" type="number" value="0.5" min="0.001" max="10000" step="any" list="speedPresets"></label></div><div class="buttons"><button class="go" data-step="reverse" data-axis="${a}">反向</button><button class="stop" data-step="stop" data-axis="${a}">停止</button><button class="go" data-step="forward" data-axis="${a}">正向</button></div><button class="enable wide" data-step="applycfg" data-axis="${a}">应用轴配置</button></div>`);
         syncAxisModeUi(a,'linear');
       }
       showStepperGroup();document.getElementById('topologyNote').textContent=`${stepperTopology.length} 轴 · ESP32 本地 + 6 个普通 Pico`;

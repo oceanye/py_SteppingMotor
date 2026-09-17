@@ -58,7 +58,10 @@ from motor_control import (
     AxisMotionTelemetry,
     BindingSet,
     BindingValidationError,
+    DEFAULT_PULSE_PER_REV,
+    MODE_LINEAR,
     MODE_ROTARY,
+    STEPPER_DRIVER_PROFILE_ID,
     AxisProfile,
     AxisRuntime,
     NUM_STEPPER_AXES,
@@ -75,7 +78,10 @@ from motor_control.protocol import StepResult, StepTerminal
 
 def _headless_app():
     app = StepperGUI.__new__(StepperGUI)
-    app.axis_profiles = [AxisProfile() for _ in range(NUM_STEPPER_AXES)]
+    # Most integration cases verify scheduling rather than the hardware preset.
+    app.axis_profiles = [
+        AxisProfile(pulse_per_rev=200) for _ in range(NUM_STEPPER_AXES)
+    ]
     app.axis_runtime = [
         AxisRuntime(position_trusted=True) for _ in range(NUM_STEPPER_AXES)
     ]
@@ -103,6 +109,65 @@ def _headless_app():
 
 
 class DesktopAxisIntegrationTests(unittest.TestCase):
+    def test_legacy_dm_axis_config_preserves_mechanics_but_resets_ppr(self):
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Store:
+            @staticmethod
+            def load_axis_config():
+                return {
+                    "mode": [MODE_ROTARY],
+                    "pulse_per_rev": [200.0],
+                    "gear_ratio": [21.5],
+                    "lead_mm": [1.0],
+                }
+
+        app = StepperGUI.__new__(StepperGUI)
+        app.state_store = Store()
+        app._startup_warnings = []
+        app._axis_profile_load_fallback = set()
+        app.axis_profiles = [AxisProfile() for _ in range(NUM_STEPPER_AXES)]
+        app.axis_mode_var = [Value(MODE_LINEAR) for _ in range(NUM_STEPPER_AXES)]
+        app.axis_ppr_var = [Value(DEFAULT_PULSE_PER_REV) for _ in range(NUM_STEPPER_AXES)]
+        app.axis_gr_var = [Value(1.0) for _ in range(NUM_STEPPER_AXES)]
+        app.axis_lead_var = [Value(1.0) for _ in range(NUM_STEPPER_AXES)]
+
+        StepperGUI._load_axis_config(app)
+
+        self.assertEqual(app.axis_profiles[0].mode, MODE_ROTARY)
+        self.assertEqual(app.axis_profiles[0].gear_ratio, 21.5)
+        self.assertEqual(app.axis_profiles[0].pulse_per_rev, 1600.0)
+        self.assertEqual(
+            app._axis_profile_load_fallback, set(range(NUM_STEPPER_AXES))
+        )
+        self.assertTrue(any("DM422/旧版" in item for item in app._startup_warnings))
+
+    def test_axis_config_save_records_tmc2209_driver_contract(self):
+        saved = []
+
+        class Store:
+            @staticmethod
+            def save_axis_config(value):
+                saved.append(value)
+
+        app = StepperGUI.__new__(StepperGUI)
+        app.state_store = Store()
+        app.axis_profiles = [AxisProfile() for _ in range(NUM_STEPPER_AXES)]
+        app.log = lambda _message: None
+
+        StepperGUI._save_axis_config(app)
+
+        self.assertEqual(saved[0]["driver_profile"], STEPPER_DRIVER_PROFILE_ID)
+        self.assertEqual(saved[0]["pulse_per_rev"][0], 1600.0)
+
     def test_absolute_target_is_recomputed_after_worker_delay(self):
         app = _headless_app()
         app.axis_param_valid = [True] * NUM_STEPPER_AXES
@@ -270,7 +335,7 @@ class DesktopAxisIntegrationTests(unittest.TestCase):
         rotary = AxisProfile(mode=MODE_ROTARY)
 
         self.assertEqual(_continuous_burst_units(linear), 0.2)
-        self.assertAlmostEqual(_continuous_burst_units(rotary), 1.8)
+        self.assertAlmostEqual(_continuous_burst_units(rotary), 0.225)
         self.assertEqual(
             rotary.command_steps_from_units(_continuous_burst_units(rotary)), 1
         )
@@ -283,6 +348,33 @@ class DesktopAxisIntegrationTests(unittest.TestCase):
             StepperGUI._profile_metadata_matches(profile, metadata)
         )
         metadata["gear_ratio"] = 3
+        self.assertFalse(
+            StepperGUI._profile_metadata_matches(profile, metadata)
+        )
+
+    def test_calibration_without_driver_metadata_is_untrusted(self):
+        class Store:
+            @staticmethod
+            def load_calibration():
+                return {
+                    "0": {
+                        "position": 12.0,
+                        "min": 0.0,
+                        "max": 20.0,
+                        "trusted": True,
+                    }
+                }
+
+        app = _headless_app()
+        app.state_store = Store()
+        app._axis_profile_load_fallback = set()
+
+        StepperGUI._load_calib(app)
+
+        self.assertFalse(app.axis_runtime[0].position_trusted)
+        self.assertTrue(any("位置已标记为不可信" in line for line in app._logs))
+        metadata = StepperGUI._profile_metadata(profile)
+        metadata.pop("driver_profile")
         self.assertFalse(
             StepperGUI._profile_metadata_matches(profile, metadata)
         )
@@ -307,7 +399,7 @@ class DesktopAxisIntegrationTests(unittest.TestCase):
         )
 
         self.assertTrue(accepted)
-        self.assertEqual(commands, ["MOVE,0,1,1,6000000"])
+        self.assertEqual(commands, ["MOVE,0,1,1,750000"])
 
     def test_compatibility_launcher_preserves_historical_constants(self):
         import pc_gui

@@ -2,6 +2,7 @@ import math
 import unittest
 
 from motor_control.axis_math import (
+    DEFAULT_PULSE_PER_REV,
     GEAR_RATIO_MAX,
     GEAR_RATIO_MIN,
     LEAD_MM_MAX,
@@ -16,6 +17,10 @@ from motor_control.axis_math import (
     speed_to_delay_ms,
     steps_to_units,
     units_to_steps,
+)
+from motor_control.driver_profile import (
+    TMC2209_DEFAULT_MICROSTEPS,
+    tmc2209_input_pulses_per_rev,
 )
 from motor_control.axis_model import AxisProfile, AxisRuntime
 from motor_control.topology import (
@@ -89,8 +94,18 @@ class StepperTopologyTests(unittest.TestCase):
 
 class AxisMathTests(unittest.TestCase):
     def test_default_linear_and_rotary_pulses_per_unit(self):
-        self.assertEqual(pulses_per_unit(MODE_LINEAR), 200.0)
-        self.assertAlmostEqual(pulses_per_unit(MODE_ROTARY), 200.0 / 360.0)
+        self.assertEqual(DEFAULT_PULSE_PER_REV, 1600.0)
+        self.assertEqual(pulses_per_unit(MODE_LINEAR), 1600.0)
+        self.assertAlmostEqual(pulses_per_unit(MODE_ROTARY), 1600.0 / 360.0)
+
+    def test_tmc2209_standalone_microstep_contract(self):
+        self.assertEqual(TMC2209_DEFAULT_MICROSTEPS, 8)
+        self.assertEqual(tmc2209_input_pulses_per_rev(), 1600)
+        self.assertEqual(tmc2209_input_pulses_per_rev(400, 64), 25600)
+        for invalid in (0, 1, 4, 256, 8.5, math.nan):
+            with self.subTest(microsteps=invalid):
+                with self.assertRaises(ValueError):
+                    tmc2209_input_pulses_per_rev(200, invalid)
 
     def test_gear_and_lead_are_applied_with_existing_formulas(self):
         self.assertEqual(pulses_per_unit(MODE_LINEAR, 400, 10, 5), 800.0)
@@ -159,7 +174,7 @@ class AxisModelTests(unittest.TestCase):
         invalid_profiles = (
             {"mode": "LINEAR"},
             {"pulse_per_rev": math.nan},
-            {"pulse_per_rev": 10_001},
+            {"pulse_per_rev": PULSE_PER_REV_MAX + 1},
             {"gear_ratio": math.inf},
             {"gear_ratio": 0.0009},
             {"lead_mm": 0},
@@ -171,7 +186,7 @@ class AxisModelTests(unittest.TestCase):
                     AxisProfile(**kwargs)
 
     def test_runtime_keeps_canonical_steps_when_mode_changes(self):
-        linear = AxisProfile(mode=MODE_LINEAR)
+        linear = AxisProfile(mode=MODE_LINEAR, pulse_per_rev=200)
         rotary = linear.with_mode(MODE_ROTARY)
         runtime = AxisRuntime.from_legacy_units(
             linear,
@@ -204,7 +219,7 @@ class AxisModelTests(unittest.TestCase):
         self.assertIs(restored["trusted"], True)
 
     def test_runtime_limit_checks_use_steps(self):
-        profile = AxisProfile()
+        profile = AxisProfile(pulse_per_rev=200)
         runtime = AxisRuntime.from_legacy_units(
             profile, position=5, minimum=0, maximum=10, trusted=True
         )

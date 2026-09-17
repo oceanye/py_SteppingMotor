@@ -15,9 +15,16 @@ from typing import Any
 from .axis_math import (
     MODE_LINEAR,
     MODE_ROTARY,
+    PULSE_PER_REV_MAX,
     PULSE_RATE_WARN_PPS,
     SPEED_DEFAULT,
     coerce_finite_in_range,
+)
+from .driver_profile import (
+    STEPPER_DRIVER_CONTROL_MODE,
+    STEPPER_DRIVER_DISPLAY_NAME,
+    STEPPER_DRIVER_PROFILE_ID,
+    TMC2209_DEFAULT_MICROSTEPS,
 )
 from .coordinated_control import (
     AxisMotionTelemetry,
@@ -153,6 +160,10 @@ class DesktopWebController:
                     "gear_ratio": app.axis_profiles[axis].gear_ratio,
                     "lead_mm": app.axis_profiles[axis].lead_mm,
                     "config_valid": bool(app.axis_param_valid[axis]),
+                    "driver_profile": STEPPER_DRIVER_PROFILE_ID,
+                    "driver_model": STEPPER_DRIVER_DISPLAY_NAME,
+                    "driver_control_mode": STEPPER_DRIVER_CONTROL_MODE,
+                    "default_microsteps": TMC2209_DEFAULT_MICROSTEPS,
                     "controller": topology_axes[axis]["controller"],
                     "node": topology_axes[axis]["node"],
                     "local_axis": topology_axes[axis]["local_axis"],
@@ -402,7 +413,7 @@ class DesktopWebController:
         try:
             if pulse_per_rev is not None:
                 pulse_per_rev = self._coerce_axis_param(
-                    pulse_per_rev, 1.0, 10_000.0, "pulse_per_rev"
+                    pulse_per_rev, 1.0, PULSE_PER_REV_MAX, "pulse_per_rev"
                 )
             if gear_ratio is not None:
                 gear_ratio = self._coerce_axis_param(

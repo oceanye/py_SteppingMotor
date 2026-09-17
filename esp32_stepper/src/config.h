@@ -20,7 +20,7 @@
 
 #define NUM_AXES 2
 
-// ── 步进（PUL / DIR 每轴一对）──
+// ── 步进（STEP / DIR 每轴一对；PIN_STEP_PUL_* 名称为协议兼容保留）──
 #define PIN_STEP_PUL_0     5
 #define PIN_STEP_DIR_0     6
 #define PIN_STEP_PUL_1     7
@@ -59,14 +59,14 @@
 #endif  // DRIVE_MODE_FOC
 
 // ============================================================
-// GEAR 模式（六路 DM422/DM442 + 两路闭环 DRV8871 + 一路轨道 D）
+// GEAR 模式（六路 MKS TMC2209 V2.0 + 两路闭环 DRV8871 + 一路轨道 D）
 // ============================================================
 #if defined(DRIVE_MODE_GEAR)
 
-#define NUM_AXES 6          // 步进轴数（6 × DM422）
+#define NUM_AXES 6          // 步进轴数（6 × TMC2209，独立 STEP/DIR 模式）
 #define NUM_GEAR_AXES 2     // GEAR 减速电机轴数（DRV8871，不变）
 
-// ── 步进（PUL/DIR 每轴一对）──
+// ── 步进（STEP/DIR 每轴一对；PIN_STEP_PUL_* 名称为协议兼容保留）──
 #define PIN_STEP_PUL_0     5
 #define PIN_STEP_DIR_0     6
 #define PIN_STEP_PUL_1     7
@@ -79,6 +79,17 @@
 #define PIN_STEP_DIR_4    10
 #define PIN_STEP_PUL_5    38
 #define PIN_STEP_DIR_5    39
+
+// ── TMC2209 共用 EN（低有效）──
+// 调试接线：四块 MKS TMC2209 的 EN 并联到 GPIO36，并用一只 10k 电阻上拉到 3V3。
+// 固件启动时先拉高禁用，所有 STEP/DIR 初始化完成后再拉低统一使能。
+// GPIO36 原为未启用的 GEAR nFAULT_0 预留脚，二者不能同时使用。
+#ifndef STEPPER_SHARED_ENABLE_ENABLED
+  #define STEPPER_SHARED_ENABLE_ENABLED  1
+#endif
+#ifndef PIN_STEPPER_SHARED_ENABLE
+  #define PIN_STEPPER_SHARED_ENABLE      36
+#endif
 
 // ── 减速电机 axis 0（已接好，2026-05-22 调通） ──
 // 物理上 ESP32 GPIO 11 → DRV8871 IN1，GPIO 16 → DRV8871 IN2。
@@ -128,7 +139,7 @@
 // RS485 或其他占用这两个 GPIO 的模块。长线 I2C 易受电机噪声干扰，应使用短线、
 // 合理上拉、共地，必要时降低时钟或采用差分 I2C 延长器。
 #define STEPPER_ENCODER_DIAGNOSTICS_ENABLED  0  // 编码器尚未安装；安装后显式改为 1
-#define STEPPER_ENCODER_CLOSED_LOOP_ENABLED  0  // 预留；当前 DM442 始终原生 PUL/DIR 开环
+#define STEPPER_ENCODER_CLOSED_LOOP_ENABLED  0  // 预留；当前 TMC2209 始终原生 STEP/DIR 开环
 #define NUM_STEPPER_ENCODERS                  6
 #define PIN_STEPPER_ENCODER_I2C_SDA          42
 #define PIN_STEPPER_ENCODER_I2C_SCL          47
@@ -143,11 +154,11 @@
 #define STEPPER_ENCODER_TASK_PRIORITY          1
 #define STEPPER_ENCODER_TASK_CORE              0
 
-// PCF8575 仅预留地址和未来诊断入口；当前 DIR/PUL 路径绝不经过 PCF8575。
+// PCF8575 仅预留地址和未来诊断入口；当前 DIR/STEP 路径绝不经过 PCF8575。
 #define PCF8575_DIAGNOSTICS_ENABLED           0
 #define PCF8575_I2C_ADDR                    0x20
 #if STEPPER_ENCODER_CLOSED_LOOP_ENABLED
-  #error "Closed-loop DM442 control is not implemented; keep PUL/DIR open-loop"
+  #error "Closed-loop TMC2209 control is not implemented; keep STEP/DIR open-loop"
 #endif
 
 // Optional RS485 master for six Raspberry Pi Pico (RP2040) stepper nodes.
@@ -187,6 +198,9 @@
 #define GEAR_NFAULT_ENABLED     0
 #define PIN_GEAR_NFAULT_0       36
 #define PIN_GEAR_NFAULT_1       37
+#if STEPPER_SHARED_ENABLE_ENABLED && GEAR_NFAULT_ENABLED
+  #error "GPIO36 conflict: shared TMC2209 EN and GEAR nFAULT cannot both be enabled"
+#endif
 
 // ── 编码器换算 ──
 #define GEAR_RATIO_DEFAULT      1000.0f                  // N20 1000:1

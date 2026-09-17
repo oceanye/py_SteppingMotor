@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>接线检查表 · 6×DM422/DM442 + 2×GEAR + 轨道 D</title>
+<title>接线检查表 · 6×TMC2209 + 2×GEAR + 轨道 D</title>
 <style>
   * { box-sizing: border-box; }
   :root {
@@ -59,11 +59,11 @@
 </head>
 <body>
 
-<h1>接线检查表 · ESP32-S3 + 6×DM422/DM442 + 2×GEAR + 轨道 D</h1>
+<h1>接线检查表 · ESP32-S3 + 6×MKS TMC2209 V2.0 + 2×GEAR + 轨道 D</h1>
 <p class="small">对应 <code>esp32s3_gear</code> / <code>DRIVE_MODE_GEAR</code> · 固件引脚源：<code>esp32_stepper/src/config.h</code> · PCB 接口源：<code>pcb/README.md</code></p>
 
 <div class="legend">
-  <span class="p24">DM 驱动专用 24V（板外）</span>
+  <span class="p24">TMC VM 电源（板外）</span>
   <span class="pvm">VM_MOTOR（按电机额定电压）</span>
   <span class="p33">3.3V 逻辑</span>
   <span class="pgnd">公共 GND</span>
@@ -75,7 +75,7 @@
 </div>
 
 <div class="danger">
-<strong>DM422/DM442 的 24V 绝不进入模块化 PCB，也绝不接到 N20、轨道 D 电机或 DRV8871。</strong>六套 DM 驱动的 24V 必须由板外、额定电流足够且带保险的成品分配模块供电。三块 DRV8871 只接独立的 <code>VM_MOTOR</code> 低压电源；VM 电压以实际电机和模块额定值为准，不再假定固定 12V。
+<strong>TMC2209 的 VM、线圈输出和电机电流绝不进入当前模块化 PCB，也绝不接到 N20、轨道 D 电机或 DRV8871。</strong>每块 TMC2209 必须安装到带端子、本地至少 100 µF 储能电容和散热的外置 StepStick 适配板。三块 DRV8871 只接独立的 <code>VM_MOTOR</code> 低压电源。
 </div>
 
 <h2>1. 当前系统与电源拓扑</h2>
@@ -83,17 +83,17 @@
 <pre class="diagram">
 PC / 台式机 USB
   └── ESP32-S3 DevKitC-1
-        └── 模块化 PCB：6 路 PUL/DIR、2 路 GEAR、轨道 D、AUX
+        └── 模块化 PCB：6 路 STEP/DIR/VIO、2 路 GEAR、轨道 D、AUX
 
-DM 专用 24V 电源
-  └── 板外带保险的成品 24V 分配模块
-        ├── DM422/DM442 #0  V+ / V-
-        ├── DM422/DM442 #1  V+ / V-
-        ├── DM422/DM442 #2  V+ / V-
-        ├── DM422/DM442 #3  V+ / V-
-        ├── DM422/DM442 #4  V+ / V-
-        └── DM422/DM442 #5  V+ / V-
-             （24V 不进入模块化 PCB）
+TMC 电机电源（按电机与回灌峰值选型）
+  └── 板外带保险的电源分配模块
+        ├── TMC2209 适配板 #0  VM / GND / 线圈
+        ├── TMC2209 适配板 #1  VM / GND / 线圈
+        ├── TMC2209 适配板 #2  VM / GND / 线圈
+        ├── TMC2209 适配板 #3  VM / GND / 线圈
+        ├── TMC2209 适配板 #4  VM / GND / 线圈
+        └── TMC2209 适配板 #5  VM / GND / 线圈
+             （VM 与线圈不进入模块化 PCB）
 
 独立低压电机电源（电压按 N20 / 轨道 D 实物铭牌）
   └── PCB J_VM_IN：VM_MOTOR / GND
@@ -101,15 +101,15 @@ DM 专用 24V 电源
         ├── U_DRV1：闭环 GEAR 1 的 DRV8871 成品模块
         └── U_DRVD：轨道 D 的第 3 块 DRV8871 成品模块
 
-可选后装编码器（当前 DNP，六路 DM 仍开环）
+可选后装编码器（当前 DNP，六路 TMC 仍开环）
   └── GPIO42/47 I²C
         ├── U_I2CMUX：TCA9548A @ 0x70
         │     └── CH0～CH5：AS5600 #0～#5 @ 0x36
         └── U_IOEXP：PCF8575 @ 0x20（仅低速逻辑预留）
 
 公共 GND 汇合：
-  ESP32 GND ─ PCB GND 平面 ─ DM 24V 负极 ─ VM_MOTOR 负极
-             ├─ 6×DM 的 PUL-/DIR-
+  ESP32 GND ─ PCB GND 平面 ─ TMC VM 负极 ─ VM_MOTOR 负极
+             ├─ 6×TMC 逻辑 GND
              ├─ 3×DRV8871 GND
              ├─ 2×编码器 GND
              └─ AUX / RS485 GND
@@ -123,12 +123,12 @@ DM 专用 24V 电源
 
 <table class="pin-table">
   <tr><th>功能组</th><th>GPIO</th><th>方向</th><th>PCB / 模块去向</th></tr>
-  <tr><td>DM #0 PUL / DIR</td><td class="gpio">5 / 6</td><td>OUT</td><td>J_DM0_SIG → PUL+ / DIR+</td></tr>
-  <tr><td>DM #1 PUL / DIR</td><td class="gpio">7 / 15</td><td>OUT</td><td>J_DM1_SIG → PUL+ / DIR+</td></tr>
-  <tr><td>DM #2 PUL / DIR</td><td class="gpio">1 / 2</td><td>OUT</td><td>J_DM2_SIG → PUL+ / DIR+</td></tr>
-  <tr><td>DM #3 PUL / DIR</td><td class="gpio">4 / 8</td><td>OUT</td><td>J_DM3_SIG → PUL+ / DIR+</td></tr>
-  <tr><td>DM #4 PUL / DIR</td><td class="gpio">9 / 10</td><td>OUT</td><td>J_DM4_SIG → PUL+ / DIR+</td></tr>
-  <tr><td>DM #5 PUL / DIR</td><td class="gpio">38 / 39</td><td>OUT</td><td>J_DM5_SIG → PUL+ / DIR+</td></tr>
+  <tr><td>TMC #0 STEP / DIR</td><td class="gpio">5 / 6</td><td>OUT</td><td>J_TMC0_SIG → STEP / DIR</td></tr>
+  <tr><td>TMC #1 STEP / DIR</td><td class="gpio">7 / 15</td><td>OUT</td><td>J_TMC1_SIG → STEP / DIR</td></tr>
+  <tr><td>TMC #2 STEP / DIR</td><td class="gpio">1 / 2</td><td>OUT</td><td>J_TMC2_SIG → STEP / DIR</td></tr>
+  <tr><td>TMC #3 STEP / DIR</td><td class="gpio">4 / 8</td><td>OUT</td><td>J_TMC3_SIG → STEP / DIR</td></tr>
+  <tr><td>TMC #4 STEP / DIR</td><td class="gpio">9 / 10</td><td>OUT</td><td>J_TMC4_SIG → STEP / DIR</td></tr>
+  <tr><td>TMC #5 STEP / DIR</td><td class="gpio">38 / 39</td><td>OUT</td><td>J_TMC5_SIG → STEP / DIR</td></tr>
   <tr><td>GEAR 0 实体 IN1 / IN2</td><td class="gpio">11 / 16</td><td>OUT PWM</td><td>U_DRV0 → DRV8871 IN1 / IN2</td></tr>
   <tr><td>GEAR 0 实体 ENC A(C1) / B(C2)</td><td class="gpio">18 / 21</td><td>IN PCNT</td><td>J_ENC0 → A / B</td></tr>
   <tr><td>GEAR 1 实体 IN1 / IN2</td><td class="gpio">12 / 17</td><td>OUT PWM</td><td>U_DRV1 → DRV8871 IN1 / IN2</td></tr>
@@ -143,34 +143,34 @@ DM 专用 24V 电源
 GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pico/RP2040 UART、低速 I²C 或 RS485 扩展预留，三种用途只能选一种；当前固件尚未启用该接口。部分 ESP32-S3 DevKit 版本用 GPIO48 驱动板载 RGB LED，正式启用 DE 前必须核对实物版本。
 </div>
 
-<h2>3. 六套 DM422 / DM442 接线</h2>
+<h2>3. 六套 MKS TMC2209 V2.0 接线</h2>
 
-<p>模块化 PCB 上 <code>J_DM0_SIG</code> 到 <code>J_DM5_SIG</code> 的端子顺序完全相同：</p>
+<p>模块化 PCB 上 <code>J_TMC0_SIG</code> 到 <code>J_TMC5_SIG</code> 的端子顺序完全相同：</p>
 
 <table>
-  <tr><th>PCB 端子 Pin</th><th>信号</th><th>接 DM 驱动端子</th><th>说明</th></tr>
-  <tr><td>1</td><td>对应轴 GPIO PUL</td><td>PUL+</td><td>脉冲正端</td></tr>
-  <tr><td>2</td><td>GND</td><td>PUL-</td><td class="gnd">公共地</td></tr>
-  <tr><td>3</td><td>对应轴 GPIO DIR</td><td>DIR+</td><td>方向正端</td></tr>
-  <tr><td>4</td><td>GND</td><td>DIR-</td><td class="gnd">公共地</td></tr>
+  <tr><th>PCB 端子 Pin</th><th>信号</th><th>接外置 TMC 适配板</th><th>说明</th></tr>
+  <tr><td>1</td><td>对应轴 GPIO STEP</td><td>STEP</td><td>上升沿计步</td></tr>
+  <tr><td>2</td><td>对应轴 GPIO DIR</td><td>DIR</td><td>方向</td></tr>
+  <tr><td>3</td><td>3V3</td><td>3.3-5V / VIO</td><td class="power3v3">只供逻辑，不接 VM</td></tr>
+  <tr><td>4</td><td>GND</td><td>GND</td><td class="gnd">逻辑与 VM− 公共参考</td></tr>
 </table>
 
 <table class="pin-table">
-  <tr><th>轴</th><th>PCB 接口</th><th>PUL+</th><th>DIR+</th><th>24V 供电</th></tr>
-  <tr><td>0</td><td>J_DM0_SIG</td><td class="gpio">GPIO5</td><td class="gpio">GPIO6</td><td rowspan="6" class="power24">板外带保险分配模块 → 各 DM 的 V+/V-；不得经过 PCB</td></tr>
-  <tr><td>1</td><td>J_DM1_SIG</td><td class="gpio">GPIO7</td><td class="gpio">GPIO15</td></tr>
-  <tr><td>2</td><td>J_DM2_SIG</td><td class="gpio">GPIO1</td><td class="gpio">GPIO2</td></tr>
-  <tr><td>3</td><td>J_DM3_SIG</td><td class="gpio">GPIO4</td><td class="gpio">GPIO8</td></tr>
-  <tr><td>4</td><td>J_DM4_SIG</td><td class="gpio">GPIO9</td><td class="gpio">GPIO10</td></tr>
-  <tr><td>5</td><td>J_DM5_SIG</td><td class="gpio">GPIO38</td><td class="gpio">GPIO39</td></tr>
+  <tr><th>轴</th><th>PCB 接口</th><th>STEP</th><th>DIR</th><th>VM / 线圈</th></tr>
+  <tr><td>0</td><td>J_TMC0_SIG</td><td class="gpio">GPIO5</td><td class="gpio">GPIO6</td><td rowspan="6" class="power24">板外带保险分配 → 各 TMC 适配板；不得经过当前 PCB</td></tr>
+  <tr><td>1</td><td>J_TMC1_SIG</td><td class="gpio">GPIO7</td><td class="gpio">GPIO15</td></tr>
+  <tr><td>2</td><td>J_TMC2_SIG</td><td class="gpio">GPIO1</td><td class="gpio">GPIO2</td></tr>
+  <tr><td>3</td><td>J_TMC3_SIG</td><td class="gpio">GPIO4</td><td class="gpio">GPIO8</td></tr>
+  <tr><td>4</td><td>J_TMC4_SIG</td><td class="gpio">GPIO9</td><td class="gpio">GPIO10</td></tr>
+  <tr><td>5</td><td>J_TMC5_SIG</td><td class="gpio">GPIO38</td><td class="gpio">GPIO39</td></tr>
 </table>
 
 <ul class="checklist">
-  <li>每套驱动器的 V+/V- 名称、允许电压和拨码电流以实物 DM422/DM442 手册为准。</li>
-  <li>六路 24V 支路分别有合适的保险或可复位保护，分配模块和线径满足总电流。</li>
-  <li>每套 DM 的 PUL-、DIR- 与 PCB GND 连通；不要把 PUL-/DIR- 接到 24V+。</li>
-  <li>A+/A-/B+/B- 只接对应步进电机绕组，先用万用表找出两组线圈。</li>
-  <li><strong>ENA+ 悬空不接</strong>（每轴只需 PUL+ 和 DIR+ 两根信号到 ESP32）；DM422/DM442 默认使能驱动。不要把 EN+/EN- 随意同时接地。</li>
+  <li><code>MS1=MS2=GND</code> 固定为 1/8 输入微步；200 整步/转电机在 GUI 中填写 1600 脉冲/转。</li>
+  <li><code>EN</code> 低有效，本阶段在适配板侧处理；软件急停不会切断线圈电流。</li>
+  <li>每块模块 VM 附近至少 100 µF，并有合适的保险、陶瓷去耦、散热与浪涌抑制。</li>
+  <li>先用万用表找出两组线圈，再按模块实物丝印/原理图接 1A/1B/2A/2B。</li>
+  <li>按电机额定相电流设 VREF；先单轴、低电流、低速、机构卸载测试温升和方向。</li>
 </ul>
 
 <h2>4. 两路闭环 GEAR（DRV8871 + 编码器）</h2>
@@ -190,7 +190,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
   <tr><td>实体 IN1</td><td class="gpio">GPIO11</td><td>PWM；固件逻辑名 PIN_GEAR_IN2_0</td></tr>
   <tr><td>实体 IN2</td><td class="gpio">GPIO16</td><td>PWM；固件逻辑名 PIN_GEAR_IN1_0</td></tr>
   <tr><td>Motor+ / Motor-</td><td>N20 / GEAR 0 电机两线</td><td>接模块自带电机端子，不绕回 PCB</td></tr>
-  <tr><td>额定电压</td><td>以实际 N20 铭牌为准</td><td class="danger-cell">不是固定 12V，更不是 DM 24V</td></tr>
+  <tr><td>额定电压</td><td>以实际 N20 铭牌为准</td><td class="danger-cell">不是固定 12V，也不是 TMC 的 VM 电源</td></tr>
   <tr><td rowspan="6">GEAR 1<br>U_DRV1</td><td>VM</td><td>VM_MOTOR</td><td class="powervm">与 U_DRV0 共用独立低压源</td></tr>
   <tr><td>GND</td><td>公共 GND</td><td class="gnd">必须连接</td></tr>
   <tr><td>实体 IN1</td><td class="gpio">GPIO12</td><td>PWM；固件逻辑名 PIN_GEAR_IN2_1</td></tr>
@@ -233,7 +233,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
 <table>
   <tr><th>位号</th><th>模块 / 端子</th><th>用途</th><th>装配前核对</th></tr>
   <tr><td>U1</td><td>ESP32-S3 DevKitC-1 2×22P</td><td>主控制器模块</td><td>版本、22.86 mm 排距、天线/USB 方向</td></tr>
-  <tr><td>J_DM0_SIG…J_DM5_SIG</td><td>4P 5.08 mm</td><td>六路 DM PUL/DIR</td><td>P+/P-/D+/D- 顺序与端子进线方向</td></tr>
+  <tr><td>J_TMC0_SIG…J_TMC5_SIG</td><td>4P 5.08 mm</td><td>六路 TMC STEP/DIR/VIO</td><td>STEP/DIR/3V3/GND 顺序与端子进线方向</td></tr>
   <tr><td>U_DRV0 / U_DRV1</td><td>DRV8871 成品模块</td><td>两路闭环 GEAR</td><td>外形、孔位、VM/GND/IN2/IN1 实际顺序</td></tr>
   <tr><td>U_DRVD</td><td>DRV8871 成品模块</td><td>轨道 D</td><td>同上，且核对电机额定电压</td></tr>
   <tr><td>J_ENC0 / J_ENC1</td><td>4P 5.08 mm</td><td>3V3/GND/A/B</td><td>编码器电平和线色，不要凭线色直接接</td></tr>
@@ -241,7 +241,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
   <tr><td>J_AS0…J_AS5</td><td>4P 5.08 mm / DNP</td><td>3V3/GND/SDAx/SCLx</td><td>AS5600 模块针序、磁铁同轴安装和短线抗干扰</td></tr>
   <tr><td>U_IOEXP</td><td>PCF8575 成品模块 MOCK / DNP</td><td>未来 DIR/ENA 低速逻辑预留</td><td>实测尺寸、针序、0x20 地址、上电状态和 3.3V 上拉</td></tr>
   <tr><td>J_PCF_DIR / J_PCF_ENA / J_PCF_RSVD</td><td>PCF raw logic / DNP</td><td>P0-P15/INT 引出</td><td class="danger-cell">不直连 DM；先选型并验证成品开集电极/ULN/隔离缓冲模块</td></tr>
-  <tr><td>J_VM_IN</td><td>2P 5.08 mm</td><td>VM_MOTOR/GND</td><td class="danger-cell">只接低压电机源，不接 DM 24V</td></tr>
+  <tr><td>J_VM_IN</td><td>2P 5.08 mm</td><td>VM_MOTOR/GND</td><td class="danger-cell">只接低压直流电机源，不接 TMC VM</td></tr>
   <tr><td>J_AUX_UART</td><td>1×6P 2.54 mm</td><td>Pico/RP2040 UART 或低速 I²C 预留</td><td>5V/3V3/GND/TX-SDA42/RX-SCL47/DE48</td></tr>
   <tr><td>U_RS485</td><td>3.3V RS485 成品模块 MOCK</td><td>可选 UART-RS485</td><td>实物 footprint、3.3V 兼容、A/B 定义</td></tr>
   <tr><td>J_RS485</td><td>3P 5.08 mm</td><td>A/B/GND</td><td>A/B 极性及总线终端配置</td></tr>
@@ -262,7 +262,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
 <ul class="checklist">
   <li>Pico/RP2040 UART 使用 3.3V 逻辑电平，TX 与 RX 交叉连接，双方 GND 必须连接。</li>
   <li>编码器模式使用 TCA9548A 隔离 6 个固定地址 0x36 的 AS5600；PCF8575 不能代替 TCA9548A。</li>
-  <li>PCF8575 只用于 DIR、ENA、限位等低速扩展，不用 GPIO 扩展器实时生成 PUL，当前也不接管原生 DIR。</li>
+  <li>PCF8575 只用于 DIR、EN、限位等低速扩展，不用 GPIO 扩展器实时生成 STEP，当前也不接管原生 DIR。</li>
   <li>外部 Pico 同时接自己的 USB 时，不再从 J_AUX_UART 的 5V_USB 反向供电；只保留一种供电路径。</li>
   <li>直接 TTL UART、编码器/PCF I²C 与 U_RS485 共用 GPIO42/47，正常装配三选一；TCA 与 PCF 可在同一 I²C 模式内并存。</li>
   <li>U_RS485 只装 3.3V 逻辑兼容的成品模块；A/B/GND 从 J_RS485 出板。</li>
@@ -275,8 +275,8 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
 
 <ul class="checklist">
   <li>ESP32 / 模块化 PCB 的 GND。</li>
-  <li>DM 专用 24V 电源负极及板外保险分配模块负极。</li>
-  <li>六套 DM422/DM442 的 V-、PUL- 和 DIR-。</li>
+  <li>TMC VM 电源负极及板外保险分配模块负极。</li>
+  <li>六套 TMC2209 适配板的 VM− 与逻辑 GND。</li>
   <li>VM_MOTOR 独立低压电源负极。</li>
   <li>U_DRV0、U_DRV1、U_DRVD 的 GND。</li>
   <li>J_ENC0、J_ENC1 的 GND。</li>
@@ -300,22 +300,22 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
 
 <h3>断电电气核对</h3>
 <ul class="checklist">
-  <li>DM 24V+ 只到板外 DM 驱动分配，不进入 PCB 的任何端子。</li>
+  <li>TMC VM+ 只到板外 TMC 适配板，不进入 PCB 的任何端子。</li>
   <li>J_VM_IN 正端只接实际电机允许的 VM 电压，不与 24V+、5V_USB、3V3 连通。</li>
-  <li>公共 GND 全部连通；每个 DM 的 PUL-/DIR- 均到 GND。</li>
+  <li>公共 GND 全部连通；每个 TMC 的逻辑 GND 与 VM− 同参考。</li>
   <li>3V3 ↔ GND、5V_USB ↔ GND、VM_MOTOR ↔ GND 均无明显短路。</li>
-  <li>六组 PUL/DIR、两组编码器、三块 DRV 的 GPIO 与 §2 完全一致。</li>
+  <li>六组 STEP/DIR、两组编码器、三块 DRV 的 GPIO 与 §2 完全一致。</li>
   <li>轨道 D 明确为 GPIO40/41；AUX 明确为 GPIO42/47/48。</li>
 </ul>
 
 <h2>10. 安全上电顺序</h2>
 
 <ol>
-  <li>架空所有机械负载或确保运动范围无人、无线束和硬限位碰撞；准备可立即切断 DM 24V 与 VM_MOTOR 的物理开关。</li>
-  <li>保持 DM 24V 和 VM_MOTOR 关闭，先给 ESP32 接 USB。</li>
+  <li>架空所有机械负载或确保运动范围无人、无线束和硬限位碰撞；准备可立即切断 TMC VM 与 VM_MOTOR 的物理开关。</li>
+  <li>保持 TMC VM 和 VM_MOTOR 关闭，先给 ESP32 接 USB。</li>
   <li>连接 PC GUI / 网页服务后立即执行全局停止，确认固件处于 <code>GEAR</code> 模式且没有待执行命令。</li>
   <li>先开启 VM_MOTOR，确认三块 DRV8871 与电机都静止、无发热和异常电流。</li>
-  <li>再开启板外 DM 专用 24V，确认六套驱动器状态正常且步进电机没有意外运动。</li>
+  <li>再开启板外 TMC VM，确认六套驱动器无过温/故障且步进电机没有意外运动。</li>
   <li>首次仅用最低合理速度/占空比，逐轴点动；一次只验证一个执行器。</li>
   <li>最后验证轨道 D 前进、停止、后退及租约超时停止，不要从高速直接反向。</li>
 </ol>
@@ -323,7 +323,7 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
 <h2>11. 首次逐项验证清单</h2>
 
 <ul class="checklist">
-  <li>DM #0～#5 逐轴短距离前进/后退，方向与机械定义一致。</li>
+  <li>TMC #0～#5 逐轴短距离前进/后退，方向与机械定义一致。</li>
   <li>任意步进运动中发送 STOP，实际停止位置不会被当作完整目标位置。</li>
   <li>发送 <code>ESTOP</code>，确认收到唯一响应 <code>OK,ESTOP</code>，全部步进/轨道停止且两路闭环失能。</li>
   <li>硬件急停（GPIO35，默认禁用）：安装常闭 NC 回路后烧录 <code>esp32s3_gear_hwestop</code>。安全态 GPIO35↔GND 导通为低；按下或断线后变高，应上报 <code>HWESTOP,TRIGGERED</code>、停止全部输出并拒绝新的运动命令。回路恢复后应上报 <code>HWESTOP,CLEARED</code>，且不自动恢复运动。该机制是软件急停，仍需独立的切断电机功率的硬件断电急停按钮。</li>
@@ -341,8 +341,8 @@ GPIO40/41 已分配给轨道 D，不是空闲引脚。GPIO42/47/48 是未来 Pic
 
 <table>
   <tr><th>现象</th><th>优先检查</th><th>处理</th></tr>
-  <tr><td>DM 有锁力但不转（运动时 24V 电流不增）</td><td>信号线接触不良、PUL-/DIR- 未共地、PUL/DIR 轴号接错、拨码或脉宽</td><td>断电按 §3 逐线核对；<strong>拔插 PUL+/DIR+ 信号线排除接触不良</strong>（R 轴曾因此误判驱动器损坏）；万用表测 GPIO 端有 3.3V 翻转即 ESP32 正常，病根在 DM 侧回路</td></tr>
-  <tr><td>某两路 DM 同时异常</td><td>是否把 6 轴旧图当成双轴图接线</td><td>按 GPIO 5/6、7/15、1/2、4/8、9/10、38/39 重新核对</td></tr>
+  <tr><td>TMC 有锁力但不转</td><td>STEP/DIR/GND 接错、EN 状态、线圈配对错误、VREF 过低或过温保护</td><td>断电按 §3 逐线核对；先用万用表确认两组线圈，再用示波器/逻辑分析仪确认 STEP 边沿与 DIR 电平</td></tr>
+  <tr><td>某两路 TMC 同时异常</td><td>是否把 6 轴旧图或旧 DM 四针顺序继续使用</td><td>确认已换成 STEP/DIR/3V3/GND，并按 GPIO 5/6、7/15、1/2、4/8、9/10、38/39 重新核对</td></tr>
   <tr><td>DRV8871 / N20 发热</td><td>VM_MOTOR 电压过高、堵转、模块 pin 顺序错误</td><td>立刻切断 VM，按铭牌和实物模块资料检查</td></tr>
   <tr><td>GEAR 使能后 runaway</td><td>编码器 A/B 或电机方向反、编码器无计数</td><td>切断 VM 后检查 A/B；低输出重新验证闭环方向</td></tr>
   <tr><td>轨道 D 不动</td><td>GPIO40/41、U_DRVD IN1/IN2、租约是否有效</td><td>核对第三块模块，不要误接到 AUX 42/47</td></tr>

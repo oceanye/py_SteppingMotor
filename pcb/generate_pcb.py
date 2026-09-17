@@ -6,7 +6,7 @@ This file is the design's single source of truth.  The PCB is strictly a
 carrier for complete ready-made modules: use pin headers/sockets by default,
 or a module-specific castellated-pad footprint only when that module actually
 has castellated edges.  It must not recreate ESP32, DRV8871, TCA9548A,
-PCF8575, AS5600, DM422 or RS485 circuitry from individual ICs.
+PCF8575, AS5600, TMC2209 or RS485 circuitry from individual ICs.
 
 All dimensions that still depend on the user's physical modules are grouped in
 MODULE_GEOMETRY below.  Replace those values (and only the associated footprint
@@ -307,22 +307,23 @@ pcb.footprint(
     ),
 )
 
-# Six external DM422 drivers: signals only.  Their 24 V motor supply must use a
-# separate fused distribution module/wiring block; no +24 V enters this PCB.
-DM_CONNECTOR_X = [6.0, 35.0, 64.0, 93.0, 122.0, 151.0]
-DM_CONNECTOR_Y = 10.0
-DM_DEST = {}
-for axis, x in enumerate(DM_CONNECTOR_X):
+# Six external MKS TMC2209 StepStick adapter boards: low-current logic only.
+# VM, motor coils, EN/MS straps, local >=100 uF bulk capacitance and cooling
+# stay on each external adapter; motor supply never enters this carrier.
+TMC_CONNECTOR_X = [6.0, 35.0, 64.0, 93.0, 122.0, 151.0]
+TMC_CONNECTOR_Y = 10.0
+TMC_DEST = {}
+for axis, x in enumerate(TMC_CONNECTOR_X):
     pul, direction = STEPPER_PINS[axis]
     terminal(
-        f"J_DM{axis}_SIG",
-        f"DM422 #{axis} PUL+/PUL-/DIR+/DIR-",
-        (x, DM_CONNECTOR_Y),
-        [gpio_net(pul), "GND", gpio_net(direction), "GND"],
+        f"J_TMC{axis}_SIG",
+        f"TMC2209 #{axis} STEP/DIR/VIO/GND",
+        (x, TMC_CONNECTOR_Y),
+        [gpio_net(pul), gpio_net(direction), "3V3", "GND"],
     )
-    DM_DEST[(axis, "PUL")] = (x, DM_CONNECTOR_Y)
-    DM_DEST[(axis, "DIR")] = (x + 2 * 5.08, DM_CONNECTOR_Y)
-    pcb.text(f"DM{axis}  P+ P- D+ D-", (x + 7.62, 4.2), 0.75, justify="center")
+    TMC_DEST[(axis, "STEP")] = (x, TMC_CONNECTOR_Y)
+    TMC_DEST[(axis, "DIR")] = (x + 5.08, TMC_CONNECTOR_Y)
+    pcb.text(f"TMC{axis} STEP DIR 3V3 GND", (x + 7.62, 4.2), 0.68, justify="center")
 
 
 DRV_AT = [(73.0, 57.0), (108.0, 57.0), (143.0, 57.0)]
@@ -365,10 +366,10 @@ for index, (at, ref, label, (in2, in1)) in enumerate(zip(DRV_AT, DRV_REFS, DRV_L
     pcb.text("1 VM  2 GND  3 IN2  4 IN1", (at[0] + 10, at[1] + 20.5), 0.65, justify="center")
 
 # A separate low-voltage source powers all three DRV8871 modules.  It is never
-# connected to the external DM422 24 V supply on this board.
+# connected to the external TMC2209 motor supply on this board.
 terminal("J_VM_IN", "N20/TRACK LOW-VOLTAGE VM INPUT", (155.0, 110.0), ["VM_MOTOR", "GND"])
 pcb.text("LOW-VOLTAGE VM ONLY", (160.1, 104.5), 0.85, justify="center")
-pcb.text("DO NOT CONNECT DM422 24V", (160.1, 101.7), 0.7, justify="center")
+pcb.text("DO NOT CONNECT TMC VM", (160.1, 101.7), 0.7, justify="center")
 
 # Two encoder connectors for the two closed-loop GEAR axes.
 ENC_AT = [(72.0, 90.0), (107.0, 90.0)]
@@ -473,7 +474,7 @@ pcb.text("HOST: 3V3 G SDA42 SCL47 RST A0 A1 A2", (87.0, 151.5), 0.62, justify="c
 
 # Optional ready-made PCF8575 module on the same 3.3 V I2C bus.  Its
 # quasi-bidirectional pins are logic-only reservations: they are deliberately
-# NOT wired to DM optocoupler inputs.  A measured/verified ready-made
+# NOT wired to TMC inputs.  A measured/verified ready-made
 # open-collector or ULN-type buffer stage is required before field use.
 PCF_AT = (120.0, 120.0)
 pcf_cfg = MODULE_GEOMETRY["pcf8575_module"]
@@ -539,7 +540,7 @@ logic_header("J_PCF_RSVD", "PCF RESERVED: 3V3 G P12..P15 INT", PCF_RESERVED_HEAD
 pcb.text("PCF RAW LOGIC ONLY - EXTERNAL BUFFER REQUIRED", (130.0, 182.0), 0.66, justify="center")
 
 # One connector per external AS5600 module: 3V3/GND/SDAx/SCLx.
-AS_CONNECTOR_X = DM_CONNECTOR_X
+AS_CONNECTOR_X = TMC_CONNECTOR_X
 AS_CONNECTOR_Y = 200.0
 AS_DEST = {}
 for channel, x in enumerate(AS_CONNECTOR_X):
@@ -594,10 +595,10 @@ def routed_signal(net, source, destination, lane_y=None, destination_escape_x=No
     route_index += 1
 
 
-# 6 x PUL/DIR.
+# 6 x STEP/DIR.
 for axis, (pul, direction) in enumerate(STEPPER_PINS):
-    routed_signal(gpio_net(pul), GPIO_PAD[pul], DM_DEST[(axis, "PUL")])
-    routed_signal(gpio_net(direction), GPIO_PAD[direction], DM_DEST[(axis, "DIR")])
+    routed_signal(gpio_net(pul), GPIO_PAD[pul], TMC_DEST[(axis, "STEP")])
+    routed_signal(gpio_net(direction), GPIO_PAD[direction], TMC_DEST[(axis, "DIR")])
 
 # 2 x closed-loop GEAR motor inputs and encoders.
 for axis, pins in enumerate(GEAR_PINS):
@@ -649,11 +650,20 @@ pcb.segment("VM_MOTOR", "B.Cu", MOTOR_PWR_W, (73.0, 98.0), (155.0, 98.0))
 for at in DRV_AT:
     pcb.segment("VM_MOTOR", "B.Cu", MOTOR_PWR_W, (at[0], 98.0), (at[0], at[1]))
 
-# 3V3 distribution to both encoders, UART header and RS485 module.
+# 3V3 distribution to TMC VIO, both encoders, UART header and RS485 module.
 v33_source = devkit_pad("L", 1)
 pcb.segment("3V3", "B.Cu", LOGIC_PWR_W, v33_source, (39.0, v33_source[1]))
 pcb.segment("3V3", "B.Cu", LOGIC_PWR_W, (39.0, v33_source[1]), (39.0, 93.0))
 pcb.segment("3V3", "B.Cu", LOGIC_PWR_W, (39.0, 93.0), (107.0, 93.0))
+# Dedicated top-edge VIO bus.  This powers only TMC logic, never VM or motors.
+tmc_vio_x = [x + 2 * 5.08 for x in TMC_CONNECTOR_X]
+pcb.via("3V3", (39.0, 93.0))
+pcb.segment("3V3", "F.Cu", LOGIC_PWR_W, (39.0, 93.0), (39.0, 14.0))
+pcb.via("3V3", (39.0, 14.0))
+pcb.segment("3V3", "B.Cu", LOGIC_PWR_W, (tmc_vio_x[0], 14.0),
+            (tmc_vio_x[-1], 14.0))
+for x in tmc_vio_x:
+    pcb.segment("3V3", "B.Cu", LOGIC_PWR_W, (x, 14.0), (x, TMC_CONNECTOR_Y))
 for x, y in ENC_AT:
     pcb.segment("3V3", "B.Cu", LOGIC_PWR_W, (x, 93.0), (x, y))
 pcb.segment("3V3", "B.Cu", LOGIC_PWR_W, (45.0 + PITCH, 93.0), (45.0 + PITCH, 110.0))
@@ -720,7 +730,7 @@ for channel in range(6):
         pcb.segment(net, "F.Cu", SIG_W, (destination[0] - 1.0, destination[1]), destination)
         as_route_index += 1
 
-# PCF8575 raw logic fanout.  No PCF net is connected to a DM connector.
+# PCF8575 raw logic fanout.  No PCF net is connected to a TMC connector.
 PCF_LOGIC_DEST = {}
 for port in range(6):
     PCF_LOGIC_DEST[port] = (PCF_DIR_HEADER_AT[0] + (port + 2) * PITCH, PCF_DIR_HEADER_AT[1])
@@ -774,12 +784,12 @@ pcb.items.append(
 )
 
 pcb.rect((0, 0), (BOARD_W, BOARD_H), "Edge.Cuts", 0.05)
-pcb.text("ESP32-S3 6xDM422 + 2xGEAR + TRACK-D MODULAR CARRIER", (90, 18.5), 1.25, justify="center")
+pcb.text("ESP32-S3 6xTMC2209 + 2xGEAR + TRACK-D MODULAR CARRIER", (90, 18.5), 1.25, justify="center")
 pcb.text("REV 2 MOCK MODULE FOOTPRINTS - MEASURE BEFORE FABRICATION", (90, 21.5), 0.78, justify="center")
 pcb.text("ESP32-S3 DEVKITC-1", (24.8, 43.0), 0.85, justify="center")
 pcb.text("ANTENNA KEEPOUT", (24.0, 51.0), 0.72, justify="center")
 pcb.text("USB END", (24.0, 104.0), 0.72, justify="center")
-pcb.text("DM422 POWER: EXTERNAL FUSED 24V DISTRIBUTION (NOT ON THIS PCB)", (90, 29.0), 0.75, justify="center")
+pcb.text("TMC2209 VM + MOTOR OUTPUTS: EXTERNAL ADAPTERS ONLY", (90, 29.0), 0.75, justify="center")
 pcb.text("DNP OPTIONS: TCA9548A + 6xAS5600 + PCF8575", (90, 187.0), 0.72, justify="center")
 pcb.text("GPIO42/47: I2C OR AUX UART/RS485 - MUTUALLY EXCLUSIVE", (90, 190.0), 0.66, justify="center")
 pcb.text("AS5600: 3V3 LOGIC ONLY - KEEP I2C CABLES SHORT", (90, 193.0), 0.66, justify="center")

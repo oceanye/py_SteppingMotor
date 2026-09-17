@@ -117,8 +117,8 @@ class GaitParams:
     swing_segments: int = 12          # S4 公转拆成的 MOVE 段数
     lift_mm: float = 10.0             # z_clear：抬足高度（轴行程单位）
     swing_speed_deg_s: float = 6.0    # 支撑侧（横梁驱动）电机速度
-    lift_speed_mm_s: float = 2.0      # 抬足速度
-    settle_speed_mm_s: float = 1.0    # 落足速度（更慢）
+    lift_speed_mm_s: float = 0.5      # TMC2209 1/8 + 1mm 导程时约 800 pps
+    settle_speed_mm_s: float = 0.3    # 落足更慢，约 480 pps
     feasibility_samples: int = 120    # 干跑碰撞校验采样密度
     # 标定：电机方向符号与基准零位（向导写入；+1 表示轴坐标增大 = q 增大）
     mr1_sign: int = 1

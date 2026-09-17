@@ -54,7 +54,9 @@ bool heartbeat_seen = false;
 PIO step_pio = pio0;
 uint step_program_offset = 0;
 
-// One state machine per axis. At 1 MHz, SET+NOP holds PUL high for 50 us.
+// One state machine per axis. At 1 MHz, SET+NOP holds STEP high for 50 us.
+// This is compatible with TMC2209 and deliberately preserves the proven pulse
+// timing used before the driver migration.
 // ISR stores the programmable low-loop count; Y stores pulses minus one.
 const uint16_t step_program_instructions[] = {
     pio_encode_pull(false, true),

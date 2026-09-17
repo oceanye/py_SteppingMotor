@@ -24,7 +24,11 @@ from motor_control import (
     NUM_PICO_NODES,
     NUM_STEPPER_AXES,
     PICO_AXES_PER_NODE,
+    PULSE_PER_REV_MAX,
     SPEED_DEFAULT,
+    STEPPER_DRIVER_DISPLAY_NAME,
+    STEPPER_DRIVER_PROFILE_ID,
+    TMC2209_DEFAULT_MICROSTEPS,
     STEPPER_PINS,
     AxisProfile,
     AxisRuntime,
@@ -105,7 +109,7 @@ NUM_AXES = NUM_STEPPER_AXES       # 向后兼容
 NUM_GEAR_AXES = NUM_MOTOR_AXES    # 向后兼容
 
 # ============== 步进标定 ==============
-# 兼容：默认 200 微步/圈 ÷ 1.0mm 导程 = 200 pulse/mm（28HD140GT81-200LR 贯通式步进）。
+# TMC2209 独立模式默认 1/8：200 整步/圈 × 8 = 1600 STEP/圈。
 PULSES_PER_MM = [DEFAULT_PULSE_PER_REV / DEFAULT_LEAD_MM] * NUM_STEPPER_AXES
 # 速度档位（单位/s：直线=mm/s, 旋转=°/s）。
 # 2026-08-21 应用户要求扩充：低速加 0.05/0.1/0.2（减速箱微动），
@@ -1252,7 +1256,7 @@ class StepperGUI:
     def _on_axis_param_change(self, axis):
         try:
             ppr = self._coerce_axis_param(
-                self.axis_ppr_var[axis].get(), 1.0, 10000.0, "脉冲/转")
+                self.axis_ppr_var[axis].get(), 1.0, PULSE_PER_REV_MAX, "脉冲/转")
             gear_ratio = self._coerce_axis_param(
                 self.axis_gr_var[axis].get(), 0.001, 1000.0, "减速比")
             lead_mm = self._coerce_axis_param(
@@ -1294,7 +1298,7 @@ class StepperGUI:
         """仅从 UI 线程调用；运动前拒绝无效或尚未输入完成的参数。"""
         if self._on_axis_param_change(axis):
             return True
-        message = (f"轴{AXIS_LABEL[axis]}参数无效：脉冲/转 1–10000，"
+        message = (f"轴{AXIS_LABEL[axis]}参数无效：脉冲/转 1–{PULSE_PER_REV_MAX:g}，"
                    "减速比 0.001–1000，导程 0.01–100")
         self.log(f"⛔ {message}")
         messagebox.showerror("轴参数无效", message)
@@ -1355,6 +1359,7 @@ class StepperGUI:
 
     def _save_axis_config(self):
         data = {
+            "driver_profile": STEPPER_DRIVER_PROFILE_ID,
             "mode": [profile.mode for profile in self.axis_profiles],
             "pulse_per_rev": [profile.pulse_per_rev for profile in self.axis_profiles],
             "gear_ratio": [profile.gear_ratio for profile in self.axis_profiles],
@@ -1373,6 +1378,17 @@ class StepperGUI:
             return
         if data is None:
             return
+        driver_profile_matches = (
+            data.get("driver_profile") == STEPPER_DRIVER_PROFILE_ID
+        )
+        if not driver_profile_matches:
+            self._axis_profile_load_fallback.update(range(NUM_STEPPER_AXES))
+            self._startup_warnings.append(
+                f"⚠️ 检测到 DM422/旧版轴配置；已保留模式、减速比和导程，"
+                f"但按 {STEPPER_DRIVER_DISPLAY_NAME} 独立模式 "
+                f"1/{TMC2209_DEFAULT_MICROSTEPS} 将脉冲/转重置为 "
+                f"{DEFAULT_PULSE_PER_REV:g}。所有位置与限位必须重新校准。"
+            )
         mode_list = data.get("mode", [])
         ppr_list = data.get("pulse_per_rev", [])
         gr_list = data.get("gear_ratio", [])
@@ -1406,10 +1422,10 @@ class StepperGUI:
                 mode = mode_list[axis]
             elif axis < len(mode_list):
                 self._axis_profile_load_fallback.add(axis)
-            if axis < len(ppr_list):
+            if driver_profile_matches and axis < len(ppr_list):
                 try:
                     ppr = self._coerce_axis_param(
-                        ppr_list[axis], 1.0, 10000.0, "脉冲/转")
+                        ppr_list[axis], 1.0, PULSE_PER_REV_MAX, "脉冲/转")
                 except (ValueError, TypeError):
                     self._axis_profile_load_fallback.add(axis)
             if axis < len(gr_list):
@@ -2541,6 +2557,7 @@ class StepperGUI:
     @staticmethod
     def _profile_metadata(profile):
         return {
+            "driver_profile": STEPPER_DRIVER_PROFILE_ID,
             "mode": profile.mode,
             "pulse_per_rev": profile.pulse_per_rev,
             "gear_ratio": profile.gear_ratio,
@@ -2552,6 +2569,8 @@ class StepperGUI:
         if not isinstance(value, dict):
             return False
         try:
+            if value["driver_profile"] != STEPPER_DRIVER_PROFILE_ID:
+                return False
             stored = AxisProfile(
                 mode=value["mode"],
                 pulse_per_rev=value["pulse_per_rev"],
@@ -2595,10 +2614,7 @@ class StepperGUI:
                 metadata = d.get("_profile")
                 profile_mismatch = (
                     a in self._axis_profile_load_fallback
-                    or (
-                        metadata is not None
-                        and not self._profile_metadata_matches(profile, metadata)
-                    )
+                    or not self._profile_metadata_matches(profile, metadata)
                 )
                 try:
                     runtime = AxisRuntime.from_legacy_units(

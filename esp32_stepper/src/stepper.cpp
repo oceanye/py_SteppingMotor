@@ -39,7 +39,8 @@ static bool valid_axis(int axis) { return axis >= 0 && axis < NUM_AXES; }
 #define STEP_RAMP_FACTOR      0.02f  // 每步延时缩减比例（越大加速越猛）
 #define STEP_PROGRESS_INTERVAL_MS 250  // 与 Pico 节点一致；限制多轴串口进度流量
 
-// 单脉冲输出：50us HIGH + 指定 LOW 延时，含周期性 yield 防饿死其他任务
+// 单脉冲输出：50us HIGH + 指定 LOW 延时。TMC2209 的 STEP 最小高/低时间
+// 远小于 50us；保持既有时序以避免换驱动时引入运动回归。
 static inline void emit_pulse(int pul, int delay_us, int* step_count, uint32_t* last_yield_ms,
                               uint32_t* last_progress_ms, int axis, int total_steps) {
   digitalWrite(pul, HIGH);
@@ -147,6 +148,13 @@ static void stepper_task(void* arg) {
 }
 
 void stepper_init() {
+#if defined(DRIVE_MODE_GEAR) && STEPPER_SHARED_ENABLE_ENABLED
+  // Preload HIGH before switching to OUTPUT so the active-low TMC2209 EN line
+  // never receives a deliberate low glitch during GPIO initialization.  The
+  // external 10k pull-up keeps the drivers disabled during reset/bootloader.
+  digitalWrite(PIN_STEPPER_SHARED_ENABLE, HIGH);
+  pinMode(PIN_STEPPER_SHARED_ENABLE, OUTPUT);
+#endif
   for (int axis = 0; axis < NUM_AXES; axis++) {
     pinMode(PIN_PUL[axis], OUTPUT);
     pinMode(PIN_DIR[axis], OUTPUT);
@@ -158,6 +166,11 @@ void stepper_init() {
     xTaskCreatePinnedToCore(stepper_task, name, 4096,
                             (void*)(intptr_t)axis, 2, &s_task[axis], 1);
   }
+#if defined(DRIVE_MODE_GEAR) && STEPPER_SHARED_ENABLE_ENABLED
+  // All pulse pins now have deterministic idle levels; enable all local
+  // TMC2209 modules together (ENN is active-low).
+  digitalWrite(PIN_STEPPER_SHARED_ENABLE, LOW);
+#endif
 }
 
 void stepper_move(int axis, int steps, int direction, int delay_us) {

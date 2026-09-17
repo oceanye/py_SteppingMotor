@@ -62,6 +62,12 @@ void setup() {
     serial_tx_printf("  stepper %d: PUL=%d DIR=%d", a, pul_pins[a],
                      dir_pins[a]);
   }
+#if STEPPER_SHARED_ENABLE_ENABLED
+  serial_tx_printf("  TMC2209 shared EN: GPIO%d active-low (4 drivers in parallel)",
+                   PIN_STEPPER_SHARED_ENABLE);
+#else
+  serial_tx_line("  TMC2209 shared EN: DISABLED (handle EN externally)");
+#endif
   const int gin1[] = {PIN_GEAR_IN1_0, PIN_GEAR_IN1_1};
   const int gin2[] = {PIN_GEAR_IN2_0, PIN_GEAR_IN2_1};
   const int gea[]  = {PIN_GEAR_ENCA_0, PIN_GEAR_ENCA_1};

@@ -1,6 +1,14 @@
 from tkinter import ttk
 
-from motor_control import AXIS_LABEL, MODE_LINEAR, MODE_ROTARY, stepper_axis_topology
+from motor_control import (
+    AXIS_LABEL,
+    MODE_LINEAR,
+    MODE_ROTARY,
+    PULSE_PER_REV_MAX,
+    STEPPER_DRIVER_DISPLAY_NAME,
+    TMC2209_DEFAULT_MICROSTEPS,
+    stepper_axis_topology,
+)
 from motor_control.ui.common import PAD, attach_numeric_input
 
 
@@ -21,32 +29,38 @@ def build_stepper_tab(app, parent, axis, speed_presets, dir_outward, dir_inward)
     ttk.Label(axf, text=route_text,
               font=("Consolas", 10, "bold"), foreground="#1565c0").grid(
         row=0, column=0, columnspan=6, sticky="w", **pad)
-    ttk.Label(axf, text="模式:").grid(row=1, column=0, sticky="w", **pad)
+    ttk.Label(
+        axf,
+        text=(f"驱动: {STEPPER_DRIVER_DISPLAY_NAME} · STEP/DIR · 默认 "
+              f"1/{TMC2209_DEFAULT_MICROSTEPS}（MS1=MS2=GND）"),
+        foreground="#6a1b9a",
+    ).grid(row=1, column=0, columnspan=6, sticky="w", **pad)
+    ttk.Label(axf, text="模式:").grid(row=2, column=0, sticky="w", **pad)
     mf = ttk.Frame(axf)
-    mf.grid(row=1, column=1, columnspan=5, sticky="w")
+    mf.grid(row=2, column=1, columnspan=5, sticky="w")
     ttk.Radiobutton(mf, text="直线 高度/导程 (mm)", variable=app.axis_mode_var[axis],
                     value=MODE_LINEAR, command=lambda a=axis: app._on_axis_mode_change(a)).pack(side="left", padx=6)
     ttk.Radiobutton(mf, text="旋转 圈/角度 (°)", variable=app.axis_mode_var[axis],
                     value=MODE_ROTARY, command=lambda a=axis: app._on_axis_mode_change(a)).pack(side="left", padx=6)
-    ttk.Label(axf, text="脉冲/转:").grid(row=2, column=0, sticky="w", **pad)
-    ppr_spin = ttk.Spinbox(axf, from_=1.0, to=10000.0, increment=1.0,
+    ttk.Label(axf, text="脉冲/转:").grid(row=3, column=0, sticky="w", **pad)
+    ppr_spin = ttk.Spinbox(axf, from_=1.0, to=PULSE_PER_REV_MAX, increment=1.0,
                            textvariable=app.axis_ppr_var[axis], width=8, format="%.1f",
                            command=lambda a=axis: app._on_axis_param_change(a))
     attach_numeric_input(ppr_spin, app.axis_ppr_var[axis])
-    ppr_spin.grid(row=2, column=1, **pad)
-    ttk.Label(axf, text="减速比:").grid(row=2, column=2, sticky="w", padx=(16, 0))
+    ppr_spin.grid(row=3, column=1, **pad)
+    ttk.Label(axf, text="减速比:").grid(row=3, column=2, sticky="w", padx=(16, 0))
     gr_spin = ttk.Spinbox(axf, from_=0.001, to=1000.0, increment=0.01,
                           textvariable=app.axis_gr_var[axis], width=8, format="%.2f",
                           command=lambda a=axis: app._on_axis_param_change(a))
     attach_numeric_input(gr_spin, app.axis_gr_var[axis])
-    gr_spin.grid(row=2, column=3, **pad)
+    gr_spin.grid(row=3, column=3, **pad)
     sw['lead_label'] = ttk.Label(axf, text="导程(mm/转):")
-    sw['lead_label'].grid(row=2, column=4, sticky="w", padx=(16, 0))
+    sw['lead_label'].grid(row=3, column=4, sticky="w", padx=(16, 0))
     sw['lead_spin'] = ttk.Spinbox(axf, from_=0.01, to=100.0, increment=0.1,
                                   textvariable=app.axis_lead_var[axis], width=8, format="%.3f",
                                   command=lambda a=axis: app._on_axis_param_change(a))
     attach_numeric_input(sw['lead_spin'], app.axis_lead_var[axis])
-    sw['lead_spin'].grid(row=2, column=5, **pad)
+    sw['lead_spin'].grid(row=3, column=5, **pad)
     app._apply_axis_param_ui(axis)
 
     pf = ttk.LabelFrame(parent, text=f"运动参数 — 轴 {AXIS_LABEL[axis]}")

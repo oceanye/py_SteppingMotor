@@ -68,7 +68,11 @@ class FakeDesktopApplication:
         self.control_bindings = BindingSet.empty()
         self.pico_node_health = {node: "unknown" for node in range(1, 7)}
         self.axis_param_valid = [True] * NUM_STEPPER_AXES
-        self.axis_profiles = [AxisProfile() for _ in range(NUM_STEPPER_AXES)]
+        # Keep the existing generic-config tests at 200 PPR; hardware-default
+        # behaviour is covered by the axis/driver-profile tests.
+        self.axis_profiles = [
+            AxisProfile(pulse_per_rev=200) for _ in range(NUM_STEPPER_AXES)
+        ]
         self.axis_runtime = [
             AxisRuntime(position_trusted=True) for _ in range(NUM_STEPPER_AXES)
         ]
@@ -345,6 +349,11 @@ class DesktopWebControllerTests(unittest.TestCase):
             "host_pulse_accounting",
         )
         self.assertFalse(status["stepper_axes"][0]["measured"])
+        self.assertEqual(
+            status["stepper_axes"][0]["driver_profile"],
+            "mks-tmc2209-v2-standalone-step-dir-v1",
+        )
+        self.assertEqual(status["stepper_axes"][0]["default_microsteps"], 8)
 
     def test_status_projects_four_bound_logical_motors(self):
         self.app.control_bindings = BindingSet.suggested().with_revision(3)

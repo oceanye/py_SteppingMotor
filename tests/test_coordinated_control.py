@@ -19,7 +19,11 @@ from motor_control.topology import NUM_STEPPER_AXES
 
 def _axis_state():
     return {
-        "profiles": [AxisProfile() for _ in range(NUM_STEPPER_AXES)],
+        # Use an explicit profile so snapshot-unit tests are independent of the
+        # project's current hardware-driver default.
+        "profiles": [
+            AxisProfile(pulse_per_rev=200) for _ in range(NUM_STEPPER_AXES)
+        ],
         "runtimes": [AxisRuntime() for _ in range(NUM_STEPPER_AXES)],
         "axis_param_valid": [True] * NUM_STEPPER_AXES,
         "running": [False] * NUM_STEPPER_AXES,

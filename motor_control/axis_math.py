@@ -5,23 +5,33 @@ from __future__ import annotations
 import math
 from typing import Final
 
+from .driver_profile import tmc2209_input_pulses_per_rev
+
 
 MODE_LINEAR: Final = "linear"
 MODE_ROTARY: Final = "rotary"
 AXIS_MODES: Final = (MODE_LINEAR, MODE_ROTARY)
 
-DEFAULT_PULSE_PER_REV: Final = 200.0
+# MKS TMC2209 V2.0 standalone default: 200 full steps/rev x 1/8 input
+# microsteps (MS1=LOW, MS2=LOW).  MicroPlyer interpolation does not change the
+# number of STEP edges the host must send.
+DEFAULT_PULSE_PER_REV: Final = float(tmc2209_input_pulses_per_rev())
 DEFAULT_GEAR_RATIO: Final = 1.0
 DEFAULT_LEAD_MM: Final = 1.0
 
 PULSE_PER_REV_MIN: Final = 1.0
-PULSE_PER_REV_MAX: Final = 10_000.0
+# Covers a 400-step motor at 1/256 for a future UART configuration.  The
+# current standalone pin selections are limited to 1/8, 1/16, 1/32 and 1/64.
+PULSE_PER_REV_MAX: Final = 102_400.0
 GEAR_RATIO_MIN: Final = 0.001
 GEAR_RATIO_MAX: Final = 1_000.0
 LEAD_MM_MIN: Final = 0.01
 LEAD_MM_MAX: Final = 100.0
 
-SPEED_DEFAULT: Final = 3.0
+# 1 mm lead at the default 1600 pulse/rev would be 4800 pps at 3 mm/s, above
+# the local firmware's accurately modelled ~4000 pps ceiling.  Start below the
+# project's conservative 1000 pps open-loop warning threshold instead.
+SPEED_DEFAULT: Final = 0.5
 DELAY_OVERHEAD_US: Final = 200.0
 MIN_DELAY_MS: Final = 0.05
 

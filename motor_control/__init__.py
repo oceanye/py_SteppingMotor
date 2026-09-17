@@ -29,6 +29,15 @@ from .axis_math import (
     units_to_steps,
 )
 from .axis_model import AxisProfile, AxisRuntime
+from .driver_profile import (
+    DEFAULT_MOTOR_FULL_STEPS_PER_REV,
+    STEPPER_DRIVER_CONTROL_MODE,
+    STEPPER_DRIVER_DISPLAY_NAME,
+    STEPPER_DRIVER_PROFILE_ID,
+    TMC2209_DEFAULT_MICROSTEPS,
+    TMC2209_STANDALONE_MICROSTEPS,
+    tmc2209_input_pulses_per_rev,
+)
 from .coordinated_control import (
     AUTOMATION_BLOCKERS,
     ActuatorBinding,
@@ -83,6 +92,7 @@ __all__ = [
     "BindingValidationError",
     "DEFAULT_GEAR_RATIO",
     "DEFAULT_LEAD_MM",
+    "DEFAULT_MOTOR_FULL_STEPS_PER_REV",
     "DEFAULT_PULSE_PER_REV",
     "DELAY_OVERHEAD_US",
     "DesktopWebController",
@@ -109,8 +119,13 @@ __all__ = [
     "PULSE_PER_REV_MIN",
     "SPEED_DEFAULT",
     "STEPPER_PINS",
+    "STEPPER_DRIVER_CONTROL_MODE",
+    "STEPPER_DRIVER_DISPLAY_NAME",
+    "STEPPER_DRIVER_PROFILE_ID",
     "SUGGESTED_AXIS_BY_ROLE",
     "StepperAxisTopology",
+    "TMC2209_DEFAULT_MICROSTEPS",
+    "TMC2209_STANDALONE_MICROSTEPS",
     "clamp_step_delay_us",
     "binding_compatibility_issues",
     "build_coordinated_snapshot",
@@ -131,6 +146,7 @@ __all__ = [
     "step_speed_to_delay_ms",
     "stepper_axis_topology",
     "steps_to_units",
+    "tmc2209_input_pulses_per_rev",
     "unit_label",
     "units_to_exact_steps",
     "units_to_steps",
