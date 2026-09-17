@@ -212,5 +212,48 @@ class SerialSessionTests(unittest.TestCase):
         self.assertEqual(self.port.writes, [])
 
 
+class SoftTimeoutTests(unittest.TestCase):
+    """幂等只读轮询的软超时：跳过本轮而不退役会话。"""
+
+    def setUp(self):
+        self.port = FakeSerial()
+        self.session = SerialSession(self.port)
+        self.session.start()
+
+    def tearDown(self):
+        self.session.close()
+
+    def test_soft_timeout_returns_none_and_keeps_session_open(self):
+        self.assertIsNone(self.session.request("MODE", timeout=0.02,
+                                               soft_timeout=True))
+        self.assertTrue(self.session.is_open)
+
+        self.port.on_write = lambda _data: self.port.feed("MODE,FOC")
+        reply = self.session.request("MODE", timeout=0.5)
+        self.assertEqual(reply.raw, "MODE,FOC")
+        self.assertEqual(reply.mode.value, "FOC")
+
+    def test_late_reply_goes_unsolicited_instead_of_poisoning_next(self):
+        self.assertIsNone(self.session.request("MODE", timeout=0.02,
+                                               soft_timeout=True))
+        # 上一个 MODE 的迟到回复不能吞掉本请求；它自己的回复才算数。
+        self.port.on_write = lambda _data: self.port.feed("MODE,GEAR")
+        reply = self.session.request("MODE", timeout=0.5)
+        self.assertEqual(reply.raw, "MODE,GEAR")
+        self.port.feed("MODE,FOC")  # 迟到的第一轮回复
+        late = self.session.next_unsolicited(0.5)
+        self.assertEqual(late.raw, "MODE,FOC")
+        self.assertTrue(self.session.is_open)
+
+    def test_late_reply_satisfies_next_poll_of_same_command(self):
+        # 同命令轮询场景：迟到的上一轮回复直接满足下一轮，内容幂等等价。
+        self.assertIsNone(self.session.request("MODE", timeout=0.02,
+                                               soft_timeout=True))
+        self.port.feed("MODE,GEAR")
+        reply = self.session.request("MODE", timeout=0.5)
+        self.assertEqual(reply.raw, "MODE,GEAR")
+        self.assertTrue(self.session.is_open)
+
+
 if __name__ == "__main__":
     unittest.main()

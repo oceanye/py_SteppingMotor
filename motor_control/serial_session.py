@@ -235,12 +235,19 @@ class SerialSession:
         timeout: float = 1.0,
         matcher: Optional[ReplyMatcher] = None,
         guard: Optional[Callable[[], bool]] = None,
-    ) -> Reply:
+        soft_timeout: bool = False,
+    ) -> Optional[Reply]:
         """Send one command and wait for its matching typed reply.
 
         Calls are serialized for the full write/wait transaction.  Unknown
         lines and known replies that do not match the command are published as
         unsolicited messages and cannot accidentally complete the request.
+
+        With ``soft_timeout=True`` a missing reply returns ``None`` instead of
+        raising: intended for idempotent read-only polls where a transient
+        firmware slowdown must not retire the session.  The late reply is then
+        delivered as an unsolicited message (or satisfies the next poll of the
+        same command) instead of poisoning a following command.
         """
 
         if timeout < 0:
@@ -277,6 +284,8 @@ class SerialSession:
                     raise error
                 raise SerialIoError(str(error)) from error
             if reply is None:
+                if soft_timeout:
+                    return None
                 timeout_error = RequestTimeout(command, timeout)
                 self._fail(
                     SessionDesynchronized(
@@ -292,11 +301,14 @@ class SerialSession:
         timeout: float = 1.0,
         matcher: Optional[ReplyMatcher] = None,
         guard: Optional[Callable[[], bool]] = None,
-    ) -> str:
+        soft_timeout: bool = False,
+    ) -> Optional[str]:
         """Compatibility convenience for callers that still consume raw text."""
 
-        return self.request(
-            command, timeout=timeout, matcher=matcher, guard=guard).raw
+        reply = self.request(
+            command, timeout=timeout, matcher=matcher, guard=guard,
+            soft_timeout=soft_timeout)
+        return None if reply is None else reply.raw
 
     def _ensure_running(self) -> None:
         with self._state_lock:
