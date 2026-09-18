@@ -837,8 +837,11 @@ class StepperGUI:
         route = (start, target, pivot, bearing)
         report = plan_swing_trajectory(params, side=side, route=route)
         self.log(f"步态角度联动校验（{start}→{target}，支点{pivot}）：{report.message}")
+        # 2026-09-18 按用户要求：碰撞/避障类校验不再一票否决，只收集
+        # 警告提示；行程、线缆窗口、固件能力、标定等操作安全检查仍拦截。
+        clearance_warnings: list[str] = []
         if not report.feasible:
-            raise GaitExecutorError(f"干跑不可行，拒绝开始：{report.message}")
+            clearance_warnings.append(f"干跑校验不可行：{report.message}")
         stages = plan_gait_stages(params, side=side, swing_psi_start_deg=psi_now)
         # S3 也有扫掠风险，按相同包络检查整个原地相位调整，不只检查 S4。
         phase_stage = next((s for s in stages if s.stage_id == "S3"), None)
@@ -850,7 +853,8 @@ class StepperGUI:
                 pivot=pads[pivot].center) for i in range(361))
             phase_margin -= params.geometry.arm_length_mm * math.radians(abs(delta_psi)) / 720.0
             if phase_margin <= 0:
-                raise GaitExecutorError("S3 原地相位调整扫掠高点，拒绝执行")
+                clearance_warnings.append(
+                    f"S3 原地相位调整可能扫掠高点（最小间隙 {phase_margin:.2f}mm）")
         p_swing, p_support = self.axis_profiles[axis], self.axis_profiles[support_axis]
         # One shared master tick, rounded total counts and DDA rounding contribute
         # at most two pulse quanta per joint. Reserve their geometric displacement.
@@ -865,7 +869,9 @@ class StepperGUI:
         pulse_envelope += params.geometry.arm_length_mm * math.radians(phase_residual)
         pulse_envelope += params.geometry.d_mm * math.radians(abs((bearing - expected_bearing + 180) % 360 - 180))
         if report.min_margin_mm <= pulse_envelope or (phase_stage is not None and phase_margin <= pulse_envelope):
-            raise GaitExecutorError(f"避障余量不足以覆盖脉冲量化包络 {pulse_envelope:.2f}mm；请提高实际细分/减速比或修正几何")
+            clearance_warnings.append(
+                f"避障余量（最小间隙 {report.min_margin_mm:.2f}mm）可能不足以覆盖"
+                f"脉冲量化包络 {pulse_envelope:.2f}mm；建议提高细分/减速比或修正几何")
         # 预检整个行程与两侧线缆角限制；不允许发出抬足后才发现公转越界。
         with self.state_lock:
             if self._gait_hardware_fingerprint() != params.calibration_fingerprint:
@@ -920,6 +926,13 @@ class StepperGUI:
         self._gait_run.rotation_start = None
         self.log(f"步态执行器就绪（{side}）：{len(stages)} 个阶段，"
                  f"当前 ψ={psi_now:.1f}°")
+        if clearance_warnings:
+            text = "\n".join(clearance_warnings)
+            self.log(f"⚠️ 碰撞/避障校验未通过（仅提示，不拦截）：{text}")
+            messagebox.showwarning(
+                "碰撞/避障校验未通过（仅提示）",
+                text + "\n\n按要求不再拦截执行；请确认现场安全，"
+                "运动中随时可【⛔ 中止】。")
         return self._gait_run, report
 
     def _gait_release_ownership(self):

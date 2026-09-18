@@ -146,6 +146,24 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
             app._gait_begin_run("right")
         self.assertFalse(any(c.startswith("MOVE,") for c in app.commands))
 
+    def test_infeasible_clearance_warns_but_no_longer_blocks(self):
+        # 2026-09-18 按用户要求：碰撞/避障校验不再一票否决，
+        # 改为日志+弹窗提示；执行器照常就绪。
+        app = mechanism()
+        app.gait_params = replace(
+            app.gait_params,
+            geometry=GaitGeometry(beam_height_mm=13),
+            calibration_fingerprint=app._gait_hardware_fingerprint())
+        app.gait_params = replace(app.gait_params,
+                                  mr1_zero_signature=app._gait_zero_signature("Mr1", app.gait_params),
+                                  mr2_zero_signature=app._gait_zero_signature("Mr2", app.gait_params))
+        with patch("motor_control.desktop_app.messagebox.showwarning") as warn:
+            run, report = app._gait_begin_run("left")
+        self.assertFalse(report.feasible)
+        self.assertIsNotNone(run)
+        warn.assert_called_once()
+        self.assertTrue(any("仅提示，不拦截" in m for m in app._logs))
+
     def test_legacy_firmware_rejected_before_lifting(self):
         app = mechanism()
         app._send_and_read = lambda *_args, **_kw: "ERR:unknown command"
