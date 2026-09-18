@@ -93,24 +93,61 @@ def build_gait_tab(app, parent) -> None:
 def _build_params_column(app, parent) -> None:
     left = ttk.LabelFrame(parent, text="参数与标定（.gait_params.json）")
     left.grid(row=1, column=0, sticky="ns", **PAD)
+    left.rowconfigure(0, weight=1)
+    left.columnconfigure(0, weight=1)
+
+    # 字段共 26+ 行，矮窗口下 grid 会直接把底部截断（Tk 无自动滚动，
+    # 记零按钮/确认复选框会被裁掉看不到）。用 Canvas+滚动条承载，
+    # 窗口够高时内容不足一屏、自然不滚。
+    canvas = tk.Canvas(left, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+    inner = ttk.Frame(canvas)
+    window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
+    inner.bind(
+        "<Configure>",
+        lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind(
+        "<Configure>",
+        lambda e: canvas.itemconfigure(window_id, width=e.width))
+    theme_bg = ttk.Style().lookup("TFrame", "background")
+    if theme_bg:
+        canvas.configure(background=theme_bg)
+
+    # Windows 下滚轮事件发给焦点控件；用与日志区相同的“鼠标位置判定”
+    # 模式全局接管：仅当指针位于本参数栏内时滚动并吞掉事件。
+    def scroll_if_over(event):
+        widget = app.root.winfo_containing(event.x_root, event.y_root)
+        while widget is not None and widget is not app.root:
+            if widget is canvas or widget is inner:
+                if event.delta:
+                    canvas.yview_scroll(
+                        -1 if event.delta > 0 else 1, "units")
+                return "break"
+            widget = widget.nametowidget(widget.winfo_parent())
+        return None
+
+    app.root.bind_all("<MouseWheel>", scroll_if_over, add="+")
 
     row = 0
 
     def add_section(title):
         nonlocal row
         ttk.Label(
-            left, text=title, font=("Microsoft YaHei", 9, "bold")
+            inner, text=title, font=("Microsoft YaHei", 9, "bold")
         ).grid(row=row, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 1))
         row += 1
 
     def add_number_field(key, label):
         nonlocal row
-        ttk.Label(left, text=label).grid(
+        ttk.Label(inner, text=label).grid(
             row=row, column=0, sticky="w", padx=6, pady=1)
         var = tk.StringVar()
         var.trace_add("write", lambda *_: _invalidate_calibration(app))
         app.gait_field_vars[key] = var
-        ttk.Entry(left, textvariable=var, width=12).grid(
+        ttk.Entry(inner, textvariable=var, width=12).grid(
             row=row, column=1, sticky="w", padx=4, pady=1)
         row += 1
 
@@ -124,34 +161,34 @@ def _build_params_column(app, parent) -> None:
 
     add_section("方向符号（点动验证后填写）")
     for key, label, hint in SIGN_FIELDS:
-        ttk.Label(left, text=label).grid(
+        ttk.Label(inner, text=label).grid(
             row=row, column=0, sticky="w", padx=6, pady=1)
         var = tk.StringVar(value="+1")
         var.trace_add("write", lambda *_: _invalidate_calibration(app))
         app.gait_sign_vars[key] = var
         ttk.Combobox(
-            left, textvariable=var, values=("+1", "-1"),
+            inner, textvariable=var, values=("+1", "-1"),
             state="readonly", width=5,
         ).grid(row=row, column=1, sticky="w", padx=4, pady=1)
-        ttk.Label(left, text=hint, foreground="#666").grid(
+        ttk.Label(inner, text=hint, foreground="#666").grid(
             row=row, column=2, sticky="w", padx=2)
         row += 1
 
     add_section("旋转零位（ψ=30° 基准；先摆位再记零）")
     for role_name in ("Mr1", "Mr2"):
-        ttk.Label(left, text=f"{role_name} 零位").grid(
+        ttk.Label(inner, text=f"{role_name} 零位").grid(
             row=row, column=0, sticky="w", padx=6, pady=1)
         ttk.Label(
-            left, textvariable=app.gait_zero_vars[role_name],
+            inner, textvariable=app.gait_zero_vars[role_name],
             font=("Consolas", 10, "bold"),
         ).grid(row=row, column=1, sticky="w", padx=4)
         ttk.Button(
-            left, text="记零",
+            inner, text="记零",
             command=lambda name=role_name: app._gait_record_zero_clicked(name),
         ).grid(row=row, column=2, sticky="w", padx=4, pady=1)
         row += 1
 
-    buttons = ttk.Frame(left)
+    buttons = ttk.Frame(inner)
     buttons.grid(row=row, column=0, columnspan=3, sticky="ew", padx=6, pady=8)
     ttk.Button(
         buttons, text="保存参数", command=app._gait_save_params_clicked
@@ -161,12 +198,12 @@ def _build_params_column(app, parent) -> None:
     ).pack(side="left", padx=3)
     row += 1
 
-    app.gait_widgets["readiness"] = ttk.Label(left, text="", justify="left")
-    ttk.Checkbutton(left, variable=app.gait_calibrated_var,
+    app.gait_widgets["readiness"] = ttk.Label(inner, text="", justify="left")
+    ttk.Checkbutton(inner, variable=app.gait_calibrated_var,
                     text="已实测几何/包络，验证方向、PPR及支撑反力闭合").grid(
                         row=row, column=0, columnspan=3, sticky="w", padx=6)
     row += 1
-    ttk.Button(left, text="人工重建 A/B 物理基准（不动电机）",
+    ttk.Button(inner, text="人工重建 A/B 物理基准（不动电机）",
                command=app._gait_reestablish_baseline).grid(
                    row=row, column=0, columnspan=3, sticky="w", padx=6, pady=4)
     row += 1
