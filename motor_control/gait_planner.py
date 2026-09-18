@@ -7,9 +7,8 @@
 - 同步自转 ``ψ1 = ψ10 + 2φ``（ψ10=30°，低节点相位）；
 - 横梁角 ``β = 180° - 60°·S(s)``，关节角 ``q = ψ - β + c``；
 - 一个摆动循环里：摆动侧电机 Δq=+180°、支撑侧电机 Δq=+60°；
-- 高点避让：爪臂（胶囊体）对每个六边形高节点（带半径圆）的连续
-  轨迹间隙 ``D_jk = dist - r_爪 - r_高点 - δ > 0``；壳体正下方的
-  "飞越节点"除外（2D 模型判不了垂向间隙，上报为需目视确认项）。
+- 高点避让：邻接六边形、爪臂、中心结构、横梁与实测垂向包络；
+  采样间运动距离界给出连续间隙保守下界，不排除壳体下的高点。
 
 本模块不 import Tk、不碰串口：所有几何/轨迹/碰撞/阶段计划都可以离线
 单元测试。执行与标定向导在 ``desktop_app`` 里基于这里的纯函数搭建。
@@ -31,8 +30,8 @@ HIGH_NODE_PHASE_DEG = 90.0  # 高节点相位（与低节点相间 60°）
 
 SWING_JOINT_DELTA_DEG = 180.0  # 摆动侧电机关节角总变化 Δq = 120-(-60)
 SUPPORT_JOINT_DELTA_DEG = 60.0  # 支撑侧电机补偿角总变化 Δq = 0-(-60)
-# 三足盘三重对称：摆动 Δq 取 60+120·k（k∈Z）落地位形全部等效（爪臂照对
-# 低节点、公转照走 60°）。解绕即利用该自由度反向/缩短摆动增量。
+# 终点三重对称不意味着中途轨迹等效。下方legacy候选函数不能用于公转
+# 的同步避障轨迹，只能供将来独立验证的悬空原地解绕规划参考。
 
 
 def unwrap_swing_joint_delta(
@@ -139,6 +138,11 @@ class GaitGeometry:
     arm_radius_mm: float = 4.0      # 爪臂等效半径（胶囊粗细）
     node_radius_mm: float = 5.0     # 高节点等效半径
     safety_margin_mm: float = 2.0   # δ：要求的最小安全间隙
+    high_node_height_mm: float = 12.0  # 相对低节点，必须实测
+    body_drop_mm: float = 0.0       # 壳体/电机/轴承最低点低于爪臂中心线的量
+    beam_height_mm: float = 30.0    # 横梁中心线相对低节点高度，必须实测
+    beam_radius_mm: float = 4.0    # 横梁/连接件保守胶囊包络
+    surrounding_pads: bool = True  # 检查紧邻的六边形，不只 A/B/C
 
     def validated(self) -> "GaitGeometry":
         positive = (
@@ -151,23 +155,32 @@ class GaitGeometry:
                 raise ValueError(f"几何参数 {name} 必须是大于 0 的有限数值")
         if self.hub_radius_mm >= self.arm_length_mm:
             raise ValueError("壳体半径必须小于爪臂长度")
+        if self.d_mm + 1e-8 < math.sqrt(3) * self.arm_length_mm:
+            raise ValueError("六边形中心距小于紧贴正六边形要求，节点环模型重叠；请核实几何")
+        for name in ("high_node_height_mm", "body_drop_mm"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} 必须是非负有限数值")
+        for name in ("beam_height_mm", "beam_radius_mm"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} 必须是正有限数值")
+        if not isinstance(self.surrounding_pads, bool):
+            raise ValueError("surrounding_pads 必须是布尔值")
         return self
 
 
 @dataclass(frozen=True)
 class GaitParams:
-    """干跑与分阶段执行的全部可调参数（schema v1，JSON 持久化）。"""
+    """统一预览与实际分阶段执行参数；旧v1文档须重新建立零位签名。"""
 
     geometry: GaitGeometry = field(default_factory=GaitGeometry)
     # 执行节拍
-    swing_segments: int = 12          # S4 公转拆成的 MOVE 段数
+    swing_segments: int = 12          # 展示密度；不会切分实际同步指令
     lift_mm: float = 10.0             # z_clear：抬足高度（轴行程单位）
     swing_speed_deg_s: float = 6.0    # 支撑侧（横梁驱动）电机速度
     lift_speed_mm_s: float = 2.0      # 抬足速度
     settle_speed_mm_s: float = 1.0    # 落足速度（更慢）
     feasibility_samples: int = 120    # 干跑碰撞校验采样密度
-    # 每侧 Mr 累计角解绕窗口：摆动侧自动选等效小步（Δq=60+120k），使累计
-    # 角（≈线缆缠绕量）始终徘徊在 ±limit 内（2026-09-09 用户指定 ±180°）
+    # 每侧Mr线缆角度限制；轨迹不能放入窗口时拒绝，不替换中途角度关系。
     rotation_limit_deg: float = 180.0
     # 标定：电机方向符号与基准零位（向导写入；+1 表示轴坐标增大 = q 增大）
     mr1_sign: int = 1
@@ -177,6 +190,12 @@ class GaitParams:
     # 标定基准：记零时各 Mr 轴的软件坐标（度）；ψ 基准固定为 30°
     mr1_zero_deg: float | None = None
     mr2_zero_deg: float | None = None
+    phase_gain: float = 2.0          # Δψ/φ；不受中心距/升降行程影响
+    beam_reference_deg: float = 180.0  # 两个 Mr 同时记零时横梁世界角
+    calibration_confirmed: bool = False  # 实测几何、方向、PPR、反力闭合已确认
+    calibration_fingerprint: str | None = None
+    mr1_zero_signature: str | None = None
+    mr2_zero_signature: str | None = None
 
     SCHEMA = "gait-params-v1"
 
@@ -202,13 +221,25 @@ class GaitParams:
             value = getattr(self, name)
             if value is not None and not math.isfinite(value):
                 raise ValueError(f"零位 {name} 必须是有限数值")
+        if (not math.isfinite(self.phase_gain) or not 0 < self.phase_gain <= 10
+                or abs(self.phase_gain * SWING_ARC_DEG % 120.0) > 1e-8):
+            raise ValueError("phase_gain 必须为 2/4/6/8/10；终点须对准三重对称低节点")
+        if not math.isfinite(self.beam_reference_deg):
+            raise ValueError("beam_reference_deg 必须是有限数值")
+        if not isinstance(self.calibration_confirmed, bool):
+            raise ValueError("calibration_confirmed 必须是布尔值")
+        if self.calibration_fingerprint is not None and not isinstance(self.calibration_fingerprint, str):
+            raise ValueError("calibration_fingerprint 必须是字符串或 null")
+        for value in (self.mr1_zero_signature, self.mr2_zero_signature):
+            if value is not None and not isinstance(value, str):
+                raise ValueError("旋转零位签名必须是字符串或 null")
         return self
 
     # 传统摆动侧速度（3×支撑速度）。S4 解绕后按增量比另算段速；
     # 此值现用于 S3 相位调整等单轴整段运动。
     @property
     def swing_side_speed_deg_s(self) -> float:
-        return 3.0 * self.swing_speed_deg_s
+        return (self.phase_gain + 1.0) * self.swing_speed_deg_s
 
     def as_document(self) -> dict[str, Any]:
         geometry = self.geometry
@@ -221,6 +252,11 @@ class GaitParams:
                 "arm_radius_mm": geometry.arm_radius_mm,
                 "node_radius_mm": geometry.node_radius_mm,
                 "safety_margin_mm": geometry.safety_margin_mm,
+                "high_node_height_mm": geometry.high_node_height_mm,
+                "body_drop_mm": geometry.body_drop_mm,
+                "beam_height_mm": geometry.beam_height_mm,
+                "beam_radius_mm": geometry.beam_radius_mm,
+                "surrounding_pads": geometry.surrounding_pads,
             },
             "swing_segments": int(self.swing_segments),
             "lift_mm": self.lift_mm,
@@ -235,6 +271,12 @@ class GaitParams:
             "mup2_lift_sign": self.mup2_lift_sign,
             "mr1_zero_deg": self.mr1_zero_deg,
             "mr2_zero_deg": self.mr2_zero_deg,
+            "phase_gain": self.phase_gain,
+            "beam_reference_deg": self.beam_reference_deg,
+            "calibration_confirmed": self.calibration_confirmed,
+            "calibration_fingerprint": self.calibration_fingerprint,
+            "mr1_zero_signature": self.mr1_zero_signature,
+            "mr2_zero_signature": self.mr2_zero_signature,
         }
 
 
@@ -288,6 +330,11 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         safety_margin_mm=float(
             geometry_raw.get("safety_margin_mm",
                              GaitGeometry.safety_margin_mm)),
+        high_node_height_mm=float(geometry_raw.get("high_node_height_mm", 12.0)),
+        body_drop_mm=float(geometry_raw.get("body_drop_mm", 0.0)),
+        beam_height_mm=float(geometry_raw.get("beam_height_mm", 30.0)),
+        beam_radius_mm=float(geometry_raw.get("beam_radius_mm", 4.0)),
+        surrounding_pads=geometry_raw.get("surrounding_pads", True),
     )
     params = GaitParams(
         geometry=geometry,
@@ -310,6 +357,12 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         mup2_lift_sign=_sign("mup2_lift_sign"),
         mr1_zero_deg=_opt_number("mr1_zero_deg"),
         mr2_zero_deg=_opt_number("mr2_zero_deg"),
+        phase_gain=_number("phase_gain", 2.0),
+        beam_reference_deg=_number("beam_reference_deg", 180.0),
+        calibration_confirmed=value.get("calibration_confirmed", False),
+        calibration_fingerprint=value.get("calibration_fingerprint"),
+        mr1_zero_signature=value.get("mr1_zero_signature"),
+        mr2_zero_signature=value.get("mr2_zero_signature"),
     )
     return params.validated()
 
@@ -325,6 +378,11 @@ class HexPad:
     name: str
     center: tuple[float, float]
     orientation_deg: float = 0.0
+
+    def __post_init__(self):
+        if (len(self.center) != 2 or not all(math.isfinite(v) for v in self.center)
+                or not math.isfinite(self.orientation_deg)):
+            raise ValueError("六边形中心及方向必须是有限数值")
 
     def node_center(
         self,
@@ -352,11 +410,19 @@ def default_hex_pads(geometry: GaitGeometry) -> dict[str, HexPad]:
     """A/B/C 三个固定六边形：B 为原点，A 在 180°，C 在 120°，间距 d。"""
 
     d = geometry.d_mm
-    return {
+    pads = {
         "B": HexPad("B", (0.0, 0.0)),
         "A": HexPad("A", _scale(_dir(180.0), d)),
         "C": HexPad("C", _scale(_dir(120.0), d)),
     }
+    if geometry.surrounding_pads:
+        # 三角晶格：覆盖 A/B/C 外的一圈邻座。与爪臂半径无关的 d 只参与几何。
+        for i in range(-2, 2):
+            for j in range(-1, 3):
+                center = (d * (i + j / 2.0), d * math.sqrt(3) * j / 2.0)
+                if not any(math.dist(center, p.center) < 1e-8 for p in pads.values()):
+                    pads[f"邻座({i},{j})"] = HexPad(f"邻座({i},{j})", center)
+    return pads
 
 
 def swing_center(
@@ -385,6 +451,8 @@ class SwingSample:
     beta_deg: float           # 横梁方位（pivot→摆动端）
     center: tuple[float, float]
     margin_mm: float | None   # 该采样处最小间隙（None = 未做碰撞校验）
+    swing_q_delta_deg: float = 0.0
+    support_q_delta_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -430,13 +498,7 @@ def node_under_hub(
     center: tuple[float, float],
     geometry: GaitGeometry,
 ) -> bool:
-    """该高节点是否位于抬起三足壳体的正下方（2D 模型判不了的"飞越事件"）。
-
-    中心圆弧路径与起点/目标六边形的邻弧高节点恒定贴近（最近距离
-    ≈ ring²/(2d)），任何 d 都躲不开。这类节点由抬升的壳体从正上方
-    越过，水平间隙无意义，只能靠执行时的垂向间隙确认（文档 §7 把
-    壳体列为需 3D 数据的检查项）。
-    """
+    """仅诊断水平投影重叠；这不允许跳过高点或放行未校验的飞越。"""
 
     distance = math.hypot(node[0] - center[0], node[1] - center[1])
     return distance <= geometry.hub_radius_mm + geometry.node_radius_mm
@@ -448,18 +510,14 @@ def clearance_margin_mm(
     geometry: GaitGeometry,
     hexagons: Sequence[HexPad],
     *,
-    include_hub: bool = False,
+    include_hub: bool = True,
+    lift_mm: float = 0.0,
+    pivot: tuple[float, float] | None = None,
 ) -> float:
-    """当前 (φ,ψ) 位形下：3 根爪臂（可选含壳体）对所有高节点的最小间隙。
+    """爪胶囊、中心结构圆盘、横梁胶囊对有高度的高节点的包络间隙。
 
-    返回值已扣除爪臂/节点等效半径与安全裕度 δ；> 0 才安全。
-    不检查低节点（落脚/支撑足与它们同层接触，不是障碍）。
-
-    ``include_hub`` 默认关：壳体位于抬升高度上，2D 零高度代理会把
-    "末段中心必然进入目标六边形节点环"的几何事实误报成碰撞（文档 §7
-    的壳体检查需要真实高度数据，留待实测后做 3D 校验）。
-    壳体正下方（见 :func:`node_under_hub`）的节点跳过臂检查——它们
-    由抬升壳体越过，2D 零高度代理给不出有效结论。
+    >0才安全；不排除任何节点。升降位移、最低点下伸和横梁最低中心线
+    高度必须实测；低节点触地仍须独立接触确认，不由此模型判定。
     """
 
     worst = math.inf
@@ -470,18 +528,36 @@ def clearance_margin_mm(
     for arm_index in range(3):
         start, end = arm_segment(center, psi_deg, arm_index, geometry)
         for _name, node in high_nodes:
-            if node_under_hub(node, center, geometry):
-                continue
             distance = point_segment_distance(node, start, end)
-            worst = min(worst, distance - geometry.arm_radius_mm)
+            vertical = max(0.0, lift_mm - geometry.high_node_height_mm)
+            margin = (math.hypot(max(0.0, distance - geometry.node_radius_mm), vertical)
+                      - geometry.arm_radius_mm - geometry.safety_margin_mm)
+            worst = min(worst, margin)
     if include_hub:
         for _name, node in high_nodes:
-            worst = min(
-                worst,
-                math.hypot(node[0] - center[0], node[1] - center[1])
-                - geometry.hub_radius_mm,
-            )
-    return worst - geometry.node_radius_mm - geometry.safety_margin_mm
+            lateral = max(0.0, math.dist(node, center)
+                          - geometry.hub_radius_mm - geometry.node_radius_mm)
+            vertical = max(0.0, lift_mm - geometry.body_drop_mm
+                           - geometry.high_node_height_mm)
+            worst = min(worst, math.hypot(lateral, vertical) - geometry.safety_margin_mm)
+    if pivot is not None:
+        for _name, node in high_nodes:
+            lateral = max(0.0, point_segment_distance(node, pivot, center)
+                          - geometry.node_radius_mm)
+            vertical = max(0.0, geometry.beam_height_mm - geometry.high_node_height_mm)
+            worst = min(worst, math.hypot(lateral, vertical)
+                        - geometry.beam_radius_mm - geometry.safety_margin_mm)
+    return worst
+
+
+def angular_targets(params: GaitParams, phi_deg: float) -> tuple[float, float, float]:
+    """Δψ, Δq_swing, Δq_support；旋转关系只取决于角度与相位增益。
+
+    同一横梁参考系 Δβ=-φ，安装符号在转换为轴坐标时再乘。
+    不允许用终点三重对称来替换中途避障路径。
+    """
+    return (params.phase_gain * phi_deg,
+            (params.phase_gain + 1.0) * phi_deg, phi_deg)
 
 
 def plan_swing_trajectory(
@@ -490,24 +566,24 @@ def plan_swing_trajectory(
     side: str,
     extra_hexagons: Iterable[HexPad] = (),
     swing_joint_delta_deg: float | None = None,
+    route: tuple[str, str, str, float] | None = None,
 ) -> DryRunReport:
     """干跑：生成整条摆动轨迹并做连续碰撞校验。
 
     ``side`` 是 "left"（A→C 绕 B）或 "right"（B→A 绕 C）。
-    ``swing_joint_delta_deg`` 是解绕后的摆动关节增量 Δq（None 用默认
-    +180°）；自转 Δψ = Δq − 公转 60°，爪臂扫掠轨迹随实际 Δq 变化，
-    干跑必须用与执行一致的值校验。
+    legacy参数 ``swing_joint_delta_deg`` 仅接受与当前角度模型一致的值。
+    不能传入终点等效解绕增量来改变中途自转。route可用于后续换位。
     """
 
     params = params.validated()
     geometry = params.geometry
     if side not in ("left", "right"):
         raise ValueError("side 必须是 left 或 right")
-    spin_deg = (
-        SWING_SPIN_DEG if swing_joint_delta_deg is None
-        else float(swing_joint_delta_deg) - SWING_ARC_DEG)
+    spin_deg, joint_delta, _support_delta = angular_targets(params, SWING_ARC_DEG)
+    if swing_joint_delta_deg is not None and not math.isclose(swing_joint_delta_deg, joint_delta):
+        raise ValueError("不能用终点等效解绕增量替换同步避障角度轨迹")
     _start, _target, pivot_name, start_bearing = (
-        LEFT_SWING if side == "left" else RIGHT_SWING
+        route if route is not None else (LEFT_SWING if side == "left" else RIGHT_SWING)
     )
     hexagons = dict(default_hex_pads(geometry))
     for extra in extra_hexagons:
@@ -529,34 +605,45 @@ def plan_swing_trajectory(
         phi_deg = SWING_ARC_DEG * shaping
         psi_deg = (LOW_NODE_PHASE_DEG
                    + spin_deg * shaping)
-        beta_deg = start_bearing - SWING_ARC_DEG * shaping
+        beta_deg = start_bearing - (180.0 if side == "right" else 0.0) - phi_deg
         center = swing_center(pivot, geometry.d_mm, phi_deg, start_bearing)
         for label, node in high_nodes:
             if (label not in hub_passovers
                     and node_under_hub(node, center, geometry)):
                 hub_passovers.append(label)
         margin = clearance_margin_mm(center, psi_deg, geometry,
-                                     list(hexagons.values()))
+                                     list(hexagons.values()), lift_mm=params.lift_mm,
+                                     pivot=pivot.center)
         samples.append(
             SwingSample(s=s, phi_deg=phi_deg, psi_deg=psi_deg,
-                        beta_deg=beta_deg, center=center, margin_mm=margin)
+                        beta_deg=beta_deg, center=center, margin_mm=margin,
+                        swing_q_delta_deg=joint_delta * shaping,
+                        support_q_delta_deg=phi_deg)
         )
-    worst = min(samples, key=lambda item: item.margin_mm or math.inf)
-    feasible = (worst.margin_mm is not None and worst.margin_mm > 0.0)
+    # Lipschitz 下界：每对采样之间，任一臂端移动不超过
+    # (d + k*R)*Δφ。最近距离是 1-Lipschitz；扣除半区间运动界，
+    # 防止采样点都通过但中间穿过节点。稀采样只会更保守，不会误放行。
+    worst = min(samples, key=lambda item: float(item.margin_mm))
+    interval_bound = min(
+        min(float(a.margin_mm), float(b.margin_mm))
+        - (geometry.d_mm + params.phase_gain * geometry.arm_length_mm)
+        * math.radians(b.phi_deg - a.phi_deg) / 2.0
+        for a, b in zip(samples, samples[1:]))
+    minimum = min(float(worst.margin_mm), interval_bound)
+    feasible = minimum > 0.0
     if feasible:
-        message = (f"可行：全轨迹最小间隙 {worst.margin_mm:.2f} mm "
+        message = (f"模型可行：连续间隙保守下界 {minimum:.2f} mm "
                    f"(φ={worst.phi_deg:.1f}°, ψ={worst.psi_deg:.1f}°)")
     else:
-        message = (f"不可行：最小间隙 {worst.margin_mm:.2f} mm ≤ 0 "
+        message = (f"不可行/未证实：连续间隙下界 {minimum:.2f} mm ≤ 0 "
                    f"(φ={worst.phi_deg:.1f}°, ψ={worst.psi_deg:.1f}°)；"
-                   "先增大抬足高度/间隙参数或修正几何后重试")
+                   "请实测并修正高度/包络/相位增益；必要时提高校验密度")
     if hub_passovers:
         message += ("；" + "、".join(hub_passovers)
-                    + " 从壳体正上方越过（2D 干跑不校验，"
-                    "执行时需目视确认垂向间隙）")
+                    + " 存在壳体投影重叠，已计入垂向间隙校验")
     return DryRunReport(
         feasible=feasible,
-        min_margin_mm=worst.margin_mm or 0.0,
+        min_margin_mm=minimum,
         min_margin_sample=worst,
         samples=tuple(samples),
         hexagons=tuple(hexagons.values()),
@@ -580,17 +667,14 @@ class RoleMove:
 
 @dataclass(frozen=True)
 class GaitStage:
-    """一个阶段：说明 + 顺序的运动组序列；每组内并列下发、全部完成才进下一组。
-
-    组序 = 时间序（S4 的第 k 段必须等第 k-1 段完成），组内 = 同时下发
-    （摆动侧与支撑侧速度按增量比设置：Δq=180° 时 3:1，解绕小步 Δq=±60°
-    时 1:1，保证每段两者同时完成）。
-    """
+    """阶段及运动组；synchronized组须原子下发、共用五次进度，无MOVE降级。"""
 
     stage_id: str
     title: str
     confirm_text: str  # 人工确认清单（接触/姿态检查）
     move_groups: tuple[tuple[RoleMove, ...], ...] = ()
+    synchronized: bool = False
+    duration_s: float = 0.0
 
     @property
     def is_motion_stage(self) -> bool:
@@ -685,48 +769,28 @@ def plan_gait_stages(
                 )
             )
 
-    # S4 公转 + 自转（段间顺序、段内并列；两轴速度按增量比设置，同时完成）。
-    # 解绕：按摆动侧累计角选等效小步 Δq=60+120k，使累计角（≈线缆缠绕）
-    # 保持在 ±rotation_limit_deg 内。θ=swing_sign·(ψ-30°) 是 Mr 轴坐标
-    # 相对零位的偏移，None（纯展示）按 0 处理。
-    swing_theta_deg = (
-        0.0 if swing_psi_start_deg is None
-        else swing_sign * (swing_psi_start_deg - LOW_NODE_PHASE_DEG))
-    swing_delta_total = unwrap_swing_joint_delta(
-        swing_theta_deg, params.rotation_limit_deg)
-    # 同步条件 |Δq|/v_swing = 60/v_support → v_swing = v_support·|Δq|/60
-    swing_segment_speed = (
-        params.swing_speed_deg_s
-        * abs(swing_delta_total) / SUPPORT_JOINT_DELTA_DEG)
-    segment_groups: list[tuple[RoleMove, ...]] = []
-    for index in range(int(params.swing_segments)):
-        progress0, progress1 = _segment_progress(
-            index, int(params.swing_segments))
-        swing_delta = (progress1 - progress0) * swing_delta_total
-        support_delta = (progress1 - progress0) * SUPPORT_JOINT_DELTA_DEG
-        segment_groups.append(
-            (
-                RoleMove(swing_role, swing_sign * swing_delta,
-                         swing_segment_speed),
-                RoleMove(support_role, support_sign * support_delta,
-                         params.swing_speed_deg_s),
-            )
-        )
+    # S4 整条五次轨迹一次原子下发。固件共享时基/主进度，不再用两条
+    # 独立梯形 MOVE 近似同步，也不把 Δq=180 替换成终点等效的 60。
+    _spin, swing_delta_total, support_delta_total = angular_targets(params, SWING_ARC_DEG)
+    duration_s = 1.875 * SWING_ARC_DEG / params.swing_speed_deg_s
+    segment_groups = [(RoleMove(swing_role, swing_sign * swing_delta_total,
+                               (params.phase_gain + 1) * params.swing_speed_deg_s),
+                       RoleMove(support_role, support_sign * support_delta_total,
+                                params.swing_speed_deg_s))]
     stages.append(
         GaitStage(
             stage_id="S4",
             title="公转 + 同步自转",
             confirm_text=(
-                f"共 {int(params.swing_segments)} 段同步运动；观察爪臂始终从"
+                "同一五次进度同步运动；观察爪臂始终从"
                 "高点间隙中扫过。任何异常立即点【中止】。\n"
-                f"解绕小步：本次摆动 Δq={swing_delta_total:+g}°"
-                f"（等效 {SWING_JOINT_DELTA_DEG:g}° 位形），累计角 "
-                f"{swing_theta_deg:+.1f}° → "
-                f"{swing_theta_deg + swing_delta_total:+.1f}°"
-                f"（限 ±{params.rotation_limit_deg:g}°，支撑侧随后 "
-                f"{SUPPORT_JOINT_DELTA_DEG:g}°）。"
+                f"φ=60°，Δψ={params.phase_gain * 60:g}°，"
+                f"Δq摆={swing_delta_total:g}°，Δq支=60°，"
+                f"计划时长 {duration_s:.2f}s；禁止轨迹内等效解绕。"
             ),
             move_groups=tuple(segment_groups),
+            synchronized=True,
+            duration_s=duration_s,
         )
     )
 

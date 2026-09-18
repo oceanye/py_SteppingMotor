@@ -4,6 +4,7 @@
 #include "../../src/safety_input.h"
 #include "../../src/remote_stepper_map.h"
 #include "../../src/protocol_limits.h"
+#include "../../src/sync_math.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -111,6 +112,28 @@ void test_remote_axis_mapping_boundaries(void) {
     TEST_ASSERT_FALSE(remote_stepper_node_to_global(1, 4, 6, 6, 4, global));
 }
 
+void test_sync_quintic_common_clock_and_pulse_rounding(void) {
+    TEST_ASSERT_FLOAT_WITHIN(0.000001, 0.5, sync_progress(0.5));
+    for (int tick = 1; tick <= 480; ++tick) {
+        double s = sync_inverse_progress((double)tick / 480);
+        TEST_ASSERT_FLOAT_WITHIN(0.000001, (double)tick/480, sync_progress(s));
+        int a = sync_step_target(tick, 480, 480);
+        int b = sync_step_target(tick, 160, 480);
+        TEST_ASSERT_TRUE(abs(a - 3*b) <= 1);
+    }
+    TEST_ASSERT_EQUAL_INT(160, sync_step_target(480, 160, 480));
+    TEST_ASSERT_EQUAL_INT(0, sync_step_target(480, 0, 480));
+}
+
+void test_sync_peak_rate_and_duration_limits(void) {
+    TEST_ASSERT_TRUE(sync_timing_valid(480, 18000000));
+    TEST_ASSERT_FALSE(sync_timing_valid(0, 18000000));
+    TEST_ASSERT_FALSE(sync_timing_valid(480, 1000));
+    TEST_ASSERT_FALSE(sync_timing_valid(480, 120000001));
+    TEST_ASSERT_TRUE(sync_timing_valid(8000, 3000000));
+    TEST_ASSERT_FALSE(sync_timing_valid(8000, 2999999));
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     UNITY_BEGIN();
     RUN_TEST(test_integer_accepts_boundaries);
@@ -124,5 +147,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN_TEST(test_nc_pullup_estop_polarity);
     RUN_TEST(test_active_low_input_remains_supported);
     RUN_TEST(test_remote_axis_mapping_boundaries);
+    RUN_TEST(test_sync_quintic_common_clock_and_pulse_rounding);
+    RUN_TEST(test_sync_peak_rate_and_duration_limits);
     return UNITY_END();
 }

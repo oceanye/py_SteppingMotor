@@ -98,6 +98,23 @@ def build_stop_command(axis: Union[int, str]) -> str:
     return command_line("STOP", _axis_token(axis, wildcard=True))
 
 
+def build_sync_command(a: int, steps_a: int, b: int, steps_b: int, duration_us: int) -> str:
+    """Atomic common-clock quintic pulse trajectory, two local ESP32 axes.
+
+    Signed counts represent physical DIR level, not software position direction.
+    """
+    _axis_token(a)
+    _axis_token(b)
+    if a == b or a >= 6 or b >= 6:
+        raise ProtocolEncodingError("SYNC requires two distinct local axes")
+    sa = _integer(steps_a, "steps_a", -20_000_000, 20_000_000)
+    sb = _integer(steps_b, "steps_b", -20_000_000, 20_000_000)
+    duration = _integer(duration_us, "duration_us", 1000, 120_000_000)
+    if max(abs(sa), abs(sb)) == 0 or duration * 8 < max(abs(sa), abs(sb)) * 3000:
+        raise ProtocolEncodingError("SYNC exceeds peak pulse rate or has no motion")
+    return command_line("SYNC", a, sa, b, sb, duration)
+
+
 def build_ena_command(axis: Union[int, str], locked: Optional[bool] = None) -> str:
     """Build ``ENA,<axis>,<0|1>`` (release/lock driver) or ``ENA,<axis>,S`` query.
 
@@ -491,7 +508,13 @@ def reply_matcher_for(command: str) -> ReplyMatcher:
             return (isinstance(reply, OkReply)
                     and len(reply.values) >= 3
                     and reply.values[0] == "ENA"
-                    and (tokens[1] == "*" or reply.values[1] == tokens[1]))
+                    and (tokens[1] == "*" or reply.values[1] == tokens[1])
+                    and (len(tokens) < 3 or tokens[2] == "S" or reply.values[2] == tokens[2]))
+        if verb == "SYNC" and tokens == ["SYNC", "S"]:
+            return (isinstance(reply, OkReply) and len(reply.values) == 3
+                    and reply.values[:2] == ("SYNC", "V1") and reply.values[2].isdigit())
+        if verb == "SYNC" and len(tokens) == 6:
+            return isinstance(reply, OkReply) and reply.values == ("SYNC", tokens[1], tokens[3])
         if verb == "ESTOP":
             return isinstance(reply, OkReply) and reply.values == ("ESTOP",)
         if verb == "MODE":

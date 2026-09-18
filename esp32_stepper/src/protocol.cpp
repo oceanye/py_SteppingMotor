@@ -115,6 +115,24 @@ static void handle_move(const String tok[], int n) {
   serial_tx_printf("ACK,%d", axis);
 }
 
+// SYNC,a,signed_steps_a,b,signed_steps_b,duration_us (local axes only).
+static void handle_sync(const String tok[], int n) {
+  if (n == 2 && tok[1] == "S") {
+    serial_tx_printf("OK,SYNC,V1,%d", NUM_AXES);
+    return;
+  }
+  if (n != 6) { reply_err("bad format"); return; }
+  if (reject_if_hardware_estop_active()) return;
+  int a, b, sa, sb, duration;
+  if (!parse_axis(tok[1], NUM_AXES, a) || !parse_axis(tok[3], NUM_AXES, b)
+      || !protocol_parse_int(tok[2].c_str(), -MAX_MOVE_STEPS, MAX_MOVE_STEPS, sa)
+      || !protocol_parse_int(tok[4].c_str(), -MAX_MOVE_STEPS, MAX_MOVE_STEPS, sb)
+      || !protocol_parse_int(tok[5].c_str(), 1000, 120000000, duration)) {
+    reply_err("bad sync value"); return;
+  }
+  if (!stepper_sync_async(a, sa, b, sb, duration)) reply_err("sync rejected");
+}
+
 // ENA,<axis>,<0|1>  设置驱动器释放(0)/锁定(1)；ENA,<axis>,S 查询当前状态。
 // 仅接了 ENA 线的本地轴支持(旋转轴)；释放正在运动的轴会被拒绝。
 static void handle_ena(const String tok[], int n) {
@@ -429,6 +447,7 @@ void protocol_handle_line(const String& command) {
     serial_tx_line("MODE,GEAR");
 #endif
   } else if (tok[0] == "MOVE") handle_move(tok, n);
+  else if (tok[0] == "SYNC") handle_sync(tok, n);
   else if (tok[0] == "STOP") handle_stop(tok, n);
   else if (tok[0] == "ESTOP") handle_estop(tok, n);
   else if (tok[0] == "ENA") handle_ena(tok, n);

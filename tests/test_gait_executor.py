@@ -41,6 +41,14 @@ class FakeHost:
         self.events.append(("wait", axis, timeout_s))
         return self.wait_results.pop(0) if self.wait_results else "DONE"
 
+    def send_synchronized(self, moves, duration_s):
+        self.events.append(("sync", None, duration_s))
+        if any(a in self.fail_send_axes or a in self.noop_axes for a, _, _ in moves):
+            return "failed"
+        for a, d, v in moves:
+            self.events.append(("send", a, (d, v)))
+        return "sent"
+
     def stop_axes(self, axes):
         self.events.append(("stop", tuple(sorted(set(axes))), None))
 
@@ -99,16 +107,16 @@ class HappyPathTests(unittest.TestCase):
         group_events = host.events[s4_wait_start:]
         send_indices = [i for i, e in enumerate(group_events) if e[0] == "send"]
         wait_indices = [i for i, e in enumerate(group_events) if e[0] == "wait"]
-        self.assertEqual(len(send_indices), 6)   # 3 组 × 摆动+支撑
-        self.assertEqual(len(wait_indices), 6)
-        # 第 1 组的两条 wait 都在第 2 组的两条 send 之前
-        self.assertLess(max(wait_indices[:2]), min(send_indices[2:]))
+        self.assertEqual(len(send_indices), 2)   # 一条原子轨迹，两轴共用进度
+        self.assertEqual(len(wait_indices), 2)
+        self.assertLess(max(send_indices), min(wait_indices))
+        self.assertEqual(len([e for e in group_events if e[0] == "sync"]), 1)
         # 摆动侧总量 +60°（θ=0 解绕小步，sign=+1），支撑侧 +60°（sign=+1）
         swing_total = sum(e[2][0] for e in group_events
                           if e[0] == "send" and e[1] == host.role_axes["Mr1"])
         support_total = sum(e[2][0] for e in group_events
                             if e[0] == "send" and e[1] == host.role_axes["Mr2"])
-        self.assertAlmostEqual(swing_total, 60.0, places=6)
+        self.assertAlmostEqual(swing_total, 180.0, places=6)
         self.assertAlmostEqual(support_total, 60.0, places=6)
 
         # S5 确认、S6 落脚（速度为 settle）、S7 确认 → done
@@ -207,14 +215,22 @@ class FailureTests(unittest.TestCase):
         self.assertEqual(run.state, "aborted")
         self.assertEqual(len(host.sends()), sends_before)
 
-    def test_noop_move_skips_wait(self):
+    def test_one_half_noop_rejects_entire_synchronized_motion(self):
         host = FakeHost()
         params = _params()
         host.noop_axes.add(host.role_axes["Mr2"])   # 支撑侧每段都不足 1 脉冲
         run = self._run_until_s4(host, params)
-        self.assertTrue(run.execute_current_stage())
-        waits = {e[1] for e in host.waits()}
-        self.assertNotIn(host.role_axes["Mr2"], waits)
+        self.assertFalse(run.execute_current_stage())
+        self.assertEqual(run.state, "failed")
+
+    def test_legacy_host_cannot_fall_back_to_independent_moves(self):
+        host = FakeHost()
+        host.send_synchronized = None
+        run = self._run_until_s4(host, _params())
+        before = len(host.sends())
+        self.assertFalse(run.execute_current_stage())
+        self.assertEqual(len(host.sends()), before)
+        self.assertIn("不允许", run.last_error)
 
     def test_missing_role_binding_fails_closed(self):
         host = FakeHost()

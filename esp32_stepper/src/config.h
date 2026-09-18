@@ -12,6 +12,8 @@
 // 共用常量
 // ============================================================
 #define FAULT_POLL_MS            100
+#define STEPPER_ENA_LOCKED_LEVEL    LOW
+#define STEPPER_ENA_RELEASED_LEVEL  HIGH
 
 // ============================================================
 // FOC 模式（原有双轴：步进 + BLDC + AS5600）
@@ -91,8 +93,6 @@
 // ⚠ 若模组丝印为 N16R8(Octal PSRAM)，GPIO35-37 被 PSRAM 占用，
 //   须换 42/47/48 并放弃对应预留功能。
 // 其余轴未接线：引脚表填 -1，ENA 命令对它们回复 unsupported。
-#define STEPPER_ENA_LOCKED_LEVEL    LOW
-#define STEPPER_ENA_RELEASED_LEVEL  HIGH
 #define PIN_STEP_ENA_0  -1
 #define PIN_STEP_ENA_1  -1
 #define PIN_STEP_ENA_2   3   // 左侧转 DM442 ENA+

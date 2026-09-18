@@ -4,6 +4,8 @@
 #include "serial_tx.h"
 #include <atomic>
 #include <math.h>
+#include <esp_timer.h>
+#include "sync_math.h"
 
 // 每轴引脚（编译期常量数组）
 #if defined(DRIVE_MODE_FOC)
@@ -54,8 +56,105 @@ enum StepState : uint8_t {
 };
 static std::atomic<uint8_t> s_state[NUM_AXES];
 static int               s_steps[NUM_AXES], s_dir[NUM_AXES], s_delay_us[NUM_AXES];
+static SemaphoreHandle_t s_sync_sem = nullptr;
+static std::atomic<int> s_sync_a{-1}, s_sync_b{-1};
+static int s_sync_steps[2], s_sync_dirs[2], s_sync_duration;
+static std::atomic<bool> s_sync_active{false};
 
 static bool valid_axis(int axis) { return axis >= 0 && axis < NUM_AXES; }
+
+static bool sync_aborting(int a, int b) {
+  return s_state[a].load() == STEP_ABORTING || s_state[b].load() == STEP_ABORTING;
+}
+
+static void sync_task(void*) {
+  for (;;) {
+    xSemaphoreTake(s_sync_sem, portMAX_DELAY);
+    const int a = s_sync_a.load(), b = s_sync_b.load();
+    const int axes[2] = {a, b};
+    const int master = max(s_sync_steps[0], s_sync_steps[1]);
+    int done[2] = {0, 0};
+    for (int j = 0; j < 2; ++j) digitalWrite(PIN_DIR[axes[j]], s_sync_dirs[j]);
+    delayMicroseconds(100);
+    const int64_t start = esp_timer_get_time();
+    uint32_t last_progress = millis();
+    uint32_t last_yield = last_progress;
+    int64_t last_pulse = start - 200;
+    bool aborted = false;
+    for (int tick = 1; tick <= master; ++tick) {
+      // Both axes follow this ONE quintic master path; separate motor ramps
+      // would distort q_swing/q_support even if their end times matched.
+      int64_t due = start + (int64_t)(s_sync_duration *
+                          sync_inverse_progress((double)tick / master));
+      due = max(due, last_pulse + 200);  // never burst to catch up after scheduling delay
+      while (esp_timer_get_time() < due && !sync_aborting(a, b)) {
+        int64_t remaining = due - esp_timer_get_time();
+        if (remaining >= 2000) vTaskDelay(1);
+        else if (remaining > 0) delayMicroseconds((uint32_t)min(remaining, (int64_t)100));
+      }
+      if (sync_aborting(a, b)) { aborted = true; break; }
+      bool fire[2];
+      for (int j = 0; j < 2; ++j) {
+        fire[j] = sync_step_target(tick, s_sync_steps[j], master) > done[j];
+        if (fire[j]) digitalWrite(PIN_PUL[axes[j]], HIGH);
+      }
+      last_pulse = esp_timer_get_time();
+      delayMicroseconds(50);
+      for (int j = 0; j < 2; ++j) if (fire[j]) {
+        digitalWrite(PIN_PUL[axes[j]], LOW);
+        ++done[j];
+      }
+      if ((uint32_t)(millis() - last_progress) >= 250 && tick < master) {
+        for (int j = 0; j < 2; ++j)
+          serial_tx_printf("STEP,%d,P,%d,%d", axes[j], done[j], s_sync_steps[j]);
+        last_progress = millis();
+      }
+      if ((uint32_t)(millis() - last_yield) >= 10) {
+        vTaskDelay(1);
+        last_yield = millis();
+      }
+    }
+    // Claim both terminals; a STOP winning either transition aborts the pair.
+    for (int j = 0; j < 2; ++j) {
+      uint8_t expected = STEP_RUNNING;
+      if (!s_state[axes[j]].compare_exchange_strong(expected, STEP_FINISHING)) {
+        aborted = true;
+        s_state[axes[j]].store(STEP_FINISHING);
+      }
+    }
+    for (int j = 0; j < 2; ++j)
+      serial_tx_printf("STEP,%d,%s,%d,%d", axes[j], aborted ? "ABORT" : "DONE",
+                       done[j], s_sync_steps[j]);
+    // Clear the pair BEFORE making either axis reusable.
+    s_sync_active.store(false);
+    for (int j = 0; j < 2; ++j) s_state[axes[j]].store(STEP_IDLE);
+  }
+}
+
+bool stepper_sync_async(int a, int signed_a, int b, int signed_b, int duration_us) {
+  if (!valid_axis(a) || !valid_axis(b) || a == b || !s_sync_sem || s_sync_active.load()) return false;
+  if (signed_a < -20000000 || signed_a > 20000000 || signed_b < -20000000 || signed_b > 20000000) return false;
+  const int na = abs(signed_a), nb = abs(signed_b);
+  if (!sync_timing_valid(max(na, nb), duration_us)
+      || !stepper_ena_locked(a) || !stepper_ena_locked(b)) return false;
+  uint8_t expected = STEP_IDLE;
+  if (!s_state[a].compare_exchange_strong(expected, STEP_RUNNING)) return false;
+  expected = STEP_IDLE;
+  if (!s_state[b].compare_exchange_strong(expected, STEP_RUNNING)) {
+    s_state[a].store(STEP_IDLE);
+    return false;
+  }
+  s_sync_a.store(a); s_sync_b.store(b);
+  s_sync_steps[0] = na; s_sync_steps[1] = nb;
+  s_sync_dirs[0] = signed_a >= 0 ? HIGH : LOW;
+  s_sync_dirs[1] = signed_b >= 0 ? HIGH : LOW;
+  s_sync_duration = duration_us;
+  s_sync_active.store(true);
+  // ACK before waking the pulse task. Both STEP terminals retain existing format.
+  serial_tx_printf("OK,SYNC,%d,%d", a, b);
+  xSemaphoreGive(s_sync_sem);
+  return true;
+}
 
 // ── 加减速曲线参数 ──
 #define STEP_RAMP_START_US    5000   // 启动延时(us)，安全慢速 ~60 RPM @200微步
@@ -170,6 +269,11 @@ static void stepper_task(void* arg) {
 }
 
 void stepper_init() {
+  s_sync_sem = xSemaphoreCreateBinary();
+  if (s_sync_sem && xTaskCreatePinnedToCore(sync_task, "step_sync", 4096, nullptr, 2, nullptr, 1) != pdPASS) {
+    vSemaphoreDelete(s_sync_sem);
+    s_sync_sem = nullptr;
+  }
   for (int axis = 0; axis < NUM_AXES; axis++) {
     pinMode(PIN_PUL[axis], OUTPUT);
     pinMode(PIN_DIR[axis], OUTPUT);
@@ -210,6 +314,12 @@ bool stepper_is_busy(int axis) {
 
 bool stepper_abort(int axis) {
   if (!valid_axis(axis)) return false;
+  if (s_sync_active.load() && (axis == s_sync_a.load() || axis == s_sync_b.load())) {
+    for (int peer : {s_sync_a.load(), s_sync_b.load()}) {
+      uint8_t running = STEP_RUNNING;
+      s_state[peer].compare_exchange_strong(running, STEP_ABORTING);
+    }
+  }
   uint8_t expected = STEP_RUNNING;
   if (s_state[axis].compare_exchange_strong(expected, STEP_ABORTING)) return true;
   return expected == STEP_ABORTING;

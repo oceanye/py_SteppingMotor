@@ -4,8 +4,8 @@
 把它变成对既有运动链路的顺序调用：
 
 - 组序 = 时间序：上一组全部到达终态（DONE）才发下一组；
-- 组内并列：先依次下发（串口往返只有毫秒级），两轴在固件侧并行走，
-  摆动侧/支撑侧按 3:1 速度比近似同时完成；
+- S4同步组：一条SYNC原子下发，两轴共用五次进度；宿主不支持则拒绝，
+  不通过独立MOVE近似同步；
 - 任何一轴 ABORT/TIMEOUT/下发失败 → 停掉本次用到的全部轴，状态
   置为 aborted/failed，后续阶段拒绝执行（ABORT 后位置不可信，运动
   链路本身也会拒绝）。
@@ -14,6 +14,7 @@
 
 - ``role_axis(role_name) -> int``          绑定解析；缺失抛 GaitExecutorError
 - ``send_relative(axis, delta, speed) -> str``   "sent" / "noop" / "failed"
+- ``send_synchronized(moves, duration_s) -> str``  原子同步组，仅允许"sent"
 - ``wait_terminal(axis, timeout_s) -> str``      "DONE"/"ABORTED"/"TIMEOUT"/"CANCELLED"
 - ``stop_axes(axes)``                            中止时停轴
 - ``cancelled() -> bool``                        急停/关闭/控制代数失效
@@ -208,12 +209,11 @@ class GaitExecutor:
 
     def _stop_stage_axes(self, stage: GaitStage, reason: str) -> None:
         axes: list[int] = []
-        for group in stage.move_groups:
-            for move in group:
-                try:
-                    axes.append(self._host.role_axis(move.role))
-                except GaitExecutorError:
-                    continue
+        for role in ("Mup1", "Mr1", "Mup2", "Mr2"):
+            try:
+                axes.append(self._host.role_axis(role))
+            except GaitExecutorError:
+                continue
         if axes:
             self._host.log(f"停止步态用轴（{reason}）")
             self._host.stop_axes(axes)
@@ -235,6 +235,35 @@ class GaitExecutor:
 
     def _run_group(self, stage: GaitStage, group) -> bool:
         dispatched: list[tuple[int, str]] = []  # (axis, role)
+        expected_s = stage.duration_s if stage.synchronized else 0.0
+        if stage.synchronized:
+            try:
+                moves = [(self._host.role_axis(m.role), m.delta, m.speed) for m in group]
+                sender = getattr(self._host, "send_synchronized", None)
+                if sender is None or sender(moves, stage.duration_s) != "sent":
+                    raise GaitExecutorError("固件/宿主不支持原子同步轨迹或预检未通过；不允许独立 MOVE 降级")
+                dispatched = [(axis, m.role) for (axis, _, _), m in zip(moves, group)]
+            except Exception as exc:
+                self._stop_stage_axes(stage, "同步下发失败")
+                self._fail("failed", str(exc))
+                return False
+        else:
+            return self._run_independent_group(stage, group)
+
+        timeout_s = GROUP_TIMEOUT_FACTOR * expected_s + GROUP_TIMEOUT_MARGIN_S
+        for axis, role in dispatched:
+            terminal = self._host.wait_terminal(axis, timeout_s)
+            if terminal != "DONE":
+                self._stop_stage_axes(stage, "同步轨迹未完整完成")
+                self._fail("aborted" if terminal in ("ABORTED", "CANCELLED") else "failed",
+                           f"{role} 同步轨迹 {terminal}；位置可能不可信，停止全部四轴并重新校准")
+                return False
+        if self._abort_check(stage):
+            return False
+        return True
+
+    def _run_independent_group(self, stage, group) -> bool:
+        dispatched = []
         expected_s = 0.0
         for move in group:
             if self._abort_check(stage):

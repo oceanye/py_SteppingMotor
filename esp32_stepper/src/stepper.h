@@ -1,6 +1,10 @@
 // esp32_stepper/src/stepper.h
 #pragma once
 
+// Atomic two-local-axis quintic trajectory. Signed counts encode DIR HIGH/LOW.
+// No RS485 fallback: remote nodes do not share a synchronized clock.
+bool stepper_sync_async(int a, int signed_a, int b, int signed_b, int duration_us);
+
 // 多轴：所有函数都按 axis 索引（0=L, 1=R），axis 超界返回 false / 忽略
 void stepper_init();
 

@@ -10,6 +10,8 @@ import socket
 import webbrowser
 import sys
 import traceback
+import hashlib
+import json
 from dataclasses import replace
 
 from motor_control import (
@@ -46,6 +48,7 @@ from motor_control import (
     step_speed_to_delay_ms,
     stepper_axis_topology,
     parse_binding_document,
+    projected_step_position,
 )
 from motor_control.axis_math import (
     PULSE_RATE_WARN_PPS,
@@ -65,6 +68,7 @@ from motor_control.protocol import (
     ProtocolEncodingError,
     build_ena_command,
     build_move_command,
+    build_sync_command,
     build_stop_command,
     build_track_command,
 )
@@ -83,6 +87,9 @@ from motor_control.gait_planner import (
     plan_gait_stages,
     plan_swing_trajectory,
     unwrap_swing_joint_delta,
+    angular_targets,
+    default_hex_pads,
+    clearance_margin_mm,
 )
 from motor_control.ui_dispatch import UiDispatcher
 from motor_control.ui import (
@@ -165,6 +172,9 @@ class _GaitHostAdapter:
 
     def send_relative(self, axis, delta, speed):
         return self._app._gait_send_relative(axis, delta, speed)
+
+    def send_synchronized(self, moves, duration_s):
+        return self._app._gait_send_synchronized(moves, duration_s)
 
     def wait_terminal(self, axis, timeout_s):
         return self._app._gait_wait_terminal(axis, timeout_s)
@@ -329,6 +339,10 @@ class StepperGUI:
         # ── 三足轮换步态：参数（标定向导写入 .gait_params.json）+ 当前执行实例 ──
         self.gait_params = GaitParams()
         self._gait_run: GaitExecutor | None = None
+        self._gait_owned = {}
+        self._gait_supports = ("A", "B")
+        self._gait_beta_deg = 180.0
+        self._gait_needs_recovery = False
         self._load_gait_params()
 
         self._build_ui()
@@ -584,6 +598,7 @@ class StepperGUI:
         refresh_coordinated_tab_view(self, control, snapshots)
         if self._binding_editor_dirty:
             self._show_binding_draft_validation()
+        self._refresh_gait_ui()
         if reschedule and not self._closing:
             self._coordinated_refresh_after = self.root.after(
                 200, self._refresh_coordinated_ui
@@ -601,7 +616,8 @@ class StepperGUI:
         if data is None:
             return
         try:
-            self.gait_params = parse_gait_params(data)
+            # Pulse coordinates do not establish physical support locations on restart.
+            self.gait_params = replace(parse_gait_params(data), calibration_confirmed=False)
         except ValueError as exc:
             self._startup_warnings.append(
                 f"⚠️ 步态参数无效（{exc}）；已回退为默认占位参数")
@@ -611,9 +627,40 @@ class StepperGUI:
         """校验、原子写盘并发布到内存（UI 线程调用）。"""
 
         params = params.validated()
+        if getattr(self, "_gait_owned", {}):
+            raise GaitExecutorError("步态执行中禁止改参数/标定，请先中止或完成")
         self.state_store.save_gait_params(params.as_document())
         self.gait_params = params
         return params
+
+    def _gait_hardware_fingerprint(self):
+        with self.state_lock:
+            value = [(role.value, self._gait_role_axis(role.value),
+                      repr(self.axis_profiles[self._gait_role_axis(role.value)]))
+                     for role in LOGICAL_ROLE_ORDER]
+        return hashlib.sha256(json.dumps(value).encode("utf-8")).hexdigest()
+
+    def _gait_zero_signature(self, role, params):
+        axis = self._gait_role_axis(role)
+        sign = params.mr1_sign if role == "Mr1" else params.mr2_sign
+        return repr((axis, self.axis_profiles[axis], sign))
+
+    def _gait_reestablish_baseline(self):
+        if getattr(self, "_gait_owned", {}):
+            messagebox.showwarning("步态占用", "请先中止并确认四轴停止")
+            return
+        if not messagebox.askokcancel("重建物理基准", "必须人工确认：左足在A、右足在B，三爪均踩低节点；四轴静止、位置已校准。\n此按钮不移动电机。确认后须重新记两侧旋转零位并确认标定。"):
+            return
+        with self.state_lock:
+            if any(self._axis_motion_active_locked(a) for a in self.control_bindings.bound_axes):
+                return
+            self._gait_supports, self._gait_beta_deg = ("A", "B"), 180.0
+            self._gait_needs_recovery = False
+        self._gait_run = None
+        self._save_gait_params(replace(self.gait_params, mr1_zero_deg=None, mr2_zero_deg=None,
+                                      calibration_confirmed=False, beam_reference_deg=180.0))
+        load_gait_fields(self)
+        self._refresh_gait_ui()
 
     def _gait_role_axis(self, role_name):
         """逻辑角色 → 物理轴；未绑定/模式不符抛 GaitExecutorError。"""
@@ -647,6 +694,8 @@ class StepperGUI:
         if role_name not in ("Mr1", "Mr2"):
             raise GaitExecutorError(f"{role_name} 不是旋转角色，无零位标定")
         axis = self._gait_role_axis(role_name)
+        if getattr(self, "_gait_owned", {}):
+            raise GaitExecutorError("步态拥有四轴时不能修改零位；请先中止/完成")
         with self.state_lock:
             if self._axis_motion_active_locked(axis):
                 raise GaitExecutorError(f"{role_name} 正在运动，不能记零")
@@ -659,9 +708,11 @@ class StepperGUI:
         updates = {}
         if role_name == "Mr1":
             updates["mr1_zero_deg"] = position
+            updates["mr1_zero_signature"] = self._gait_zero_signature(role_name, self.gait_params)
         else:
             updates["mr2_zero_deg"] = position
-        self._save_gait_params(replace(self.gait_params, **updates))
+            updates["mr2_zero_signature"] = self._gait_zero_signature(role_name, self.gait_params)
+        self._save_gait_params(replace(self.gait_params, calibration_confirmed=False, **updates))
         self.log(f"✓ {role_name} 零位已记录：轴坐标 {position:+.3f}"
                  f"（对应 ψ 基准 {LOW_NODE_PHASE_DEG:g}°）")
         return position
@@ -698,10 +749,37 @@ class StepperGUI:
             raise GaitExecutorError("side 必须是 left 或 right")
         if not self._is_serial_connected():
             raise GaitExecutorError("串口未连接")
+        with self.state_lock:
+            if any(getattr(self, key, False) for key in ("_closing", "_disconnecting",
+                   "_estop_in_progress", "_hardware_estop_active", "_estop_unconfirmed")):
+                raise GaitExecutorError("控制器正在关闭/急停或停车未确认")
+        if getattr(self, "_gait_owned", {}):
+            raise GaitExecutorError("上一次步态尚未完成/中止，不能覆盖执行器")
+        if not params.calibration_confirmed:
+            raise GaitExecutorError("尚未确认实测几何、包络高度、方向、PPR及支撑反力闭合；仅允许预览")
+        if getattr(self, "_gait_needs_recovery", False):
+            raise GaitExecutorError("上一次动作未完整完成；必须人工重建 A/B 物理基准、重新标定")
+        if params.calibration_fingerprint != self._gait_hardware_fingerprint():
+            raise GaitExecutorError("绑定或PPR/减速比已变化，旧零位标定失效，请重新标定")
+        if self._rot_release_active:
+            raise GaitExecutorError("旋转轴释放状态未解除，不能执行步态")
+        if not params.geometry.surrounding_pads:
+            raise GaitExecutorError("实际步态不能关闭邻接六边形高点检查")
         # 1. 四个逻辑角色全部绑定且模式正确
         role_axes = {}
         for role in LOGICAL_ROLE_ORDER:
             role_axes[role.value] = self._gait_role_axis(role.value)
+        with self.state_lock:
+            for role, a in role_axes.items():
+                if self._axis_motion_active_locked(a) or not self.axis_runtime[a].position_trusted:
+                    raise GaitExecutorError(f"{role} 忙碌/位置不可信，禁止开始")
+        if role_axes["Mr1"] >= 6 or role_axes["Mr2"] >= 6:
+            raise GaitExecutorError("同步旋转必须绑定 ESP32 本地轴；Pico 未实现公共时基，不允许降级")
+        if self._send_and_read("SYNC,S") != "OK,SYNC,V1,6":
+            raise GaitExecutorError("固件缺少六轴SYNC V1能力；先更新主线固件，不能抬足后才发现不支持")
+        for a in (role_axes["Mr1"], role_axes["Mr2"]):
+            if self._send_and_read(build_ena_command(a)) != f"OK,ENA,{a},1":
+                raise GaitExecutorError("旋转驱动器未确认使能；禁止抬足/联动")
         # 2. 两侧旋转轴都已记零（相位换算的基准）
         for role_name, zero in (("Mr1", params.mr1_zero_deg),
                                 ("Mr2", params.mr2_zero_deg)):
@@ -709,6 +787,9 @@ class StepperGUI:
                 raise GaitExecutorError(
                     f"{role_name} 尚未做零位标定；请先把三足摆到基准位"
                     f"（ψ=30°）并【记零】")
+            saved_signature = params.mr1_zero_signature if role_name == "Mr1" else params.mr2_zero_signature
+            if saved_signature != self._gait_zero_signature(role_name, params):
+                raise GaitExecutorError(f"{role_name} 零位与绑定/方向/PPR不匹配，必须重新记零")
         # 3. 摆动侧旋转轴当前相位与累计角（决定 S3 相位调整和解绕小步）
         swing_role = "Mr1" if side == "left" else "Mr2"
         axis = role_axes[swing_role]
@@ -724,26 +805,157 @@ class StepperGUI:
                 runtime.position_steps)
         sign = params.mr1_sign if swing_role == "Mr1" else params.mr2_sign
         zero = params.mr1_zero_deg if swing_role == "Mr1" else params.mr2_zero_deg
-        theta_now = position - zero
-        psi_now = LOW_NODE_PHASE_DEG + sign * theta_now
-        try:
-            swing_delta = unwrap_swing_joint_delta(
-                theta_now, params.rotation_limit_deg)
-        except ValueError as exc:
-            raise GaitExecutorError(str(exc)) from None
-        # 4. 干跑校验必须可行（用与执行一致的解绕 Δq 校验轨迹）
-        report = plan_swing_trajectory(
-            params, side=side, swing_joint_delta_deg=swing_delta)
-        self.log(f"步态干跑（{side}，解绕 Δq={swing_delta:+g}°）："
-                 f"{report.message}")
+        beta_now = getattr(self, "_gait_beta_deg", params.beam_reference_deg)
+        psi_now = (LOW_NODE_PHASE_DEG + sign * (position - zero)
+                   + beta_now - params.beam_reference_deg)
+        support_role = "Mr2" if side == "left" else "Mr1"
+        support_axis = role_axes[support_role]
+        support_zero = params.mr2_zero_deg if side == "left" else params.mr1_zero_deg
+        support_sign = params.mr2_sign if side == "left" else params.mr1_sign
+        with self.state_lock:
+            support_pos = self.axis_profiles[support_axis].units_from_steps(
+                self.axis_runtime[support_axis].position_steps)
+        support_psi = (LOW_NODE_PHASE_DEG + support_sign * (support_pos - support_zero)
+                       + beta_now - params.beam_reference_deg)
+        if abs((support_psi - LOW_NODE_PHASE_DEG + 60) % 120 - 60) > 0.5:
+            raise GaitExecutorError("支撑足世界相位未对准低节点；不能把电机相对横梁角当作绝对姿态")
+        supports = getattr(self, "_gait_supports", ("A", "B"))
+        start, pivot = supports if side == "left" else supports[::-1]
+        target = next(p for p in ("A", "B", "C") if p not in supports)
+        bearing = beta_now + (180.0 if side == "right" else 0.0)
+        pads = default_hex_pads(params.geometry)
+        expected_bearing = math.degrees(math.atan2(
+            pads[start].center[1] - pads[pivot].center[1],
+            pads[start].center[0] - pads[pivot].center[0]))
+        if abs((bearing - expected_bearing + 180) % 360 - 180) > 0.5:
+            raise GaitExecutorError("横梁角与当前支座位置不一致；请重新建立 A/B 标定基准")
+        expected_target = math.degrees(math.atan2(
+            pads[target].center[1] - pads[pivot].center[1],
+            pads[target].center[0] - pads[pivot].center[0]))
+        if abs((bearing - 60.0 - expected_target + 180) % 360 - 180) > 0.5:
+            raise GaitExecutorError("该侧顺向60°公转不通向目标低节点；当前应交换摆动/支撑侧")
+        route = (start, target, pivot, bearing)
+        report = plan_swing_trajectory(params, side=side, route=route)
+        self.log(f"步态角度联动校验（{start}→{target}，支点{pivot}）：{report.message}")
         if not report.feasible:
             raise GaitExecutorError(f"干跑不可行，拒绝开始：{report.message}")
         stages = plan_gait_stages(params, side=side, swing_psi_start_deg=psi_now)
+        # S3 也有扫掠风险，按相同包络检查整个原地相位调整，不只检查 S4。
+        phase_stage = next((s for s in stages if s.stage_id == "S3"), None)
+        if phase_stage is not None:
+            delta_psi = phase_stage.move_groups[0][0].delta * sign
+            phase_margin = min(clearance_margin_mm(
+                pads[start].center, psi_now + delta_psi * i / 360.0,
+                params.geometry, report.hexagons, lift_mm=params.lift_mm,
+                pivot=pads[pivot].center) for i in range(361))
+            phase_margin -= params.geometry.arm_length_mm * math.radians(abs(delta_psi)) / 720.0
+            if phase_margin <= 0:
+                raise GaitExecutorError("S3 原地相位调整扫掠高点，拒绝执行")
+        p_swing, p_support = self.axis_profiles[axis], self.axis_profiles[support_axis]
+        # One shared master tick, rounded total counts and DDA rounding contribute
+        # at most two pulse quanta per joint. Reserve their geometric displacement.
+        phi_error = 2.0 / p_support.pulses_per_unit
+        psi_error = phi_error + 2.0 / p_swing.pulses_per_unit
+        pulse_envelope = math.radians(phi_error) * params.geometry.d_mm + math.radians(psi_error) * params.geometry.arm_length_mm
+        lift_axis = role_axes["Mup1" if side == "left" else "Mup2"]
+        pulse_envelope += 0.5 / self.axis_profiles[lift_axis].pulses_per_unit
+        phase_residual = abs((psi_now - LOW_NODE_PHASE_DEG + 60) % 120 - 60)
+        if phase_stage is not None:
+            phase_residual = 0.5 / p_swing.pulses_per_unit
+        pulse_envelope += params.geometry.arm_length_mm * math.radians(phase_residual)
+        pulse_envelope += params.geometry.d_mm * math.radians(abs((bearing - expected_bearing + 180) % 360 - 180))
+        if report.min_margin_mm <= pulse_envelope or (phase_stage is not None and phase_margin <= pulse_envelope):
+            raise GaitExecutorError(f"避障余量不足以覆盖脉冲量化包络 {pulse_envelope:.2f}mm；请提高实际细分/减速比或修正几何")
+        # 预检整个行程与两侧线缆角限制；不允许发出抬足后才发现公转越界。
+        with self.state_lock:
+            if self._gait_hardware_fingerprint() != params.calibration_fingerprint:
+                raise GaitExecutorError("预检期间配置已变化")
+            if any(self._axis_motion_active_locked(a) or not self.axis_runtime[a].position_trusted
+                   for a in role_axes.values()):
+                raise GaitExecutorError("预检期间轴状态已变化")
+            targets = {a: self.axis_runtime[a].position_steps for a in role_axes.values()}
+            for role, a in role_axes.items():
+                p, r = self.axis_profiles[a], self.axis_runtime[a]
+                if ((r.min_steps is not None and r.position_steps < r.min_steps)
+                        or (r.max_steps is not None and r.position_steps > r.max_steps)):
+                    raise GaitExecutorError(f"{role} 当前坐标已在行程外，请先恢复标定")
+                if role.startswith("Mr"):
+                    z = params.mr1_zero_deg if role == "Mr1" else params.mr2_zero_deg
+                    if abs(p.units_from_steps(r.position_steps)-z) > params.rotation_limit_deg:
+                        raise GaitExecutorError(f"{role} 当前已在线缆窗口外")
+            for stage in stages:
+                for group in stage.move_groups:
+                    sync_counts = []
+                    for move in group:
+                        a = role_axes[move.role]
+                        p, r = self.axis_profiles[a], self.axis_runtime[a]
+                        count = p.command_steps_from_units(abs(move.delta))
+                        if count < 1 or move.speed * p.pulses_per_unit > PULSE_RATE_WARN_PPS:
+                            raise GaitExecutorError(f"{move.role} {stage.stage_id} 脉冲分辨率/速度不符合安全要求")
+                        if count > 20000000:
+                            raise GaitExecutorError("步态运动超过固件单段脉冲数限制")
+                        targets[a] += math.copysign(count, move.delta)
+                        direction = DIR_OUTWARD if move.delta * outward_position_sign(a) > 0 else DIR_INWARD
+                        sync_counts.append((a, count if direction ^ DIR_INVERT[a] else -count))
+                        if ((r.min_steps is not None and targets[a] < r.min_steps)
+                                or (r.max_steps is not None and targets[a] > r.max_steps)):
+                            raise GaitExecutorError(f"{move.role} {stage.stage_id} 超过已标定行程")
+                        if move.role.startswith("Mr"):
+                            z = params.mr1_zero_deg if move.role == "Mr1" else params.mr2_zero_deg
+                            if abs(p.units_from_steps(targets[a]) - z) > params.rotation_limit_deg + 1e-8:
+                                raise GaitExecutorError(f"{move.role} 角度轨迹超过线缆窗口；必须另行校验悬空解绕，不能缩短公转自转轨迹")
+                    if stage.synchronized:
+                        try:
+                            build_sync_command(sync_counts[0][0], sync_counts[0][1],
+                                               sync_counts[1][0], sync_counts[1][1], round(stage.duration_s*1000000))
+                        except ProtocolEncodingError as exc:
+                            raise GaitExecutorError(f"同步轨迹时间/脉冲数超出固件能力：{exc}") from exc
+            token = object()
+            for a in role_axes.values():
+                self._move_reservation[a] = token
+            self._gait_owned = {a: token for a in role_axes.values()}
         self._gait_run = GaitExecutor(
             _GaitHostAdapter(self), params, stages, side=side)
+        self._gait_run.route = route
+        self._gait_run.rotation_start = None
         self.log(f"步态执行器就绪（{side}）：{len(stages)} 个阶段，"
                  f"当前 ψ={psi_now:.1f}°")
         return self._gait_run, report
+
+    def _gait_release_ownership(self):
+        with self.state_lock:
+            for a, token in getattr(self, "_gait_owned", {}).items():
+                if self._move_reservation[a] is token:
+                    self._move_reservation[a] = None
+            self._gait_owned = {}
+
+    def _gait_angle_snapshot(self):
+        """Estimated (not measured) world/beam/joint angles from shared pulse progress."""
+        run = getattr(self, "_gait_run", None)
+        if run is None or run.rotation_start is None:
+            return None
+        try:
+            if run.params.calibration_fingerprint != self._gait_hardware_fingerprint():
+                return None
+        except GaitExecutorError:
+            return None
+        swing, support = ("Mr1", "Mr2") if run.side == "left" else ("Mr2", "Mr1")
+        offsets = {}
+        with self.state_lock:
+            for role in (swing, support):
+                a = self._gait_role_axis(role)
+                r, p = self.axis_runtime[a], self.axis_profiles[a]
+                position = projected_step_position(r.position_steps, self._pending_step[a],
+                                                   self.axis_motion_telemetry[a])
+                position = r.position_steps if position is None else position
+                sign = run.params.mr1_sign if role == "Mr1" else run.params.mr2_sign
+                offsets[role] = sign * p.units_from_steps(position - run.rotation_start[a])
+            phi = offsets[support]
+            beta_start = run.route[3] - (180 if run.side == "right" else 0)
+        return {"phi_deg": phi, "beta_deg": beta_start - phi,
+                "psi_delta_deg": offsets[swing] - phi,
+                "swing_q_delta_deg": offsets[swing], "support_q_delta_deg": offsets[support],
+                "measured": False}
 
     def _gait_execute_stage(self):
         """UI 线程：启动控制工作线程执行当前运动阶段。"""
@@ -777,9 +989,16 @@ class StepperGUI:
 
         try:
             run.execute_current_stage(progress)
-        except GaitExecutorError as exc:
+        except Exception as exc:
             self.log(f"⛔ 步态阶段未执行：{exc}")
+            run.request_stop()
+            run._fail("failed", f"执行异常：{exc}")
+            self._gait_stop_axes(self.control_bindings.bound_axes)
         finally:
+            if run.state in ("aborted", "failed"):
+                self._gait_needs_recovery = True
+                self.gait_params = replace(self.gait_params, calibration_confirmed=False)
+                self._gait_release_ownership()
             self._post_ui(lambda: self._refresh_gait_ui())
 
     def _gait_abort_run(self):
@@ -789,6 +1008,8 @@ class StepperGUI:
         if run is None:
             return
         run.request_stop()
+        self._gait_needs_recovery = True
+        run._fail("aborted", "步态已中止，须人工重建物理基准")
         axes = []
         for role in LOGICAL_ROLE_ORDER:
             try:
@@ -796,6 +1017,7 @@ class StepperGUI:
             except GaitExecutorError:
                 continue
         self._gait_stop_axes(axes)
+        self._gait_release_ownership()
         self.log("⛔ 步态已中止：四个逻辑轴都已发 STOP；"
                  "如有轴被 ABORT，位置不可信，需重新校准后才能继续")
 
@@ -833,15 +1055,97 @@ class StepperGUI:
             if delta * outward_position_sign(axis) > 0
             else DIR_INWARD
         )
-        return "sent" if self._send_mm(
-            axis, abs(delta), direction, delay_ms) else "failed"
+        token = getattr(self, "_gait_owned", {}).get(axis)
+        if token is None:
+            return "failed"
+        guard = lambda: self._move_reservation[axis] is token and not self._control_worker_cancelled()
+        return "sent" if self._send_mm_reserved(
+            axis, abs(delta), direction, delay_ms, profile=profile, guard=guard) else "failed"
+
+    def _gait_send_synchronized(self, moves, duration_s):
+        """Preflight/reserve BOTH axes before one SYNC write; no serial motion fallback."""
+        if len(moves) != 2 or self._control_worker_cancelled():
+            return "failed"
+        prepared = []
+        with self.state_lock:
+            for axis, delta, speed in moves:
+                if not 0 <= axis < 6 or not math.isfinite(delta) or not math.isfinite(speed) or speed <= 0:
+                    return "failed"
+                p, r = self.axis_profiles[axis], self.axis_runtime[axis]
+                token = getattr(self, "_gait_owned", {}).get(axis)
+                if (token is None or self._move_reservation[axis] is not token
+                        or not r.position_trusted or not self.axis_param_valid[axis]
+                        or p.mode != MODE_ROTARY or self._pending_step[axis] is not None
+                        or self.stepper_in_progress[axis] or self._move_dispatching[axis]):
+                    return "failed"
+                count = p.command_steps_from_units(abs(delta))
+                if count <= 0:  # cannot silently drop one half of a coupled path
+                    return "failed"
+                signed = count if delta > 0 else -count
+                target = r.position_steps + signed
+                if ((r.min_steps is not None and target < r.min_steps)
+                        or (r.max_steps is not None and target > r.max_steps)):
+                    return "failed"
+                if speed * p.pulses_per_unit > min(5000, PULSE_RATE_WARN_PPS):
+                    return "failed"
+                direction = DIR_OUTWARD if delta * outward_position_sign(axis) > 0 else DIR_INWARD
+                wire_count = count if direction ^ DIR_INVERT[axis] else -count
+                prepared.append((axis, signed, wire_count, token))
+            a, b = prepared
+            try:
+                command = build_sync_command(a[0], a[2], b[0], b[2], round(duration_s * 1_000_000))
+            except (ProtocolEncodingError, TypeError, ValueError, OverflowError):
+                return "failed"
+            for axis, signed, _, _ in prepared:
+                self._move_dispatching[axis] = True
+                self.stepper_in_progress[axis] = True
+                self._pending_step[axis] = signed
+                self.axis_motion_telemetry[axis] = AxisMotionTelemetry.starting(
+                    self._axis_motion_generation[axis], abs(signed))
+            if self._gait_run is not None:
+                self._gait_run.rotation_start = {axis: self.axis_runtime[axis].position_steps
+                                                for axis, _, _, _ in prepared}
+
+        def guard():
+            with self.state_lock:
+                return (not self._control_worker_cancelled()
+                        and all(self._move_reservation[axis] is token for axis, _, _, token in prepared))
+
+        uncertain = False
+        try:
+            response = self._send_and_read(command, guard=guard, propagate_request_error=True)
+        except RequestCancelled:
+            response = ""
+        except (RequestTimeout, SerialSessionError):
+            response, uncertain = "", True
+        except Exception as exc:
+            self.log(f"SYNC 下发异常：{exc}")
+            response, uncertain = "", True
+        accepted = response == f"OK,SYNC,{a[0]},{b[0]}"
+        # Generic ERR lacks a transaction id; after a write, even a stale ERR
+        # must not leave the host claiming a trusted position.
+        uncertain = uncertain or not accepted
+        with self.state_lock:
+            for axis, signed, _, _ in prepared:
+                self._move_dispatching[axis] = False
+                if not accepted:
+                    if uncertain:
+                        self.axis_runtime[axis].position_trusted = False
+                    if self._pending_step[axis] is not None:
+                        self._pending_step[axis] = None
+                        self.stepper_in_progress[axis] = False
+                        self.axis_motion_telemetry[axis] = self.axis_motion_telemetry[axis].reset(
+                            result="UNKNOWN" if uncertain else "REJECTED")
+        self.log(f"角度同步轨迹 {command} → {response or '未确认'}")
+        return "sent" if accepted else "failed"
 
     def _gait_wait_terminal(self, axis, timeout_s):
         """轮询等待一轴到达终态；DONE / ABORTED / TIMEOUT / CANCELLED。"""
 
         deadline = time.monotonic() + timeout_s
         while True:
-            if self._control_worker_cancelled():
+            if (self._control_worker_cancelled()
+                    or (getattr(self, "_gait_run", None) is not None and self._gait_run._stop_requested)):
                 return "CANCELLED"
             with self.state_lock:
                 busy = (
@@ -885,9 +1189,12 @@ class StepperGUI:
     def _gait_params_from_ui(self):
         """收集输入框 → 校验后的 GaitParams；非法时弹窗并返回 None。"""
 
+        if getattr(self, "_gait_owned", {}):
+            messagebox.showwarning("步态占用", "执行期间不能保存/更换参数，请先完成或中止")
+            return None
         try:
             return collect_gait_params(self, self.gait_params)
-        except ValueError as exc:
+        except (ValueError, GaitExecutorError) as exc:
             messagebox.showerror("步态参数无效", str(exc))
             return None
 
@@ -905,11 +1212,16 @@ class StepperGUI:
         self._refresh_gait_ui()
 
     def _gait_record_zero_clicked(self, role_name):
+        params = self._gait_params_from_ui()
+        if params is None:
+            return
         try:
+            self._save_gait_params(replace(params, calibration_confirmed=False))
             self._gait_record_role_zero(role_name)
         except GaitExecutorError as exc:
             messagebox.showerror("记零失败", str(exc))
             return
+        self.gait_calibrated_var.set(False)
         self._refresh_gait_ui()
 
     def _gait_run_dry_run(self):
@@ -918,25 +1230,11 @@ class StepperGUI:
             return
         self._save_gait_params(params)
         side = self.gait_side_var.get()
-        theta = self._gait_swing_theta_deg(side, params)
-        theta_known = theta is not None
-        if not theta_known:
-            theta = 0.0  # 绑定/零位不可用：按基准位展示
-        try:
-            swing_delta = unwrap_swing_joint_delta(
-                theta, params.rotation_limit_deg)
-        except ValueError as exc:
-            messagebox.showerror("累计角越窗", str(exc))
-            return
-        report = plan_swing_trajectory(
-            params, side=side, swing_joint_delta_deg=swing_delta)
+        report = plan_swing_trajectory(params, side=side)
         self._gait_last_report = report
         self.gait_report_var.set(report.message)
         self.log(
-            f"步态干跑（{side}，解绕 Δq={swing_delta:+g}°"
-            + (f"，累计角 θ={theta:+.1f}°）" if theta_known else
-               "，按基准位 θ=0）")
-            + f"：{report.message}")
+            f"步态角度预览（{side}，相位增益 {params.phase_gain:g}）：{report.message}")
         draw_gait_preview(self)
         if not report.feasible:
             messagebox.showwarning(
@@ -962,6 +1260,12 @@ class StepperGUI:
         run = self._gait_run
         if run is None:
             return
+        if run.state == "running":
+            return
+        if run._stop_requested:
+            self._gait_abort_run()
+            self._refresh_gait_ui()
+            return
         stage = run.current_stage()
         if stage is None:
             self._refresh_gait_ui()
@@ -975,6 +1279,16 @@ class StepperGUI:
             self._gait_execute_stage()
         elif run.advance_confirm():
             self.log(f"✓ {stage.stage_id} {stage.title} 人工确认通过")
+            if run.state == "done":
+                start, target, pivot, _bearing = run.route
+                self._gait_supports = (target, pivot) if run.side == "left" else (pivot, target)
+                support_role = "Mr2" if run.side == "left" else "Mr1"
+                a = self._gait_role_axis(support_role)
+                support_sign = run.params.mr2_sign if run.side == "left" else run.params.mr1_sign
+                actual_phi = support_sign * self.axis_profiles[a].units_from_steps(
+                    self.axis_runtime[a].position_steps - run.rotation_start[a])
+                self._gait_beta_deg -= actual_phi
+                self._gait_release_ownership()
         self._refresh_gait_ui()
 
     def _gait_abort_clicked(self):
@@ -982,6 +1296,8 @@ class StepperGUI:
         self._refresh_gait_ui()
 
     def _gait_reset_run(self):
+        if getattr(self, "_gait_owned", {}):
+            self._gait_abort_run()
         self._gait_run = None
         self.log("步态流程已重置（执行器丢弃，重新开始前会重新干跑）")
         self._refresh_gait_ui()
@@ -2092,6 +2408,10 @@ class StepperGUI:
         """Invalidate queued MOVE work and reserve the axis until STOP replies."""
 
         with self.state_lock:
+            if axis in getattr(self, "_gait_owned", {}):
+                self._gait_needs_recovery = True
+                if self._gait_run is not None:
+                    self._gait_run.request_stop()
             self._axis_motion_generation[axis] += 1
             stop_reservation = object()
             self.running[axis] = False
@@ -2329,6 +2649,20 @@ class StepperGUI:
         return max(0.0, min(1.0, float(executed_steps) / float(requested_steps)))
 
     def _on_step_done(self, axis, executed_steps=None, requested_steps=None):
+        # A gait may lower a foot only after the full commanded path completes.
+        # Legacy/mismatched/partial DONE is not sufficient evidence, even if
+        # the controller labels it DONE. Keep ordinary legacy MOVE behavior.
+        with self.state_lock:
+            expected = self._pending_step[axis]
+            gait_owned = axis in getattr(self, "_gait_owned", {})
+        if (gait_owned and expected is not None
+                and (requested_steps != abs(expected)
+                     or executed_steps != abs(expected))):
+            self.log(f"步态轴{AXIS_LABEL[axis]} DONE脉冲数异常，禁止继续落脚")
+            if requested_steps != abs(expected):
+                executed_steps = requested_steps = None
+            self._on_step_aborted(axis, executed_steps, requested_steps)
+            return
         with self.state_lock:
             pending_step = self._pending_step[axis]
             if pending_step is not None:
@@ -2476,7 +2810,7 @@ class StepperGUI:
     def _land_release_tick(self, axis):
         """直线轴运动事件钩子（UI 线程）：监测落地收敛 + 尝试重新锁定。"""
 
-        if axis not in self.paired_axes:
+        if getattr(self, "_gait_owned", {}) or axis not in self.paired_axes:
             return
         try:
             enabled = self.pair_land_release_enabled.get()
@@ -2529,6 +2863,11 @@ class StepperGUI:
 
         self._rot_release_active = True
         self._rot_release_axes = tuple(sorted(set(axes)))
+        # Free rotor motion is not observed by host pulse accounting.
+        with self.state_lock:
+            for released_axis in self._rot_release_axes:
+                self.axis_runtime[released_axis].position_trusted = False
+        self._save_calib()
         if self._start_control_worker(worker) is None:
             self._rot_release_active = False
             self._rot_release_axes = ()
@@ -3607,6 +3946,11 @@ class StepperGUI:
     def _stop_all_outputs(self, allow_closing=False):
         """发送固件原子软件急停；返回是否收到精确确认。"""
         with self.state_lock:
+            if getattr(self, "_gait_owned", {}):
+                self._gait_needs_recovery = True
+                if self._gait_run is not None:
+                    self._gait_run.request_stop()
+                self._gait_release_ownership()
             self._control_generation += 1
             self._track_lease_generation += 1
             for axis in range(NUM_STEPPER_AXES):

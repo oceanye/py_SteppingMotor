@@ -130,14 +130,13 @@ class TrajectoryTests(unittest.TestCase):
         self.assertAlmostEqual(first.beta_deg, 180.0)
         self.assertAlmostEqual(last.beta_deg, 120.0)
 
-    def test_default_placeholder_geometry_is_feasible(self):
+    def test_unmeasured_geometry_does_not_hide_vertical_collision(self):
         for side in ("left", "right"):
             report = plan_swing_trajectory(GaitParams().validated(), side=side)
-            self.assertTrue(
-                report.feasible,
-                f"{side}: {report.message}",
-            )
-            self.assertGreater(report.min_margin_mm, 0.0)
+            self.assertFalse(report.feasible)
+            safe = plan_swing_trajectory(GaitParams(lift_mm=35.0), side=side)
+            self.assertTrue(safe.feasible, safe.message)
+            self.assertGreater(safe.min_margin_mm, 0.0)
 
     def test_oversized_nodes_make_trajectory_infeasible(self):
         params = GaitParams(
@@ -182,7 +181,8 @@ class StagePlanTests(unittest.TestCase):
         # 左摆动：摆动 Mr1 +180°（sign=+1），支撑 Mr2 −60°（sign=−1）
         swing_total = support_total = 0.0
         s4 = by_id["S4"]
-        self.assertEqual(len(s4.move_groups), 10)
+        self.assertEqual(len(s4.move_groups), 1)
+        self.assertTrue(s4.synchronized)
         for group in s4.move_groups:
             self.assertEqual(len(group), 2)
             for move in group:
@@ -191,7 +191,7 @@ class StagePlanTests(unittest.TestCase):
                 else:
                     support_total += move.delta
                     self.assertEqual(move.role, "Mr2")
-        self.assertAlmostEqual(swing_total, 60.0, places=6)
+        self.assertAlmostEqual(swing_total, 180.0, places=6)
         self.assertAlmostEqual(support_total, -60.0, places=6)
         # 抬起/落足方向相反
         s2 = next(m for m in by_id["S2"].move_groups[0] if m.role == "Mup1")
@@ -211,7 +211,7 @@ class StagePlanTests(unittest.TestCase):
             if move.role == "Mr2"
         )
         # 右摆动 Mr2，θ=0 解绕小步 +60°
-        self.assertAlmostEqual(swing_total, 60.0, places=6)
+        self.assertAlmostEqual(swing_total, 180.0, places=6)
         lift_roles = {
             move.role
             for stage in stages
@@ -321,7 +321,7 @@ class MarginTests(unittest.TestCase):
         geometry = GaitGeometry(d_mm=140.0).validated()
         center = (0.0, 0.0)
         margin = clearance_margin_mm(center, LOW_NODE_PHASE_DEG, geometry,
-                                     [HexPad("H", center)])
+                                     [HexPad("H", center)], include_hub=False)
         expected = (geometry.arm_length_mm * math.sin(math.radians(60.0))
                     - geometry.arm_radius_mm - geometry.node_radius_mm
                     - geometry.safety_margin_mm)
@@ -337,7 +337,7 @@ class MarginTests(unittest.TestCase):
         self.assertLess(near, far)
         self.assertLess(near, 0.0)
 
-    def test_nodes_under_hub_are_excluded_from_arm_check(self):
+    def test_nodes_under_hub_are_never_silently_excluded(self):
         # 节点落在壳体正下方（(15,0)，距中心 ≤ hub+node 半径）时即使
         # 正对爪臂方向也不计水平碰撞——它由抬升壳体越过，属垂向间隙问题。
         geometry = GaitGeometry().validated()
@@ -348,7 +348,10 @@ class MarginTests(unittest.TestCase):
         without = clearance_margin_mm((0.0, 0.0), 30.0, geometry, base)
         with_node = clearance_margin_mm((0.0, 0.0), 30.0, geometry,
                                         with_under_hub)
-        self.assertAlmostEqual(without, with_node)
+        self.assertLess(with_node, without)
+        self.assertLess(with_node, 0)
+        self.assertGreater(clearance_margin_mm((0.0, 0.0), 30.0, geometry,
+                                              with_under_hub, lift_mm=35.0), 0)
         self.assertTrue(
             node_under_hub((15.0, 0.0), (0.0, 0.0), geometry)
         )
@@ -439,35 +442,24 @@ class UnwrapGaitSequenceTests(unittest.TestCase):
                         move.delta if move.role.startswith("Mr") else 0.0)
         return thetas
 
-    def test_alternating_walk_keeps_both_thetas_in_window(self):
+    def test_planning_never_shortcuts_angular_path_to_fit_cable_window(self):
         params = GaitParams(swing_segments=3).validated()
-        thetas = {"left": 0.0, "right": 0.0}
-        for index in range(12):
-            side = "left" if index % 2 == 0 else "right"
-            self._advance(params, side, thetas)
-            for name, theta in thetas.items():
-                self.assertLessEqual(
-                    abs(theta), params.rotation_limit_deg + 1e-6,
-                    msg=f"第 {index} 步后 {name} 累计角 {theta:.1f}° 越窗")
-        # 机器持续前进：两侧累计变化都为正（左撑右摆/右撑左摆交替累加）
-        self.assertGreater(thetas["left"], 0.0)
-        self.assertGreater(thetas["right"], 0.0)
+        for theta in (-180, -60, 0, 60, 180):
+            stages = plan_gait_stages(params, side="left", swing_psi_start_deg=30+theta)
+            s4 = next(s for s in stages if s.stage_id == "S4")
+            self.assertAlmostEqual(s4.move_groups[0][0].delta, 180)
+            self.assertAlmostEqual(s4.move_groups[0][1].delta, 60)
 
     def test_dry_run_trajectory_follows_actual_joint_delta(self):
         params = GaitParams().validated()
-        # Δq=60 → Δψ=0：摆动全程三足不自转
-        report = plan_swing_trajectory(
-            params, side="left", swing_joint_delta_deg=60.0)
-        for sample in report.samples:
-            self.assertAlmostEqual(sample.psi_deg, 30.0, places=9)
+        with self.assertRaises(ValueError):
+            plan_swing_trajectory(params, side="left", swing_joint_delta_deg=60.0)
         # Δq=180 → Δψ=120：ψ 从 30 走到 150
         report = plan_swing_trajectory(params, side="left")
         self.assertAlmostEqual(report.samples[0].psi_deg, 30.0)
         self.assertAlmostEqual(report.samples[-1].psi_deg, 150.0)
-        # Δq=−60 → Δψ=−120：ψ 从 30 走到 −90
-        report = plan_swing_trajectory(
-            params, side="left", swing_joint_delta_deg=-60.0)
-        self.assertAlmostEqual(report.samples[-1].psi_deg, -90.0)
+        with self.assertRaises(ValueError):
+            plan_swing_trajectory(params, side="left", swing_joint_delta_deg=-60.0)
 
 
 if __name__ == "__main__":

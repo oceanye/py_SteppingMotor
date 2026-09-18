@@ -227,7 +227,7 @@ def build_coordinated_tab(app, parent) -> None:
             "progress": progress,
         }
 
-    readiness = ttk.LabelFrame(parent, text="协调控制就绪度")
+    readiness = ttk.LabelFrame(parent, text="自主步态就绪度（不替代分阶段人工确认联动）")
     readiness.grid(row=3, column=0, sticky="ew", **PAD)
     ready_label = ttk.Label(
         readiness,
