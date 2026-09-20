@@ -756,7 +756,7 @@ class StepperGUI:
         if getattr(self, "_gait_owned", {}):
             raise GaitExecutorError("上一次步态尚未完成/中止，不能覆盖执行器")
         if not params.calibration_confirmed:
-            raise GaitExecutorError("尚未确认实测几何、包络高度、方向、PPR及支撑反力闭合；仅允许预览")
+            raise GaitExecutorError("尚未确认电机方向、PPR、零位及现场支撑条件；请在步态页的【标定】中确认")
         if getattr(self, "_gait_needs_recovery", False):
             raise GaitExecutorError("上一次动作未完整完成；必须人工重建 A/B 物理基准、重新标定")
         if params.calibration_fingerprint != self._gait_hardware_fingerprint():
@@ -920,10 +920,15 @@ class StepperGUI:
             for a in role_axes.values():
                 self._move_reservation[a] = token
             self._gait_owned = {a: token for a in role_axes.values()}
+            twin_lift_start = {role: self.axis_profiles[role_axes[role]].units_from_steps(
+                self.axis_runtime[role_axes[role]].position_steps) for role in ("Mup1", "Mup2")}
         self._gait_run = GaitExecutor(
             _GaitHostAdapter(self), params, stages, side=side)
         self._gait_run.route = route
         self._gait_run.rotation_start = None
+        self._gait_run.twin_lift_start = twin_lift_start
+        self._gait_run.twin_final_positions = None
+        self._gait_run.twin_manual_invalid = False
         self.log(f"步态执行器就绪（{side}）：{len(stages)} 个阶段，"
                  f"当前 ψ={psi_now:.1f}°")
         if clearance_warnings:
@@ -969,6 +974,45 @@ class StepperGUI:
                 "psi_delta_deg": offsets[swing] - phi,
                 "swing_q_delta_deg": offsets[swing], "support_q_delta_deg": offsets[support],
                 "measured": False}
+
+    def _gait_twin_snapshot(self):
+        """Read-only visual model; its output never enters motion/safety decisions."""
+        from motor_control.gait_twin import build_twin_snapshot
+
+        with self.state_lock:
+            _control, axes = self._snapshot_coordinated_control_locked()
+            params = self.gait_params
+            try:
+                reference_valid = (params.calibration_fingerprint == self._gait_hardware_fingerprint()
+                         and params.mr1_zero_deg is not None and params.mr2_zero_deg is not None
+                         and params.mr1_zero_signature == self._gait_zero_signature("Mr1", params)
+                         and params.mr2_zero_signature == self._gait_zero_signature("Mr2", params))
+            except GaitExecutorError:
+                reference_valid = False
+            valid = params.calibration_confirmed and reference_valid
+            run = getattr(self, "_gait_run", None)
+            context = None
+            if (run is not None and hasattr(run, "twin_lift_start") and reference_valid
+                    and run.params.calibration_fingerprint == params.calibration_fingerprint
+                    and all(getattr(run.params, key) == getattr(params, key) for key in (
+                        "mr1_zero_deg", "mr2_zero_deg", "mr1_sign", "mr2_sign",
+                        "mup1_lift_sign", "mup2_lift_sign", "beam_reference_deg"))):
+                if run.twin_final_positions is not None and any(
+                        a.get("target_position") is not None
+                        or a.get("position") != run.twin_final_positions.get(a["role"])
+                        for a in axes):
+                    # After independent manual/Web moves the grounded pivot is
+                    # unknown. Keep axis readouts, do not invent a world pose.
+                    run.twin_manual_invalid = True
+                rotation_start = (None if run.rotation_start is None else {
+                    role: self.axis_profiles[self._gait_role_axis(role)].units_from_steps(
+                        run.rotation_start[self._gait_role_axis(role)]) for role in ("Mr1", "Mr2")})
+                context = {"side": run.side, "route": run.route,
+                           "rotation_start": rotation_start, "lift_start": run.twin_lift_start,
+                           "reference_key": id(run), "manual_invalid": run.twin_manual_invalid}
+            return build_twin_snapshot(params, axes, context=context,
+                                       calibration_valid=valid,
+                                       needs_recovery=getattr(self, "_gait_needs_recovery", False))
 
     def _gait_execute_stage(self):
         """UI 线程：启动控制工作线程执行当前运动阶段。"""
@@ -1301,6 +1345,10 @@ class StepperGUI:
                 actual_phi = support_sign * self.axis_profiles[a].units_from_steps(
                     self.axis_runtime[a].position_steps - run.rotation_start[a])
                 self._gait_beta_deg -= actual_phi
+                run.twin_final_positions = {
+                    role.value: self.axis_profiles[self._gait_role_axis(role.value)].units_from_steps(
+                        self.axis_runtime[self._gait_role_axis(role.value)].position_steps)
+                    for role in LOGICAL_ROLE_ORDER}
                 self._gait_release_ownership()
         self._refresh_gait_ui()
 

@@ -1,0 +1,650 @@
+下面将四台电机统一定义为一个“**双足交替支撑、抬起足公转换位、同时自转避障**”的控制系统。
+
+## 1. 电机与运动变量
+
+| 电机       | 物理动作      | 控制变量             |
+| -------- | --------- | ---------------- |
+| `Mz_L`   | 左足抬起、落下   | 左足高度 \(z_L\)     |
+| `Mz_R`   | 右足抬起、落下   | 右足高度 \(z_R\)     |
+| `Mrot_L` | 左足绕自身中心旋转 | 左足自转角 \(\psi_L\) |
+| `Mrot_R` | 右足绕自身中心旋转 | 右足自转角 \(\psi_R\) |
+
+需要注意：四台电机中没有单独的“公转电机”。因此：
+
+* **自转**：由对应的 `Mrot_L` 或 `Mrot_R` 直接控制；
+* **公转**：由一侧足锁定、另一侧足抬起，再通过旋转电机和横梁约束形成；
+* 公转是机构约束下的整体运动，不能简单理解为某台电机直接输出水平位移。
+
+程序中应同时维护三类角度：
+
+```text
+psi_L       左足相对于自身中心的姿态角
+psi_R       右足相对于自身中心的姿态角
+phi         当前公转角
+beta        横梁相对于固定坐标系的角度
+```
+
+如果旋转电机编码器安装在足与横梁之间，则：
+
+$$
+q_L=\psi_L-\beta+c_L
+$$
+
+$$
+q_R=\psi_R-\beta+c_R
+$$
+
+其中 \(q_L,q_R\) 为 `Mrot_L`、`Mrot_R` 的电机角度，\(c_L,c_R\) 为安装零位补偿。
+
+因此，公转过程中，即使某一足的地面姿态保持不变，电机编码器角度也可能需要随横梁角度变化进行补偿。
+
+---
+
+## 2. 机构状态定义
+
+假设初始状态为：
+
+$$
+L=A,\qquad R=B
+$$
+
+即：
+
+* 左足支撑在六边形支座 A；
+* 右足支撑在六边形支座 B；
+* 横梁连接 A、B；
+* 低节点可以踩踏；
+* 高节点不能踩踏。
+
+一次步进采用左足换位：
+
+$$
+(A,B)\rightarrow(C,B)
+$$
+
+即右足锁定在 B，左足从 A 公转到 C。
+
+下一步采用右足换位：
+
+$$
+(C,B)\rightarrow(C,A)
+$$
+
+整个行走过程采用左右交替。
+
+---
+
+## 3. 总体控制状态机
+
+```text
+INIT
+  ↓
+CALIBRATE
+  ↓
+BOTH_STANCE
+  ↓
+LOCK_SUPPORT
+  ↓
+LIFT_SWING
+  ↓
+SELF_ROTATE_ALIGN
+  ↓
+REVOLUTION
+  ↓
+PLACE_SWING
+  ↓
+CONTACT_VERIFY
+  ↓
+LOAD_TRANSFER
+  ↓
+STEP_COMPLETE
+  ↓
+交换左右足，进入下一步
+```
+
+发生以下任一情况时进入 `FAULT`：
+
+```text
+FAULT
+  ├─ 过流
+  ├─ 堵转
+  ├─ 超行程
+  ├─ 高节点误接触
+  ├─ 两足同时失去支撑
+  ├─ 目标低节点未检测到
+  ├─ 公转角度异常
+  └─ 编码器与实际位置不一致
+```
+
+---
+
+# 4. 一次左足换位的完整逻辑
+
+## S0：双足支撑状态 `BOTH_STANCE`
+
+初始状态：
+
+```text
+Mz_L  = DOWN + HOLD
+Mz_R  = DOWN + HOLD
+Mrot_L = HOLD
+Mrot_R = HOLD
+```
+
+确认条件：
+
+```text
+left_contact == VALID
+right_contact == VALID
+high_node_contact == FALSE
+motor_current_normal == TRUE
+```
+
+这里要求左右两组三足均落在低位节点上。
+
+---
+
+## S1：锁定右足 B 点 `LOCK_RIGHT`
+
+右足 B 是本次公转的固定支点。
+
+```text
+Mz_R  = DOWN + FORCE_HOLD
+Mrot_R = TORQUE_HOLD
+```
+
+右足必须能够承受：
+
+* 横梁反力；
+* 左足公转产生的水平力；
+* 机构重力偏心；
+* 公转加减速产生的惯性力矩。
+
+确认条件：
+
+```text
+right_contact == VALID
+right_support_force >= F_lock_min
+Mrot_R torque <= T_lock_max
+```
+
+此时右足不能抬起，也不能发生非期望转动。
+
+---
+
+## S2：抬起左足 `LIFT_LEFT`
+
+释放左足 A 点支撑：
+
+```text
+Mz_L = UP_TO(z_clear)
+Mrot_L = POSITION_HOLD
+Mz_R = DOWN + FORCE_HOLD
+Mrot_R = TORQUE_HOLD
+```
+
+其中：
+
+$$
+z_{\text{clear}}
+>
+h_{\text{高节点}}-h_{\text{低节点}}
++\Delta h_{\text{安全}}
+$$
+
+`Mz_L` 不应只运动到固定时间，而应通过编码器或限位确认。
+
+确认条件：
+
+```text
+left_contact == RELEASED
+z_L >= z_clear
+right_contact == VALID
+```
+
+禁止事项：
+
+```text
+禁止左右足同时抬起
+禁止右足未锁定时抬起左足
+禁止左足尚未离开 A 点就启动公转
+```
+
+---
+
+## S3：左足自转避障 `SELF_ROTATE_ALIGN`
+
+左足已经抬起，开始用 `Mrot_L` 调整三个爪的方向。
+
+设左足公转角为 \(\phi\)，左足姿态角为 \(\psi_L\)。
+
+一种候选同步关系是：
+
+$$
+\psi_L(\phi)
+=
+\psi_{L0}+k\phi
+$$
+
+其中 \(k\) 不应直接写死，需根据高节点几何和爪臂宽度计算。对于当前等边六边形模型，可以先用：
+
+$$
+k=2
+$$
+
+作为初始试验值，即：
+
+$$
+\psi_L=\psi_{L0}+2\phi
+$$
+
+其作用是：
+
+* 使爪臂避开高节点；
+* 使爪端在终点重新对准 C 的低节点；
+* 使高节点位于相邻两条爪臂之间。
+
+控制方式：
+
+```text
+Mz_L = UP + HOLD
+Mrot_L = MOVE_TO(psi_L_start)
+Mrot_R = TORQUE_HOLD
+```
+
+若旋转电机角度是相对于横梁的角度，则目标应转换为：
+
+```text
+q_L_target = psi_L_target - beta + calibration_offset
+```
+
+而不是直接把 `psi_L_target` 当作电机角度。
+
+---
+
+## S4：左足公转 `REVOLVE_LEFT`
+
+左足中心从 A 绕右足 B 公转到 C。
+
+理论公转角：
+
+$$
+0^\circ\leq\phi\leq60^\circ
+$$
+
+左足中心轨迹：
+
+$$
+O_L(\phi)
+=
+B+
+d
+\begin{bmatrix}
+\cos(\theta_B+\phi)\\
+\sin(\theta_B+\phi)
+\end{bmatrix}
+$$
+
+其中 \(d=AB=BC\)。
+
+这一阶段的电机状态：
+
+```text
+Mz_L  = UP + HOLD
+Mz_R  = DOWN + FORCE_HOLD
+Mrot_R = SUPPORT_HOLD
+Mrot_L = REVOLUTION_DRIVE
+```
+
+但是在控制程序中，不建议只写成：
+
+```text
+Mrot_L 转 180°
+```
+
+应实时根据公转角生成左足的目标角度：
+
+```text
+phi_target = 60°
+psi_L_target = psi_L0 + k * phi
+beta_target = beta0 + phi
+q_L_target = transform(psi_L_target, beta_target)
+```
+
+其中：
+
+* `phi` 是公转角；
+* `psi_L_target` 是左足目标自转角；
+* `beta_target` 是横梁目标角；
+* `q_L_target` 是 `Mrot_L` 的实际目标角。
+
+右足的 `Mrot_R` 负责保持 B 点支撑姿态，而不是简单断电。
+
+---
+
+## S5：连续避障检查
+
+公转过程不能只检查起点和终点，必须检查整个轨迹。
+
+每个控制周期计算：
+
+```text
+for each high_node:
+    for each left_leg:
+        calculate distance(leg_segment, high_node)
+        if distance < safety_clearance:
+            stop_motion()
+```
+
+安全条件：
+
+$$
+D_{jk}
+>
+r_{\text{爪臂}}
++
+r_{\text{高节点}}
++
+\delta_{\text{安全}}
+$$
+
+其中：
+
+* \(D_{jk}\)：第 \(j\) 条爪臂到第 \(k\) 个高节点的最小距离；
+* \(r_{\text{爪臂}}\)：爪臂等效半径；
+* \(r_{\text{高节点}}\)：高节点等效半径；
+* \(\delta_{\text{安全}}\)：额外安全间隙。
+
+需要检查的不仅是三根爪臂，还包括：
+
+* 三足中心壳体；
+* 旋转电机外壳；
+* 横梁端部；
+* 轴承座；
+* 连接件。
+
+---
+
+## S6：左足到达 C 点 `PLACE_LEFT`
+
+当：
+
+```text
+phi >= phi_target - angle_tolerance
+```
+
+且左足三爪已经对准 C 的低节点后：
+
+```text
+Mrot_L = LOW_SPEED_ALIGN
+Mz_L = DOWN_SLOW
+Mz_R = DOWN + FORCE_HOLD
+Mrot_R = TORQUE_HOLD
+```
+
+`Mz_L` 应低速落下，不能快速冲击节点。
+
+落下过程中确认：
+
+```text
+left_leg_1_contact == TRUE
+left_leg_2_contact == TRUE
+left_leg_3_contact == TRUE
+high_node_contact == FALSE
+```
+
+只有三条腿均接触低节点，才允许进入下一状态。
+
+---
+
+## S7：重新建立双足支撑 `LOAD_TRANSFER`
+
+左足落到 C 后：
+
+```text
+Mz_L = DOWN + FORCE_HOLD
+Mrot_L = HOLD
+Mz_R = DOWN + FORCE_HOLD
+Mrot_R = HOLD
+```
+
+然后逐步将载荷从右足 B 转移到左足 C。
+
+确认：
+
+```text
+left_contact(C) == VALID
+right_contact(B) == VALID
+support_force_left >= F_min
+support_force_right >= F_min
+```
+
+最终状态：
+
+$$
+L=C,\qquad R=B
+$$
+
+完成一次左足换位。
+
+---
+
+# 5. 右足换位逻辑
+
+下一步交换左右角色：
+
+$$
+(C,B)\rightarrow(C,A)
+$$
+
+控制逻辑为：
+
+```text
+左足 C 锁定：
+Mz_L = DOWN + FORCE_HOLD
+Mrot_L = TORQUE_HOLD
+
+抬起右足：
+Mz_R = UP
+
+右足自转避障：
+Mrot_R = 根据公转角调整
+
+右足公转：
+右足 B 绕左足 C 公转到 A
+
+右足落下：
+Mz_R = DOWN_SLOW
+
+重新建立双足支撑：
+Mz_L、Mz_R = DOWN + FORCE_HOLD
+```
+
+连续运动如下：
+
+```text
+第 1 步：右足锁定 B，左足 A → C
+第 2 步：左足锁定 C，右足 B → A
+第 3 步：右足锁定 A，左足 C → B
+```
+
+---
+
+# 6. 四台电机的控制模式
+
+| 电机       | 模式                 | 含义       |
+| -------- | ------------------ | -------- |
+| `Mz_L`   | `UP`               | 左足抬起     |
+| `Mz_L`   | `DOWN`             | 左足落下     |
+| `Mz_L`   | `FORCE_HOLD`       | 左足保持支撑力  |
+| `Mz_R`   | `UP`               | 右足抬起     |
+| `Mz_R`   | `DOWN`             | 右足落下     |
+| `Mz_R`   | `FORCE_HOLD`       | 右足保持支撑力  |
+| `Mrot_L` | `SELF_ROTATE`      | 左足自转调整   |
+| `Mrot_L` | `REVOLUTION_DRIVE` | 左足参与公转换位 |
+| `Mrot_L` | `HOLD`             | 左足角度保持   |
+| `Mrot_R` | `SELF_ROTATE`      | 右足自转调整   |
+| `Mrot_R` | `REVOLUTION_DRIVE` | 右足参与公转换位 |
+| `Mrot_R` | `HOLD`             | 右足角度保持   |
+
+---
+
+# 7. 推荐的动作接口
+
+程序不应直接调用“电机转动若干脉冲”，而应建立上层动作接口：
+
+```text
+lift_left(height)
+lower_left(force)
+lift_right(height)
+lower_right(force)
+
+self_rotate_left(angle)
+self_rotate_right(angle)
+
+revolve_left(from_support, to_support)
+revolve_right(from_support, to_support)
+
+lock_left()
+lock_right()
+verify_contact()
+emergency_stop()
+```
+
+例如：
+
+```text
+step_left_A_to_C():
+    lock_right(B)
+    lift_left(z_clear)
+    align_left_phase()
+    revolve_left(A, C)
+    place_left(C)
+    verify_left_contact(C)
+    lock_left(C)
+```
+
+底层再将其转换为四台电机的目标位置、速度、力矩和限位条件。
+
+---
+
+# 8. 推荐的伪代码
+
+```python
+def step_left_A_to_C():
+
+    assert left_support == "A"
+    assert right_support == "B"
+    assert left_contact_valid()
+    assert right_contact_valid()
+
+    # 1. 锁定右足
+    Mz_R.down_force_hold()
+    Mrot_R.torque_hold()
+
+    if not right_support_locked():
+        fault_stop("右足未锁定")
+
+    # 2. 抬起左足
+    Mz_L.up_to(Z_CLEAR)
+
+    if not left_contact_released():
+        fault_stop("左足未完全释放")
+
+    # 3. 自转相位初始化
+    Mrot_L.move_to(left_phase_start)
+
+    # 4. 公转与自转同步
+    for s in trajectory(0.0, 1.0):
+
+        phi = 60.0 * smoothstep5(s)
+        beta = beta_start + phi
+        psi_L = psi_start + K_PHASE * phi
+
+        qL = convert_left_motor_angle(psi_L, beta)
+        qR = maintain_right_support_angle(beta)
+
+        Mrot_L.position_torque_control(qL)
+        Mrot_R.support_hold(qR)
+
+        if not collision_free(phi, psi_L):
+            fault_stop("高节点避让失败")
+
+        if motor_overcurrent():
+            fault_stop("电机过流")
+
+        if unexpected_contact():
+            fault_stop("异常接触")
+
+    # 5. 左足落到 C
+    Mrot_L.align_to_low_nodes("C")
+    Mz_L.down_slow()
+
+    if not left_three_low_contacts_valid("C"):
+        fault_stop("左足未正确落到 C")
+
+    # 6. 双足重新锁定
+    Mz_L.down_force_hold()
+    Mz_R.down_force_hold()
+    Mrot_L.hold()
+    Mrot_R.hold()
+
+    left_support = "C"
+```
+
+---
+
+# 9. 必须具备的传感器
+
+至少建议配置：
+
+```text
+Mz_L 上限位、下限位、编码器或位置传感器
+Mz_R 上限位、下限位、编码器或位置传感器
+Mrot_L 编码器
+Mrot_R 编码器
+左右三足接触检测
+左右支撑力或电机电流检测
+横梁角度检测
+```
+
+如果没有三足独立接触检测，程序无法可靠判断“是否真的踩在三个低节点上”，只能依靠电机电流间接判断，可靠性会明显下降。
+
+---
+
+# 10. 最重要的互锁条件
+
+```text
+1. 两足不能同时抬起。
+2. 摆动足未完全抬起，不允许旋转。
+3. 支撑足未锁定，不允许摆动足公转。
+4. 公转时，摆动足必须保持足够离地高度。
+5. 高节点发生接触，立即停止。
+6. 三个低节点未全部接触，不允许锁定。
+7. 任何时刻至少保留一组三足有效支撑。
+8. 旋转电机与抬起电机不得同时执行冲突动作。
+9. Mz 到达上、下限位后必须停止。
+10. 任意电机过流、堵转、失步，四台电机进入安全停止。
+```
+
+核心控制思想可以概括为：
+
+```text
+一组足锁定支撑
+        ↓
+另一组足抬起释放
+        ↓
+抬起足自转避开高节点
+        ↓
+抬起足绕锁定足公转
+        ↓
+自转对准低节点
+        ↓
+抬起足落下
+        ↓
+确认三点接触
+        ↓
+交换左右足角色
+```
+
+其中，`Mz_L/Mz_R` 决定“是否支撑”，`Mrot_L/Mrot_R` 决定“足的姿态和公转换位”。四台电机必须由状态机统一协调，不能作为四个相互独立的电机分别运行。

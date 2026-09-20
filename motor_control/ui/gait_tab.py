@@ -1,6 +1,6 @@
 """Desktop view for the tripod gait: calibration, dry-run preview, staged run.
 
-页面分两列：左侧参数与标定（几何/节拍/方向符号/记零），右侧干跑预览
+页面分两列：左侧运行/标定/几何参考分页，右侧干跑预览
 （俯视 Canvas）与 S0–S7 阶段推进。所有回调都在 ``desktop_app`` 上，
 本模块只负责构建与刷新控件。
 """
@@ -14,30 +14,36 @@ from dataclasses import replace
 
 from motor_control.gait_planner import GaitParams
 from motor_control.ui.common import PAD
+from motor_control.ui.gait_twin import build_twin_panel, refresh_twin_panel
 
 GEOMETRY_FIELDS = (
     ("d_mm", "中心距 d (mm)"),
     ("arm_length_mm", "爪臂长/节点环半径 (mm)"),
-    ("hub_radius_mm", "壳体/电机/轴承水平包络半径 (mm)"),
+    ("hub_radius_mm", "壳体等水平包络半径 (mm)"),
     ("arm_radius_mm", "爪臂等效半径 (mm)"),
     ("node_radius_mm", "高节点等效半径 (mm)"),
-    ("safety_margin_mm", "安全间隙 δ (mm)"),
     ("high_node_height_mm", "高低节点高差 (mm)"),
-    ("body_drop_mm", "壳体/电机最低点下伸 (mm)"),
+    ("body_drop_mm", "壳体等最低点下伸 (mm)"),
     ("beam_height_mm", "横梁中心线高度 (mm)"),
     ("beam_radius_mm", "横梁/连接件包络半径 (mm)"),
 )
-BEAT_FIELDS = (
-    ("swing_segments", "轨迹展示分段数（不影响同步）"),
-    ("lift_mm", "抬足高度 z_clear"),
-    ("swing_speed_deg_s", "支撑侧速度 (°/s)"),
-    ("lift_speed_mm_s", "抬足速度"),
-    ("settle_speed_mm_s", "落足速度"),
-    ("feasibility_samples", "干跑采样密度"),
-    ("rotation_limit_deg", "线缆角度限位 ±(°)"),
+GAP_FIELDS = (("safety_margin_mm", "参考安全间隙 δ (mm)"),)
+RUN_FIELDS = (
     ("phase_gain", "自转/公转增益 k（默认2）"),
+    ("swing_speed_deg_s", "公转峰值速度 (°/s)"),
+    ("rotation_limit_deg", "线缆角度限位 ±(°)"),
+    ("lift_mm", "实际抬足行程 (mm)"),
+    ("lift_speed_mm_s", "抬足速度 (mm/s)"),
+    ("settle_speed_mm_s", "落足速度 (mm/s)"),
+)
+CALIBRATION_FIELDS = (
     ("beam_reference_deg", "记零时横梁世界角 β₀ (°)"),
 )
+PREVIEW_FIELDS = (
+    ("swing_segments", "预览爪臂展示数量"),
+    ("feasibility_samples", "间隙估算采样数"),
+)
+BEAT_FIELDS = RUN_FIELDS + CALIBRATION_FIELDS + PREVIEW_FIELDS
 SIGN_FIELDS = (
     ("mr1_sign", "Mr1 旋转方向", "轴坐标增大 = q 增大"),
     ("mr2_sign", "Mr2 旋转方向", "轴坐标增大 = q 增大"),
@@ -46,7 +52,6 @@ SIGN_FIELDS = (
 )
 INTEGER_FIELDS = {"swing_segments", "feasibility_samples"}
 
-PREVIEW_W, PREVIEW_H = 420, 330
 PREVIEW_MARGIN = 16
 
 
@@ -70,99 +75,77 @@ def build_gait_tab(app, parent) -> None:
     app._gait_loading_fields = False
     app._gait_last_report = None
 
-    warning = ttk.LabelFrame(parent, text="安全边界（先读）")
-    warning.grid(row=0, column=0, columnspan=2, sticky="ew", **PAD)
-    ttk.Label(
+    warning = ttk.LabelFrame(parent, text="角度联动与实机执行")
+    warning.grid(row=0, column=0, sticky="ew", **PAD)
+    notice = ttk.Label(
         warning,
         text=(
-            "执行 handoff 文档的 S0–S7 分阶段流程：每按一次【确认并执行本阶段】只推进一个阶段，随时可【⛔ 中止】。\n"
-            "默认 φ=60°、Δψ=120°、Δq摆:Δq支=180°:60°；两电机共用五次进度，不在公转内解绕。\n"
-            "几何、高差和结构包络必须实测并确认标定；旋转轴须接同一ESP32并安装支持SYNC的新固件。\n"
-            "无接触/载荷/编码器反馈时须逐阶段人工确认，不能宣称接触有效或力矩受控；异常后重建物理基准。"
+            "旋转联动只按角度计算；中心距和六边形尺寸不改变电机转角。实机按 S0–S7 逐阶段确认，"
+            "旋转轴需支持 SYNC 的同一 ESP32。几何参考仅作间隙提示；接触和支撑状态仍需现场确认。"
         ),
-        foreground="#b42318",
+        foreground="#334155", wraplength=680,
         justify="left",
-    ).pack(anchor="w", padx=8, pady=5)
+    )
+    notice.pack(fill="x", padx=8, pady=5)
+    warning.bind("<Configure>", lambda e: notice.configure(wraplength=max(200, e.width - 24)))
 
-    _build_params_column(app, parent)
-    _build_run_column(app, parent)
+    panes = tk.PanedWindow(parent, orient="horizontal", sashwidth=6,
+                          borderwidth=0, opaqueresize=True)
+    panes.grid(row=1, column=0, sticky="nsew", **PAD)
+    left, right = ttk.Frame(panes), ttk.Frame(panes)
+    panes.add(left, minsize=350, width=350, stretch="always")
+    panes.add(right, minsize=260, width=500, stretch="always")
+    app.gait_widgets["panes"] = panes
+    _build_params_column(app, left)
+    _build_run_column(app, right)
     load_gait_fields(app)
     refresh_gait_panel(app)
 
 
 def _build_params_column(app, parent) -> None:
-    left = ttk.LabelFrame(parent, text="参数与标定（.gait_params.json）")
-    left.grid(row=1, column=0, sticky="ns", **PAD)
-    left.rowconfigure(0, weight=1)
-    left.columnconfigure(0, weight=1)
+    from motor_control.ui.scrollable import ScrollableFrame
 
-    # 字段共 26+ 行，矮窗口下 grid 会直接把底部截断（Tk 无自动滚动，
-    # 记零按钮/确认复选框会被裁掉看不到）。用 Canvas+滚动条承载，
-    # 窗口够高时内容不足一屏、自然不滚。
-    canvas = tk.Canvas(left, highlightthickness=0)
-    scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
-    inner = ttk.Frame(canvas)
-    window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-    canvas.configure(yscrollcommand=scrollbar.set)
-    canvas.grid(row=0, column=0, sticky="nsew")
-    scrollbar.grid(row=0, column=1, sticky="ns")
-    inner.bind(
-        "<Configure>",
-        lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-    canvas.bind(
-        "<Configure>",
-        lambda e: canvas.itemconfigure(window_id, width=e.width))
-    theme_bg = ttk.Style().lookup("TFrame", "background")
-    if theme_bg:
-        canvas.configure(background=theme_bg)
+    parent.columnconfigure(0, weight=1)
+    parent.rowconfigure(0, weight=1)
+    book = ttk.Notebook(parent)
+    book.grid(row=0, column=0, sticky="nsew")
+    app.gait_widgets["params_book"] = book
+    pages = {}
+    for name, title in (("run", "运行"), ("calibration", "标定"), ("geometry", "几何参考")):
+        page = ScrollableFrame(book, width=330)
+        book.add(page, text=title)
+        pages[name] = page
+        page.content.columnconfigure(0, weight=1)
+    app.gait_widgets["param_pages"] = pages
 
-    # Windows 下滚轮事件发给焦点控件；用与日志区相同的“鼠标位置判定”
-    # 模式全局接管：仅当指针位于本参数栏内时滚动并吞掉事件。
-    def scroll_if_over(event):
-        widget = app.root.winfo_containing(event.x_root, event.y_root)
-        while widget is not None and widget is not app.root:
-            if widget is canvas or widget is inner:
-                if event.delta:
-                    canvas.yview_scroll(
-                        -1 if event.delta > 0 else 1, "units")
-                return "break"
-            widget = widget.nametowidget(widget.winfo_parent())
-        return None
+    def note(inner, row, text):
+        ttk.Label(inner, text=text, wraplength=280, justify="left", foreground="#64748b").grid(
+            row=row, column=0, columnspan=3, sticky="ew", padx=6, pady=6)
 
-    app.root.bind_all("<MouseWheel>", scroll_if_over, add="+")
-
-    row = 0
-
-    def add_section(title):
-        nonlocal row
-        ttk.Label(
-            inner, text=title, font=("Microsoft YaHei", 9, "bold")
-        ).grid(row=row, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 1))
-        row += 1
-
-    def add_number_field(key, label):
-        nonlocal row
-        ttk.Label(inner, text=label).grid(
-            row=row, column=0, sticky="w", padx=6, pady=1)
+    def add_number_field(inner, row, key, label):
+        ttk.Label(inner, text=label, wraplength=185, justify="left").grid(
+            row=row, column=0, sticky="w", padx=6, pady=3)
         var = tk.StringVar()
         var.trace_add("write", lambda *_: _invalidate_calibration(app))
         app.gait_field_vars[key] = var
-        ttk.Entry(inner, textvariable=var, width=12).grid(
-            row=row, column=1, sticky="w", padx=4, pady=1)
-        row += 1
+        ttk.Entry(inner, textvariable=var, width=9).grid(
+            row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
 
-    add_section("俯视几何（现场实测后覆盖占位值）")
-    for key, label in GEOMETRY_FIELDS:
-        add_number_field(key, label)
+    inner = pages["run"].content
+    note(inner, 0, "每步公转 60°；Δψ = kφ，Δq摆 = (k+1)φ，Δq支 = φ。\n"
+         "默认 k=2：世界自转120°，两关节180° / 60°。")
+    for row, (key, label) in enumerate(RUN_FIELDS + GAP_FIELDS, 1):
+        add_number_field(inner, row, key, label)
+    note(inner, 8, "抬足行程直接控制升降电机。参考间隙只用于几何估算，"
+         "不会增加抬升距离或改变旋转角度。")
 
-    add_section("执行节拍")
-    for key, label in BEAT_FIELDS:
-        add_number_field(key, label)
-
-    add_section("方向符号（点动验证后填写）")
+    inner = pages["calibration"].content
+    note(inner, 0, "先在电机绑定页设置 PPR、减速比和升降导程，再点动验证方向。")
+    add_number_field(inner, 1, *CALIBRATION_FIELDS[0])
+    row = 2
     for key, label, hint in SIGN_FIELDS:
         ttk.Label(inner, text=label).grid(
-            row=row, column=0, sticky="w", padx=6, pady=1)
+            row=row, column=0, sticky="w", padx=6, pady=3)
         var = tk.StringVar(value="+1")
         var.trace_add("write", lambda *_: _invalidate_calibration(app))
         app.gait_sign_vars[key] = var
@@ -171,10 +154,11 @@ def _build_params_column(app, parent) -> None:
             state="readonly", width=5,
         ).grid(row=row, column=1, sticky="w", padx=4, pady=1)
         ttk.Label(inner, text=hint, foreground="#666").grid(
-            row=row, column=2, sticky="w", padx=2)
-        row += 1
+            row=row+1, column=0, columnspan=3, sticky="w", padx=6)
+        row += 2
 
-    add_section("旋转零位（ψ=30° 基准；先摆位再记零）")
+    note(inner, row, "旋转零位：把三足摆到 ψ=30° 基准后分别记零。")
+    row += 1
     for role_name in ("Mr1", "Mr2"):
         ttk.Label(inner, text=f"{role_name} 零位").grid(
             row=row, column=0, sticky="w", padx=6, pady=1)
@@ -188,68 +172,93 @@ def _build_params_column(app, parent) -> None:
         ).grid(row=row, column=2, sticky="w", padx=4, pady=1)
         row += 1
 
-    buttons = ttk.Frame(inner)
-    buttons.grid(row=row, column=0, columnspan=3, sticky="ew", padx=6, pady=8)
+    ttk.Checkbutton(inner, variable=app.gait_calibrated_var,
+                    text="已确认电机标定与现场支撑").grid(
+                        row=row, column=0, columnspan=3, sticky="w", padx=6, pady=6)
+    row += 1
+    ttk.Button(inner, text="人工重建 A/B 基准（不动电机）",
+               command=app._gait_reestablish_baseline).grid(
+                   row=row, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+
+    inner = pages["geometry"].content
+    note(inner, 0, "仅用于画图和碰撞间隙提示，不参与旋转角度计算。"
+         "无需每次运行填写；旧配置会保留。未实测时，图示和间隙结果不能代表实际机构。")
+    for row, (key, label) in enumerate(GEOMETRY_FIELDS + PREVIEW_FIELDS, 1):
+        add_number_field(inner, row, key, label)
+    note(inner, len(GEOMETRY_FIELDS + PREVIEW_FIELDS)+1,
+         "紧贴正六边形满足 d=√3×节点环半径；只有参考模型使用这些尺寸。"
+         "壳体包络应包含电机、轴承和连接件。")
+    for page in pages.values():
+        page.bind_navigation()
+
+    buttons = ttk.Frame(parent)
+    buttons.grid(row=1, column=0, sticky="ew", pady=4)
     ttk.Button(
         buttons, text="保存参数", command=app._gait_save_params_clicked
     ).pack(side="left", padx=3)
     ttk.Button(
         buttons, text="放弃修改并重读", command=app._gait_reload_params_clicked
     ).pack(side="left", padx=3)
-    row += 1
-
-    app.gait_widgets["readiness"] = ttk.Label(inner, text="", justify="left")
-    ttk.Checkbutton(inner, variable=app.gait_calibrated_var,
-                    text="已实测几何/包络，验证方向、PPR及支撑反力闭合").grid(
-                        row=row, column=0, columnspan=3, sticky="w", padx=6)
-    row += 1
-    ttk.Button(inner, text="人工重建 A/B 物理基准（不动电机）",
-               command=app._gait_reestablish_baseline).grid(
-                   row=row, column=0, columnspan=3, sticky="w", padx=6, pady=4)
-    row += 1
+    app.gait_widgets["readiness"] = ttk.Label(parent, text="", justify="left", wraplength=280)
     app.gait_widgets["readiness"].grid(
-        row=row, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
+        row=2, column=0, sticky="ew", padx=6, pady=(0, 4))
 
 
 def _build_run_column(app, parent) -> None:
-    right = ttk.Frame(parent)
-    right.grid(row=1, column=1, sticky="nsew", **PAD)
-    right.columnconfigure(0, weight=1)
-    right.rowconfigure(0, weight=1)
+    from motor_control.ui.scrollable import ScrollableFrame
 
-    preview = ttk.LabelFrame(right, text="干跑预览（俯视：A/B/C 六边形 + 摆动轨迹）")
-    preview.grid(row=0, column=0, sticky="nsew", **PAD)
+    parent.columnconfigure(0, weight=1)
+    parent.rowconfigure(1, weight=1)
+    toolbar = ttk.Frame(parent)
+    toolbar.grid(row=0, column=0, sticky="ew", padx=4, pady=(0, 4))
+    # Abort remains visible even when the preview or stage text is scrolled.
+    app.gait_widgets["abort"] = ttk.Button(
+        toolbar, text="⛔ 中止", command=app._gait_abort_clicked)
+    app.gait_widgets["abort"].pack(side="left", padx=3)
+    app.gait_widgets["reset"] = ttk.Button(
+        toolbar, text="重置流程", command=app._gait_reset_run)
+    app.gait_widgets["reset"].pack(side="left", padx=3)
+    viewport = ScrollableFrame(parent, width=450)
+    viewport.grid(row=1, column=0, sticky="nsew")
+    app.gait_widgets["run_viewport"] = viewport
+    right = viewport.content
+    right.columnconfigure(0, weight=1)
+    build_twin_panel(app, right)
+
+    preview = ttk.LabelFrame(right, text="轨迹与间隙参考（不动电机）")
+    preview.grid(row=2, column=0, sticky="nsew", **PAD)
+    preview.columnconfigure(0, weight=1)
     canvas = tk.Canvas(
-        preview, width=PREVIEW_W, height=PREVIEW_H,
+        preview, width=240, height=260,
         bg="#ffffff", highlightthickness=1, highlightbackground="#cbd5e1",
     )
-    canvas.grid(row=0, column=0, rowspan=3, padx=6, pady=6)
+    canvas.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
+    canvas.bind("<Configure>", lambda _e: draw_gait_preview(app))
     controls = ttk.Frame(preview)
-    controls.grid(row=0, column=1, sticky="ew", padx=6, pady=(6, 2))
-    ttk.Label(controls, text="摆动侧:").pack(side="left")
+    controls.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
     ttk.Radiobutton(
-        controls, text="左 A→C（绕 B）", value="left",
+        controls, text="左侧换位", value="left",
         variable=app.gait_side_var,
     ).pack(side="left", padx=4)
     ttk.Radiobutton(
-        controls, text="右 B→A（绕 C）", value="right",
+        controls, text="右侧换位", value="right",
         variable=app.gait_side_var,
     ).pack(side="left", padx=4)
     ttk.Button(
-        controls, text="▶ 干跑校验（不动电机）",
+        controls, text="预览 / 校验",
         command=app._gait_run_dry_run,
-    ).pack(side="left", padx=8)
+    ).pack(side="left", padx=4)
     result = ttk.Label(
         preview, textvariable=app.gait_report_var,
         wraplength=260, justify="left",
     )
-    result.grid(row=1, column=1, sticky="nw", padx=6)
+    result.grid(row=2, column=0, sticky="ew", padx=6)
     hint = ttk.Label(
         preview,
         text="绿=低节点(落脚) 红=高节点(避让)\n蓝虚线=三足中心轨迹 细线=爪臂采样",
-        foreground="#666", justify="left",
+        foreground="#666", justify="left", wraplength=260,
     )
-    hint.grid(row=2, column=1, sticky="sw", padx=6, pady=6)
+    hint.grid(row=3, column=0, sticky="ew", padx=6, pady=6)
     app.gait_widgets["preview_canvas"] = canvas
     app.gait_widgets["report_label"] = result
 
@@ -257,50 +266,53 @@ def _build_run_column(app, parent) -> None:
     stage.grid(row=1, column=0, sticky="ew", **PAD)
     current = ttk.Label(
         stage, textvariable=app.gait_stage_var,
-        font=("Microsoft YaHei", 10, "bold"), justify="left",
+        font=("Microsoft YaHei", 10, "bold"), justify="left", wraplength=260,
     )
-    current.pack(anchor="w", padx=8, pady=(6, 2))
+    current.pack(fill="x", padx=8, pady=(6, 2))
     app.gait_widgets["confirm_text"] = ttk.Label(
-        stage, text="", wraplength=620, justify="left", foreground="#334155",
+        stage, text="", wraplength=260, justify="left", foreground="#334155",
     )
-    app.gait_widgets["confirm_text"].pack(anchor="w", padx=8, pady=2)
+    app.gait_widgets["confirm_text"].pack(fill="x", padx=8, pady=2)
     app.gait_widgets["progress"] = ttk.Label(
         stage, text="", foreground="#1565c0", font=("Consolas", 10, "bold"),
+        wraplength=260, justify="left",
     )
-    app.gait_widgets["progress"].pack(anchor="w", padx=8)
-    app.gait_widgets["angles"] = ttk.Label(stage, text="", foreground="#1565c0")
-    app.gait_widgets["angles"].pack(anchor="w", padx=8, pady=2)
+    app.gait_widgets["progress"].pack(fill="x", padx=8)
+    app.gait_widgets["angles"] = ttk.Label(stage, text="", foreground="#1565c0",
+                                           wraplength=260, justify="left")
+    app.gait_widgets["angles"].pack(fill="x", padx=8, pady=2)
 
     buttons = ttk.Frame(stage)
-    buttons.pack(anchor="w", padx=8, pady=8)
+    buttons.pack(fill="x", padx=8, pady=8)
+    buttons.columnconfigure((0, 1), weight=1)
     app.gait_widgets["start_left"] = ttk.Button(
-        buttons, text="🦶 开始 左 A→C",
+        buttons, text="开始左侧换位",
         command=lambda: app._gait_start_run_clicked("left"),
     )
-    app.gait_widgets["start_left"].pack(side="left", padx=3, ipadx=4)
+    app.gait_widgets["start_left"].grid(row=0, column=0, sticky="ew", padx=3)
     app.gait_widgets["start_right"] = ttk.Button(
-        buttons, text="🦶 开始 右 B→A",
+        buttons, text="开始右侧换位",
         command=lambda: app._gait_start_run_clicked("right"),
     )
-    app.gait_widgets["start_right"].pack(side="left", padx=3, ipadx=4)
+    app.gait_widgets["start_right"].grid(row=0, column=1, sticky="ew", padx=3)
     app.gait_widgets["advance"] = ttk.Button(
         buttons, text="✓ 确认并执行本阶段", command=app._gait_stage_confirmed,
     )
-    app.gait_widgets["advance"].pack(side="left", padx=12, ipadx=4)
-    app.gait_widgets["abort"] = ttk.Button(
-        buttons, text="⛔ 中止", command=app._gait_abort_clicked,
-    )
-    app.gait_widgets["abort"].pack(side="left", padx=3)
-    app.gait_widgets["reset"] = ttk.Button(
-        buttons, text="重置流程", command=app._gait_reset_run,
-    )
-    app.gait_widgets["reset"].pack(side="left", padx=3)
+    app.gait_widgets["advance"].grid(row=1, column=0, columnspan=2, sticky="ew", padx=3, pady=(6, 0))
 
     app.gait_widgets["state"] = ttk.Label(
         stage, textvariable=app.gait_state_var,
-        font=("Microsoft YaHei", 10, "bold"),
+        font=("Microsoft YaHei", 10, "bold"), wraplength=260, justify="left",
     )
-    app.gait_widgets["state"].pack(anchor="w", padx=8, pady=(0, 6))
+    app.gait_widgets["state"].pack(fill="x", padx=8, pady=(0, 6))
+
+    def resize_text(event):
+        width = max(220, event.width - 36)
+        for label in (current, result, hint, *(app.gait_widgets[key] for key in
+                      ("confirm_text", "progress", "angles", "state"))):
+            label.configure(wraplength=width)
+    viewport.canvas.bind("<Configure>", resize_text, add="+")
+    viewport.bind_navigation()
 
 
 # ── 参数字段 ↔ GaitParams ──────────────────────────────────
@@ -315,14 +327,17 @@ def load_gait_fields(app) -> None:
 
     params = app.gait_params
     app._gait_loading_fields = True
-    for key, _label in GEOMETRY_FIELDS:
+    for key, _label in GEOMETRY_FIELDS + GAP_FIELDS:
         value = getattr(params.geometry, key)
-        app.gait_field_vars[key].set(f"{value:g}")
+        # Preserve the saved value exactly (especially d = sqrt(3) * R).
+        # Six-significant-digit display formatting can make valid touching
+        # hexagons overlap on the next save, even if geometry was not edited.
+        app.gait_field_vars[key].set(str(value))
     for key, _label in BEAT_FIELDS:
         value = getattr(params, key)
         if key in INTEGER_FIELDS:
             value = int(value)
-        app.gait_field_vars[key].set(f"{value:g}")
+        app.gait_field_vars[key].set(str(value))
     for key, _label, _hint in SIGN_FIELDS:
         app.gait_sign_vars[key].set(f"{getattr(params, key):+d}")
     refresh_zero_labels(app)
@@ -353,7 +368,7 @@ def collect_gait_params(app, base: GaitParams) -> GaitParams:
     """从输入框收集并构造校验后的 GaitParams；非法抛 ValueError。"""
 
     geometry_updates = {}
-    for key, _label in GEOMETRY_FIELDS:
+    for key, _label in GEOMETRY_FIELDS + GAP_FIELDS:
         value = _field_number(app, key)
         if key in INTEGER_FIELDS:
             if value != int(value):
@@ -393,10 +408,12 @@ def draw_gait_preview(app) -> None:
     if canvas is None:
         return
     report = getattr(app, "_gait_last_report", None)
+    width = max(1, canvas.winfo_width())
+    height = max(1, canvas.winfo_height())
     canvas.delete("all")
     if report is None:
         canvas.create_text(
-            PREVIEW_W / 2, PREVIEW_H / 2, text="选择摆动侧后点【干跑校验】",
+            width / 2, height / 2, text="选择摆动侧后点【预览 / 校验】",
             fill="#64748b", font=("Microsoft YaHei", 11),
         )
         return
@@ -426,16 +443,16 @@ def draw_gait_preview(app) -> None:
     span_x = max(max_x - min_x, 1.0)
     span_y = max(max_y - min_y, 1.0)
     scale = min(
-        (PREVIEW_W - 2 * PREVIEW_MARGIN) / span_x,
-        (PREVIEW_H - 2 * PREVIEW_MARGIN) / span_y,
+        max(1, width - 2 * PREVIEW_MARGIN) / span_x,
+        max(1, height - 2 * PREVIEW_MARGIN) / span_y,
     )
 
     def to_canvas(x, y):
         return (
             PREVIEW_MARGIN + (x - min_x) * scale
-            + (PREVIEW_W - 2 * PREVIEW_MARGIN - span_x * scale) / 2,
-            PREVIEW_H - PREVIEW_MARGIN - (y - min_y) * scale
-            - (PREVIEW_H - 2 * PREVIEW_MARGIN - span_y * scale) / 2,
+            + (width - 2 * PREVIEW_MARGIN - span_x * scale) / 2,
+            height - PREVIEW_MARGIN - (y - min_y) * scale
+            - (height - 2 * PREVIEW_MARGIN - span_y * scale) / 2,
         )
 
     # 六边形：六个节点连线 + 中心标签
@@ -574,14 +591,7 @@ def refresh_gait_panel(app, progress_text=None) -> None:
     app.gait_widgets["reset"].configure(
         state="normal" if snapshot is not None else "disabled")
     app.gait_widgets["progress"].configure(text=progress_text or "")
-    angles = app._gait_angle_snapshot()
-    if angles is None:
-        text = f"支座 {getattr(app, '_gait_supports', ('A', 'B'))} · 横梁估算β={getattr(app, '_gait_beta_deg', 180):.2f}°"
-    else:
-        text = (f"脉冲估算（非实测）：φ={angles['phi_deg']:.2f}°，β={angles['beta_deg']:.2f}°，"
-                f"Δψ摆={angles['psi_delta_deg']:.2f}°；"
-                f"Δq摆/支={angles['swing_q_delta_deg']:.2f}°/{angles['support_q_delta_deg']:.2f}°")
-    app.gait_widgets["angles"].configure(text=text)
+    refresh_twin_panel(app)
 
 
 __all__ = [
