@@ -14,6 +14,7 @@ from motor_control.gait_planner import (
     GaitStage,
     HexPad,
     RoleMove,
+    angular_targets,
     arm_segment,
     clearance_margin_mm,
     default_hex_pads,
@@ -121,7 +122,9 @@ class PointSegmentTests(unittest.TestCase):
 
 class TrajectoryTests(unittest.TestCase):
     def test_endpoint_angles_follow_handoff_document(self):
-        report = plan_swing_trajectory(GaitParams().validated(), side="left")
+        # handoff 文档的 k=2 联动：ψ 30→150，β 180→120
+        report = plan_swing_trajectory(
+            GaitParams(phase_gain=2.0).validated(), side="left")
         first, last = report.samples[0], report.samples[-1]
         self.assertAlmostEqual(first.phi_deg, 0.0)
         self.assertAlmostEqual(last.phi_deg, SWING_ARC_DEG)
@@ -132,7 +135,10 @@ class TrajectoryTests(unittest.TestCase):
 
     def test_unmeasured_geometry_does_not_hide_vertical_collision(self):
         for side in ("left", "right"):
-            report = plan_swing_trajectory(GaitParams().validated(), side=side)
+            # lift_mm=10 显式指定：默认抬足 2026-09-21 已改为 50mm，
+            # 本用例回归"占位几何 + 小抬足 → 不可行"的原边界。
+            report = plan_swing_trajectory(
+                GaitParams(lift_mm=10.0).validated(), side=side)
             self.assertFalse(report.feasible)
             safe = plan_swing_trajectory(GaitParams(lift_mm=35.0), side=side)
             self.assertTrue(safe.feasible, safe.message)
@@ -140,6 +146,7 @@ class TrajectoryTests(unittest.TestCase):
 
     def test_oversized_nodes_make_trajectory_infeasible(self):
         params = GaitParams(
+            lift_mm=10.0,
             geometry=GaitGeometry(node_radius_mm=60.0)
         ).validated()
         report = plan_swing_trajectory(params, side="left")
@@ -148,8 +155,9 @@ class TrajectoryTests(unittest.TestCase):
         self.assertIn("不可行", report.message)
 
     def test_mid_swing_keeps_high_node_between_arms(self):
-        # 文档 §3：φ=30° 时 ψ=90°，爪臂 90/210/330，高点落在爪臂之间。
-        report = plan_swing_trajectory(GaitParams().validated(), side="left")
+        # 文档 §3：φ=30° 时 ψ=90°（k=2），爪臂 90/210/330，高点落在爪臂之间。
+        report = plan_swing_trajectory(
+            GaitParams(phase_gain=2.0).validated(), side="left")
         mid = min(report.samples, key=lambda s: abs(s.phi_deg - 30.0))
         self.assertAlmostEqual(mid.psi_deg, 90.0, delta=1.5)
         self.assertGreater(mid.margin_mm, 0.0)
@@ -170,13 +178,14 @@ class StagePlanTests(unittest.TestCase):
     def test_left_plan_roles_and_totals(self):
         params = GaitParams(
             geometry=GaitGeometry(d_mm=140.0), swing_segments=10,
-            mr1_sign=1, mr2_sign=-1,
+            mr1_sign=1, mr2_sign=-1, phase_gain=2.0,
         ).validated()
         stages = plan_gait_stages(params, side="left", swing_psi_start_deg=30.0)
         by_id = {stage.stage_id: stage for stage in stages}
         self.assertEqual(
             [s for s in stages if s.stage_id != "S3"],
-            [by_id[key] for key in ("S0", "S1", "S2", "S4", "S5", "S6", "S7")],
+            [by_id[key] for key in
+             ("S0", "S1", "S2", "S2B", "S4", "S5", "S6", "S7")],
         )
         # 左摆动：摆动 Mr1 +180°（sign=+1），支撑 Mr2 −60°（sign=−1）
         swing_total = support_total = 0.0
@@ -193,15 +202,21 @@ class StagePlanTests(unittest.TestCase):
                     self.assertEqual(move.role, "Mr2")
         self.assertAlmostEqual(swing_total, 180.0, places=6)
         self.assertAlmostEqual(support_total, -60.0, places=6)
-        # 抬起/落足方向相反
-        s2 = next(m for m in by_id["S2"].move_groups[0] if m.role == "Mup1")
-        s6 = next(m for m in by_id["S6"].move_groups[0] if m.role == "Mup1")
-        self.assertAlmostEqual(s2.delta, params.lift_mm)
+        # 2026-09-21 新流程：S2 两轴同时抬升；S2B 摆动腿收起；
+        # S6 站立腿（Mup2）收回落位。结束后两直轴坐标都回到抬升前。
+        s2_deltas = {m.role: m.delta for m in by_id["S2"].move_groups[0]}
+        self.assertAlmostEqual(s2_deltas["Mup1"], params.lift_mm)
+        self.assertAlmostEqual(s2_deltas["Mup2"], params.lift_mm)
+        s2b = by_id["S2B"].move_groups[0][0]
+        self.assertEqual(s2b.role, "Mup1")           # left 摆动侧
+        self.assertAlmostEqual(s2b.delta, -params.lift_mm)
+        s6 = by_id["S6"].move_groups[0][0]
+        self.assertEqual(s6.role, "Mup2")            # left 站立侧
         self.assertAlmostEqual(s6.delta, -params.lift_mm)
         self.assertAlmostEqual(s6.speed, params.settle_speed_mm_s)
 
     def test_right_plan_swaps_roles(self):
-        params = GaitParams(swing_segments=4).validated()
+        params = GaitParams(swing_segments=4, phase_gain=2.0).validated()
         stages = plan_gait_stages(params, side="right", swing_psi_start_deg=30.0)
         s4 = next(stage for stage in stages if stage.stage_id == "S4")
         roles = {move.role for group in s4.move_groups for move in group}
@@ -212,14 +227,10 @@ class StagePlanTests(unittest.TestCase):
         )
         # 右摆动 Mr2，θ=0 解绕小步 +60°
         self.assertAlmostEqual(swing_total, 180.0, places=6)
-        lift_roles = {
-            move.role
-            for stage in stages
-            for group in stage.move_groups
-            for move in group
-            if move.role.startswith("Mup")
-        }
-        self.assertEqual(lift_roles, {"Mup2"})
+        by_id = {stage.stage_id: stage for stage in stages}
+        # 右摆动：S2B 收 Mr2（摆动侧），S6 收 Mr1（站立侧）
+        self.assertEqual(by_id["S2B"].move_groups[0][0].role, "Mup2")
+        self.assertEqual(by_id["S6"].move_groups[0][0].role, "Mup1")
 
     def test_phase_adjustment_uses_shortest_path(self):
         params = GaitParams(mr1_sign=1, mr1_zero_deg=0.0).validated()
@@ -246,7 +257,59 @@ class StagePlanTests(unittest.TestCase):
             self.assertTrue(stage.confirm_text)
 
 
-class PhaseCorrectionTests(unittest.TestCase):
+class NegativePhaseGainTests(unittest.TestCase):
+    """2026-09-21 用户需求：公转 +60°、摆动电机反向 -60°（k=-2）。
+
+    世界自转 Δψ=-120°，三重对称下与 k=2 的 +120° 终点等效，
+    但摆动侧电机走短路径反方向，线缆缠绕更少。
+    """
+
+    def test_negative_gain_is_new_default_and_lands_equivalently(self):
+        params = GaitParams()
+        self.assertEqual(params.phase_gain, -2.0)
+        params.validated()
+        self.assertEqual(angular_targets(params, 60.0), (-120.0, -60.0, 60.0))
+
+    def test_validation_accepts_even_negatives_rejects_others(self):
+        for valid in (-2.0, -4.0, -10.0, 2.0, 4.0, 10.0):
+            GaitParams(phase_gain=valid).validated()
+        for invalid in (0.0, 1.0, -1.0, 3.0, -3.0, 12.0, -12.0, float("nan")):
+            with self.assertRaises(ValueError):
+                GaitParams(phase_gain=invalid).validated()
+
+    def test_left_plan_swings_backwards_60_while_support_pivots_60(self):
+        params = GaitParams(mr1_sign=1, mr2_sign=1).validated()
+        stages = plan_gait_stages(params, side="left", swing_psi_start_deg=30.0)
+        s4 = next(s for s in stages if s.stage_id == "S4")
+        moves = {m.role: m for g in s4.move_groups for m in g}
+        self.assertAlmostEqual(moves["Mr1"].delta, -60.0)
+        self.assertAlmostEqual(moves["Mr2"].delta, 60.0)
+        # 速度恒正（k=-1 被拒，|k+1|=1），方向由 delta 符号承载
+        self.assertAlmostEqual(moves["Mr1"].speed, params.swing_speed_deg_s)
+        self.assertAlmostEqual(moves["Mr2"].speed, params.swing_speed_deg_s)
+        self.assertAlmostEqual(params.swing_side_speed_deg_s,
+                               params.swing_speed_deg_s)
+
+    def test_trajectory_world_psi_decreases_but_lands_on_low_nodes(self):
+        report = plan_swing_trajectory(GaitParams().validated(), side="left")
+        self.assertTrue(report.feasible, report.message)
+        first, last = report.samples[0], report.samples[-1]
+        self.assertAlmostEqual(first.psi_deg, 30.0)
+        self.assertAlmostEqual(last.psi_deg, -90.0)   # ≡ 30 (mod 120)
+        self.assertAlmostEqual(first.swing_q_delta_deg, 0.0)
+        self.assertAlmostEqual(last.swing_q_delta_deg, -60.0)
+        self.assertAlmostEqual(last.support_q_delta_deg, 60.0)
+
+    def test_legacy_equivalent_delta_still_rejected(self):
+        # 入参必须与模型一致：k=-2 的 Δq摆=-60 合法，旧 k=2 的 180 被拒
+        plan_swing_trajectory(GaitParams().validated(), side="left",
+                              swing_joint_delta_deg=-60.0)
+        with self.assertRaises(ValueError):
+            plan_swing_trajectory(GaitParams().validated(), side="left",
+                                  swing_joint_delta_deg=180.0)
+
+
+
     def test_correction_from_calibrated_zero(self):
         params = GaitParams(mr1_sign=1, mr1_zero_deg=12.5).validated()
         self.assertAlmostEqual(
@@ -443,7 +506,7 @@ class UnwrapGaitSequenceTests(unittest.TestCase):
         return thetas
 
     def test_planning_never_shortcuts_angular_path_to_fit_cable_window(self):
-        params = GaitParams(swing_segments=3).validated()
+        params = GaitParams(swing_segments=3, phase_gain=2.0).validated()
         for theta in (-180, -60, 0, 60, 180):
             stages = plan_gait_stages(params, side="left", swing_psi_start_deg=30+theta)
             s4 = next(s for s in stages if s.stage_id == "S4")
@@ -451,7 +514,7 @@ class UnwrapGaitSequenceTests(unittest.TestCase):
             self.assertAlmostEqual(s4.move_groups[0][1].delta, 60)
 
     def test_dry_run_trajectory_follows_actual_joint_delta(self):
-        params = GaitParams().validated()
+        params = GaitParams(phase_gain=2.0).validated()
         with self.assertRaises(ValueError):
             plan_swing_trajectory(params, side="left", swing_joint_delta_deg=60.0)
         # Δq=180 → Δψ=120：ψ 从 30 走到 150

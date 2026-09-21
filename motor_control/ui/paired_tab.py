@@ -125,17 +125,23 @@ def build_paired_tab(app, parent, axes, speed_presets,
         font=("Microsoft YaHei UI", 11, "bold"))
     pw['land_release_status'].grid(
         row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 2))
+    # 手动释放/锁定双态按钮：验证旋转电机释放是否生效（2026-09-21）。
+    pw['land_release_button'] = ttk.Button(
+        lf, text="🔓 手动释放旋转电机（验证用）",
+        command=app._toggle_manual_rot_release)
+    pw['land_release_button'].grid(
+        row=1, column=0, sticky="w", padx=8, pady=2)
     ttk.Checkbutton(
         lf, text="启用落地纠偏",
         variable=app.pair_land_release_enabled,
-    ).grid(row=1, column=0, sticky="w", padx=8, pady=2)
+    ).grid(row=2, column=0, sticky="w", padx=8, pady=2)
     ttk.Label(lf, text="落地阈值 (mm):").grid(
-        row=1, column=1, sticky="e", padx=(16, 0))
+        row=2, column=1, sticky="e", padx=(16, 0))
     threshold_spin = ttk.Spinbox(
         lf, from_=0.5, to=20.0, increment=0.5, width=6, format="%.1f",
         textvariable=app.pair_land_release_threshold_mm)
     attach_numeric_input(threshold_spin, app.pair_land_release_threshold_mm)
-    threshold_spin.grid(row=1, column=2, sticky="w", padx=4, pady=2)
+    threshold_spin.grid(row=2, column=2, sticky="w", padx=4, pady=2)
     ttk.Label(
         lf,
         text=(
@@ -144,8 +150,12 @@ def build_paired_tab(app, parent, axes, speed_presets,
             "两轴联动的整体升降不触发。\n"
             "动作：同时释放左右旋转电机（Mr1/Mr2），机构在逐渐承载的"
             "重力下自正一次；软件角度显示不变、不重新校准。\n"
-            "恢复：两直线轴都回到空闲后自动重新锁定；急停/断开/关闭"
-            "立即锁定。释放期间旋转轴运动会被拒绝。"
+            "恢复：落地（两直线轴都回到空闲）后 5 秒自动重新锁定；"
+            "急停/断开/关闭立即锁定。释放期间旋转轴运动会被拒绝。\n"
+            "三足步态：落脚阶段的下降同样触发释放与延迟重锁；下一旋转"
+            "阶段开始前会提前锁定并等固件确认，换位流程不中断。\n"
+            "手动验证：上方按钮释放后转子可用手扭动确认，软件位置不变；"
+            "5 秒自动锁定或再点一次立即锁定。"
         ),
         justify="left", foreground="#666",
-    ).grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+    ).grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))

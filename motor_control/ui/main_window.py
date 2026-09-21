@@ -38,6 +38,9 @@ def build_ui(app, log_dir, num_motor_axes):
                                width=8, font=("Consolas", 11, "bold"),
                                foreground="gray")
     app.mode_label.grid(row=0, column=8, **pad)
+    # 使用说明按钮：指向 docs/user_guide.html（离线，浏览器打开）。
+    ttk.Button(conn_frame, text="❓ 使用说明",
+               command=app._open_user_guide).grid(row=0, column=9, **pad)
 
     ttk.Label(conn_frame, text="模式选择:").grid(row=1, column=0, sticky="e", **pad)
     mode_inner = ttk.Frame(conn_frame)

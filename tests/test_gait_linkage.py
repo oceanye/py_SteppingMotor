@@ -36,6 +36,7 @@ def mechanism(limit=720.0):
     app._gait_stop_axes = lambda axes: app.stopped.extend(axes)
     app.stopped, app.commands = [], []
     app.gait_params = GaitParams(lift_mm=35, rotation_limit_deg=limit,
+                                phase_gain=2.0,   # k=2 旧联动；k=-2 见下方专项
                                 mr1_zero_deg=0, mr2_zero_deg=0,
                                 calibration_confirmed=True,
                                 calibration_fingerprint=app._gait_hardware_fingerprint())
@@ -71,8 +72,9 @@ def mechanism(limit=720.0):
 
 class AngularLawTests(unittest.TestCase):
     def test_every_sample_uses_world_and_joint_reference_frames(self):
+        # k=2 旧联动（handoff 文档）：Δψ=2φ，Δq摆=3φ
         for side in ("left", "right"):
-            p = GaitParams(lift_mm=35)
+            p = GaitParams(lift_mm=35, phase_gain=2.0)
             report = plan_swing_trajectory(p, side=side)
             self.assertTrue(report.feasible, report.message)
             for sample in report.samples:
@@ -81,9 +83,21 @@ class AngularLawTests(unittest.TestCase):
                 self.assertAlmostEqual(sample.support_q_delta_deg, sample.phi_deg)
             self.assertAlmostEqual(report.samples[-1].beta_deg, 120 if side == "left" else 60)
 
+    def test_default_negative_gain_swings_backwards(self):
+        # 2026-09-21 默认 k=-2：Δψ=-2φ，Δq摆=(k+1)φ=-φ，支撑仍 +φ
+        for side in ("left", "right"):
+            p = GaitParams(lift_mm=35)
+            report = plan_swing_trajectory(p, side=side)
+            self.assertTrue(report.feasible, report.message)
+            for sample in report.samples:
+                self.assertAlmostEqual(sample.psi_deg-30, -2*sample.phi_deg)
+                self.assertAlmostEqual(sample.swing_q_delta_deg, -1*sample.phi_deg)
+                self.assertAlmostEqual(sample.support_q_delta_deg, sample.phi_deg)
+
     def test_linkage_does_not_depend_on_mm_geometry_or_lift(self):
         for d, lift, segments in ((80, 20, 1), (220, 35, 12), (500, 80, 200)):
-            p = GaitParams(geometry=GaitGeometry(d_mm=d), lift_mm=lift, swing_segments=segments)
+            p = GaitParams(geometry=GaitGeometry(d_mm=d), lift_mm=lift,
+                           swing_segments=segments, phase_gain=2.0)
             s4 = next(s for s in plan_gait_stages(p, side="left") if s.stage_id == "S4")
             self.assertEqual([m.delta for m in s4.move_groups[0]], [180, 60])
             self.assertEqual(angular_targets(p, 30), (60, 90, 30))
@@ -105,10 +119,11 @@ class AngularLawTests(unittest.TestCase):
         self.assertFalse(plan_swing_trajectory(p, side="left").feasible)
 
     def test_gain_is_calibratable_but_must_land_on_low_nodes(self):
-        for invalid in (0, 1, 3, float("nan")):
+        for invalid in (0, 1, 3, -1, -3, float("nan")):
             with self.assertRaises(ValueError):
                 GaitParams(phase_gain=invalid).validated()
         self.assertEqual(angular_targets(GaitParams(phase_gain=4), 60), (240, 300, 60))
+        self.assertEqual(angular_targets(GaitParams(phase_gain=-2), 60), (-120, -60, 60))
 
 
 class PhysicalExecutionBridgeTests(unittest.TestCase):
@@ -140,11 +155,37 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
             self.assertEqual(app.axis_runtime[a].position_steps, 0)
         self.assertAlmostEqual(app._gait_angle_snapshot()["psi_delta_deg"], 119.925)
 
-    def test_reverse_side_at_initial_stance_cannot_miss_target_pad(self):
+    def test_reverse_side_at_initial_stance_lands_on_adjacent_pad(self):
+        # 2026-09-21 按用户要求放开区域限制：初始站位 (A,B) 的右侧换位
+        # 顺向 60° 几何落点是邻座(0,-1)（而非 C），照常建立执行器。
         app = mechanism()
-        with self.assertRaisesRegex(GaitExecutorError, "交换"):
+        run, report = app._gait_begin_run("right")
+        start, target, pivot, bearing = run.route
+        self.assertEqual((start, pivot), ("B", "A"))
+        self.assertEqual(target, "邻座(0,-1)")
+        self.assertTrue(report.feasible, report.message)
+        self.assertTrue(any("邻座(0,-1)" in c for c in app._logs))
+
+    def test_no_pad_at_sixty_degree_landing_still_blocks(self):
+        # 顺向落点真的没有支座时仍要拦截（站位/横梁角不实的保护）。
+        app = mechanism()
+        app._gait_beta_deg = 90.0                   # 横梁角与 A/B 站位矛盾
+        with self.assertRaisesRegex(GaitExecutorError, "横梁角"):
             app._gait_begin_run("right")
-        self.assertFalse(any(c.startswith("MOVE,") for c in app.commands))
+
+    def test_negative_gain_left_then_right_unwind_cable_to_zero(self):
+        # k=-2 全链路：摆动电机反向 60°。左右各换位一次后，两侧旋转轴
+        # 累计角都回到零位（对比 k=2 的 +180/+60，线缆几乎不缠绕）。
+        app = mechanism()
+        app.gait_params = replace(app.gait_params, phase_gain=-2.0)
+        self.complete(app, "left")
+        self.assertEqual(app._gait_supports, ("C", "B"))
+        self.complete(app, "right")
+        self.assertEqual(app._gait_supports, ("C", "A"))
+        for axis in (2, 3):
+            units = app.axis_profiles[axis].units_from_steps(
+                app.axis_runtime[axis].position_steps)
+            self.assertAlmostEqual(units, 0.0, places=6)
 
     def test_infeasible_clearance_warns_but_no_longer_blocks(self):
         # 2026-09-18 按用户要求：碰撞/避障校验不再一票否决，
@@ -220,7 +261,8 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
                 app = mechanism()
                 run, _ = app._gait_begin_run("left")
                 run.advance_confirm(); run.advance_confirm()
-                self.assertTrue(run.execute_current_stage())
+                self.assertTrue(run.execute_current_stage())   # S2 两轴抬升
+                self.assertTrue(run.execute_current_stage())   # S2B 收移位腿
                 before_sync = len(app.commands)
                 original = app._on_step_done
 
@@ -246,7 +288,8 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         app = mechanism()
         run, _ = app._gait_begin_run("left")
         run.advance_confirm(); run.advance_confirm()
-        self.assertTrue(run.execute_current_stage())
+        self.assertTrue(run.execute_current_stage())   # S2 两轴抬升
+        self.assertTrue(run.execute_current_stage())   # S2B 收移位腿
         def lost_ack(*_args, **_kw):
             raise RequestTimeout("SYNC", 1.0)
         app._send_and_read = lost_ack

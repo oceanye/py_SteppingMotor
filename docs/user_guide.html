@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>步进电机控制系统 · 使用说明</title>
+<style>
+  :root { --ink:#1e293b; --sub:#475569; --line:#e2e8f0; --brand:#1565c0;
+          --ok:#2e7d32; --warn:#b26a00; --err:#b42318; --bg:#f8fafc; }
+  * { box-sizing:border-box; }
+  body { font-family:"Microsoft YaHei","PingFang SC",sans-serif; color:var(--ink);
+         margin:0; background:var(--bg); line-height:1.65; }
+  .wrap { max-width:960px; margin:0 auto; padding:24px 20px 80px; }
+  header { border-bottom:3px solid var(--brand); padding:18px 0 14px; margin-bottom:22px; }
+  h1 { font-size:26px; margin:0 0 6px; }
+  .meta { color:var(--sub); font-size:13px; }
+  h2 { font-size:20px; margin:34px 0 10px; padding:8px 12px; background:#eef3fa;
+       border-left:4px solid var(--brand); border-radius:3px; }
+  h3 { font-size:16px; margin:20px 0 8px; color:#0f3d6e; }
+  p, li { font-size:14.5px; }
+  code, .path { font-family:Consolas,monospace; background:#eef2f7; padding:1px 5px;
+                border-radius:3px; font-size:13px; }
+  table { border-collapse:collapse; width:100%; margin:10px 0; background:#fff; font-size:13.5px; }
+  th, td { border:1px solid var(--line); padding:7px 9px; text-align:left; vertical-align:top; }
+  th { background:#f1f5f9; }
+  .box { border:1px solid var(--line); background:#fff; border-radius:6px;
+         padding:12px 16px; margin:10px 0; }
+  .box.danger { border-left:4px solid var(--err); background:#fdf3f2; }
+  .box.warn { border-left:4px solid var(--warn); background:#fdf8ef; }
+  .box.tip { border-left:4px solid var(--ok); background:#f2faf3; }
+  .steps { counter-reset:s; padding-left:0; list-style:none; }
+  .steps > li { counter-increment:s; position:relative; padding:6px 0 6px 40px; margin:4px 0;
+                background:#fff; border:1px solid var(--line); border-radius:5px; }
+  .steps > li::before { content:counter(s); position:absolute; left:10px; top:8px;
+        width:22px; height:22px; border-radius:50%; background:var(--brand); color:#fff;
+        font-size:13px; font-weight:bold; display:flex; align-items:center; justify-content:center; }
+  kbd { font-family:Consolas,monospace; background:#fff; border:1px solid #cbd5e1;
+        border-bottom-width:2px; border-radius:3px; padding:0 6px; font-size:12.5px; }
+  nav.toc { background:#fff; border:1px solid var(--line); border-radius:6px; padding:14px 20px; }
+  nav.toc ol { margin:6px 0; padding-left:22px; }
+  nav.toc a { color:var(--brand); text-decoration:none; }
+  nav.toc a:hover { text-decoration:underline; }
+  .tag { display:inline-block; font-size:12px; padding:1px 8px; border-radius:10px;
+         margin-right:6px; vertical-align:1px; }
+  .tag.ok { background:#e3f2e5; color:var(--ok); }
+  .tag.warn { background:#fdf0dd; color:var(--warn); }
+  .tag.err { background:#fbe4e2; color:var(--err); }
+  footer { margin-top:50px; color:var(--sub); font-size:12.5px; border-top:1px solid var(--line);
+           padding-top:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>步进电机控制系统 · 使用说明</h1>
+  <div class="meta">30 轴步进（ESP32-S3 + Pico）+ FOC/GEAR 闭环 + 轨道 D + 三足轮换步态
+  &nbsp;|&nbsp; 适用版本：main <code>2d1bc3c</code>（2026-09-20）&nbsp;|&nbsp; 离线文档，可直接分享</div>
+</header>
+
+<nav class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#safety">安全须知（先读）</a></li>
+    <li><a href="#quick">快速开始：连接与模式</a></li>
+    <li><a href="#bind">电机绑定与状态</a></li>
+    <li><a href="#stepper">步进轴页：单轴操作与校准</a></li>
+    <li><a href="#paired">左右直联动与落地纠偏</a></li>
+    <li><a href="#foc">FOC / 减速（GEAR）闭环页</a></li>
+    <li><a href="#track">轨道 D</a></li>
+    <li><a href="#gait">三足步态（重点）</a></li>
+    <li><a href="#web">手机网页控制</a></li>
+    <li><a href="#faq">常见问题与报错对照</a></li>
+    <li><a href="#files">数据文件清单</a></li>
+  </ol>
+</nav>
+
+<h2 id="safety">1. 安全须知（先读）</h2>
+<div class="box danger">
+  <p><b>⚠️ 本系统为开环步进（无编码器），软件位置是脉冲累计的估算。</b>断电、堵转、丢步、
+  中止运动后，实际位置可能与显示不一致。任何"位置可信"标记都只代表脉冲账本有效，
+  不代表电机真实到位。</p>
+</div>
+<ul>
+  <li><b>速度红线</b>：脉冲率超过 <code>1000 pps</code> 时会弹窗要求确认；无加速曲线的开环步进
+      高速极易失步（啸叫、实际行程远小于设定）。带减速箱的轴尤其注意模式/减速比是否填对。</li>
+  <li><b>急停优先</b>：软件【停止】按钮和网页急停发 <code>ESTOP</code> 停全部输出；
+      现场应另配物理急停/断电手段。硬件急停触发后，释放按钮才能恢复操作。</li>
+  <li><b>断开前必停</b>：点"断开"前软件会先发 ESTOP 停车；若提示"停车未确认"，
+      说明控制器没响应，请立即物理急停。</li>
+  <li><b>中止/异常后</b>：轴位置会标记"不可信"（橙色），必须人工确认位置并重新校准后才能继续。</li>
+  <li><b>三足步态</b>：碰撞/避障校验失败只弹提示、<b>不拦截执行</b>——是否运动由现场人员判断。
+      运动中随时可【⛔ 中止】。</li>
+</ul>
+
+<h2 id="quick">2. 快速开始：连接与模式</h2>
+<ol class="steps">
+  <li>ESP32-S3 接 USB（本机通常为 <code>COM9</code>），机构上电；双击 <code>start_gui</code> 启动。</li>
+  <li>左上角"串口连接"框：选择串口 → 波特率 <code>115200</code> → 点【连接】。
+      成功后状态变绿"● 已连接"，固件自动回报模式（如 <code>GEAR</code>）。</li>
+  <li>连接时软件自动执行安全握手（ESTOP 全停确认），并按当前固件模式自动灰掉无关页。</li>
+  <li><b>模式选择</b>：
+      <table>
+        <tr><th>选项</th><th>行为</th></tr>
+        <tr><td>Auto（默认）</td><td>向固件发 <code>MODE</code> 查询，按回报自动切换显示</td></tr>
+        <tr><td>强制 FOC / 强制 GEAR</td><td>跳过查询直接应用（用于旧固件无 MODE 命令时）</td></tr>
+      </table></li>
+  <li>日志区在窗口底部，同日汇总写入 <code>logs/gui_年-月-日.log</code>；
+      排查问题先看日志，再看 <code>logs/gui_stderr.log</code>。</li>
+</ol>
+
+<h2 id="bind">3. 电机绑定与状态</h2>
+<p>三足步态不直接使用"轴号"，而是使用四个<b>逻辑角色</b>，每个角色绑定一个物理步进轴：</p>
+<table>
+  <tr><th>角色</th><th>含义</th><th>要求</th></tr>
+  <tr><td><code>Mup1</code></td><td>左侧直线升降</td><td>直线模式</td></tr>
+  <tr><td><code>Mr1</code></td><td>左侧换位旋转</td><td>旋转模式，<b>必须绑定 ESP32 本地轴（0–5）</b></td></tr>
+  <tr><td><code>Mup2</code></td><td>右侧直线升降</td><td>直线模式</td></tr>
+  <tr><td><code>Mr2</code></td><td>右侧支撑切换旋转</td><td>旋转模式，<b>必须绑定 ESP32 本地轴（0–5）</b></td></tr>
+</table>
+<ul>
+  <li>在"🧭 电机绑定与状态"页为每个角色选择物理轴；【填充建议绑定】可一键填入推荐组合。</li>
+  <li>草稿校验通过后点【保存】生效；换绑时对应轴必须空闲。</li>
+  <li><b>换绑 / 改 PPR / 减速比后，步态零位标定自动失效</b>，需要重新记零。</li>
+</ul>
+
+<h2 id="stepper">4. 步进轴页：单轴操作与校准</h2>
+<p>“🔩 步进轴 (30)”按 <code>ESP32 本地</code> / <code>Pico 1–4</code> 分组，每轴一页。</p>
+<h3>4.1 轴参数（模式三联动，先填对再动）</h3>
+<table>
+  <tr><th>参数</th><th>含义</th><th>范围</th></tr>
+  <tr><td>控制模式</td><td>直线（mm）/ 旋转（°）</td><td>按电机实际结构选</td></tr>
+  <tr><td>脉冲/转 (PPR)</td><td>每转脉冲数（含细分）</td><td>1 – 10000</td></tr>
+  <tr><td>减速比</td><td>电机输出端减速</td><td>0.001 – 1000</td></tr>
+  <tr><td>导程</td><td>直线轴每转行程</td><td>0.01 – 100 mm</td></tr>
+</table>
+<p>参数改动实时保存到 <code>.stepper_axis_config.json</code>；换算出的 mm/°、速度单位随模式切换。</p>
+<h3>4.2 运动操作</h3>
+<ul>
+  <li><b>距离+方向 →【执行】</b>：一段定长运动。</li>
+  <li><b>点动（1mm）</b>：短步进；<b>按住连续</b>：按住按钮持续走、松开停。</li>
+  <li><b>前往位置</b>：绝对定位；【⌂ 回零】= 前往 0。</li>
+  <li><b>【⛔ 停止】</b>：立即停该轴（发 STOP）。</li>
+</ul>
+<h3>4.3 位置校准与行程</h3>
+<ul>
+  <li>【⌂ 设为原点】：把当前位置定义为 0（可信）。</li>
+  <li>【校准当前位置】：把手动摆到的实际位置填入"前往位置"框后点校准。</li>
+  <li>【⊖ 最小 / ⊕ 最大】：标记软限位；越界目标会被拒绝。【清除行程】取消限位。</li>
+  <li>位置显示蓝色 = 可信；橙色 <code>≈ 值（需校准）</code> = 不可信，禁止运动。</li>
+</ul>
+
+<h2 id="paired">5. 左右直联动与落地纠偏</h2>
+<p>位于“ESP32 本地”组内“轴 左右直联动”页：左右两条直线轴（Mup1/Mup2 对应轴）
+同一命令同步执行，预检两轴都空闲才启动，防止只动一边。</p>
+<div class="box tip">
+  <p><b>落地纠偏（默认开启）</b>：悬空腿落地时（两直轴标高差从大于阈值收敛到阈值内，
+  且只发生在<b>单轴运动</b>中），软件自动<b>释放</b> Mr1/Mr2 旋转电机（断使能），
+  让机构在重力下自正一次；直线运动结束后自动重新<b>锁定</b>。</p>
+  <ul>
+    <li>释放期间旋转轴禁止发脉冲；软件位置沿用不重算。</li>
+    <li>阈值默认 3mm，可在联动页改；也可取消勾选关闭该功能。</li>
+    <li>状态条：<span style="color:#2e7d32">🔒 旋转电机已锁定</span>（常态）/
+        <span style="color:#b42318">🔓 已释放 · 机构纠偏中</span>（瞬时，通常 1–3 秒）。</li>
+  </ul>
+</div>
+
+<h2 id="foc">6. FOC / 减速（GEAR）闭环页</h2>
+<ul>
+  <li>两套界面共用目标角变量；当前固件是哪种模式，哪组页可用（另一组灰）。</li>
+  <li><b>使能 → 设目标角</b>：电机闭环走位；watcher 每 1.5s 报进度，到位/超时会写日志。</li>
+  <li><b>FOC 调参</b>：V（电压=扭矩）、PA（刚度）、VP（阻尼）；存 <code>.foc_tune.json</code>。</li>
+  <li><b>GEAR 调参</b>：PWM 上限、Kp/Ki/Kd、GR 齿轮比；存 <code>.gear_tune.json</code>。</li>
+  <li><b>自动调参</b>：FOC 两阶段扫描 PA+VP（约 2 分钟）；GEAR 三阶段 Kp→Kd→Ki（约 3 分钟）。
+      电机会来回转动，确认机械空间后再点。</li>
+  <li>波形图蓝=目标、红=实际，最近 10 秒。</li>
+</ul>
+
+<h2 id="track">7. 轨道 D</h2>
+<ul>
+  <li>独立 DRV8871 驱动的轨道电机；【◀ 按】/【▶ 按】按住走，松开停，占空比 1–100%。</li>
+  <li>采用 800ms 租约：按住期间软件自动续租；松开或固件租约到期自动停。</li>
+</ul>
+
+<h2 id="gait">8. 三足步态（重点）</h2>
+
+<h3>8.1 页面布局</h3>
+<table>
+  <tr><th>区域</th><th>内容</th></tr>
+  <tr><td>左栏 ·【运行】页签</td><td>日常参数：增益 k、公转峰值速度、线缆角度限位、
+      <b>实际抬足行程</b>、抬/落速度、参考安全间隙 δ</td></tr>
+  <tr><td>左栏 ·【标定】页签</td><td>横梁基准角 β₀、四轴方向符号、Mr1/Mr2 记零、
+      确认复选框、人工重建 A/B 基准</td></tr>
+  <tr><td>左栏 ·【几何参考】页签</td><td>中心距、各结构尺寸、预览采样——<b>仅用于画图与间隙提示，
+      不影响电机转角</b>；旧配置保留，无需每次填写</td></tr>
+  <tr><td>左栏底部</td><td>【保存参数】【放弃修改并重读】+ 标定状态（不随页签滚动）</td></tr>
+  <tr><td>右栏顶部</td><td>【⛔ 中止】【重置流程】（始终可见）</td></tr>
+  <tr><td>右栏 · 数字孪生</td><td>实时估算姿态（见 8.4）</td></tr>
+  <tr><td>右栏 · 轨迹与间隙参考</td><td>“预览/校验”干跑（不动电机）</td></tr>
+  <tr><td>右栏 · 分阶段执行</td><td>【开始左侧换位】【开始右侧换位】【✓ 确认并执行本阶段】</td></tr>
+</table>
+<p>左右分栏可拖动；窗口偏小时表单自动出滚动条，Tab 键聚焦会自动滚动到控件。</p>
+
+<h3>8.2 角度联动原理（一句话版）</h3>
+<div class="box">
+  <p>每步公转 <b>φ=60°</b>；世界自转 <b>Δψ = kφ</b>（默认 k=2 → 120°）；
+  关节角 <b>Δq摆 = (k+1)φ</b>（摆动侧 180°）、<b>Δq支 = φ</b>（支撑侧 60°）。
+  两旋转轴在同一个 SYNC 命令里按五次平滑曲线原子同步走完。</p>
+  <p><b>中心距、六边形尺寸等几何参数不改变任何电机转角</b>——它们只用于俯视图和间隙提示。
+  角度→脉冲的换算只依赖绑定轴的 PPR、减速比和方向符号。</p>
+</div>
+
+<h3>8.3 一次完整步态的标准流程</h3>
+<ol class="steps">
+  <li><b>前置检查</b>：串口已连接；四角色已绑定；各轴位置可信（蓝色）。</li>
+  <li><b>摆基准位</b>：人工把三足摆到 左足 A、右足 B、三爪低节点（ψ=30° 位），
+      四轴静止。</li>
+  <li><b>记零</b>：【标定】页签 → 点 <b>Mr1【记零】</b>、<b>Mr2【记零】</b>，
+      零位标签从"未标定"变为具体角度。</li>
+  <li><b>确认复选框（最后一步勾！）</b>：勾选
+      <b>"已确认电机标定与现场支撑"</b>。
+      <div class="box warn">任何参数改动、任何记零操作都会把该复选框<b>自动重置为未勾选</b>。
+      所以顺序永远是：改参数 → 记零 → 勾选 → 立刻开始。</div></li>
+  <li><b>开始</b>：右栏点【开始左侧换位】（或右侧）。软件做全部前置检查
+      （绑定/固件 SYNC 能力/使能/零位/行程/线缆窗口）。</li>
+  <li><b>碰撞提示（如触发）</b>：几何参考未实测或间隙为负时，弹黄色
+      "碰撞/避障校验未通过（仅提示，不拦截）"——确认现场安全后继续。
+      日志出现"步态执行器就绪（left）：N 个阶段"。</li>
+  <li><b>逐阶段执行</b>：每按一次【✓ 确认并执行本阶段】推进一个阶段
+      （运动阶段发脉冲；人工确认阶段只推进）。阶段文本会说明当前要做什么。</li>
+  <li><b>完成</b>：状态变 done，四轴释放；换另一侧时点对应的开始按钮，
+      软件自动使用新支点。</li>
+</ol>
+<div class="box danger">
+  <p><b>⛔ 中止 / 断连 / 急停后</b>：步态标记"须人工恢复"——必须人工把机构摆回基准位，
+  【标定】页点【人工重建 A/B 基准】（不动电机），再重新记零、勾选、开始。
+  被 ABORT 的轴位置不可信，先单轴页校准。</p>
+</div>
+
+<h3>8.4 实时数字孪生（无编码器估算）</h3>
+<ul>
+  <li><b>表格</b>：四电机"估算坐标 / 指令目标"两列。</li>
+  <li><b>XY 示意</b>：蓝=左足、橙=右足；<b>实线=当前脉冲估算、虚线=指令目标</b>；
+      顶行显示 φ / β / ψ。</li>
+  <li><b>Z 条</b>：本步开始至今的升降位移 ΔZ（按抬升方向修正），<b>不是实测离地高度</b>。</li>
+  <li>刷新随固件进度回报（SYNC 约 250ms 一帧）；<b>断连 / 急停 / 坐标失信 / 超时 →
+      灰显冻结为"历史估算"</b>，不伪造运动。</li>
+  <li>步态完成后若又单独点动某轴：世界姿态失效，只显示轴坐标，不再画公转。</li>
+  <li>孪生<b>只读</b>：不参与落脚、碰撞、电机控制的任何决策。</li>
+</ul>
+
+<h3>8.5 报错对照（步态）</h3>
+<table>
+  <tr><th>提示</th><th>原因 / 处理</th></tr>
+  <tr><td>尚未确认电机方向、PPR、零位及现场支撑条件</td>
+      <td>未勾选【标定】页确认复选框；按 8.3 顺序操作</td></tr>
+  <tr><td>Mr1/Mr2 尚未做零位标定</td><td>先摆 ψ=30° 基准位再【记零】</td></tr>
+  <tr><td>绑定或PPR/减速比已变化，旧零位标定失效</td><td>换绑/改参数后须重新记零</td></tr>
+  <tr><td>零位与绑定/方向/PPR不匹配</td><td>方向符号改动后须重新记零</td></tr>
+  <tr><td>固件缺少六轴SYNC V1能力</td><td>ESP32 需烧录最新 GEAR 主线固件</td></tr>
+  <tr><td>旋转驱动器未确认使能</td><td>检查 ENA 线/驱动器供电后重试</td></tr>
+  <tr><td>上一次动作未完整完成；必须人工重建物理基准</td><td>中止/异常后走恢复流程（见 8.3 末尾）</td></tr>
+  <tr><td>超过已标定行程 / 线缆窗口</td><td>调整参数或人工把轴移回窗口内</td></tr>
+  <tr><td>碰撞/避障校验未通过（仅提示，不拦截）</td>
+      <td><span class="tag warn">提示</span>几何间隙为负或不足；自行确认现场安全后继续</td></tr>
+  <tr><td>该侧顺向60°公转不通向目标低节点</td><td>当前应交换摆动/支撑侧，点另一侧开始</td></tr>
+</table>
+
+<h2 id="web">9. 手机网页控制</h2>
+<ol class="steps">
+  <li>手机与台式机连同一局域网；GUI 启动后"手机完整网址"显示
+      <code>http://&lt;台式机IP&gt;:8765/</code>。</li>
+  <li>手机浏览器打开该网址（【复制手机网址】/【本机打开】按钮在左上第 3–4 行）。</li>
+  <li>页面显示"串口已连接"后即可控制：步进点动/定长、闭环目标角、轨道、急停。</li>
+</ol>
+<div class="box warn">网址固定、<b>无鉴权</b>，仅在可信局域网使用。日志会提示部署环境要求。</div>
+
+<h2 id="faq">10. 常见问题</h2>
+<table>
+  <tr><th>现象</th><th>解释 / 处理</th></tr>
+  <tr><td>位置显示橙色"≈ 需校准"</td><td>脉冲账本不可信（断电/中止/换参数后正常现象）；
+      人工确认位置后【设为原点】或【校准】</td></tr>
+  <tr><td>点运动弹"速度过高确认"</td><td>当前速度折合 &gt;1000pps；核对模式/PPR/减速比/导程
+      是否与实物一致，确认无误才继续</td></tr>
+  <tr><td>日志"ENA 固件未确认（运动中响应慢）"</td><td>落地纠偏释放/重锁的软超时提示，
+      非断连；可目视确认电机状态</td></tr>
+  <tr><td>步态页参数栏出现滚动条 / 复选框看不见</td><td>窗口偏小属正常，滚动到底即可；
+      拉大窗口自动消失</td></tr>
+  <tr><td>双轴同时动时串口响应慢</td><td>固件双轴脉冲输出时查询变慢，软件已自动暂停
+      FOC 轮询，停轴后恢复</td></tr>
+  <tr><td>断开后再连不上</td><td>等待 1–2 秒（串口回收）；仍失败换 USB 口/检查占用</td></tr>
+</table>
+
+<h2 id="files">11. 数据文件清单（项目根目录）</h2>
+<table>
+  <tr><th>文件</th><th>内容</th></tr>
+  <tr><td><code>.stepper_axis_config.json</code></td><td>各轴模式/PPR/减速比/导程</td></tr>
+  <tr><td><code>.stepper_calib.json</code></td><td>各轴位置/行程限位（含参数元数据校验）</td></tr>
+  <tr><td><code>.gait_params.json</code></td><td>步态参数、几何参考、零位与标定状态</td></tr>
+  <tr><td><code>.foc_tune.json</code> / <code>.gear_tune.json</code></td><td>闭环调参</td></tr>
+  <tr><td><code>logs/gui_*.log</code></td><td>按日汇总的操作日志</td></tr>
+  <tr><td><code>logs/raw_*.log</code></td><td>串口原始流（勾选"原始流记录"时生成）</td></tr>
+</table>
+
+<footer>
+  本文档由代码库当前状态生成，与 GUI 内【❓ 使用说明】按钮指向同一文件：
+  <code>docs/user_guide.html</code>。界面文案以程序实际显示为准。
+</footer>
+
+</div>
+</body>
+</html>

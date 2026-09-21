@@ -4,9 +4,9 @@
 
 - 五次平滑曲线 ``S(s)=10s³-15s⁴+6s⁵``；
 - 左三足中心 ``O1(φ) = B + d·dir(180°-φ)``，φ∈[0°,60°]；
-- 同步自转 ``ψ1 = ψ10 + 2φ``（ψ10=30°，低节点相位）；
+- 同步自转 ``ψ1 = ψ10 + k·φ``（ψ10=30°，低节点相位；k=phase_gain）；
 - 横梁角 ``β = 180° - 60°·S(s)``，关节角 ``q = ψ - β + c``；
-- 一个摆动循环里：摆动侧电机 Δq=+180°、支撑侧电机 Δq=+60°；
+- 一个摆动循环里（默认 k=-2）：摆动侧电机 Δq=-60°、支撑侧 Δq=+60°；
 - 高点避让：邻接六边形、爪臂、中心结构、横梁与实测垂向包络；
   采样间运动距离界给出连续间隙保守下界，不排除壳体下的高点。
 
@@ -175,7 +175,11 @@ class GaitParams:
     geometry: GaitGeometry = field(default_factory=GaitGeometry)
     # 执行节拍
     swing_segments: int = 12          # 展示密度；不会切分实际同步指令
-    lift_mm: float = 10.0             # z_clear：抬足高度（轴行程单位）
+    lift_mm: float = 70.0             # 起步两直线轴同时抬升量（轴行程单位）
+                                       # 2026-09-21 按用户实测 50 → 70：
+                                       # 单腿硬顶 ~30mm 即卡顿（摩擦），两轴
+                                       # 分摊后 70 才能保证移位腿收起后
+                                       # 爪与节点不打架
     swing_speed_deg_s: float = 6.0    # 支撑侧（横梁驱动）电机速度
     lift_speed_mm_s: float = 2.0      # 抬足速度
     settle_speed_mm_s: float = 1.0    # 落足速度（更慢）
@@ -190,7 +194,10 @@ class GaitParams:
     # 标定基准：记零时各 Mr 轴的软件坐标（度）；ψ 基准固定为 30°
     mr1_zero_deg: float | None = None
     mr2_zero_deg: float | None = None
-    phase_gain: float = 2.0          # Δψ/φ；不受中心距/升降行程影响
+    # Δψ/φ；不受中心距/升降行程影响。2026-09-21 应用户要求默认 2 → -2：
+    # 公转 +60°、摆动电机 (k+1)φ = -60°（与公转反向），世界自转 -120°
+    # （三重对称下与 +120° 终点等效，但路径短、方向相反，线缆缠绕少）。
+    phase_gain: float = -2.0
     beam_reference_deg: float = 180.0  # 两个 Mr 同时记零时横梁世界角
     calibration_confirmed: bool = False  # 实测几何、方向、PPR、反力闭合已确认
     calibration_fingerprint: str | None = None
@@ -221,9 +228,13 @@ class GaitParams:
             value = getattr(self, name)
             if value is not None and not math.isfinite(value):
                 raise ValueError(f"零位 {name} 必须是有限数值")
-        if (not math.isfinite(self.phase_gain) or not 0 < self.phase_gain <= 10
+        # 2026-09-21 放开负增益：k=-2 表示摆动电机与公转反向转 60°。
+        # 终点仍须落在三重对称低节点（k×60° 必须是 120° 的整数倍）。
+        if (not math.isfinite(self.phase_gain)
+                or not -10.0 <= self.phase_gain <= 10.0
+                or self.phase_gain == 0
                 or abs(self.phase_gain * SWING_ARC_DEG % 120.0) > 1e-8):
-            raise ValueError("phase_gain 必须为 2/4/6/8/10；终点须对准三重对称低节点")
+            raise ValueError("phase_gain 必须为 ±2/±4/±6/±8/±10；终点须对准三重对称低节点")
         if not math.isfinite(self.beam_reference_deg):
             raise ValueError("beam_reference_deg 必须是有限数值")
         if not isinstance(self.calibration_confirmed, bool):
@@ -235,11 +246,12 @@ class GaitParams:
                 raise ValueError("旋转零位签名必须是字符串或 null")
         return self
 
-    # 传统摆动侧速度（3×支撑速度）。S4 解绕后按增量比另算段速；
-    # 此值现用于 S3 相位调整等单轴整段运动。
+    # 传统摆动侧速度（|k+1|×支撑速度）。S4 解绕后按增量比另算段速；
+    # 此值现用于 S3 相位调整等单轴整段运动。k=-1 已被 validated 拒绝，
+    # 结果恒为正；方向由 RoleMove.delta 的符号承载。
     @property
     def swing_side_speed_deg_s(self) -> float:
-        return (self.phase_gain + 1.0) * self.swing_speed_deg_s
+        return abs(self.phase_gain + 1.0) * self.swing_speed_deg_s
 
     def as_document(self) -> dict[str, Any]:
         geometry = self.geometry
@@ -357,7 +369,7 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         mup2_lift_sign=_sign("mup2_lift_sign"),
         mr1_zero_deg=_opt_number("mr1_zero_deg"),
         mr2_zero_deg=_opt_number("mr2_zero_deg"),
-        phase_gain=_number("phase_gain", 2.0),
+        phase_gain=_number("phase_gain", GaitParams.phase_gain),
         beam_reference_deg=_number("beam_reference_deg", 180.0),
         calibration_confirmed=value.get("calibration_confirmed", False),
         calibration_fingerprint=value.get("calibration_fingerprint"),
@@ -626,7 +638,7 @@ def plan_swing_trajectory(
     worst = min(samples, key=lambda item: float(item.margin_mm))
     interval_bound = min(
         min(float(a.margin_mm), float(b.margin_mm))
-        - (geometry.d_mm + params.phase_gain * geometry.arm_length_mm)
+        - (geometry.d_mm + abs(params.phase_gain) * geometry.arm_length_mm)
         * math.radians(b.phi_deg - a.phi_deg) / 2.0
         for a, b in zip(samples, samples[1:]))
     minimum = min(float(worst.margin_mm), interval_bound)
@@ -736,14 +748,37 @@ def plan_gait_stages(
         ),
     ]
 
-    # S2 抬起摆动足
+    # S2 顶部抬升（两直线轴同时撑起）。2026-09-21 按用户澄清的机构语义：
+    # 轴"向上" = 该腿撑起顶部，单腿硬顶实测 ~30mm 即卡顿；两轴同时抬升
+    # 分摊负载，并为移位腿收起留出爪-节点垂向间隙。
     stages.append(
         GaitStage(
             stage_id="S2",
-            title="抬起摆动足",
-            confirm_text="确认摆动三足三个接触点全部离地，与高节点有垂向间隙。",
+            title="两轴同时抬升顶部",
+            confirm_text=(
+                f"确认顶部整体抬升 {params.lift_mm:g}mm：两直线轴同步向上、"
+                "速度一致，两爪仍在原低节点；机构无卡顿、横梁无倾斜。"
+            ),
             move_groups=(
-                (RoleMove(lift_role, lift_sign * params.lift_mm,
+                (RoleMove("Mup1", params.mup1_lift_sign * params.lift_mm,
+                          params.lift_speed_mm_s),
+                 RoleMove("Mup2", params.mup2_lift_sign * params.lift_mm,
+                          params.lift_speed_mm_s)),
+            ),
+        )
+    )
+    # S2B 收起移位腿：GUI"向下"= 腿收起。顶部由站立腿撑住，移位腿收回后
+    # 爪离地间隙 = 抬升量（此时两直轴标高差 = lift_mm）。
+    stages.append(
+        GaitStage(
+            stage_id="S2B",
+            title="收起移位腿",
+            confirm_text=(
+                "确认移位腿已收起：三爪全部离地、与高节点有垂向间隙；"
+                "站立腿仍稳定撑住顶部，无侧倾。"
+            ),
+            move_groups=(
+                (RoleMove(lift_role, -lift_sign * params.lift_mm,
                           params.lift_speed_mm_s),),
             ),
         )
@@ -774,7 +809,7 @@ def plan_gait_stages(
     _spin, swing_delta_total, support_delta_total = angular_targets(params, SWING_ARC_DEG)
     duration_s = 1.875 * SWING_ARC_DEG / params.swing_speed_deg_s
     segment_groups = [(RoleMove(swing_role, swing_sign * swing_delta_total,
-                               (params.phase_gain + 1) * params.swing_speed_deg_s),
+                               abs(params.phase_gain + 1) * params.swing_speed_deg_s),
                        RoleMove(support_role, support_sign * support_delta_total,
                                 params.swing_speed_deg_s))]
     stages.append(
@@ -794,26 +829,41 @@ def plan_gait_stages(
         )
     )
 
+    # S6 落脚：站立腿收回（GUI"向下"），顶部带移位腿整体下降落位。
+    # 2026-09-21 按用户澄清：落脚由站立侧直轴执行，结束后两直轴都回到
+    # 抬升前的坐标（无标高差）；下降中标高差从 lift_mm 收敛到 0，
+    # 落地纠偏按设定阈值自动释放旋转电机。
+    support_lift_role = "Mup2" if side == "left" else "Mup1"
+    support_lift_sign = (params.mup2_lift_sign if support_lift_role == "Mup2"
+                         else params.mup1_lift_sign)
     stages.extend(
         [
             GaitStage(
                 stage_id="S5",
                 title="接近目标位",
-                confirm_text="目视检查爪臂相位与目标六边形低节点一一对应。",
+                confirm_text="目视检查移位腿爪臂相位与目标六边形低节点一一对应。",
             ),
             GaitStage(
                 stage_id="S6",
-                title="落脚",
-                confirm_text="低速下放；只有三个低节点接触均有效后才允许进入锁定。",
+                title="落脚（站立腿收回，顶部下降）",
+                confirm_text=(
+                    "站立腿低速收回，顶部带移位腿整体下降；只有移位腿三个"
+                    "低节点接触均有效后才允许进入锁定。两轴标高差收敛到阈值"
+                    "时，落地纠偏自动释放旋转电机并延迟重锁。"
+                ),
                 move_groups=(
-                    (RoleMove(lift_role, -lift_sign * params.lift_mm,
+                    (RoleMove(support_lift_role,
+                              -support_lift_sign * params.lift_mm,
                               params.settle_speed_mm_s),),
                 ),
             ),
             GaitStage(
                 stage_id="S7",
                 title="锁定完成",
-                confirm_text="确认三足踩实、姿态正确；本次摆动结束。",
+                confirm_text=(
+                    "确认移位腿三足踩实、两直轴回到抬升前标高（无标高差）、"
+                    "姿态正确；本次摆动结束。"
+                ),
             ),
         ]
     )

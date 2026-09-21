@@ -66,9 +66,12 @@ class FakeHost:
 
 
 def _params():
+    # 本文件测执行器机制（分组/等待/记账），角度断言锁定 k=2 旧联动；
+    # k=-2 新联动见 test_gait_linkage / test_gait_planner 专项用例。
     return GaitParams(
         geometry=GaitGeometry(d_mm=220.0),
         swing_segments=3,
+        phase_gain=2.0,
     ).validated()
 
 
@@ -88,15 +91,23 @@ class HappyPathTests(unittest.TestCase):
         self.assertTrue(run.advance_confirm())
         self.assertEqual(host.sends(), [])
 
-        # S2 抬足：单组单轴（Mup1 抬起）
+        # S2 两轴同时抬升顶部（Mup1/Mup2 各 +lift，非同步组背靠背下发）
         self.assertTrue(run.execute_current_stage())
         sends = host.sends()
-        self.assertEqual(len(sends), 1)
-        axis, (delta, speed) = sends[0][1], sends[0][2]
-        self.assertEqual(host.role_axes["Mup1"], axis)
-        self.assertAlmostEqual(delta, params.lift_mm)
-        self.assertAlmostEqual(speed, params.lift_speed_mm_s)
-        self.assertEqual(run.stage_index, 3)
+        self.assertEqual(len(sends), 2)
+        for axis, expected_role in ((0, "Mup1"), (1, "Mup2")):
+            entry = next(e for e in sends if e[1] == host.role_axes[expected_role])
+            delta, speed = entry[2]
+            self.assertAlmostEqual(delta, params.lift_mm)
+            self.assertAlmostEqual(speed, params.lift_speed_mm_s)
+
+        # S2B 收起移位腿（摆动侧 Mup1 -lift）
+        self.assertTrue(run.execute_current_stage())
+        retract = [e for e in host.sends()
+                   if e[1] == host.role_axes["Mup1"]][-1]
+        self.assertAlmostEqual(retract[2][0], -params.lift_mm)
+        self.assertAlmostEqual(retract[2][1], params.lift_speed_mm_s)
+        self.assertEqual(run.stage_index, 4)
 
         # S3 在基准相位时被省略
         self.assertNotIn("S3", by_id)
@@ -119,11 +130,11 @@ class HappyPathTests(unittest.TestCase):
         self.assertAlmostEqual(swing_total, 180.0, places=6)
         self.assertAlmostEqual(support_total, 60.0, places=6)
 
-        # S5 确认、S6 落脚（速度为 settle）、S7 确认 → done
+        # S5 确认、S6 落脚（站立侧 Mup2 收回，速度 settle）、S7 确认 → done
         self.assertTrue(run.advance_confirm())
         self.assertTrue(run.execute_current_stage())
         settle = [e for e in host.sends()
-                  if e[1] == host.role_axes["Mup1"]][-1]
+                  if e[1] == host.role_axes["Mup2"]][-1]
         self.assertAlmostEqual(settle[2][0], -params.lift_mm)
         self.assertAlmostEqual(settle[2][1], params.settle_speed_mm_s)
         self.assertTrue(run.advance_confirm())
@@ -136,9 +147,10 @@ class HappyPathTests(unittest.TestCase):
         run = GaitExecutor(host, params, _left_stages(params), side="left")
         run.advance_confirm()
         run.advance_confirm()
-        run.execute_current_stage()          # S2
-        run.execute_current_stage()          # S4 第一组即可观察超时
-        timeout = host.waits()[0][2]
+        run.execute_current_stage()          # S2 两轴抬升
+        run.execute_current_stage()          # S2B 收移位腿
+        run.execute_current_stage()          # S4 同步组即可观察超时
+        timeout = host.waits()[-1][2]        # S4 的同步组等待超时
         longest_delta = max(abs(e[2][0]) for e in host.sends()
                             if e[1] in (host.role_axes["Mr1"],
                                         host.role_axes["Mr2"]))
@@ -152,7 +164,8 @@ class FailureTests(unittest.TestCase):
         run = GaitExecutor(host, params, _left_stages(params), side="left")
         run.advance_confirm()
         run.advance_confirm()
-        run.execute_current_stage()   # S2
+        run.execute_current_stage()   # S2 两轴抬升
+        run.execute_current_stage()   # S2B 收起移位腿
         return run
 
     def test_dispatch_failure_stops_axes_and_blocks(self):

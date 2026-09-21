@@ -82,6 +82,7 @@ from motor_control.state_store import StateStore, StateStoreError
 from motor_control.gait_executor import GaitExecutor, GaitExecutorError
 from motor_control.gait_planner import (
     LOW_NODE_PHASE_DEG,
+    SWING_ARC_DEG,
     GaitParams,
     parse_gait_params,
     plan_gait_stages,
@@ -136,6 +137,11 @@ DIR_INWARD  = 0
 # 0 = 不翻转, 1 = 翻转 DIR 信号。两轴原始方向均正确，不翻转。
 DIR_INVERT = [0] * NUM_STEPPER_AXES
 CONTINUOUS_BURST_MM = 0.2
+
+# 落地纠偏：落地（两直轴回到空闲）后延迟重锁的秒数——留出机构在承载
+# 重力下自正中的时间。急停/断开/关闭路径不等待，立即恢复锁定。
+# 2026-09-21 应用户要求：由"空闲即锁"改为落地后延迟 5 秒。
+LAND_RELOCK_DELAY_S = 5.0
 
 
 def _continuous_burst_units(profile):
@@ -289,12 +295,18 @@ class StepperGUI:
 
         # ── 落地纠偏：悬空腿落地（两直轴标高差收敛到阈值内）时，
         #    自动释放左右旋转电机（Mr1/Mr2 绑定的轴），让机构在逐渐
-        #    承载的重力下扭正一次；两直轴回到空闲后自动重新锁定。
+        #    承载的重力下扭正一次；落地（两直轴回到空闲）后延迟
+        #    LAND_RELOCK_DELAY_S 秒自动重新锁定，留足自正中时间。
         #    释放是纯机械动作：旋转轴不发脉冲，软件位置继续沿用。──
         self.pair_land_release_enabled = tk.BooleanVar(value=True)
-        self.pair_land_release_threshold_mm = tk.DoubleVar(value=3.0)
+        # 2026-09-21 应用户要求：落地阈值 3mm → 6mm（更早进入释放）。
+        self.pair_land_release_threshold_mm = tk.DoubleVar(value=6.0)
         self._rot_release_active = False
         self._rot_release_axes: tuple[int, ...] = ()   # 触发时解析的 Mr 绑定轴
+        self._rot_relock_after = None        # 延迟重锁定时器句柄（仅 UI 线程碰）
+        self._rot_relock_generation = 0      # 递增即可作废未到点的延迟重锁
+        self._rot_release_settled = threading.Event()  # ENA,0 已落到串口上
+        self._rot_release_settled.set()
         self._last_land_gap_mm: float | None = None
 
         # ── 模式：
@@ -821,7 +833,6 @@ class StepperGUI:
             raise GaitExecutorError("支撑足世界相位未对准低节点；不能把电机相对横梁角当作绝对姿态")
         supports = getattr(self, "_gait_supports", ("A", "B"))
         start, pivot = supports if side == "left" else supports[::-1]
-        target = next(p for p in ("A", "B", "C") if p not in supports)
         bearing = beta_now + (180.0 if side == "right" else 0.0)
         pads = default_hex_pads(params.geometry)
         expected_bearing = math.degrees(math.atan2(
@@ -829,11 +840,27 @@ class StepperGUI:
             pads[start].center[0] - pads[pivot].center[0]))
         if abs((bearing - expected_bearing + 180) % 360 - 180) > 0.5:
             raise GaitExecutorError("横梁角与当前支座位置不一致；请重新建立 A/B 标定基准")
-        expected_target = math.degrees(math.atan2(
-            pads[target].center[1] - pads[pivot].center[1],
-            pads[target].center[0] - pads[pivot].center[0]))
-        if abs((bearing - 60.0 - expected_target + 180) % 360 - 180) > 0.5:
-            raise GaitExecutorError("该侧顺向60°公转不通向目标低节点；当前应交换摆动/支撑侧")
+        # 2026-09-21 按用户要求放开区域限制：目标座不再固定取 A/B/C 的
+        # 第三块，而是按该侧顺向 60° 公转的几何落点在全部支座（含邻座）
+        # 中匹配。初始站位 (A,B) 的右侧换位因此落到邻座而非被拒。
+        landing_bearing = (bearing - SWING_ARC_DEG + 180.0) % 360.0 - 180.0
+        target = None
+        for name, pad in pads.items():
+            if name in (start, pivot):
+                continue
+            pad_bearing = math.degrees(math.atan2(
+                pad.center[1] - pads[pivot].center[1],
+                pad.center[0] - pads[pivot].center[0]))
+            bearing_err = abs((pad_bearing - landing_bearing + 180) % 360 - 180)
+            radius_err = abs(math.dist(pad.center, pads[pivot].center)
+                             - params.geometry.d_mm)
+            if bearing_err <= 0.5 and radius_err <= 0.5:
+                target = name
+                break
+        if target is None:
+            raise GaitExecutorError(
+                "该侧顺向60°落点处没有六边形支座；请核实站位与横梁角，"
+                "或先交换摆动/支撑侧")
         route = (start, target, pivot, bearing)
         report = plan_swing_trajectory(params, side=side, route=route)
         self.log(f"步态角度联动校验（{start}→{target}，支点{pivot}）：{report.message}")
@@ -861,8 +888,9 @@ class StepperGUI:
         phi_error = 2.0 / p_support.pulses_per_unit
         psi_error = phi_error + 2.0 / p_swing.pulses_per_unit
         pulse_envelope = math.radians(phi_error) * params.geometry.d_mm + math.radians(psi_error) * params.geometry.arm_length_mm
-        lift_axis = role_axes["Mup1" if side == "left" else "Mup2"]
-        pulse_envelope += 0.5 / self.axis_profiles[lift_axis].pulses_per_unit
+        # 2026-09-21 起 S2 两直轴同时抬升，量化包络须覆盖两条直轴。
+        for lift_axis in (role_axes["Mup1"], role_axes["Mup2"]):
+            pulse_envelope += 0.5 / self.axis_profiles[lift_axis].pulses_per_unit
         phase_residual = abs((psi_now - LOW_NODE_PHASE_DEG + 60) % 120 - 60)
         if phase_stage is not None:
             phase_residual = 0.5 / p_swing.pulses_per_unit
@@ -1045,6 +1073,9 @@ class StepperGUI:
                     f"{stage_id} 第 {done_groups}/{total_groups} 组"))
 
         try:
+            # 步态中的落脚释放可能还处在延迟重锁窗口内：旋转阶段开始前
+            # 先恢复锁定并等固件确认，绝不带着失能的旋转轴走 SYNC。
+            self._ensure_rot_axes_locked_blocking()
             run.execute_current_stage(progress)
         except Exception as exc:
             self.log(f"⛔ 步态阶段未执行：{exc}")
@@ -2448,6 +2479,17 @@ class StepperGUI:
                 self.axis_profiles[axis],
             )
 
+    def _axis_move_denied_reason(self, axis) -> str:
+        """2026-09-21：步态占用与轴自身运动中的拒绝原因分开说清，
+        避免步态 S6 下降期间手动点动被"正在运动"误导为轴卡住。"""
+
+        with self.state_lock:
+            gait_owned = axis in self._gait_owned
+        if gait_owned:
+            return (f"轴{AXIS_LABEL[axis]} 步态运行中，禁止手动操作"
+                    "（可点步态页【中止】后单独调整）")
+        return f"轴{AXIS_LABEL[axis]} 正在运动，MOVE 未排队"
+
     def _release_axis_move(self, axis, reservation):
         with self.state_lock:
             if self._move_reservation[axis] is reservation:
@@ -2869,9 +2911,14 @@ class StepperGUI:
                    - self._axis_estimated_position_units(self.paired_axes[1]))
 
     def _land_release_tick(self, axis):
-        """直线轴运动事件钩子（UI 线程）：监测落地收敛 + 尝试重新锁定。"""
+        """直线轴运动事件钩子（UI 线程）：监测落地收敛 + 尝试重新锁定。
 
-        if getattr(self, "_gait_owned", {}) or axis not in self.paired_axes:
+        单轴日常运动与三足步态的直线阶段（S2 抬足 / S5 接近 / S6 落脚）
+        共用本钩子：步态占用期间同样触发释放，只是不把旋转轴位置标记
+        为不可信，换位流程才能继续走完。
+        """
+
+        if axis not in self.paired_axes:
             return
         try:
             enabled = self.pair_land_release_enabled.get()
@@ -2893,11 +2940,20 @@ class StepperGUI:
                     last = self._last_land_gap_mm
                     self._last_land_gap_mm = gap
                     if last is not None and last > threshold >= gap:
-                        self._trigger_land_release(gap)
+                        self._trigger_land_release(
+                            gap,
+                            mark_untrusted=not bool(getattr(self, "_gait_owned", {})))
         self._maybe_relock_rot_axes()
 
-    def _trigger_land_release(self, gap_mm):
-        """释放 Mr1/Mr2 绑定的旋转轴（有一个未绑定就整体跳过并提示）。"""
+    def _trigger_land_release(self, gap_mm=None, *, mark_untrusted=True):
+        """释放 Mr1/Mr2 绑定的旋转轴（有一个未绑定就整体跳过并提示）。
+
+        gap_mm 为 None 表示手动验证释放（复用同一释放/延迟重锁链路）。
+        mark_untrusted：单轴日常路径释放后把旋转轴位置标记为不可信
+        （自由转子不受主机脉冲监控，需重新校准）；三足步态路径与手动
+        验证路径为让流程继续/便于恢复，软件位置继续沿用（与"纠偏量
+        小且有界、不重新校准"的既有决定一致）。
+        """
 
         axes = []
         for role_name in ("Mr1", "Mr2"):
@@ -2907,38 +2963,57 @@ class StepperGUI:
                          "（纠偏需要两侧旋转轴同时释放）")
                 return
             axes.append(binding.axis)
+        with self.state_lock:
+            # 旋转轴正在脉冲（如步态 SYNC 摆动段）时绝不失能：释放只
+            # 允许发生在旋转空闲的落脚窗口。
+            if any(self._axis_motion_active_locked(a) for a in axes):
+                return
 
         def worker():
-            for axis in self._rot_release_axes:
-                # 释放命令在直线轴脉冲运动中发出，固件串口响应会变慢；
-                # ENA 是幂等设置命令，超时按"未确认"处理而不是判定会话
-                # 失步断连（硬超时会误杀整个连接）。
-                resp = self._send_and_read(
-                    build_ena_command(axis, False), timeout=1.2,
-                    soft_timeout=True)
-                if resp:
-                    self.log(f"🔓 落地纠偏：释放旋转轴{AXIS_LABEL[axis]} → {resp}")
-                else:
-                    self.log(f"⚠️ 落地纠偏：释放旋转轴{AXIS_LABEL[axis]}"
-                             " 固件未确认（运动中响应慢），纠偏可能未执行")
+            try:
+                for axis in self._rot_release_axes:
+                    # 释放命令在直线轴脉冲运动中发出，固件串口响应会变慢；
+                    # ENA 是幂等设置命令，超时按"未确认"处理而不是判定会话
+                    # 失步断连（硬超时会误杀整个连接）。
+                    resp = self._send_and_read(
+                        build_ena_command(axis, False), timeout=1.2,
+                        soft_timeout=True)
+                    if resp:
+                        self.log(f"🔓 落地纠偏：释放旋转轴{AXIS_LABEL[axis]} → {resp}")
+                    else:
+                        self.log(f"⚠️ 落地纠偏：释放旋转轴{AXIS_LABEL[axis]}"
+                                 " 固件未确认（运动中响应慢），纠偏可能未执行")
+            finally:
+                # 让提前重锁的等待方知道 ENA,0 已经落到串口上。
+                self._rot_release_settled.set()
 
         self._rot_release_active = True
         self._rot_release_axes = tuple(sorted(set(axes)))
-        # Free rotor motion is not observed by host pulse accounting.
-        with self.state_lock:
-            for released_axis in self._rot_release_axes:
-                self.axis_runtime[released_axis].position_trusted = False
-        self._save_calib()
+        self._rot_release_settled.clear()
+        if mark_untrusted:
+            # Free rotor motion is not observed by host pulse accounting.
+            with self.state_lock:
+                for released_axis in self._rot_release_axes:
+                    self.axis_runtime[released_axis].position_trusted = False
+            self._save_calib()
+        elif gap_mm is not None:
+            self.log("🔓 步态落脚纠偏：旋转轴软件位置继续沿用，不标记不可信")
         if self._start_control_worker(worker) is None:
             self._rot_release_active = False
             self._rot_release_axes = ()
+            self._rot_release_settled.set()
             return
-        self.log(f"🔓 落地纠偏：两轴标高差 {gap_mm:.1f}mm 已进入阈值，"
-                 "释放左右旋转电机，机构自正中；直线运动结束后自动重新锁定")
+        if gap_mm is None:
+            self.log("🔓 手动验证：释放左右旋转电机（转子可用手扭动）；"
+                     f"{LAND_RELOCK_DELAY_S:.0f} 秒后自动锁定，或再点一次按钮立即锁定")
+        else:
+            self.log(f"🔓 落地纠偏：两轴标高差 {gap_mm:.1f}mm 已进入阈值，"
+                     "释放左右旋转电机，机构自正中；落地后 "
+                     f"{LAND_RELOCK_DELAY_S:.0f} 秒自动重新锁定")
         self._update_land_release_status()
 
     def _maybe_relock_rot_axes(self):
-        """两直轴都空闲（含连动/预约/网页）后自动恢复旋转轴锁定。"""
+        """两直轴都空闲（含连动/预约/网页）= 落地完成，调度延迟重锁。"""
 
         if not self._rot_release_active:
             return
@@ -2947,11 +3022,49 @@ class StepperGUI:
         with self.state_lock:
             busy = any(self._axis_motion_active_locked(a)
                        for a in self.paired_axes)
+            pending = self._rot_relock_after is not None
         if busy:
+            # 落地尚未完成（直线运动重启）：作废本次延迟，等再次落地。
+            self._cancel_rot_relock_timer()
             return
-        self._rot_release_active = False
-        axes = self._rot_release_axes
-        self._rot_release_axes = ()
+        if pending:
+            return
+        self._schedule_rot_relock()
+
+    def _schedule_rot_relock(self):
+        """UI 线程：安排 LAND_RELOCK_DELAY_S 秒后的重锁定时器。"""
+
+        with self.state_lock:
+            self._rot_relock_generation += 1
+            generation = self._rot_relock_generation
+        self._rot_relock_after = self.root.after(
+            int(LAND_RELOCK_DELAY_S * 1000),
+            lambda: self._rot_relock_timer_fired(generation))
+
+    def _rot_relock_timer_fired(self, generation):
+        """延迟到点（UI 线程）：仍处于释放态且机构空闲时恢复锁定。"""
+
+        self._rot_relock_after = None
+        with self.state_lock:
+            if (generation != self._rot_relock_generation
+                    or not self._rot_release_active):
+                return
+            # 直线轴又在运动 → 交回 _maybe_relock 在下一个直线事件重排；
+            # 旋转轴正在脉冲（防御，正常流程不会走到）→ 绝不失能中使能。
+            if (any(self._axis_motion_active_locked(a) for a in self.paired_axes)
+                    or any(self._axis_motion_active_locked(a)
+                           for a in self._rot_release_axes)):
+                return
+            self._rot_release_active = False
+            axes = self._rot_release_axes
+            self._rot_release_axes = ()
+
+        self._start_control_worker(
+            self._relock_rot_axes_worker(axes, reason="纠偏完成"))
+        self._update_land_release_status()
+
+    def _relock_rot_axes_worker(self, axes, *, reason):
+        """构造重锁 worker（控制线程执行）：向各旋转轴发 ENA,1。"""
 
         def worker():
             for axis in axes:
@@ -2960,19 +3073,123 @@ class StepperGUI:
                     build_ena_command(axis, True), timeout=1.2,
                     soft_timeout=True)
                 if resp:
-                    self.log(f"🔒 纠偏完成：重新锁定旋转轴{AXIS_LABEL[axis]} → {resp}")
+                    self.log(f"🔒 {reason}：重新锁定旋转轴{AXIS_LABEL[axis]} → {resp}")
                 else:
-                    self.log(f"⚠️ 纠偏完成：重新锁定旋转轴{AXIS_LABEL[axis]}"
+                    self.log(f"⚠️ {reason}：重新锁定旋转轴{AXIS_LABEL[axis]}"
                              " 固件未确认，请目视确认旋转电机已锁定")
 
-        self._start_control_worker(worker)
+        return worker
+
+    def _toggle_manual_rot_release(self):
+        """验证用双态按钮：手动释放 / 立即锁定左右旋转电机。
+
+        手动释放不改变软件位置（与步态路径一致），5 秒后自动锁定
+        兜底，期间再点一次立即锁定。步态占用四轴期间禁用。
+        """
+
+        if self._rot_release_active:
+            self._cancel_rot_relock_timer()
+            with self.state_lock:
+                self._rot_release_active = False
+                axes = self._rot_release_axes
+                self._rot_release_axes = ()
+            if axes:
+                def worker():
+                    # 与提前重锁同理：先等 ENA,0 落到串口再发 ENA,1。
+                    self._rot_release_settled.wait(timeout=2.5)
+                    self._relock_rot_axes_worker(axes, reason="手动锁定")()
+                self._start_control_worker(worker)
+            self.log("🔒 手动锁定：恢复左右旋转电机锁定")
+            self._update_land_release_status()
+            return
+        if getattr(self, "_gait_owned", {}):
+            messagebox.showwarning(
+                "步态执行中", "步态占用四轴期间禁止手动释放；请先完成或中止")
+            return
+        if not self._is_serial_connected():
+            messagebox.showwarning("未连接", "请先连接串口再手动释放")
+            return
+        try:
+            mr_axes = (self._gait_role_axis("Mr1"), self._gait_role_axis("Mr2"))
+        except GaitExecutorError as exc:
+            messagebox.showerror(
+                "无法释放", f"需要 Mr1/Mr2 绑定旋转模式轴：{exc}")
+            return
+        with self.state_lock:
+            if any(self._axis_motion_active_locked(a) for a in mr_axes):
+                messagebox.showwarning(
+                    "旋转轴运动中", "旋转轴正在运动，停止后才能手动释放")
+                return
+        if not messagebox.askokcancel(
+                "手动释放旋转电机",
+                "将向 Mr1/Mr2 绑定的旋转轴发送失能（ENA,0）。\n\n"
+                "释放后转子可用手扭动验证；软件位置继续沿用、不会自动\n"
+                "更新，请勿大力扭动。"
+                f"{LAND_RELOCK_DELAY_S:.0f} 秒后自动锁定，或再点一次按钮\n"
+                "立即锁定。\n\n继续？"):
+            return
+        self._trigger_land_release(mark_untrusted=False)
+        if self._rot_release_active:
+            # 直线轴此刻空闲，不会有运动事件来调度重锁：手动安排
+            # 延迟自动锁定兜底。
+            self._schedule_rot_relock()
+
+    def _cancel_rot_relock_timer(self):
+        """UI 线程：作废未到点的延迟重锁。"""
+
+        with self.state_lock:
+            self._rot_relock_generation += 1
+            after_id = self._rot_relock_after
+            self._rot_relock_after = None
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+
+    def _ensure_rot_axes_locked_blocking(self):
+        """控制线程：步态旋转阶段开始前确保旋转轴已重新锁定。
+
+        5 秒延迟未到时终止等待立即重锁（换位流程不因延迟卡住）；
+        重锁未获固件确认时抛 GaitExecutorError，由阶段 worker 的
+        失败路径接管。
+        """
+
+        with self.state_lock:
+            if not self._rot_release_active:
+                return
+            self._rot_relock_generation += 1   # 未到点的延迟重锁立即失效
+        # 先等 ENA,0 落到串口（保证失能→再使能的因果顺序）。
+        self._rot_release_settled.wait(timeout=2.5)
+        with self.state_lock:
+            if not self._rot_release_active:
+                return   # 延迟回调或其它路径已抢先完成重锁
+            self._rot_release_active = False
+            axes = self._rot_release_axes
+            self._rot_release_axes = ()
+        unconfirmed = []
+        for axis in axes:
+            resp = self._send_and_read(
+                build_ena_command(axis, True), timeout=1.2, soft_timeout=True)
+            if resp:
+                self.log(f"🔒 步态继续：提前重新锁定旋转轴{AXIS_LABEL[axis]} → {resp}")
+            else:
+                unconfirmed.append(AXIS_LABEL[axis])
         self._update_land_release_status()
+        if unconfirmed:
+            raise GaitExecutorError(
+                "旋转轴重锁未获固件确认：" + "、".join(unconfirmed)
+                + "；禁止在失能状态下执行步态旋转运动")
 
     def _force_relock_rot_axes(self, allow_closing=False):
         """急停/断开/关闭路径：立即恢复锁定，绝不留在失能态。"""
 
         if not self._rot_release_active:
             return
+        with self.state_lock:
+            # 作废未到点的延迟重锁（回调核对 generation 后自行退出）。
+            # 本方法可能在任意线程调用：绝不跨线程碰 Tk 的 after 句柄。
+            self._rot_relock_generation += 1
         self._rot_release_active = False
         axes = self._rot_release_axes
         self._rot_release_axes = ()
@@ -2990,14 +3207,22 @@ class StepperGUI:
     def _update_land_release_status(self):
         def apply():
             label = self.paired_widgets.get('land_release_status')
-            if label is None:
+            button = self.paired_widgets.get('land_release_button')
+            if label is None and button is None:
                 return
             if self._rot_release_active:
-                label.config(
-                    text="🔓 旋转电机已释放 · 机构纠偏中（直线运动结束后自动锁定）",
-                    foreground="#b42318")
+                if label is not None:
+                    label.config(
+                        text="🔓 旋转电机已释放 · 机构纠偏中"
+                             f"（落地后 {LAND_RELOCK_DELAY_S:.0f} 秒自动锁定）",
+                        foreground="#b42318")
+                if button is not None:
+                    button.config(text="🔒 立即锁定旋转电机")
             else:
-                label.config(text="🔒 旋转电机已锁定", foreground="#2e7d32")
+                if label is not None:
+                    label.config(text="🔒 旋转电机已锁定", foreground="#2e7d32")
+                if button is not None:
+                    button.config(text="🔓 手动释放旋转电机（验证用）")
         # 急停/断开路径可能从工作线程调用；Tk 控件操作必须回到 UI 线程。
         self._post_ui(apply)
 
@@ -3015,7 +3240,7 @@ class StepperGUI:
             return
         move = self._reserve_axis_move(axis)
         if move is None:
-            self.log(f"轴{AXIS_LABEL[axis]} 正在运动，MOVE 未排队")
+            self.log(self._axis_move_denied_reason(axis))
             return
         reservation, motion_generation, profile = move
         self._start_reserved_axis_worker(
@@ -3032,7 +3257,7 @@ class StepperGUI:
             return
         move = self._reserve_axis_move(axis)
         if move is None:
-            self.log(f"轴{AXIS_LABEL[axis]} 正在运动，MOVE 未排队")
+            self.log(self._axis_move_denied_reason(axis))
             return
         reservation, motion_generation, profile = move
         self._start_reserved_axis_worker(
@@ -4223,6 +4448,21 @@ class StepperGUI:
             os.startfile(LOG_DIR)  # Windows
         except Exception:
             messagebox.showinfo("日志目录", LOG_DIR)
+
+    def _open_user_guide(self):
+        """在默认浏览器打开本地使用说明 docs/user_guide.html。"""
+        from pathlib import Path
+
+        path = Path(PROJECT_DIR) / "docs" / "user_guide.html"
+        if not path.is_file():
+            messagebox.showerror("使用说明缺失", f"未找到使用说明文件：\n{path}")
+            return
+        try:
+            webbrowser.open(path.resolve().as_uri())
+            self.log(f"已打开使用说明：{path}")
+        except Exception as exc:
+            messagebox.showerror(
+                "打开失败", f"无法打开使用说明：{exc}\n\n文件位置：{path}")
 
     def _toggle_raw_log(self):
         """打开/关闭串口原始流文件记录（每条 RX 行写到独立 log）。"""

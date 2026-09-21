@@ -60,7 +60,8 @@ from motor_control import (
     BindingSet,
     NUM_STEPPER_AXES,
 )
-from motor_control.desktop_app import StepperGUI
+from motor_control.desktop_app import LAND_RELOCK_DELAY_S, StepperGUI
+from motor_control.gait_executor import GaitExecutorError
 from motor_control.protocol import (
     ErrorReply,
     OkReply,
@@ -82,6 +83,20 @@ class Value:
         self.value = value
 
 
+class FakeRoot:
+    """root.after 的最小替身：记录延迟回调，由测试手动触发。"""
+
+    def __init__(self):
+        self.after_calls = []
+
+    def after(self, ms, callback):
+        self.after_calls.append((ms, callback))
+        return len(self.after_calls)
+
+    def after_cancel(self, _token):
+        pass
+
+
 def _land_app():
     app = StepperGUI.__new__(StepperGUI)
     app.paired_axes = (0, 1)
@@ -101,6 +116,7 @@ def _land_app():
     ]
     app.control_bindings = BindingSet.from_axis_mapping(
         {"Mup1": 0, "Mr1": 2, "Mup2": 1, "Mr2": 3})
+    app.axis_param_valid = [True] * NUM_STEPPER_AXES
     app.state_lock = threading.RLock()
     app.sw = [{} for _ in range(NUM_STEPPER_AXES)]
     app.paired_widgets = {}
@@ -114,7 +130,13 @@ def _land_app():
     app.pair_land_release_threshold_mm = Value(3.0)
     app._rot_release_active = False
     app._rot_release_axes = ()
+    app._rot_relock_after = None
+    app._rot_relock_generation = 0
+    app._rot_release_settled = threading.Event()
+    app._rot_release_settled.set()
     app._last_land_gap_mm = None
+    app._gait_owned = {}
+    app.root = FakeRoot()
     app.commands = []
     app._send_and_read = lambda command, **_kwargs: (
         app.commands.append(command) or "OK,ENA,2,0")
@@ -290,6 +312,12 @@ class LandReleaseTests(unittest.TestCase):
         app._rot_release_active = True
         app._rot_release_axes = (2, 3)
         app._land_release_tick(0)
+        # 落地后不再立即重锁：先安排延迟定时器
+        self.assertTrue(app._rot_release_active)
+        self.assertEqual(len(app.root.after_calls), 1)
+        delay_ms, fire = app.root.after_calls[0]
+        self.assertEqual(delay_ms, LAND_RELOCK_DELAY_S * 1000)
+        fire()
         self.assertFalse(app._rot_release_active)
         _run_queued(app)
         self.assertEqual(app.commands, ["ENA,2,1", "ENA,3,1"])
@@ -301,6 +329,158 @@ class LandReleaseTests(unittest.TestCase):
         app.stepper_in_progress[1] = True
         app._land_release_tick(0)
         self.assertTrue(app._rot_release_active)
+        self.assertEqual(app.commands, [])
+        self.assertEqual(app.root.after_calls, [])
+
+    def test_relaunched_linear_motion_cancels_pending_relock(self):
+        # 延迟等待期间直线运动重启 = 落地未完成：作废本次定时器，
+        # 待再次落地后重新计 5 秒。
+        app = _land_app()
+        app._rot_release_active = True
+        app._rot_release_axes = (2, 3)
+        app._land_release_tick(0)
+        self.assertEqual(len(app.root.after_calls), 1)
+        _delay_ms, stale_fire = app.root.after_calls[0]
+        app.stepper_in_progress[1] = True
+        app._land_release_tick(0)
+        self.assertIsNone(app._rot_relock_after)
+        stale_fire()                       # 已被作废的旧回调：不得重锁
+        self.assertTrue(app._rot_release_active)
+        self.assertEqual(app.commands, [])
+        app.stepper_in_progress[1] = False
+        app._land_release_tick(0)          # 再次落地 → 重新调度
+        self.assertEqual(len(app.root.after_calls), 2)
+        app.root.after_calls[1][1]()
+        _run_queued(app)
+        self.assertEqual(app.commands, ["ENA,2,1", "ENA,3,1"])
+
+    def test_gait_release_keeps_position_trusted(self):
+        # 步态占用期间同样触发，但旋转轴位置继续沿用（不标记不可信），
+        # 换位流程才能继续。
+        app = _land_app()
+        app._gait_owned = {0: object(), 1: object(), 2: object(), 3: object()}
+        app.axis_runtime[0].position_steps = 0
+        app.axis_runtime[1].position_steps = 1000
+        app.stepper_in_progress[1] = True
+        app._land_release_tick(1)
+        app.axis_runtime[1].position_steps = 500
+        app._land_release_tick(1)
+        self.assertTrue(app._rot_release_active)
+        _run_queued(app)
+        self.assertEqual(app.commands, ["ENA,2,0", "ENA,3,0"])
+        self.assertTrue(app.axis_runtime[2].position_trusted)
+        self.assertTrue(app.axis_runtime[3].position_trusted)
+        self.assertTrue(any("步态落脚纠偏" in m for m in app._logs))
+
+    def test_single_axis_release_marks_untrusted(self):
+        app = _land_app()
+        app.axis_runtime[0].position_steps = 0
+        app.axis_runtime[1].position_steps = 1000
+        app.stepper_in_progress[1] = True
+        app._land_release_tick(1)
+        app.axis_runtime[1].position_steps = 500
+        app._land_release_tick(1)
+        self.assertTrue(app._rot_release_active)
+        _run_queued(app)
+        self.assertFalse(app.axis_runtime[2].position_trusted)
+        self.assertFalse(app.axis_runtime[3].position_trusted)
+
+    def test_rot_axis_pulsing_skips_release(self):
+        # 旋转轴正在脉冲（如步态 SYNC 摆动段）时绝不失能。
+        app = _land_app()
+        app.axis_runtime[0].position_steps = 0
+        app.axis_runtime[1].position_steps = 1000
+        app.stepper_in_progress[1] = True
+        app.stepper_in_progress[2] = True     # Mr1 轴在脉冲
+        app._land_release_tick(1)
+        app.axis_runtime[1].position_steps = 500
+        app._land_release_tick(1)
+        self.assertFalse(app._rot_release_active)
+        self.assertEqual(app.commands, [])
+
+    def test_ensure_locked_before_gait_rotation_stage(self):
+        # 5 秒延迟未到就要执行下一旋转阶段：提前重锁并确认，旧定时器作废。
+        app = _land_app()
+        app._rot_release_active = True
+        app._rot_release_axes = (2, 3)
+        app._land_release_tick(0)             # 调度延迟重锁
+        self.assertEqual(len(app.root.after_calls), 1)
+        StepperGUI._ensure_rot_axes_locked_blocking(app)
+        self.assertFalse(app._rot_release_active)
+        self.assertEqual(app.commands, ["ENA,2,1", "ENA,3,1"])
+        app.root.after_calls[0][1]()          # 旧回调到点：已被作废
+        self.assertEqual(app.commands, ["ENA,2,1", "ENA,3,1"])
+        self.assertTrue(any("步态继续" in m for m in app._logs))
+
+    def test_ensure_locked_raises_without_confirmation(self):
+        app = _land_app()
+        app._send_and_read = lambda command, **_kwargs: None
+        app._rot_release_active = True
+        app._rot_release_axes = (2, 3)
+        with self.assertRaises(GaitExecutorError):
+            StepperGUI._ensure_rot_axes_locked_blocking(app)
+
+    def _manual_app(self):
+        """手动释放验证的替身：Mr1/Mr2 绑定旋转轴 + 弹窗一律放行。
+
+        本机有真 tkinter 时 messagebox 是真模块：必须 mock 掉全部
+        弹窗函数，否则 showwarning 会弹出真对话框阻塞测试。
+        """
+        from unittest import mock
+
+        from motor_control import MODE_ROTARY
+        from motor_control import desktop_app as desktop_app_module
+
+        app = _land_app()
+        app.axis_profiles[2] = AxisProfile(mode=MODE_ROTARY)
+        app.axis_profiles[3] = AxisProfile(mode=MODE_ROTARY)
+        for name in ("showwarning", "showerror", "showinfo"):
+            patcher = mock.patch.object(
+                desktop_app_module.messagebox, name, lambda *_a, **_k: None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        confirm = mock.patch.object(
+            desktop_app_module.messagebox, "askokcancel", return_value=True)
+        confirm.start()
+        self.addCleanup(confirm.stop)
+        return app
+
+    def test_manual_release_schedules_auto_relock(self):
+        # 手动释放走同一链路：ENA,0 ×2 + 5 秒兜底自动锁定；
+        # 不把旋转轴位置标记为不可信（验证用途，便于恢复）。
+        app = self._manual_app()
+        StepperGUI._toggle_manual_rot_release(app)
+        self.assertTrue(app._rot_release_active)
+        _run_queued(app)
+        self.assertEqual(app.commands, ["ENA,2,0", "ENA,3,0"])
+        self.assertTrue(app.axis_runtime[2].position_trusted)
+        self.assertTrue(app.axis_runtime[3].position_trusted)
+        self.assertEqual(len(app.root.after_calls), 1)
+        app.root.after_calls[0][1]()          # 5 秒到点
+        _run_queued(app)
+        self.assertEqual(
+            app.commands, ["ENA,2,0", "ENA,3,0", "ENA,2,1", "ENA,3,1"])
+
+    def test_manual_release_then_immediate_relock(self):
+        # 释放态再点一次：取消兜底定时器，立即锁定。
+        app = self._manual_app()
+        StepperGUI._toggle_manual_rot_release(app)     # 释放
+        _run_queued(app)
+        StepperGUI._toggle_manual_rot_release(app)     # 立即锁定
+        self.assertFalse(app._rot_release_active)
+        self.assertIsNone(app._rot_relock_after)
+        _run_queued(app)
+        self.assertEqual(
+            app.commands, ["ENA,2,0", "ENA,3,0", "ENA,2,1", "ENA,3,1"])
+        app.root.after_calls[0][1]()          # 已作废的兜底回调：不得重复发
+        self.assertEqual(
+            app.commands, ["ENA,2,0", "ENA,3,0", "ENA,2,1", "ENA,3,1"])
+
+    def test_manual_release_blocked_while_gait_owns_axes(self):
+        app = self._manual_app()
+        app._gait_owned = {0: object()}
+        StepperGUI._toggle_manual_rot_release(app)
+        self.assertFalse(app._rot_release_active)
         self.assertEqual(app.commands, [])
 
     def test_force_relock_sends_lock_immediately(self):

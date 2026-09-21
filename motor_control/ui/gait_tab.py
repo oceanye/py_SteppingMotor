@@ -29,7 +29,7 @@ GEOMETRY_FIELDS = (
 )
 GAP_FIELDS = (("safety_margin_mm", "参考安全间隙 δ (mm)"),)
 RUN_FIELDS = (
-    ("phase_gain", "自转/公转增益 k（默认2）"),
+    ("phase_gain", "自转/公转增益 k（默认-2）"),
     ("swing_speed_deg_s", "公转峰值速度 (°/s)"),
     ("rotation_limit_deg", "线缆角度限位 ±(°)"),
     ("lift_mm", "实际抬足行程 (mm)"),
@@ -133,7 +133,8 @@ def _build_params_column(app, parent) -> None:
 
     inner = pages["run"].content
     note(inner, 0, "每步公转 60°；Δψ = kφ，Δq摆 = (k+1)φ，Δq支 = φ。\n"
-         "默认 k=2：世界自转120°，两关节180° / 60°。")
+         "默认 k=-2：摆动电机与公转反向转 60°，支撑（公转）电机 +60°。\n"
+         "换位目标按顺向 60° 几何落点自动选取（含邻座）。")
     for row, (key, label) in enumerate(RUN_FIELDS + GAP_FIELDS, 1):
         add_number_field(inner, row, key, label)
     note(inner, 8, "抬足行程直接控制升降电机。参考间隙只用于几何估算，"
