@@ -5,6 +5,7 @@ No serial port, Tk window, network server or physical motor is opened.
 import math
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_desktop_axis_integration import _headless_app
@@ -12,8 +13,9 @@ from motor_control import AxisProfile, BindingSet, MODE_ROTARY
 from motor_control.desktop_app import StepperGUI
 from motor_control.gait_executor import GaitExecutorError
 from motor_control.gait_planner import (
-    GaitGeometry, GaitParams, angular_targets, plan_gait_stages,
-    plan_swing_trajectory, smoothstep5,
+    GaitGeometry, GaitParams, angular_targets, default_hex_pads,
+    plan_gait_stages, plan_swing_trajectory, smoothstep5,
+    LEFT_SWING, RIGHT_SWING,
 )
 from motor_control.protocol import build_sync_command, parse_line, reply_matcher_for
 from motor_control.serial_session import RequestTimeout
@@ -166,6 +168,103 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         self.assertTrue(report.feasible, report.message)
         self.assertTrue(any("邻座(0,-1)" in c for c in app._logs))
 
+    def test_begin_run_honors_reverse_direction_selection(self):
+        # 2026-09-22 实机移动与预览的四种换位方式一致：方向选择逆向时
+        # 路由落到镜像邻座、S4 公转/自转与顺向全部相反。
+        app = mechanism()
+        app.gait_arc_var = SimpleNamespace(get=lambda: "-60.0")
+        run, report = app._gait_begin_run("left")
+        self.assertEqual(run.route, ("A", "邻座(0,-1)", "B", 180.0))
+        self.assertEqual(report.route[1], "邻座(0,-1)")
+        self.assertTrue(report.feasible, report.message)
+        s4 = next(s for s in run.stages if s.stage_id == "S4")
+        _spin, swing_total, support_total = angular_targets(app.gait_params, -60.0)
+        self.assertEqual(
+            [m.delta for m in s4.move_groups[0]],
+            [app.gait_params.mr1_sign * swing_total,
+             app.gait_params.mr2_sign * support_total])
+        self.assertLess(app.gait_params.mr2_sign * support_total, 0.0)
+        fwd_s4 = next(s for s in plan_gait_stages(
+            app.gait_params, side="left", swing_psi_start_deg=30.0)
+            if s.stage_id == "S4")
+        self.assertAlmostEqual(fwd_s4.duration_s, s4.duration_s)
+        self.assertTrue(any("逆向" in line for line in app._logs))
+
+    def test_invalid_direction_selection_blocks_begin_run(self):
+        app = mechanism()
+        app.gait_arc_var = SimpleNamespace(get=lambda: "abc")
+        with self.assertRaisesRegex(GaitExecutorError, "方向"):
+            app._gait_begin_run("left")
+
+    def test_begin_run_explicit_arc_overrides_ui_selection(self):
+        # 2026-09-22 四个执行按钮各携带方向：显式传入优先于界面选择，
+        # "看顺向、走逆向"式误操作不可能发生。
+        app = mechanism()
+        app.gait_arc_var = SimpleNamespace(get=lambda: "60.0")
+        run, report = app._gait_begin_run("left", arc_deg=-60.0)
+        self.assertEqual(run.arc_deg, -60.0)
+        self.assertEqual(run.route, ("A", "邻座(0,-1)", "B", 180.0))
+        self.assertEqual(report.route[1], "邻座(0,-1)")
+
+    def test_gait_mode_radio_syncs_side_arc_and_preruns(self):
+        # 四个换位方式 radio（左顺/左逆/右顺/右逆）切换时同步
+        # side/arc 变量并静默重跑预览。
+        from motor_control.ui.gait_tab import _gait_mode_selected
+
+        class _Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, v):
+                self.value = v
+
+            def get(self):
+                return self.value
+
+        calls = []
+        app = SimpleNamespace(
+            gait_side_var=_Var(), gait_arc_var=_Var(),
+            _gait_run_dry_run=lambda interactive=True: calls.append(interactive),
+        )
+        for value, side, arc in (("L+", "left", "60.0"), ("L-", "left", "-60.0"),
+                                 ("R+", "right", "60.0"), ("R-", "right", "-60.0")):
+            _gait_mode_selected(app, value)
+            self.assertEqual((app.gait_side_var.value, app.gait_arc_var.value),
+                             (side, arc))
+        self.assertEqual(calls, [False] * 4)
+
+    def test_play_preview_reruns_dry_run_when_selection_changed(self):
+        # 2026-09-22 修复：切换左/右或顺/逆后直接点【▶ 模拟动作】必须
+        # 按当前选择重新干跑，不能重播旧报告（interactive=False 静默）。
+        calls = []
+
+        class _Var:
+            def __init__(self, value):
+                self._value = value
+
+            def get(self):
+                return self._value
+
+        app = SimpleNamespace(
+            gait_widgets={},
+            gait_side_var=_Var("right"),
+            gait_arc_var=_Var("-60.0"),
+            _gait_last_report=object(),
+            _gait_last_report_key=("left", 60.0),
+            _gait_run_dry_run=lambda interactive=True: calls.append(interactive),
+        )
+        with patch("motor_control.desktop_app.play_preview_animation") as play:
+            StepperGUI._gait_play_preview_clicked(app)
+        self.assertEqual(calls, [False])
+        play.assert_called_once_with(app)
+
+        calls.clear()
+        app._gait_last_report_key = ("right", -60.0)
+        with patch("motor_control.desktop_app.play_preview_animation") as play:
+            StepperGUI._gait_play_preview_clicked(app)
+        self.assertEqual(calls, [])
+        play.assert_called_once_with(app)
+
     def test_no_pad_at_sixty_degree_landing_still_blocks(self):
         # 顺向落点真的没有支座时仍要拦截（站位/横梁角不实的保护）。
         app = mechanism()
@@ -313,6 +412,80 @@ class SyncProtocolTests(unittest.TestCase):
                      (6,800,3,267,1000000), (2,800,3,267,1000)):
             with self.assertRaises(ValueError):
                 build_sync_command(*args)
+
+
+class LandingRouteTests(unittest.TestCase):
+    """几何落点 route：干跑预览与实机执行必须共用同一几何。"""
+
+    def test_default_routes_recorded_in_report(self):
+        # 不传 route 时按固定 A→C / B→A 示意路由干跑，报告记录在案。
+        base = dict(lift_mm=35, phase_gain=2.0)
+        self.assertEqual(
+            plan_swing_trajectory(GaitParams(**base), side="left").route,
+            LEFT_SWING)
+        self.assertEqual(
+            plan_swing_trajectory(GaitParams(**base), side="right").route,
+            RIGHT_SWING)
+
+    def test_custom_route_roundtrip_keeps_full_clearance_set(self):
+        # 传入几何落点 route：报告原样记录；碰撞校验仍覆盖含邻座的
+        # 全部支座（route 只影响视图聚焦，不影响安全校验范围）。
+        params = GaitParams(lift_mm=35, phase_gain=2.0)
+        route = ("B", "邻座(0,-1)", "A", 0.0)
+        report = plan_swing_trajectory(params, side="right", route=route)
+        self.assertEqual(report.route, route)
+        self.assertTrue(any(h.name == "邻座(0,-1)" for h in report.hexagons))
+        self.assertGreater(len(report.hexagons), 3)
+
+    def test_landing_route_matches_geometry_for_both_sides(self):
+        app = mechanism()
+        self.assertEqual(app._gait_landing_route("left", app.gait_params),
+                         ("A", "C", "B", 180.0))
+        # 右侧初始站位 (A,B)：bearing=β+180=360（保持坐标系原值不取模）
+        self.assertEqual(app._gait_landing_route("right", app.gait_params),
+                         ("B", "邻座(0,-1)", "A", 360.0))
+
+    def test_landing_route_returns_none_when_no_pad(self):
+        # 顺向落点没有支座（站位/横梁角矛盾）：预览回退固定路由，
+        # 实机执行在 begin_run 的横梁角校验/落点检查处拦截。
+        app = mechanism()
+        app._gait_beta_deg = 90.0
+        self.assertIsNone(app._gait_landing_route("right", app.gait_params))
+
+    def test_landing_route_reverse_direction_matches_other_pad(self):
+        # 2026-09-22 顺/逆双向预览：同一站位的逆向(-60°)落点是另一
+        # 个邻座——四种换位方式（左/右×顺/逆）各有几何落点。
+        app = mechanism()
+        self.assertEqual(
+            app._gait_landing_route("left", app.gait_params, arc_deg=-60.0),
+            ("A", "邻座(0,-1)", "B", 180.0))
+        self.assertEqual(
+            app._gait_landing_route("right", app.gait_params, arc_deg=-60.0),
+            ("B", "C", "A", 360.0))
+
+    def test_reverse_arc_trajectory_swings_the_other_way(self):
+        # 逆向弧：φ 0→-60、ψ=30+k·(-60)=150（≡30 mod 120 三爪对称）、
+        # 摆动中心终点落在支点 240° 方位、距离 d 的邻座上。
+        params = GaitParams(lift_mm=35, phase_gain=-2.0)
+        route = ("A", "邻座(0,-1)", "B", 180.0)
+        report = plan_swing_trajectory(
+            params, side="left", route=route, arc_deg=-60.0)
+        self.assertEqual(report.side, "left")
+        self.assertEqual(report.route, route)
+        self.assertAlmostEqual(report.samples[0].phi_deg, 0.0)
+        self.assertAlmostEqual(report.samples[-1].phi_deg, -60.0)
+        self.assertAlmostEqual(report.samples[-1].psi_deg, 150.0)
+        end = report.samples[-1].center
+        self.assertAlmostEqual(math.degrees(math.atan2(end[1], end[0])) % 360.0,
+                               240.0, places=3)
+        self.assertAlmostEqual(math.hypot(end[0], end[1]),
+                               params.geometry.d_mm, places=3)
+
+    def test_arc_deg_rejects_zero_and_out_of_range(self):
+        params = GaitParams(lift_mm=35, phase_gain=2.0)
+        for bad in (0.0, 400.0, -400.0, float("nan")):
+            with self.assertRaises(ValueError):
+                plan_swing_trajectory(params, side="left", arc_deg=bad)
 
 
 if __name__ == "__main__":

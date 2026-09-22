@@ -105,6 +105,8 @@ from motor_control.ui import (
     collect_gait_params,
     draw_gait_preview,
     load_gait_fields,
+    play_preview_animation,
+    stop_preview_animation,
     refresh_coordinated_tab as refresh_coordinated_tab_view,
     refresh_gait_panel as refresh_gait_panel_view,
     sync_binding_editor as sync_binding_editor_view,
@@ -750,15 +752,66 @@ class StepperGUI:
                 runtime.position_steps)
         return position - (zero if zero is not None else 0.0)
 
-    def _gait_begin_run(self, side, params=None):
+    def _gait_landing_route(self, side, params, *, pads=None,
+                            arc_deg=SWING_ARC_DEG):
+        """按当前站位与横梁角匹配该侧几何落点（默认顺向 +60°）。
+
+        2026-09-21 按用户要求放开区域限制：目标座不再固定取 A/B/C 的
+        第三块，而是在全部支座（含邻座）中按方位/半径匹配；初始站位
+        (A,B) 的右侧换位因此落到邻座。干跑预览与实机执行共用本方法，
+        预览图与实际动作才是同一几何。arc_deg 是换位方向（+60 顺向 /
+        -60 逆向），预览与执行传同一值。匹配不到返回 None（调用方决定
+        拦截还是回退）。
+        """
+
+        supports = getattr(self, "_gait_supports", ("A", "B"))
+        beta_now = getattr(self, "_gait_beta_deg", params.beam_reference_deg)
+        start, pivot = supports if side == "left" else supports[::-1]
+        bearing = beta_now + (180.0 if side == "right" else 0.0)
+        if pads is None:
+            pads = default_hex_pads(params.geometry)
+        landing_bearing = (bearing - arc_deg + 180.0) % 360.0 - 180.0
+        for name, pad in pads.items():
+            if name in (start, pivot):
+                continue
+            pad_bearing = math.degrees(math.atan2(
+                pad.center[1] - pads[pivot].center[1],
+                pad.center[0] - pads[pivot].center[0]))
+            bearing_err = abs((pad_bearing - landing_bearing + 180) % 360 - 180)
+            radius_err = abs(math.dist(pad.center, pads[pivot].center)
+                             - params.geometry.d_mm)
+            if bearing_err <= 0.5 and radius_err <= 0.5:
+                return (start, name, pivot, bearing)
+        return None
+
+    def _gait_begin_run(self, side, params=None, arc_deg=None):
         """UI 线程：前置检查 + 干跑 + 按当前相位建立执行器。
 
-        返回 (executor, dry_run_report)；任何门槛不满足抛 GaitExecutorError。
+        arc_deg 显式传入时按传入方向执行（四个执行按钮各携带方向）；
+        None 时读步态页方向选择。返回 (executor, dry_run_report)；
+        任何门槛不满足抛 GaitExecutorError。
         """
 
         params = (params if params is not None else self.gait_params).validated()
         if side not in ("left", "right"):
             raise GaitExecutorError("side 必须是 left 或 right")
+        # 2026-09-22 按用户要求：实机移动与预览的四种换位方式一致。
+        # 方向优先取调用方显式传入；未传时读步态页选择。值无效直接
+        # 拦截，绝不静默换向。（AttributeError 回退顺向仅服务无控件
+        # 的测试 harness。）
+        if arc_deg is None:
+            try:
+                arc_selection = float(self.gait_arc_var.get())
+            except AttributeError:
+                arc_selection = SWING_ARC_DEG
+            except (tk.TclError, ValueError, TypeError):
+                arc_selection = None
+        else:
+            arc_selection = arc_deg
+        if (arc_selection is None or not math.isfinite(arc_selection)
+                or not -360.0 < arc_selection < 360.0 or arc_selection == 0):
+            raise GaitExecutorError("换位方向无效；请用对应的【开始…移】按钮")
+        arc_deg = arc_selection
         if not self._is_serial_connected():
             raise GaitExecutorError("串口未连接")
         with self.state_lock:
@@ -840,36 +893,24 @@ class StepperGUI:
             pads[start].center[0] - pads[pivot].center[0]))
         if abs((bearing - expected_bearing + 180) % 360 - 180) > 0.5:
             raise GaitExecutorError("横梁角与当前支座位置不一致；请重新建立 A/B 标定基准")
-        # 2026-09-21 按用户要求放开区域限制：目标座不再固定取 A/B/C 的
-        # 第三块，而是按该侧顺向 60° 公转的几何落点在全部支座（含邻座）
-        # 中匹配。初始站位 (A,B) 的右侧换位因此落到邻座而非被拒。
-        landing_bearing = (bearing - SWING_ARC_DEG + 180.0) % 360.0 - 180.0
-        target = None
-        for name, pad in pads.items():
-            if name in (start, pivot):
-                continue
-            pad_bearing = math.degrees(math.atan2(
-                pad.center[1] - pads[pivot].center[1],
-                pad.center[0] - pads[pivot].center[0]))
-            bearing_err = abs((pad_bearing - landing_bearing + 180) % 360 - 180)
-            radius_err = abs(math.dist(pad.center, pads[pivot].center)
-                             - params.geometry.d_mm)
-            if bearing_err <= 0.5 and radius_err <= 0.5:
-                target = name
-                break
-        if target is None:
+        # 2026-09-21 按用户要求放开区域限制：目标座按所选方向几何落点
+        # 在全部支座（含邻座）中匹配（与干跑预览共用 _gait_landing_route）。
+        route = self._gait_landing_route(side, params, pads=pads, arc_deg=arc_deg)
+        if route is None:
             raise GaitExecutorError(
-                "该侧顺向60°落点处没有六边形支座；请核实站位与横梁角，"
-                "或先交换摆动/支撑侧")
-        route = (start, target, pivot, bearing)
-        report = plan_swing_trajectory(params, side=side, route=route)
-        self.log(f"步态角度联动校验（{start}→{target}，支点{pivot}）：{report.message}")
+                f"该侧{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°落点处"
+                "没有六边形支座；请核实站位与横梁角，或先交换摆动/支撑侧")
+        report = plan_swing_trajectory(
+            params, side=side, route=route, arc_deg=arc_deg)
+        self.log(f"步态角度联动校验（{route[0]}→{route[1]}，支点{route[2]}，"
+                 f"{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°）：{report.message}")
         # 2026-09-18 按用户要求：碰撞/避障类校验不再一票否决，只收集
         # 警告提示；行程、线缆窗口、固件能力、标定等操作安全检查仍拦截。
         clearance_warnings: list[str] = []
         if not report.feasible:
             clearance_warnings.append(f"干跑校验不可行：{report.message}")
-        stages = plan_gait_stages(params, side=side, swing_psi_start_deg=psi_now)
+        stages = plan_gait_stages(params, side=side, swing_psi_start_deg=psi_now,
+                                  arc_deg=arc_deg)
         # S3 也有扫掠风险，按相同包络检查整个原地相位调整，不只检查 S4。
         phase_stage = next((s for s in stages if s.stage_id == "S3"), None)
         if phase_stage is not None:
@@ -953,6 +994,7 @@ class StepperGUI:
         self._gait_run = GaitExecutor(
             _GaitHostAdapter(self), params, stages, side=side)
         self._gait_run.route = route
+        self._gait_run.arc_deg = arc_deg
         self._gait_run.rotation_start = None
         self._gait_run.twin_lift_start = twin_lift_start
         self._gait_run.twin_final_positions = None
@@ -1312,34 +1354,88 @@ class StepperGUI:
         self.gait_calibrated_var.set(False)
         self._refresh_gait_ui()
 
-    def _gait_run_dry_run(self):
+    def _gait_run_dry_run(self, interactive=True):
         params = self._gait_params_from_ui()
         if params is None:
             return
         self._save_gait_params(params)
         side = self.gait_side_var.get()
-        report = plan_swing_trajectory(params, side=side)
+        # 2026-09-22 应用户要求预览/执行支持顺/逆双向：四种换位方式
+        # （左/右 × 顺/逆）与实机执行一致。另算反向落点，底图把
+        # 起点/支点/顺逆两个落点都画出（共边相连）。
+        try:
+            arc_deg = float(self.gait_arc_var.get())
+        except (AttributeError, tk.TclError, ValueError):
+            arc_deg = SWING_ARC_DEG
+        if not math.isfinite(arc_deg) or arc_deg == 0 or abs(arc_deg) > 360.0:
+            arc_deg = SWING_ARC_DEG
+        route = self._gait_landing_route(side, params, arc_deg=arc_deg)
+        alt_route = self._gait_landing_route(side, params, arc_deg=-arc_deg)
+        self._gait_preview_alt_pad = (alt_route[1] if alt_route else None)
+        if route is None:
+            self.log(f"⚠️ 干跑：当前站位该侧{'顺' if arc_deg > 0 else '逆'}向"
+                     f"{abs(arc_deg):g}°落点没有六边形支座，"
+                     "预览退回固定 A→C/B→A 示意路由")
+        report = plan_swing_trajectory(
+            params, side=side, route=route, arc_deg=arc_deg)
         self._gait_last_report = report
+        self._gait_last_report_key = (side, arc_deg)
         self.gait_report_var.set(report.message)
+        start, target, pivot, _bearing = report.route
+        direction = "顺向" if arc_deg > 0 else "逆向"
+        alt_text = (f"，反向落点 {self._gait_preview_alt_pad}"
+                    if self._gait_preview_alt_pad else "")
         self.log(
-            f"步态角度预览（{side}，相位增益 {params.phase_gain:g}）：{report.message}")
+            f"步态角度预览（{side}·{direction}，{start}→{target} 绕{pivot}"
+            f"{alt_text}，相位增益 {params.phase_gain:g}）：{report.message}")
+        stop_preview_animation(self)
         draw_gait_preview(self)
-        if not report.feasible:
+        if not report.feasible and interactive:
             messagebox.showwarning(
                 "干跑不可行",
                 report.message + "\n\n请修正几何/半径/间隙参数后再试。")
 
-    def _gait_start_run_clicked(self, side):
+    def _gait_play_preview_clicked(self):
+        """▶ 模拟动作：沿当前选择的换位方式逐帧回放（只动视图）。"""
+
+        anim = self.gait_widgets.get("preview_anim")
+        if anim is not None and anim.get("playing"):
+            stop_preview_animation(self, redraw=True)
+            return
+        # 2026-09-22 修复：切换左/右或顺/逆后直接点播放会重播旧报告。
+        # 播放前核对报告与当前选择，不一致先按当前选择重新干跑。
+        try:
+            selection = (self.gait_side_var.get(),
+                         float(self.gait_arc_var.get()))
+        except (AttributeError, tk.TclError, ValueError):
+            selection = None
+        if (getattr(self, "_gait_last_report", None) is None
+                or selection is None
+                or getattr(self, "_gait_last_report_key", None) != selection):
+            self._gait_run_dry_run(interactive=False)
+        play_preview_animation(self)
+
+    def _gait_start_run_clicked(self, side, arc_deg=None):
         params = self._gait_params_from_ui()
         if params is None:
             return
         self._save_gait_params(params)
         try:
-            _run, report = self._gait_begin_run(side, params)
+            _run, report = self._gait_begin_run(side, params, arc_deg=arc_deg)
         except GaitExecutorError as exc:
             messagebox.showerror("不能开始步态", str(exc))
             return
+        # 预览与执行共用画面：把预览选择同步到本次实际执行的换位方式，
+        # 图上显示的就是即将/正在走的动作。
+        run = self._gait_run
+        self.gait_side_var.set(side)
+        self.gait_arc_var.set(f"{run.arc_deg:g}")
+        mode_var = getattr(self, "gait_mode_var", None)
+        if mode_var is not None:
+            mode_var.set(("L" if side == "left" else "R")
+                         + ("+" if run.arc_deg > 0 else "-"))
         self._gait_last_report = report
+        self._gait_last_report_key = (side, run.arc_deg)
         self.gait_report_var.set(report.message)
         draw_gait_preview(self)
         self._refresh_gait_ui()

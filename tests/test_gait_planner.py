@@ -232,6 +232,23 @@ class StagePlanTests(unittest.TestCase):
         self.assertEqual(by_id["S2B"].move_groups[0][0].role, "Mup2")
         self.assertEqual(by_id["S6"].move_groups[0][0].role, "Mup1")
 
+    def test_reverse_arc_mirrors_stage_deltas(self):
+        # 2026-09-22 实机执行与预览同向：逆向 60° 的 S4 公转/自转
+        # 全部取反，时长不变；无效方向角度直接拒绝。
+        params = GaitParams(swing_segments=4, phase_gain=2.0).validated()
+        fwd = plan_gait_stages(
+            params, side="left", swing_psi_start_deg=30.0, arc_deg=60.0)
+        rev = plan_gait_stages(
+            params, side="left", swing_psi_start_deg=30.0, arc_deg=-60.0)
+        f4 = next(s for s in fwd if s.stage_id == "S4")
+        r4 = next(s for s in rev if s.stage_id == "S4")
+        self.assertEqual([m.delta for m in f4.move_groups[0]], [180.0, 60.0])
+        self.assertEqual([m.delta for m in r4.move_groups[0]], [-180.0, -60.0])
+        self.assertAlmostEqual(f4.duration_s, r4.duration_s)
+        for bad in (0.0, 400.0, -400.0, float("nan")):
+            with self.assertRaises(ValueError):
+                plan_gait_stages(params, side="left", arc_deg=bad)
+
     def test_phase_adjustment_uses_shortest_path(self):
         params = GaitParams(mr1_sign=1, mr1_zero_deg=0.0).validated()
         stages = plan_gait_stages(params, side="left", swing_psi_start_deg=120.0)

@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import ttk
 from dataclasses import replace
 
-from motor_control.gait_planner import GaitParams
+from motor_control.gait_planner import GaitParams, LOW_NODE_PHASE_DEG
 from motor_control.ui.common import PAD
 from motor_control.ui.gait_twin import build_twin_panel, refresh_twin_panel
 
@@ -55,6 +55,14 @@ INTEGER_FIELDS = {"swing_segments", "feasibility_samples"}
 PREVIEW_MARGIN = 16
 
 
+def _gait_mode_selected(app, value: str) -> None:
+    """四个换位方式 radio 的回调：同步 side/arc 变量并静默重跑预览。"""
+
+    app.gait_side_var.set("left" if value[0] == "L" else "right")
+    app.gait_arc_var.set("60.0" if value[1] == "+" else "-60.0")
+    app._gait_run_dry_run(interactive=False)
+
+
 def build_gait_tab(app, parent) -> None:
     """Build calibration params, dry-run preview and stage controls."""
 
@@ -64,6 +72,11 @@ def build_gait_tab(app, parent) -> None:
     app.gait_field_vars = {}
     app.gait_sign_vars = {}
     app.gait_side_var = tk.StringVar(value="left")
+    # 换位方向（顺向 +60 / 逆向 -60）。gait_mode_var 是四个换位方式
+    # （"L+/L-/R+/R-"）的合并选择，切换时同步下面两个变量。
+    app.gait_arc_var = tk.StringVar(value="60.0")
+    app.gait_mode_var = tk.StringVar(value="L+")
+    app._gait_preview_alt_pad = None
     app.gait_zero_vars = {
         "Mr1": tk.StringVar(value="未标定"),
         "Mr2": tk.StringVar(value="未标定"),
@@ -233,33 +246,45 @@ def _build_run_column(app, parent) -> None:
         preview, width=240, height=260,
         bg="#ffffff", highlightthickness=1, highlightbackground="#cbd5e1",
     )
-    canvas.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
+    canvas.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
     canvas.bind("<Configure>", lambda _e: draw_gait_preview(app))
-    controls = ttk.Frame(preview)
-    controls.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
-    ttk.Radiobutton(
-        controls, text="左侧换位", value="left",
-        variable=app.gait_side_var,
-    ).pack(side="left", padx=4)
-    ttk.Radiobutton(
-        controls, text="右侧换位", value="right",
-        variable=app.gait_side_var,
-    ).pack(side="left", padx=4)
+    # 2026-09-22 按用户要求：摆动侧与顺/逆方向合并为四个换位方式选项
+    # （左顺移/左逆移/右顺移/右逆移）。切换即同步 side/arc 并静默重跑，
+    # 预览图与【▶ 模拟动作】永远对应当前选择。
+    modes = ttk.Frame(preview)
+    modes.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+    for value, text in (("L+", "左顺移"), ("L-", "左逆移"),
+                        ("R+", "右顺移"), ("R-", "右逆移")):
+        ttk.Radiobutton(
+            modes, text=text, value=value,
+            variable=app.gait_mode_var,
+            command=lambda v=value: _gait_mode_selected(app, v),
+        ).pack(side="left", padx=3)
+    actions = ttk.Frame(preview)
+    actions.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 2))
     ttk.Button(
-        controls, text="预览 / 校验",
+        actions, text="预览 / 校验",
         command=app._gait_run_dry_run,
     ).pack(side="left", padx=4)
+    app.gait_widgets["play_btn"] = ttk.Button(
+        actions, text="▶ 模拟动作",
+        command=app._gait_play_preview_clicked,
+    )
+    app.gait_widgets["play_btn"].pack(side="left", padx=4)
     result = ttk.Label(
         preview, textvariable=app.gait_report_var,
         wraplength=260, justify="left",
     )
-    result.grid(row=2, column=0, sticky="ew", padx=6)
+    result.grid(row=3, column=0, sticky="ew", padx=6)
     hint = ttk.Label(
         preview,
-        text="绿=低节点(落脚) 红=高节点(避让)\n蓝虚线=三足中心轨迹 细线=爪臂采样",
+        text="蓝=左足 橙=右足 绿点=低节点(落脚) 红点=高节点(避让)\n"
+             "虚线=摆动中心轨迹；六边形按共边几何紧贴摆放\n"
+             "▶=逐帧模拟旋转段(不含抬升/下降)\n"
+             "四个【开始…移】按钮与换位方式一一对应，点哪个走哪个",
         foreground="#666", justify="left", wraplength=260,
     )
-    hint.grid(row=3, column=0, sticky="ew", padx=6, pady=6)
+    hint.grid(row=4, column=0, sticky="ew", padx=6, pady=6)
     app.gait_widgets["preview_canvas"] = canvas
     app.gait_widgets["report_label"] = result
 
@@ -286,20 +311,31 @@ def _build_run_column(app, parent) -> None:
     buttons = ttk.Frame(stage)
     buttons.pack(fill="x", padx=8, pady=8)
     buttons.columnconfigure((0, 1), weight=1)
-    app.gait_widgets["start_left"] = ttk.Button(
-        buttons, text="开始左侧换位",
-        command=lambda: app._gait_start_run_clicked("left"),
-    )
-    app.gait_widgets["start_left"].grid(row=0, column=0, sticky="ew", padx=3)
-    app.gait_widgets["start_right"] = ttk.Button(
-        buttons, text="开始右侧换位",
-        command=lambda: app._gait_start_run_clicked("right"),
-    )
-    app.gait_widgets["start_right"].grid(row=0, column=1, sticky="ew", padx=3)
+    # 2026-09-22 按用户要求：执行入口与四种换位方式一一对应，方向由
+    # 按钮显式携带，不依赖预览区当前选择（防止“看逆向、走顺向”误操作）。
+    for key, text, side, arc in (
+        ("start_left_cw", "开始左顺移", "left", 60.0),
+        ("start_left_ccw", "开始左逆移", "left", -60.0),
+        ("start_right_cw", "开始右顺移", "right", 60.0),
+        ("start_right_ccw", "开始右逆移", "right", -60.0),
+    ):
+        app.gait_widgets[key] = ttk.Button(
+            buttons, text=text,
+            command=lambda s=side, a=arc: app._gait_start_run_clicked(s, a),
+        )
+    app.gait_widgets["start_left_cw"].grid(row=0, column=0, sticky="ew", padx=3)
+    app.gait_widgets["start_left_ccw"].grid(row=0, column=1, sticky="ew", padx=3)
+    app.gait_widgets["start_right_cw"].grid(
+        row=1, column=0, sticky="ew", padx=3, pady=(3, 0))
+    app.gait_widgets["start_right_ccw"].grid(
+        row=1, column=1, sticky="ew", padx=3, pady=(3, 0))
     app.gait_widgets["advance"] = ttk.Button(
         buttons, text="✓ 确认并执行本阶段", command=app._gait_stage_confirmed,
     )
-    app.gait_widgets["advance"].grid(row=1, column=0, columnspan=2, sticky="ew", padx=3, pady=(6, 0))
+    # row=2：四个方向按钮占 2×2（row0/row1），advance 独占下一行。
+    # 2026-09-22 修复：advance 原在 row=1 且 columnspan=2，与右顺/右逆
+    # 两按钮同行同格，后 grid 者覆盖前者——右侧两按钮被整个遮住不可见。
+    app.gait_widgets["advance"].grid(row=2, column=0, columnspan=2, sticky="ew", padx=3, pady=(6, 0))
 
     app.gait_widgets["state"] = ttk.Label(
         stage, textvariable=app.gait_state_var,
@@ -402,12 +438,23 @@ def collect_gait_params(app, base: GaitParams) -> GaitParams:
 
 # ── 干跑预览绘制 ──────────────────────────────────────────
 
+ANIM_FRAME_MS = 40          # 动画帧间隔
+ANIM_TARGET_FRAMES = 180    # 总帧数上限（约 7 秒），采样多时跳步
+
+
 def draw_gait_preview(app) -> None:
-    """按最近一次干跑报告重画俯视图（无报告时画占位提示）。"""
+    """按最近一次干跑报告重画俯视图（无报告时画占位提示）。
+
+    只画本次 route 涉及的起点/支点/目标三座——碰撞校验仍覆盖全部
+    支座，图面聚焦后轨迹与间隙最紧点才看得清。
+    """
 
     canvas = app.gait_widgets.get("preview_canvas")
     if canvas is None:
         return
+    anim = app.gait_widgets.get("preview_anim")
+    if anim is not None and anim.get("playing"):
+        return   # 动画逐帧重画并自适应尺寸；不闪静态帧
     report = getattr(app, "_gait_last_report", None)
     width = max(1, canvas.winfo_width())
     height = max(1, canvas.winfo_height())
@@ -418,17 +465,43 @@ def draw_gait_preview(app) -> None:
             fill="#64748b", font=("Microsoft YaHei", 11),
         )
         return
-    geometry = app.gait_params.geometry
+    scene = _preview_scene(app, report, width, height)
+    if scene is None:
+        return
+    _draw_preview_pads(canvas, scene)
+    _draw_preview_path(canvas, scene, report, app.gait_params)
+    worst = report.min_margin_sample
+    if worst is not None:
+        x, y = scene["to_canvas"](*worst.center)
+        canvas.create_oval(
+            x - 6, y - 6, x + 6, y + 6, outline="#f59e0b", width=2)
+        canvas.create_text(
+            PREVIEW_MARGIN + 4, PREVIEW_MARGIN + 10,
+            text=f"最紧点 φ={worst.phi_deg:.1f}° ψ={worst.psi_deg:.1f}°",
+            anchor="w", fill="#b45309", font=("Microsoft YaHei", 9))
 
-    # 收集所有需要显示的世界坐标点，求整体包围盒。
+
+def _preview_scene(app, report, width, height):
+    """route 支座（起点/支点/目标 + 反向落点）+ 轨迹包围盒 → 坐标换算。"""
+
+    geometry = app.gait_params.geometry
+    route = report.route
+    names = {route[0], route[1], route[2]} if route is not None else None
+    alt = getattr(app, "_gait_preview_alt_pad", None)
+    if alt and names is not None:
+        names.add(alt)   # 反向落点也画出：顺/逆两种方式同图可比
     points = []
     hexagon_nodes = {}
     for hexagon in report.hexagons:
+        if names is not None and hexagon.name not in names:
+            continue
         nodes = hexagon.low_nodes(geometry.arm_length_mm) + \
             hexagon.high_nodes(geometry.arm_length_mm)
         hexagon_nodes[hexagon.name] = nodes
         points.extend(nodes)
         points.append(hexagon.center)
+    if not hexagon_nodes:
+        return None
     for sample in report.samples:
         points.append(sample.center)
         for arm_index in range(3):
@@ -455,15 +528,20 @@ def draw_gait_preview(app) -> None:
             height - PREVIEW_MARGIN - (y - min_y) * scale
             - (height - 2 * PREVIEW_MARGIN - span_y * scale) / 2,
         )
+    return {"to_canvas": to_canvas, "hexagon_nodes": hexagon_nodes}
 
-    # 六边形：六个节点连线 + 中心标签
-    for name, nodes in hexagon_nodes.items():
+
+def _draw_preview_pads(canvas, scene) -> None:
+    """六边形：六个节点连线 + 中心标签 + 绿(低)/红(高)节点。"""
+
+    to_canvas = scene["to_canvas"]
+    for name, nodes in scene["hexagon_nodes"].items():
+        center = (sum(n[0] for n in nodes) / 6.0,
+                  sum(n[1] for n in nodes) / 6.0)
         ordered = sorted(
             nodes,
             key=lambda node: math.atan2(
-                node[1] - sum(n[1] for n in nodes) / 6.0,
-                node[0] - sum(n[0] for n in nodes) / 6.0,
-            ),
+                node[1] - center[1], node[0] - center[0]),
         )
         polygon = []
         for node in ordered:
@@ -471,10 +549,7 @@ def draw_gait_preview(app) -> None:
         polygon.extend(polygon[:2])
         canvas.create_line(
             *polygon, fill="#94a3b8", width=1.5, dash=(3, 2))
-        label_x, label_y = to_canvas(*(
-            sum(n[0] for n in nodes) / 6.0,
-            sum(n[1] for n in nodes) / 6.0,
-        ))
+        label_x, label_y = to_canvas(*center)
         canvas.create_text(
             label_x, label_y, text=name, fill="#475569",
             font=("Microsoft YaHei", 11, "bold"))
@@ -489,14 +564,18 @@ def draw_gait_preview(app) -> None:
                 x - 3.5, y - 3.5, x + 3.5, y + 3.5,
                 fill="#dc2626", outline="")
 
-    # 三足中心轨迹
+
+def _draw_preview_path(canvas, scene, report, params) -> None:
+    """静态参考：整条摆动中心轨迹虚线 + 爪臂采样细线。"""
+
+    to_canvas = scene["to_canvas"]
+    geometry = params.geometry
     arc = []
     for sample in report.samples:
         arc.extend(to_canvas(*sample.center))
     canvas.create_line(*arc, fill="#2563eb", width=2, dash=(6, 3))
-
-    # 爪臂采样（每 8 个采样画一组，避免过密）
-    step = max(1, len(report.samples) // int(app.gait_params.swing_segments))
+    # 爪臂采样（按 swing_segments 抽稀，避免过密）
+    step = max(1, len(report.samples) // int(params.swing_segments))
     for sample in report.samples[::step]:
         for arm_index in range(3):
             angle = math.radians(sample.psi_deg + 120.0 * arm_index)
@@ -512,16 +591,148 @@ def draw_gait_preview(app) -> None:
                 *to_canvas(*start), *to_canvas(*end),
                 fill="#93c5fd", width=1)
 
-    # 最小间隙点
-    worst = report.min_margin_sample
-    if worst is not None:
-        x, y = to_canvas(*worst.center)
-        canvas.create_oval(
-            x - 6, y - 6, x + 6, y + 6, outline="#f59e0b", width=2)
-        canvas.create_text(
-            PREVIEW_MARGIN + 4, PREVIEW_MARGIN + 10,
-            text=f"最紧点 φ={worst.phi_deg:.1f}° ψ={worst.psi_deg:.1f}°",
-            anchor="w", fill="#b45309", font=("Microsoft YaHei", 9))
+
+# ── 预览动作模拟（只动视图，不发任何命令） ─────────────────
+
+def play_preview_animation(app) -> None:
+    """沿最近一次干跑的 samples 逐帧回放摆动旋转段。"""
+
+    report = getattr(app, "_gait_last_report", None)
+    canvas = app.gait_widgets.get("preview_canvas")
+    if report is None or canvas is None or not report.samples:
+        app.log("⚠️ 模拟动作：请先点【预览 / 校验】生成轨迹")
+        return
+    stop_preview_animation(app)
+    anim = app.gait_widgets.setdefault(
+        "preview_anim", {"job": None, "frame": 0, "playing": False})
+    anim.update(frame=0, playing=True)
+    button = app.gait_widgets.get("play_btn")
+    if button is not None:
+        button.configure(text="⏹ 停止模拟")
+    start, target, pivot, _bearing = report.route
+    app.log(f"▶ 预览模拟：{start}→{target} 绕{pivot}"
+            f"（{len(report.samples)} 采样，仅视图动画，不动电机）")
+    _preview_anim_tick(app)
+
+
+def stop_preview_animation(app, *, redraw: bool = False) -> None:
+    """停止动画；redraw=True 时恢复静态预览图（Tk 线程调用）。"""
+
+    anim = app.gait_widgets.get("preview_anim")
+    if anim is None:
+        return
+    if anim.get("job") is not None:
+        try:
+            app.root.after_cancel(anim["job"])
+        except tk.TclError:
+            pass
+    anim.update(job=None, playing=False)
+    button = app.gait_widgets.get("play_btn")
+    if button is not None:
+        button.configure(text="▶ 模拟动作")
+    if redraw:
+        draw_gait_preview(app)
+
+
+def _preview_anim_tick(app) -> None:
+    anim = app.gait_widgets.get("preview_anim")
+    report = getattr(app, "_gait_last_report", None)
+    canvas = app.gait_widgets.get("preview_canvas")
+    if (anim is None or report is None or canvas is None
+            or not anim.get("playing")):
+        return
+    samples = report.samples
+    index = min(anim["frame"], len(samples) - 1)
+    draw_preview_frame(app, report, index)
+    if index + 1 >= len(samples):
+        stop_preview_animation(app)   # 终点帧保留在画布上
+        return
+    step = max(1, round(len(samples) / ANIM_TARGET_FRAMES))
+    anim["frame"] = min(index + step, len(samples) - 1)
+    try:
+        anim["job"] = canvas.after(
+            ANIM_FRAME_MS, lambda: _preview_anim_tick(app))
+    except tk.TclError:
+        anim["job"] = None
+        anim["playing"] = False
+
+
+def draw_preview_frame(app, report, index: int) -> None:
+    """动画单帧：支座 + 轨迹 + 支撑足/横梁/摆动足当前位置。
+
+    配色与机构左右固定对应（不能搞混）：蓝=左足、橙=右足；摆动足
+    用它自身左右侧的颜色——左侧换位蓝足移动、右侧换位橙足移动。
+    支撑足站在支点低节点上，公转期间世界姿态不变；摆动足三爪按 ψ
+    反向自转。横梁两端缩进壳体半径，不贯穿足本体。动画只覆盖 S4
+    旋转段；抬升/收腿/落位是直线动作，不在本图。
+    """
+
+    canvas = app.gait_widgets.get("preview_canvas")
+    if canvas is None:
+        return
+    width = max(1, canvas.winfo_width())
+    height = max(1, canvas.winfo_height())
+    canvas.delete("all")
+    scene = _preview_scene(app, report, width, height)
+    if scene is None:
+        return
+    to_canvas = scene["to_canvas"]
+    _draw_preview_pads(canvas, scene)
+    geometry = app.gait_params.geometry
+    samples = report.samples
+    index = max(0, min(index, len(samples) - 1))
+    swing_color, support_color = (
+        ("#2563eb", "#ea580c") if report.side == "left"
+        else ("#ea580c", "#2563eb"))
+
+    faint = [to_canvas(*s.center) for s in samples]
+    canvas.create_line(*faint, fill="#cbd5e1", width=1, dash=(4, 3))
+    walked = [to_canvas(*s.center) for s in samples[:index + 1]]
+    if len(walked) >= 2:
+        canvas.create_line(*walked, fill=swing_color, width=2)
+
+    sample = samples[index]
+    route = report.route
+    pivot_center = None
+    if route is not None and route[2] in scene["hexagon_nodes"]:
+        nodes = scene["hexagon_nodes"][route[2]]
+        pivot_center = (sum(n[0] for n in nodes) / 6.0,
+                        sum(n[1] for n in nodes) / 6.0)
+    if pivot_center is not None:
+        px, py = to_canvas(*pivot_center)
+        # 横梁：两端各缩进壳体半径，只画两足壳体之间的部分
+        dx = sample.center[0] - pivot_center[0]
+        dy = sample.center[1] - pivot_center[1]
+        span = math.hypot(dx, dy)
+        hub = geometry.hub_radius_mm
+        if span > 2 * hub:
+            ux, uy = dx / span, dy / span
+            beam_start = (pivot_center[0] + ux * hub, pivot_center[1] + uy * hub)
+            beam_end = (sample.center[0] - ux * hub, sample.center[1] - uy * hub)
+            canvas.create_line(*to_canvas(*beam_start), *to_canvas(*beam_end),
+                               fill="#64748b", width=3)
+        for k in range(3):
+            angle = math.radians(LOW_NODE_PHASE_DEG + 120.0 * k)
+            end = (pivot_center[0] + geometry.arm_length_mm * math.cos(angle),
+                   pivot_center[1] + geometry.arm_length_mm * math.sin(angle))
+            canvas.create_line(px, py, *to_canvas(*end),
+                               fill=support_color, width=3)
+        canvas.create_oval(px - 5, py - 5, px + 5, py + 5,
+                           fill=support_color, outline="")
+
+    x, y = to_canvas(*sample.center)
+    for k in range(3):
+        angle = math.radians(sample.psi_deg + 120.0 * k)
+        end = (sample.center[0] + geometry.arm_length_mm * math.cos(angle),
+               sample.center[1] + geometry.arm_length_mm * math.sin(angle))
+        canvas.create_line(x, y, *to_canvas(*end), fill=swing_color, width=3)
+    canvas.create_oval(x - 5, y - 5, x + 5, y + 5,
+                       fill=swing_color, outline="")
+    canvas.create_text(
+        PREVIEW_MARGIN + 4, PREVIEW_MARGIN + 10,
+        text=(f"模拟 φ={sample.phi_deg:.1f}° ψ={sample.psi_deg:.1f}°"
+              f"（{index + 1}/{len(samples)}）"),
+        anchor="w", fill="#1d4ed8", font=("Microsoft YaHei", 9))
 
 
 # ── 阶段面板刷新 ──────────────────────────────────────────
@@ -583,8 +794,10 @@ def refresh_gait_panel(app, progress_text=None) -> None:
 
     executing = snapshot is not None and snapshot["state"] == "running"
     active = snapshot is not None and snapshot["state"] in ("ready", "running")
-    app.gait_widgets["start_left"].configure(state="disabled" if active else "normal")
-    app.gait_widgets["start_right"].configure(state="disabled" if active else "normal")
+    for key in ("start_left_cw", "start_left_ccw",
+                "start_right_cw", "start_right_ccw"):
+        app.gait_widgets[key].configure(
+            state="disabled" if active else "normal")
     app.gait_widgets["advance"].configure(
         state="normal" if active and not executing and snapshot["stage_id"] is not None else "disabled")
     app.gait_widgets["abort"].configure(
@@ -600,5 +813,7 @@ __all__ = [
     "collect_gait_params",
     "draw_gait_preview",
     "load_gait_fields",
+    "play_preview_animation",
     "refresh_gait_panel",
+    "stop_preview_animation",
 ]

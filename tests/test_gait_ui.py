@@ -36,7 +36,8 @@ class GaitLayoutTests(unittest.TestCase):
         for name in ("_gait_record_zero_clicked", "_gait_save_params_clicked",
                      "_gait_reload_params_clicked", "_gait_reestablish_baseline",
                      "_gait_run_dry_run", "_gait_start_run_clicked",
-                     "_gait_stage_confirmed", "_gait_abort_clicked", "_gait_reset_run"):
+                     "_gait_play_preview_clicked", "_gait_stage_confirmed",
+                     "_gait_abort_clicked", "_gait_reset_run"):
             setattr(self.app, name, lambda *args: None)
         self.page = ttk.Frame(self.root)
         self.page.pack(fill="both", expand=True)

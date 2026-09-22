@@ -477,6 +477,11 @@ class DryRunReport:
     message: str
     # 轨迹中从壳体正上方越过的高节点（2D 干跑不校验，执行时目视确认）
     hub_passover_nodes: tuple[str, ...] = ()
+    # 本次轨迹实际使用的 (start, target, pivot, start_bearing)。
+    # 碰撞校验仍覆盖 hexagons 全部支座；视图只画 route 涉及的支座。
+    route: tuple[str, str, str, float] | None = None
+    # "left"/"right"：哪一侧腿是摆动足（视图按左右足固定配色）。
+    side: str = ""
 
     def as_summary(self) -> dict[str, Any]:
         worst = self.min_margin_sample
@@ -579,19 +584,26 @@ def plan_swing_trajectory(
     extra_hexagons: Iterable[HexPad] = (),
     swing_joint_delta_deg: float | None = None,
     route: tuple[str, str, str, float] | None = None,
+    arc_deg: float | None = None,
 ) -> DryRunReport:
     """干跑：生成整条摆动轨迹并做连续碰撞校验。
 
     ``side`` 是 "left"（A→C 绕 B）或 "right"（B→A 绕 C）。
     legacy参数 ``swing_joint_delta_deg`` 仅接受与当前角度模型一致的值。
     不能传入终点等效解绕增量来改变中途自转。route可用于后续换位。
+    ``arc_deg`` 是本次换位方向：+SWING_ARC_DEG（默认顺向）或负值逆向。
+    预览与实机执行（begin_run）传同一方向，四种换位方式所见即所得。
     """
 
     params = params.validated()
     geometry = params.geometry
     if side not in ("left", "right"):
         raise ValueError("side 必须是 left 或 right")
-    spin_deg, joint_delta, _support_delta = angular_targets(params, SWING_ARC_DEG)
+    if arc_deg is None:
+        arc_deg = SWING_ARC_DEG
+    if not math.isfinite(arc_deg) or not -360.0 < arc_deg < 360.0 or arc_deg == 0:
+        raise ValueError("arc_deg 必须是 ±360°内的非零有限角度")
+    spin_deg, joint_delta, _support_delta = angular_targets(params, arc_deg)
     if swing_joint_delta_deg is not None and not math.isclose(swing_joint_delta_deg, joint_delta):
         raise ValueError("不能用终点等效解绕增量替换同步避障角度轨迹")
     _start, _target, pivot_name, start_bearing = (
@@ -614,7 +626,7 @@ def plan_swing_trajectory(
     for index in range(int(params.feasibility_samples) + 1):
         s = index / float(params.feasibility_samples)
         shaping = smoothstep5(s)
-        phi_deg = SWING_ARC_DEG * shaping
+        phi_deg = arc_deg * shaping
         psi_deg = (LOW_NODE_PHASE_DEG
                    + spin_deg * shaping)
         beta_deg = start_bearing - (180.0 if side == "right" else 0.0) - phi_deg
@@ -635,11 +647,12 @@ def plan_swing_trajectory(
     # Lipschitz 下界：每对采样之间，任一臂端移动不超过
     # (d + k*R)*Δφ。最近距离是 1-Lipschitz；扣除半区间运动界，
     # 防止采样点都通过但中间穿过节点。稀采样只会更保守，不会误放行。
+    # 逆向弧（arc_deg<0）时 Δφ 为负，取绝对值保持同一保守方向。
     worst = min(samples, key=lambda item: float(item.margin_mm))
     interval_bound = min(
         min(float(a.margin_mm), float(b.margin_mm))
         - (geometry.d_mm + abs(params.phase_gain) * geometry.arm_length_mm)
-        * math.radians(b.phi_deg - a.phi_deg) / 2.0
+        * math.radians(abs(b.phi_deg - a.phi_deg)) / 2.0
         for a, b in zip(samples, samples[1:]))
     minimum = min(float(worst.margin_mm), interval_bound)
     feasible = minimum > 0.0
@@ -661,6 +674,8 @@ def plan_swing_trajectory(
         hexagons=tuple(hexagons.values()),
         message=message,
         hub_passover_nodes=tuple(hub_passovers),
+        route=(_start, _target, pivot_name, start_bearing),
+        side=side,
     )
 
 
@@ -706,17 +721,24 @@ def plan_gait_stages(
     *,
     side: str,
     swing_psi_start_deg: float | None = None,
+    arc_deg: float | None = None,
 ) -> list[GaitStage]:
     """生成一次完整摆动的 S0..S7 阶段计划。
 
     ``swing_psi_start_deg`` 是摆动三足当前绝对姿态（由执行器按标定零位
     换算）；等于 30°（低节点基准）时 S3 为空并自动跳过。None 表示
     只生成计划不做相位修正（用于纯展示）。
+    ``arc_deg`` 是本次换位方向：+SWING_ARC_DEG 顺向（默认）、负值逆向。
+    2026-09-22 起实机执行与预览传同一方向，四种换位方式所见即所得。
     """
 
     params = params.validated()
     if side not in ("left", "right"):
         raise ValueError("side 必须是 left 或 right")
+    if arc_deg is None:
+        arc_deg = SWING_ARC_DEG
+    if not math.isfinite(arc_deg) or not -360.0 < arc_deg < 360.0 or arc_deg == 0:
+        raise ValueError("arc_deg 必须是 ±360°内的非零有限角度")
     swing_role, support_role = (
         ("Mr1", "Mr2") if side == "left" else ("Mr2", "Mr1")
     )
@@ -727,7 +749,8 @@ def plan_gait_stages(
     lift_sign = (params.mup1_lift_sign if lift_role == "Mup1"
                  else params.mup2_lift_sign)
 
-    side_text = "左三足 A→C（支点 B）" if side == "left" else "右三足 B→A（支点 C）"
+    side_text = ("左三足换位（左侧腿摆动，右侧腿支撑）" if side == "left"
+                 else "右三足换位（右侧腿摆动，左侧腿支撑）")
 
     stages: list[GaitStage] = [
         GaitStage(
@@ -806,8 +829,8 @@ def plan_gait_stages(
 
     # S4 整条五次轨迹一次原子下发。固件共享时基/主进度，不再用两条
     # 独立梯形 MOVE 近似同步，也不把 Δq=180 替换成终点等效的 60。
-    _spin, swing_delta_total, support_delta_total = angular_targets(params, SWING_ARC_DEG)
-    duration_s = 1.875 * SWING_ARC_DEG / params.swing_speed_deg_s
+    _spin, swing_delta_total, support_delta_total = angular_targets(params, arc_deg)
+    duration_s = 1.875 * abs(arc_deg) / params.swing_speed_deg_s
     segment_groups = [(RoleMove(swing_role, swing_sign * swing_delta_total,
                                abs(params.phase_gain + 1) * params.swing_speed_deg_s),
                        RoleMove(support_role, support_sign * support_delta_total,
@@ -819,8 +842,8 @@ def plan_gait_stages(
             confirm_text=(
                 "同一五次进度同步运动；观察爪臂始终从"
                 "高点间隙中扫过。任何异常立即点【中止】。\n"
-                f"φ=60°，Δψ={params.phase_gain * 60:g}°，"
-                f"Δq摆={swing_delta_total:g}°，Δq支=60°，"
+                f"φ={arc_deg:g}°，Δψ={params.phase_gain * arc_deg:g}°，"
+                f"Δq摆={swing_delta_total:g}°，Δq支={support_delta_total:g}°，"
                 f"计划时长 {duration_s:.2f}s；禁止轨迹内等效解绕。"
             ),
             move_groups=tuple(segment_groups),
