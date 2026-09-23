@@ -4,11 +4,12 @@
 
 - 五次平滑曲线 ``S(s)=10s³-15s⁴+6s⁵``；
 - 左三足中心 ``O1(φ) = B + d·dir(180°-φ)``，φ∈[0°,60°]；
-- 同步自转 ``ψ1 = ψ10 + k·φ``（ψ10=30°，低节点相位；k=phase_gain）；
-- 横梁角 ``β = 180° - 60°·S(s)``，关节角 ``q = ψ - β + c``；
-- 一个摆动循环里（默认 k=-2）：摆动侧电机 Δq=-60°、支撑侧 Δq=+60°；
-- 高点避让：邻接六边形、爪臂、中心结构、横梁与实测垂向包络；
-  采样间运动距离界给出连续间隙保守下界，不排除壳体下的高点。
+- 横梁角 ``β = β_start - φ``，关节角 ``q = ψ - β + c``；
+- legacy 自转 ``ψ = ψ_start + k·φ``（默认 k=-2），保留旧配置；
+- two_mode_v1 按当前晶格扇区自动选择低节点侧比例／高节点侧变比例自转；
+  ``gait_avoidance`` 的同一角度折线用于预览、连续间隙下界与实际分段 SYNC；
+- 新模式检查完整径向腿扫掠邻接高杆，不用抬升高度豁免平面冲突。
+  横梁、壳体和实测垂向包络另作结构诊断，不与腿避杆证明混淆。
 
 本模块不 import Tk、不碰串口：所有几何/轨迹/碰撞/阶段计划都可以离线
 单元测试。执行与标定向导在 ``desktop_app`` 里基于这里的纯函数搭建。
@@ -17,8 +18,9 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
+from .gait_avoidance import LEGACY, TWO_MODE, MODE_NAMES, avoidance_path, leg_clearance, lattice_coordinates
 
 # ── 角度约定 ──────────────────────────────────────────────
 # 对外 API 一律用"度"；内部三角函数换算弧度。
@@ -198,6 +200,9 @@ class GaitParams:
     # 公转 +60°、摆动电机 (k+1)φ = -60°（与公转反向），世界自转 -120°
     # （三重对称下与 +120° 终点等效，但路径短、方向相反，线缆缠绕少）。
     phase_gain: float = -2.0
+    # Preserve legacy programmatic callers/configurations. New desktop sessions
+    # explicitly select TWO_MODE; existing saved gains are never reinterpreted.
+    trajectory_mode: str = LEGACY
     beam_reference_deg: float = 180.0  # 两个 Mr 同时记零时横梁世界角
     calibration_confirmed: bool = False  # 实测几何、方向、PPR、反力闭合已确认
     calibration_fingerprint: str | None = None
@@ -208,6 +213,8 @@ class GaitParams:
 
     def validated(self) -> "GaitParams":
         self.geometry.validated()
+        if self.trajectory_mode not in (LEGACY, TWO_MODE):
+            raise ValueError("未知步态轨迹模式")
         if not 1 <= int(self.swing_segments) <= 200:
             raise ValueError("swing_segments 必须在 1..200")
         if not 1 <= int(self.feasibility_samples) <= 5000:
@@ -284,6 +291,7 @@ class GaitParams:
             "mr1_zero_deg": self.mr1_zero_deg,
             "mr2_zero_deg": self.mr2_zero_deg,
             "phase_gain": self.phase_gain,
+            "trajectory_mode": self.trajectory_mode,
             "beam_reference_deg": self.beam_reference_deg,
             "calibration_confirmed": self.calibration_confirmed,
             "calibration_fingerprint": self.calibration_fingerprint,
@@ -370,6 +378,7 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         mr1_zero_deg=_opt_number("mr1_zero_deg"),
         mr2_zero_deg=_opt_number("mr2_zero_deg"),
         phase_gain=_number("phase_gain", GaitParams.phase_gain),
+        trajectory_mode=value.get("trajectory_mode", LEGACY),
         beam_reference_deg=_number("beam_reference_deg", 180.0),
         calibration_confirmed=value.get("calibration_confirmed", False),
         calibration_fingerprint=value.get("calibration_fingerprint"),
@@ -482,6 +491,10 @@ class DryRunReport:
     route: tuple[str, str, str, float] | None = None
     # "left"/"right"：哪一侧腿是摆动足（视图按左右足固定配色）。
     side: str = ""
+    modality: str = ""
+    worst_rod: str = ""
+    worst_leg: int = 0
+    structure_margin_mm: float | None = None
 
     def as_summary(self) -> dict[str, Any]:
         worst = self.min_margin_sample
@@ -493,6 +506,9 @@ class DryRunReport:
             "sample_count": len(self.samples),
             "hub_passover_nodes": list(self.hub_passover_nodes),
             "message": self.message,
+            "modality": self.modality,
+            "worst_rod": self.worst_rod,
+            "worst_leg": self.worst_leg,
         }
 
 
@@ -577,6 +593,35 @@ def angular_targets(params: GaitParams, phi_deg: float) -> tuple[float, float, f
             (params.phase_gain + 1.0) * phi_deg, phi_deg)
 
 
+def effective_geometry(params: GaitParams) -> GaitGeometry:
+    """Two-mode paths are certified on the requested touching-hexagon lattice.
+
+    Old d is retained in the config, never overwritten or used to pretend a
+    different site is certified. Radius/thickness remain measured quantities.
+    """
+    if params.trajectory_mode == TWO_MODE:
+        return replace(params.geometry, d_mm=math.sqrt(3)*params.geometry.arm_length_mm,
+                       surrounding_pads=True)
+    return params.geometry
+
+
+def gait_pads(params: GaitParams, pivot_name="B") -> dict[str, HexPad]:
+    geometry = effective_geometry(params)
+    pads = default_hex_pads(geometry)
+    if params.trajectory_mode == TWO_MODE:
+        # Recenter the obstacle neighborhood after EVERY step; never lose an
+        # outer rod just because the support left the original A/B/C patch.
+        pi, pj = lattice_coordinates(pivot_name)
+        d = geometry.d_mm
+        for i in range(pi-2, pi+3):
+            for j in range(pj-2, pj+3):
+                center = (d*(i+j/2), d*math.sqrt(3)*j/2)
+                if not any(math.dist(center, p.center) < 1e-8 for p in pads.values()):
+                    name = f"邻座({i},{j})"
+                    pads[name] = HexPad(name, center)
+    return pads
+
+
 def plan_swing_trajectory(
     params: GaitParams,
     *,
@@ -596,7 +641,7 @@ def plan_swing_trajectory(
     """
 
     params = params.validated()
-    geometry = params.geometry
+    geometry = effective_geometry(params)
     if side not in ("left", "right"):
         raise ValueError("side 必须是 left 或 right")
     if arc_deg is None:
@@ -609,7 +654,9 @@ def plan_swing_trajectory(
     _start, _target, pivot_name, start_bearing = (
         route if route is not None else (LEFT_SWING if side == "left" else RIGHT_SWING)
     )
-    hexagons = dict(default_hex_pads(geometry))
+    path = (avoidance_path(start_bearing, arc_deg)
+            if params.trajectory_mode == TWO_MODE else None)
+    hexagons = gait_pads(params, pivot_name)
     for extra in extra_hexagons:
         hexagons[extra.name] = extra
     pivot = hexagons[pivot_name]
@@ -623,12 +670,23 @@ def plan_swing_trajectory(
                  node)
             )
     hub_passovers: list[str] = []
-    for index in range(int(params.feasibility_samples) + 1):
-        s = index / float(params.feasibility_samples)
-        shaping = smoothstep5(s)
+    # Include every execution knot. Linear angle samples give an explicit
+    # interval motion bound even when the world-spin/phi ratio is variable.
+    count = max(600, int(params.feasibility_samples)) if path else int(params.feasibility_samples)
+    grid = {i/count for i in range(count+1)}
+    if path:
+        grid.update(k[0] for k in path.knots)
+    worst_rod, worst_leg, worst_leg_margin = "", 0, math.inf
+    structural = math.inf
+    for s in sorted(grid):
+        shaping = s if path else smoothstep5(s)
         phi_deg = arc_deg * shaping
         psi_deg = (LOW_NODE_PHASE_DEG
                    + spin_deg * shaping)
+        sample_joint_delta = joint_delta * shaping
+        if path:
+            spin, sample_joint_delta, phi_deg = path.angles(shaping)
+            psi_deg = LOW_NODE_PHASE_DEG + spin
         beta_deg = start_bearing - (180.0 if side == "right" else 0.0) - phi_deg
         center = swing_center(pivot, geometry.d_mm, phi_deg, start_bearing)
         for label, node in high_nodes:
@@ -638,21 +696,26 @@ def plan_swing_trajectory(
         margin = clearance_margin_mm(center, psi_deg, geometry,
                                      list(hexagons.values()), lift_mm=params.lift_mm,
                                      pivot=pivot.center)
+        structural = min(structural, margin)
+        if path:
+            margin, rod, leg = leg_clearance(center, psi_deg, geometry, list(hexagons.values()))
+            if margin < worst_leg_margin:
+                worst_leg_margin, worst_rod, worst_leg = margin, rod, leg
         samples.append(
             SwingSample(s=s, phi_deg=phi_deg, psi_deg=psi_deg,
                         beta_deg=beta_deg, center=center, margin_mm=margin,
-                        swing_q_delta_deg=joint_delta * shaping,
+                        swing_q_delta_deg=sample_joint_delta,
                         support_q_delta_deg=phi_deg)
         )
     # Lipschitz 下界：每对采样之间，任一臂端移动不超过
-    # (d + k*R)*Δφ。最近距离是 1-Lipschitz；扣除半区间运动界，
+    # d*|Δφ| + R*|Δψ|。最近距离是 1-Lipschitz；扣除半区间运动界，
     # 防止采样点都通过但中间穿过节点。稀采样只会更保守，不会误放行。
     # 逆向弧（arc_deg<0）时 Δφ 为负，取绝对值保持同一保守方向。
     worst = min(samples, key=lambda item: float(item.margin_mm))
     interval_bound = min(
         min(float(a.margin_mm), float(b.margin_mm))
-        - (geometry.d_mm + abs(params.phase_gain) * geometry.arm_length_mm)
-        * math.radians(abs(b.phi_deg - a.phi_deg)) / 2.0
+        - (geometry.d_mm * math.radians(abs(b.phi_deg-a.phi_deg))
+           + geometry.arm_length_mm * math.radians(abs(b.psi_deg-a.psi_deg))) / 2.0
         for a, b in zip(samples, samples[1:]))
     minimum = min(float(worst.margin_mm), interval_bound)
     feasible = minimum > 0.0
@@ -666,6 +729,13 @@ def plan_swing_trajectory(
     if hub_passovers:
         message += ("；" + "、".join(hub_passovers)
                     + " 存在壳体投影重叠，已计入垂向间隙校验")
+    if path:
+        message = (f"{MODE_NAMES[path.modality]}；腿—高杆平面净间隙保守下界 "
+                   f"{minimum:.3f}mm（已扣腿/杆半径及δ）；"
+                   f"最紧腿{worst_leg} / {worst_rod}，|φ|={abs(worst.phi_deg):.2f}°。"
+                   + ("模型通过，实机还需覆盖脉冲误差。" if feasible else
+                      "未通过：禁止新模式实机执行；抬高不替代平面避杆。")
+                   + " 紧贴晶格参考；非实测碰撞传感器。")
     return DryRunReport(
         feasible=feasible,
         min_margin_mm=minimum,
@@ -676,6 +746,9 @@ def plan_swing_trajectory(
         hub_passover_nodes=tuple(hub_passovers),
         route=(_start, _target, pivot_name, start_bearing),
         side=side,
+        modality="" if path is None else path.modality,
+        worst_rod=worst_rod, worst_leg=worst_leg,
+        structure_margin_mm=structural if path else None,
     )
 
 
@@ -702,6 +775,9 @@ class GaitStage:
     move_groups: tuple[tuple[RoleMove, ...], ...] = ()
     synchronized: bool = False
     duration_s: float = 0.0
+    group_durations: tuple[float, ...] = ()
+    # Ideal absolute offsets from S4 start, rounded cumulatively at the host.
+    sync_endpoints: tuple[tuple[float, float], ...] = ()
 
     @property
     def is_motion_stage(self) -> bool:
@@ -722,6 +798,7 @@ def plan_gait_stages(
     side: str,
     swing_psi_start_deg: float | None = None,
     arc_deg: float | None = None,
+    route: tuple[str, str, str, float] | None = None,
 ) -> list[GaitStage]:
     """生成一次完整摆动的 S0..S7 阶段计划。
 
@@ -827,7 +904,7 @@ def plan_gait_stages(
                 )
             )
 
-    # S4 整条五次轨迹一次原子下发。固件共享时基/主进度，不再用两条
+    # S4 每条角度折线段一次原子下发。固件共享时基/主进度，不用两条
     # 独立梯形 MOVE 近似同步，也不把 Δq=180 替换成终点等效的 60。
     _spin, swing_delta_total, support_delta_total = angular_targets(params, arc_deg)
     duration_s = 1.875 * abs(arc_deg) / params.swing_speed_deg_s
@@ -835,20 +912,45 @@ def plan_gait_stages(
                                abs(params.phase_gain + 1) * params.swing_speed_deg_s),
                        RoleMove(support_role, support_sign * support_delta_total,
                                 params.swing_speed_deg_s))]
+    group_durations, endpoints = (), ()
+    modality_text = ""
+    if params.trajectory_mode == TWO_MODE:
+        path = avoidance_path((route or (LEFT_SWING if side == "left" else RIGHT_SWING))[3], arc_deg)
+        modality_text = MODE_NAMES[path.modality] + "；分段原子SYNC，段间静止换向。\n"
+        segment_groups, durations, targets = [], [], []
+        for a, b in zip(path.knots, path.knots[1:]):
+            qa, qb = a[1]+a[2], b[1]+b[2]
+            ds, dp = qb-qa, b[1]-a[1]
+            # Cap swing joint peak at 3x the configured orbit peak. The
+            # high-mode rational curve is not assumed to have constant gain.
+            duration = max(0.05, 1.875*abs(dp)/params.swing_speed_deg_s,
+                           1.875*abs(ds)/(3*params.swing_speed_deg_s))
+            durations.append(duration)
+            targets.append((swing_sign*qb, support_sign*b[1]))
+            segment_groups.append((RoleMove(swing_role, swing_sign*ds,
+                                             max(0.001, 1.875*abs(ds)/duration)),
+                                   RoleMove(support_role, support_sign*dp,
+                                            max(0.001, 1.875*abs(dp)/duration))))
+        group_durations, endpoints = tuple(durations), tuple(targets)
+        duration_s = sum(durations)
+        _spin, swing_delta_total, support_delta_total = path.angles(1)
     stages.append(
         GaitStage(
             stage_id="S4",
             title="公转 + 同步自转",
             confirm_text=(
+                modality_text +
                 "同一五次进度同步运动；观察爪臂始终从"
                 "高点间隙中扫过。任何异常立即点【中止】。\n"
-                f"φ={arc_deg:g}°，Δψ={params.phase_gain * arc_deg:g}°，"
+                f"φ={arc_deg:g}°，Δψ={_spin:g}°，"
                 f"Δq摆={swing_delta_total:g}°，Δq支={support_delta_total:g}°，"
                 f"计划时长 {duration_s:.2f}s；禁止轨迹内等效解绕。"
             ),
             move_groups=tuple(segment_groups),
             synchronized=True,
             duration_s=duration_s,
+            group_durations=group_durations,
+            sync_endpoints=endpoints,
         )
     )
 

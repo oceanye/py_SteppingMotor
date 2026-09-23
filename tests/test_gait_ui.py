@@ -112,6 +112,16 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertEqual(saved.mr1_zero_signature, "left")
         self.assertEqual(saved.mr2_zero_signature, "right")
 
+    def test_changing_trajectory_mode_invalidates_calibration_and_cached_preview(self):
+        from motor_control.gait_avoidance import TWO_MODE
+        from motor_control.ui.gait_tab import collect_gait_params
+        self.app._gait_last_report = object()
+        self.app.gait_calibrated_var.set(True)
+        self.app.gait_trajectory_var.set(TWO_MODE)
+        self.assertFalse(self.app.gait_calibrated_var.get())
+        self.assertIsNone(self.app._gait_last_report)
+        self.assertEqual(collect_gait_params(self.app, self.app.gait_params).trajectory_mode, TWO_MODE)
+
     def test_wheel_over_direction_field_scrolls_without_changing_direction(self):
         page = self.app.gait_widgets["param_pages"]["calibration"]
         self.app.gait_widgets["params_book"].select(page)

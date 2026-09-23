@@ -108,13 +108,17 @@ def _draw(view):
             canvas.create_text(x, y+radius+18, text=role, fill="#475569")
         return
 
-    # Fixed normalized framing avoids zoom changes while moving. No size input.
-    scale = min((width-26)/2.36, (height-100)/2.23)
+    # Fixed FOR THIS ROUTE; include neighbor landings without zooming per frame.
+    pads = pose.get("route_pads", PAD_CENTERS)
+    xs, ys = zip(*pads.values())
+    xmin, xmax = min(xs)-.7, max(xs)+.7
+    ymin, ymax = min(ys)-.7, max(ys)+.7
+    scale = min((width-26)/(xmax-xmin), (height-100)/(ymax-ymin))
     def project(point):
         x, y = point
-        return width/2 + (x+0.5)*scale, 15 + (1.50-y)*scale
+        return width/2+(x-(xmin+xmax)/2)*scale, 15+(ymax-y)*scale
 
-    for name, center in PAD_CENTERS.items():
+    for name, center in pads.items():
         nodes = [(center[0]+math.cos(math.radians(30+i*60))/math.sqrt(3),
                   center[1]+math.sin(math.radians(30+i*60))/math.sqrt(3)) for i in range(6)]
         canvas.create_polygon(*(v for node in nodes for v in project(node)),

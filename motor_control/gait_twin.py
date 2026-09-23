@@ -10,11 +10,19 @@ import math
 from typing import Mapping, Sequence
 
 from motor_control.gait_planner import GaitParams, LOW_NODE_PHASE_DEG
+from motor_control.gait_avoidance import lattice_coordinates
 
 
 PAD_CENTERS = {"A": (-1.0, 0.0), "B": (0.0, 0.0),
                "C": (-0.5, math.sqrt(3) / 2)}
 ROLES = ("Mup1", "Mr1", "Mup2", "Mr2")
+
+
+def pad_center(name):
+    if name in PAD_CENTERS:
+        return PAD_CENTERS[name]
+    i, j = lattice_coordinates(name)
+    return i+j/2, math.sqrt(3)*j/2
 
 
 def build_twin_snapshot(
@@ -91,7 +99,7 @@ def _pose(params, positions, context):
     phi = (0.0 if rotation_start is None else support_sign *
            (positions[support_role] - rotation_start[support_role]))
     beta = bearing - (180.0 if side == "right" else 0.0) - phi
-    px, py = PAD_CENTERS[pivot]
+    px, py = pad_center(pivot)
     theta = math.radians(bearing - phi)
     swing_center = (px + math.cos(theta), py + math.sin(theta))
     feet = {}
@@ -100,10 +108,11 @@ def _pose(params, positions, context):
         ("right", "Mr2", "Mup2", params.mr2_sign, params.mr2_zero_deg, params.mup2_lift_sign),
     ):
         q = sign * (positions[rotation] - zero)
-        feet[foot] = {"center": swing_center if foot == side else PAD_CENTERS[pivot],
+        feet[foot] = {"center": swing_center if foot == side else (px, py),
                       "psi_deg": LOW_NODE_PHASE_DEG + q + beta - params.beam_reference_deg,
                       "q_deg": q,
                       "z_mm": lift_sign * (positions[lift] - context["lift_start"][lift]),
                       "support_assumed": foot != side}
     return {"phi_deg": phi, "beta_deg": beta, "feet": feet,
-            "route": f"{start}→{target}，支点{pivot}", "side": side}
+            "route": f"{start}→{target}，支点{pivot}", "side": side,
+            "route_pads": {name: pad_center(name) for name in (start, target, pivot)}}

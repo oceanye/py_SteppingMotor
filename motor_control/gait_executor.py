@@ -15,6 +15,8 @@
 - ``role_axis(role_name) -> int``          绑定解析；缺失抛 GaitExecutorError
 - ``send_relative(axis, delta, speed) -> str``   "sent" / "noop" / "failed"
 - ``send_synchronized(moves, duration_s) -> str``  原子同步组，仅允许"sent"
+- ``send_synchronized_endpoint(moves, duration_s, endpoints) -> str``
+  分段组使用同一 S4 原点的累计终点，段间等待双轴 DONE，不累计相对取整误差
 - ``wait_terminal(axis, timeout_s) -> str``      "DONE"/"ABORTED"/"TIMEOUT"/"CANCELLED"
 - ``stop_axes(axes)``                            中止时停轴
 - ``cancelled() -> bool``                        急停/关闭/控制代数失效
@@ -227,20 +229,28 @@ class GaitExecutor:
         for group_index, group in enumerate(stage.move_groups):
             if self._abort_check(stage):
                 return False
-            if not self._run_group(stage, group):
+            if not self._run_group(stage, group, group_index):
                 return False
             if progress is not None:
                 progress(stage.stage_id, group_index + 1, total)
         return True
 
-    def _run_group(self, stage: GaitStage, group) -> bool:
+    def _run_group(self, stage: GaitStage, group, group_index=0) -> bool:
         dispatched: list[tuple[int, str]] = []  # (axis, role)
         expected_s = stage.duration_s if stage.synchronized else 0.0
+        if stage.group_durations:
+            expected_s = stage.group_durations[group_index]
         if stage.synchronized:
             try:
                 moves = [(self._host.role_axis(m.role), m.delta, m.speed) for m in group]
-                sender = getattr(self._host, "send_synchronized", None)
-                if sender is None or sender(moves, stage.duration_s) != "sent":
+                if stage.sync_endpoints:
+                    sender = getattr(self._host, "send_synchronized_endpoint", None)
+                    result = (None if sender is None else sender(
+                        moves, expected_s, stage.sync_endpoints[group_index]))
+                else:
+                    sender = getattr(self._host, "send_synchronized", None)
+                    result = None if sender is None else sender(moves, expected_s)
+                if result != "sent":
                     raise GaitExecutorError("固件/宿主不支持原子同步轨迹或预检未通过；不允许独立 MOVE 降级")
                 dispatched = [(axis, m.role) for (axis, _, _), m in zip(moves, group)]
             except Exception as exc:
