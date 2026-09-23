@@ -122,12 +122,14 @@ static void sync_task(void*) {
         s_state[axes[j]].store(STEP_FINISHING);
       }
     }
-    for (int j = 0; j < 2; ++j)
-      serial_tx_printf("STEP,%d,%s,%d,%d", axes[j], aborted ? "ABORT" : "DONE",
-                       done[j], s_sync_steps[j]);
-    // Clear the pair BEFORE making either axis reusable.
+    // Publish terminals only after both axes can accept the next SYNC segment.
+    // Cache totals: a new command may replace the shared job after IDLE.
+    const int totals[2] = {s_sync_steps[0], s_sync_steps[1]};
     s_sync_active.store(false);
     for (int j = 0; j < 2; ++j) s_state[axes[j]].store(STEP_IDLE);
+    for (int j = 0; j < 2; ++j)
+      serial_tx_printf("STEP,%d,%s,%d,%d", axes[j], aborted ? "ABORT" : "DONE",
+                       done[j], totals[j]);
   }
 }
 

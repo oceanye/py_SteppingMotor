@@ -80,6 +80,7 @@ from motor_control.serial_session import (
 )
 from motor_control.state_store import StateStore, StateStoreError
 from motor_control.gait_executor import GaitExecutor, GaitExecutorError
+from motor_control.gait_avoidance import TWO_MODE, leg_clearance
 from motor_control.gait_planner import (
     LOW_NODE_PHASE_DEG,
     SWING_ARC_DEG,
@@ -88,9 +89,9 @@ from motor_control.gait_planner import (
     plan_gait_stages,
     plan_swing_trajectory,
     unwrap_swing_joint_delta,
-    angular_targets,
-    default_hex_pads,
     clearance_margin_mm,
+    effective_geometry,
+    gait_pads,
 )
 from motor_control.ui_dispatch import UiDispatcher
 from motor_control.ui import (
@@ -183,6 +184,10 @@ class _GaitHostAdapter:
 
     def send_synchronized(self, moves, duration_s):
         return self._app._gait_send_synchronized(moves, duration_s)
+
+    def send_synchronized_endpoint(self, moves, duration_s, endpoints):
+        return self._app._gait_send_synchronized(moves, duration_s,
+                                                cumulative_targets=endpoints)
 
     def wait_terminal(self, axis, timeout_s):
         return self._app._gait_wait_terminal(axis, timeout_s)
@@ -351,7 +356,7 @@ class StepperGUI:
         self._load_control_bindings()
 
         # ── 三足轮换步态：参数（标定向导写入 .gait_params.json）+ 当前执行实例 ──
-        self.gait_params = GaitParams()
+        self.gait_params = GaitParams(trajectory_mode=TWO_MODE)
         self._gait_run: GaitExecutor | None = None
         self._gait_owned = {}
         self._gait_supports = ("A", "B")
@@ -768,8 +773,9 @@ class StepperGUI:
         beta_now = getattr(self, "_gait_beta_deg", params.beam_reference_deg)
         start, pivot = supports if side == "left" else supports[::-1]
         bearing = beta_now + (180.0 if side == "right" else 0.0)
+        geometry = effective_geometry(params)
         if pads is None:
-            pads = default_hex_pads(params.geometry)
+            pads = gait_pads(params, pivot)
         landing_bearing = (bearing - arc_deg + 180.0) % 360.0 - 180.0
         for name, pad in pads.items():
             if name in (start, pivot):
@@ -779,7 +785,7 @@ class StepperGUI:
                 pad.center[0] - pads[pivot].center[0]))
             bearing_err = abs((pad_bearing - landing_bearing + 180) % 360 - 180)
             radius_err = abs(math.dist(pad.center, pads[pivot].center)
-                             - params.geometry.d_mm)
+                             - geometry.d_mm)
             if bearing_err <= 0.5 and radius_err <= 0.5:
                 return (start, name, pivot, bearing)
         return None
@@ -793,6 +799,8 @@ class StepperGUI:
         """
 
         params = (params if params is not None else self.gait_params).validated()
+        auto_avoidance = params.trajectory_mode == TWO_MODE
+        geometry = effective_geometry(params)
         if side not in ("left", "right"):
             raise GaitExecutorError("side 必须是 left 或 right")
         # 2026-09-22 按用户要求：实机移动与预览的四种换位方式一致。
@@ -812,6 +820,8 @@ class StepperGUI:
                 or not -360.0 < arc_selection < 360.0 or arc_selection == 0):
             raise GaitExecutorError("换位方向无效；请用对应的【开始…移】按钮")
         arc_deg = arc_selection
+        if auto_avoidance and not math.isclose(abs(arc_deg), SWING_ARC_DEG):
+            raise GaitExecutorError("两模态避杆只支持相邻支座 ±60° 换位")
         if not self._is_serial_connected():
             raise GaitExecutorError("串口未连接")
         with self.state_lock:
@@ -887,7 +897,7 @@ class StepperGUI:
         supports = getattr(self, "_gait_supports", ("A", "B"))
         start, pivot = supports if side == "left" else supports[::-1]
         bearing = beta_now + (180.0 if side == "right" else 0.0)
-        pads = default_hex_pads(params.geometry)
+        pads = gait_pads(params, pivot)
         expected_bearing = math.degrees(math.atan2(
             pads[start].center[1] - pads[pivot].center[1],
             pads[start].center[0] - pads[pivot].center[0]))
@@ -902,15 +912,17 @@ class StepperGUI:
                 "没有六边形支座；请核实站位与横梁角，或先交换摆动/支撑侧")
         report = plan_swing_trajectory(
             params, side=side, route=route, arc_deg=arc_deg)
+        if auto_avoidance and not report.feasible:
+            raise GaitExecutorError("两模态腿—高杆避让未通过，禁止抬足：" + report.message)
         self.log(f"步态角度联动校验（{route[0]}→{route[1]}，支点{route[2]}，"
                  f"{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°）：{report.message}")
-        # 2026-09-18 按用户要求：碰撞/避障类校验不再一票否决，只收集
-        # 警告提示；行程、线缆窗口、固件能力、标定等操作安全检查仍拦截。
+        # legacy 保留历史碰撞仅提示行为；两模态的腿—高杆门槛已在上方
+        # 拦截，额外结构诊断仍提示。行程、固件、标定等操作门槛仍拦截。
         clearance_warnings: list[str] = []
         if not report.feasible:
             clearance_warnings.append(f"干跑校验不可行：{report.message}")
         stages = plan_gait_stages(params, side=side, swing_psi_start_deg=psi_now,
-                                  arc_deg=arc_deg)
+                                  arc_deg=arc_deg, route=route)
         # S3 也有扫掠风险，按相同包络检查整个原地相位调整，不只检查 S4。
         phase_stage = next((s for s in stages if s.stage_id == "S3"), None)
         if phase_stage is not None:
@@ -923,21 +935,30 @@ class StepperGUI:
             if phase_margin <= 0:
                 clearance_warnings.append(
                     f"S3 原地相位调整可能扫掠高点（最小间隙 {phase_margin:.2f}mm）")
+            if auto_avoidance:
+                phase_margin = min(leg_clearance(
+                    pads[start].center, psi_now+delta_psi*i/360,
+                    geometry, report.hexagons)[0] for i in range(361))
+                phase_margin -= geometry.arm_length_mm*math.radians(abs(delta_psi))/720
         p_swing, p_support = self.axis_profiles[axis], self.axis_profiles[support_axis]
         # One shared master tick, rounded total counts and DDA rounding contribute
         # at most two pulse quanta per joint. Reserve their geometric displacement.
         phi_error = 2.0 / p_support.pulses_per_unit
         psi_error = phi_error + 2.0 / p_swing.pulses_per_unit
-        pulse_envelope = math.radians(phi_error) * params.geometry.d_mm + math.radians(psi_error) * params.geometry.arm_length_mm
+        pulse_envelope = math.radians(phi_error) * geometry.d_mm + math.radians(psi_error) * geometry.arm_length_mm
         # 2026-09-21 起 S2 两直轴同时抬升，量化包络须覆盖两条直轴。
         for lift_axis in (role_axes["Mup1"], role_axes["Mup2"]):
             pulse_envelope += 0.5 / self.axis_profiles[lift_axis].pulses_per_unit
         phase_residual = abs((psi_now - LOW_NODE_PHASE_DEG + 60) % 120 - 60)
         if phase_stage is not None:
             phase_residual = 0.5 / p_swing.pulses_per_unit
-        pulse_envelope += params.geometry.arm_length_mm * math.radians(phase_residual)
-        pulse_envelope += params.geometry.d_mm * math.radians(abs((bearing - expected_bearing + 180) % 360 - 180))
+        pulse_envelope += geometry.arm_length_mm * math.radians(phase_residual)
+        pulse_envelope += geometry.d_mm * math.radians(abs((bearing - expected_bearing + 180) % 360 - 180))
         if report.min_margin_mm <= pulse_envelope or (phase_stage is not None and phase_margin <= pulse_envelope):
+            if auto_avoidance:
+                raise GaitExecutorError(
+                    f"腿—高杆净间隙不足以覆盖脉冲/标定误差包络 {pulse_envelope:.3f}mm；"
+                    "禁止执行，请核实实测半径、间隙及脉冲分辨率")
             clearance_warnings.append(
                 f"避障余量（最小间隙 {report.min_margin_mm:.2f}mm）可能不足以覆盖"
                 f"脉冲量化包络 {pulse_envelope:.2f}mm；建议提高细分/减速比或修正几何")
@@ -959,18 +980,24 @@ class StepperGUI:
                     if abs(p.units_from_steps(r.position_steps)-z) > params.rotation_limit_deg:
                         raise GaitExecutorError(f"{role} 当前已在线缆窗口外")
             for stage in stages:
-                for group in stage.move_groups:
+                stage_origin = dict(targets)
+                for group_index, group in enumerate(stage.move_groups):
                     sync_counts = []
-                    for move in group:
+                    for move_index, move in enumerate(group):
                         a = role_axes[move.role]
                         p, r = self.axis_profiles[a], self.axis_runtime[a]
-                        count = p.command_steps_from_units(abs(move.delta))
-                        if count < 1 or move.speed * p.pulses_per_unit > PULSE_RATE_WARN_PPS:
+                        signed_delta = math.copysign(p.command_steps_from_units(abs(move.delta)), move.delta)
+                        if stage.sync_endpoints:
+                            endpoint = stage.sync_endpoints[group_index][move_index]
+                            target = stage_origin[a] + math.copysign(p.command_steps_from_units(abs(endpoint)), endpoint)
+                            signed_delta = target-targets[a]
+                        count = int(abs(signed_delta))
+                        if (count < 1 and not stage.sync_endpoints) or move.speed * p.pulses_per_unit > PULSE_RATE_WARN_PPS:
                             raise GaitExecutorError(f"{move.role} {stage.stage_id} 脉冲分辨率/速度不符合安全要求")
                         if count > 20000000:
                             raise GaitExecutorError("步态运动超过固件单段脉冲数限制")
-                        targets[a] += math.copysign(count, move.delta)
-                        direction = DIR_OUTWARD if move.delta * outward_position_sign(a) > 0 else DIR_INWARD
+                        targets[a] += signed_delta
+                        direction = DIR_OUTWARD if signed_delta * outward_position_sign(a) > 0 else DIR_INWARD
                         sync_counts.append((a, count if direction ^ DIR_INVERT[a] else -count))
                         if ((r.min_steps is not None and targets[a] < r.min_steps)
                                 or (r.max_steps is not None and targets[a] > r.max_steps)):
@@ -982,7 +1009,9 @@ class StepperGUI:
                     if stage.synchronized:
                         try:
                             build_sync_command(sync_counts[0][0], sync_counts[0][1],
-                                               sync_counts[1][0], sync_counts[1][1], round(stage.duration_s*1000000))
+                                               sync_counts[1][0], sync_counts[1][1], round(
+                                                   (stage.group_durations[group_index] if stage.group_durations
+                                                    else stage.duration_s)*1000000))
                         except ProtocolEncodingError as exc:
                             raise GaitExecutorError(f"同步轨迹时间/脉冲数超出固件能力：{exc}") from exc
             token = object()
@@ -1192,13 +1221,18 @@ class StepperGUI:
         return "sent" if self._send_mm_reserved(
             axis, abs(delta), direction, delay_ms, profile=profile, guard=guard) else "failed"
 
-    def _gait_send_synchronized(self, moves, duration_s):
+    def _gait_send_synchronized(self, moves, duration_s, *, cumulative_targets=None):
         """Preflight/reserve BOTH axes before one SYNC write; no serial motion fallback."""
         if len(moves) != 2 or self._control_worker_cancelled():
             return "failed"
         prepared = []
         with self.state_lock:
-            for axis, delta, speed in moves:
+            run = getattr(self, "_gait_run", None)
+            if cumulative_targets is not None and (run is None or len(cumulative_targets) != 2):
+                return "failed"
+            origin = (getattr(run, "rotation_start", None) or
+                      {a: self.axis_runtime[a].position_steps for a, _, _ in moves})
+            for move_index, (axis, delta, speed) in enumerate(moves):
                 if not 0 <= axis < 6 or not math.isfinite(delta) or not math.isfinite(speed) or speed <= 0:
                     return "failed"
                 p, r = self.axis_profiles[axis], self.axis_runtime[axis]
@@ -1209,16 +1243,23 @@ class StepperGUI:
                         or self.stepper_in_progress[axis] or self._move_dispatching[axis]):
                     return "failed"
                 count = p.command_steps_from_units(abs(delta))
-                if count <= 0:  # cannot silently drop one half of a coupled path
-                    return "failed"
                 signed = count if delta > 0 else -count
+                if cumulative_targets is not None:
+                    endpoint = cumulative_targets[move_index]
+                    if not math.isfinite(endpoint):
+                        return "failed"
+                    signed = int(origin[axis] + math.copysign(p.command_steps_from_units(abs(endpoint)), endpoint)
+                                 - r.position_steps)
+                    count = abs(signed)
+                if count <= 0 and cumulative_targets is None:
+                    return "failed"
                 target = r.position_steps + signed
                 if ((r.min_steps is not None and target < r.min_steps)
                         or (r.max_steps is not None and target > r.max_steps)):
                     return "failed"
                 if speed * p.pulses_per_unit > min(5000, PULSE_RATE_WARN_PPS):
                     return "failed"
-                direction = DIR_OUTWARD if delta * outward_position_sign(axis) > 0 else DIR_INWARD
+                direction = DIR_OUTWARD if signed * outward_position_sign(axis) > 0 else DIR_INWARD
                 wire_count = count if direction ^ DIR_INVERT[axis] else -count
                 prepared.append((axis, signed, wire_count, token))
             a, b = prepared
@@ -1230,9 +1271,12 @@ class StepperGUI:
                 self._move_dispatching[axis] = True
                 self.stepper_in_progress[axis] = True
                 self._pending_step[axis] = signed
-                self.axis_motion_telemetry[axis] = AxisMotionTelemetry.starting(
-                    self._axis_motion_generation[axis], abs(signed))
-            if self._gait_run is not None:
+                self.axis_motion_telemetry[axis] = (AxisMotionTelemetry.starting(
+                    self._axis_motion_generation[axis], abs(signed)) if signed else
+                    AxisMotionTelemetry(generation=self._axis_motion_generation[axis],
+                                        state="STARTING", requested_steps=0, executed_steps=0,
+                                        started_monotonic=time.monotonic(), updated_monotonic=time.monotonic()))
+            if run is not None and run.rotation_start is None:
                 self._gait_run.rotation_start = {axis: self.axis_runtime[axis].position_steps
                                                 for axis, _, _, _ in prepared}
 
@@ -1373,6 +1417,12 @@ class StepperGUI:
         alt_route = self._gait_landing_route(side, params, arc_deg=-arc_deg)
         self._gait_preview_alt_pad = (alt_route[1] if alt_route else None)
         if route is None:
+            if params.trajectory_mode == TWO_MODE:
+                stop_preview_animation(self)
+                self._gait_last_report = None
+                self.gait_report_var.set("当前站位该方向没有目标支座；未生成替代轨迹")
+                draw_gait_preview(self)
+                return
             self.log(f"⚠️ 干跑：当前站位该侧{'顺' if arc_deg > 0 else '逆'}向"
                      f"{abs(arc_deg):g}°落点没有六边形支座，"
                      "预览退回固定 A→C/B→A 示意路由")
@@ -1380,6 +1430,8 @@ class StepperGUI:
             params, side=side, route=route, arc_deg=arc_deg)
         self._gait_last_report = report
         self._gait_last_report_key = (side, arc_deg)
+        self._gait_preview_stance = (getattr(self, "_gait_supports", ("A", "B")),
+                                    getattr(self, "_gait_beta_deg", 180.0))
         self.gait_report_var.set(report.message)
         start, target, pivot, _bearing = report.route
         direction = "顺向" if arc_deg > 0 else "逆向"
@@ -1387,7 +1439,7 @@ class StepperGUI:
                     if self._gait_preview_alt_pad else "")
         self.log(
             f"步态角度预览（{side}·{direction}，{start}→{target} 绕{pivot}"
-            f"{alt_text}，相位增益 {params.phase_gain:g}）：{report.message}")
+            f"{alt_text}，轨迹模式 {params.trajectory_mode}）：{report.message}")
         stop_preview_animation(self)
         draw_gait_preview(self)
         if not report.feasible and interactive:
@@ -1409,9 +1461,12 @@ class StepperGUI:
                          float(self.gait_arc_var.get()))
         except (AttributeError, tk.TclError, ValueError):
             selection = None
+        stance = (getattr(self, "_gait_supports", ("A", "B")),
+                  getattr(self, "_gait_beta_deg", 180.0))
         if (getattr(self, "_gait_last_report", None) is None
                 or selection is None
-                or getattr(self, "_gait_last_report_key", None) != selection):
+                or getattr(self, "_gait_last_report_key", None) != selection
+                or getattr(self, "_gait_preview_stance", stance) != stance):
             self._gait_run_dry_run(interactive=False)
         play_preview_animation(self)
 
@@ -1436,7 +1491,9 @@ class StepperGUI:
                          + ("+" if run.arc_deg > 0 else "-"))
         self._gait_last_report = report
         self._gait_last_report_key = (side, run.arc_deg)
+        self._gait_preview_stance = (self._gait_supports, self._gait_beta_deg)
         self.gait_report_var.set(report.message)
+        stop_preview_animation(self)
         draw_gait_preview(self)
         self._refresh_gait_ui()
 
@@ -1715,6 +1772,11 @@ class StepperGUI:
                 self.axis_motion_telemetry[axis] = (
                     self.axis_motion_telemetry[axis].with_progress(done, total)
                 )
+            elif pending == 0 and total == 0 and done == 0 and axis in getattr(self, "_gait_owned", {}):
+                # Stationary partner still belongs to the atomic SYNC pair.
+                self.axis_motion_telemetry[axis] = replace(
+                    self.axis_motion_telemetry[axis], state="MOVING",
+                    executed_steps=0, updated_monotonic=time.monotonic())
         if 0 <= axis < len(self.sw) and 'progress' in self.sw[axis]:
             pct = int(done * 100 / total) if total > 0 else 0
             self.sw[axis]['progress']['value'] = pct

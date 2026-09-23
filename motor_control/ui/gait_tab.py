@@ -13,11 +13,12 @@ from tkinter import ttk
 from dataclasses import replace
 
 from motor_control.gait_planner import GaitParams, LOW_NODE_PHASE_DEG
+from motor_control.gait_avoidance import LEGACY, TWO_MODE
 from motor_control.ui.common import PAD
 from motor_control.ui.gait_twin import build_twin_panel, refresh_twin_panel
 
 GEOMETRY_FIELDS = (
-    ("d_mm", "中心距 d (mm)"),
+    ("d_mm", "旧中心距 d（两模态忽略）"),
     ("arm_length_mm", "爪臂长/节点环半径 (mm)"),
     ("hub_radius_mm", "壳体等水平包络半径 (mm)"),
     ("arm_radius_mm", "爪臂等效半径 (mm)"),
@@ -29,7 +30,7 @@ GEOMETRY_FIELDS = (
 )
 GAP_FIELDS = (("safety_margin_mm", "参考安全间隙 δ (mm)"),)
 RUN_FIELDS = (
-    ("phase_gain", "自转/公转增益 k（默认-2）"),
+    ("phase_gain", "旧模式增益 k（两模态忽略）"),
     ("swing_speed_deg_s", "公转峰值速度 (°/s)"),
     ("rotation_limit_deg", "线缆角度限位 ±(°)"),
     ("lift_mm", "实际抬足行程 (mm)"),
@@ -85,6 +86,8 @@ def build_gait_tab(app, parent) -> None:
     app.gait_stage_var = tk.StringVar(value="未开始")
     app.gait_state_var = tk.StringVar(value="")
     app.gait_calibrated_var = tk.BooleanVar(value=False)
+    app.gait_trajectory_var = tk.StringVar(value=TWO_MODE)
+    app.gait_trajectory_var.trace_add("write", lambda *_: _invalidate_calibration(app))
     app._gait_loading_fields = False
     app._gait_last_report = None
 
@@ -94,7 +97,8 @@ def build_gait_tab(app, parent) -> None:
         warning,
         text=(
             "旋转联动只按角度计算；中心距和六边形尺寸不改变电机转角。实机按 S0–S7 逐阶段确认，"
-            "旋转轴需支持 SYNC 的同一 ESP32。几何参考仅作间隙提示；接触和支撑状态仍需现场确认。"
+            "旋转轴需支持 SYNC 的同一 ESP32。两模态按当前站位自动判断，腿—高杆净间隙不合格禁止执行；"
+            "旧模式保留历史行为。接触和支撑仍需现场确认。"
         ),
         foreground="#334155", wraplength=680,
         justify="left",
@@ -145,13 +149,17 @@ def _build_params_column(app, parent) -> None:
             row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
 
     inner = pages["run"].content
-    note(inner, 0, "每步公转 60°；Δψ = kφ，Δq摆 = (k+1)φ，Δq支 = φ。\n"
-         "默认 k=-2：摆动电机与公转反向转 60°，支撑（公转）电机 +60°。\n"
-         "换位目标按顺向 60° 几何落点自动选取（含邻座）。")
-    for row, (key, label) in enumerate(RUN_FIELDS + GAP_FIELDS, 1):
+    ttk.Label(inner, text="避杆轨迹模式").grid(row=0, column=0, sticky="w", padx=6)
+    ttk.Combobox(inner, textvariable=app.gait_trajectory_var,
+                 values=(TWO_MODE, LEGACY), state="readonly", width=16).grid(
+                     row=0, column=1, columnspan=2, sticky="ew", padx=6)
+    note(inner, 1, "two_mode_v1：低节点侧反向比例自转；高节点侧同向变比例自转。\n"
+         "按当前站位自动分类，四按钮均支持。分段双轴SYNC，换向时停稳。\n"
+         "legacy_gain：兼容旧固定k；不是已验证的腿避杆策略。")
+    for row, (key, label) in enumerate(RUN_FIELDS + GAP_FIELDS, 2):
         add_number_field(inner, row, key, label)
-    note(inner, 8, "抬足行程直接控制升降电机。参考间隙只用于几何估算，"
-         "不会增加抬升距离或改变旋转角度。")
+    note(inner, 9, "两模态使用紧贴晶格 d=√3R，保留但不使用旧中心距。"
+         "腿/杆半径和δ必须实测，不能调小数值强行放行。抬高不能替代腿的平面避让。")
 
     inner = pages["calibration"].content
     note(inner, 0, "先在电机绑定页设置 PPR、减速比和升降导程，再点动验证方向。")
@@ -195,13 +203,13 @@ def _build_params_column(app, parent) -> None:
                    row=row, column=0, columnspan=3, sticky="w", padx=6, pady=4)
 
     inner = pages["geometry"].content
-    note(inner, 0, "仅用于画图和碰撞间隙提示，不参与旋转角度计算。"
-         "无需每次运行填写；旧配置会保留。未实测时，图示和间隙结果不能代表实际机构。")
+    note(inner, 0, "尺寸不改变候选角度规律，但腿/杆半径、R和δ决定两模态是否允许执行。"
+         "旧中心距仅用于旧模式。无需每次填写；未实测时结果不能代表实际机构。")
     for row, (key, label) in enumerate(GEOMETRY_FIELDS + PREVIEW_FIELDS, 1):
         add_number_field(inner, row, key, label)
     note(inner, len(GEOMETRY_FIELDS + PREVIEW_FIELDS)+1,
-         "紧贴正六边形满足 d=√3×节点环半径；只有参考模型使用这些尺寸。"
-         "壳体包络应包含电机、轴承和连接件。")
+         "两模态自动使用 d=√3×节点环半径。壳体/横梁参数为额外结构诊断，"
+         "不用于豁免腿的平面冲突；壳体包络应包含电机、轴承和连接件。")
     for page in pages.values():
         page.bind_navigation()
 
@@ -357,6 +365,10 @@ def _build_run_column(app, parent) -> None:
 def _invalidate_calibration(app):
     if not getattr(app, "_gait_loading_fields", False):
         app.gait_calibrated_var.set(False)
+        # Changing the law/geometry must not replay a cached, different path.
+        app._gait_last_report = None
+        if getattr(app, "gait_widgets", {}).get("preview_anim"):
+            stop_preview_animation(app)
 
 
 def load_gait_fields(app) -> None:
@@ -364,6 +376,7 @@ def load_gait_fields(app) -> None:
 
     params = app.gait_params
     app._gait_loading_fields = True
+    app.gait_trajectory_var.set(params.trajectory_mode)
     for key, _label in GEOMETRY_FIELDS + GAP_FIELDS:
         value = getattr(params.geometry, key)
         # Preserve the saved value exactly (especially d = sqrt(3) * R).
@@ -413,6 +426,7 @@ def collect_gait_params(app, base: GaitParams) -> GaitParams:
             value = int(value)
         geometry_updates[key] = value
     param_updates = {}
+    param_updates["trajectory_mode"] = app.gait_trajectory_var.get()
     for key, _label in BEAT_FIELDS:
         value = _field_number(app, key)
         if key in INTEGER_FIELDS:
@@ -445,8 +459,8 @@ ANIM_TARGET_FRAMES = 180    # 总帧数上限（约 7 秒），采样多时跳�
 def draw_gait_preview(app) -> None:
     """按最近一次干跑报告重画俯视图（无报告时画占位提示）。
 
-    只画本次 route 涉及的起点/支点/目标三座——碰撞校验仍覆盖全部
-    支座，图面聚焦后轨迹与间隙最紧点才看得清。
+    聚焦本次 route 的起点/支点/目标；两模态额外显示扫掠邻域支座，
+    避免图上漏掉相邻高杆。碰撞校验覆盖完整规划邻域。
     """
 
     canvas = app.gait_widgets.get("preview_canvas")
@@ -494,7 +508,10 @@ def _preview_scene(app, report, width, height):
     hexagon_nodes = {}
     for hexagon in report.hexagons:
         if names is not None and hexagon.name not in names:
-            continue
+            if (app.gait_params.trajectory_mode != TWO_MODE or
+                    min(math.dist(hexagon.center, s.center) for s in report.samples)
+                    > 2*geometry.arm_length_mm+geometry.node_radius_mm):
+                continue
         nodes = hexagon.low_nodes(geometry.arm_length_mm) + \
             hexagon.high_nodes(geometry.arm_length_mm)
         hexagon_nodes[hexagon.name] = nodes
@@ -579,10 +596,9 @@ def _draw_preview_path(canvas, scene, report, params) -> None:
     for sample in report.samples[::step]:
         for arm_index in range(3):
             angle = math.radians(sample.psi_deg + 120.0 * arm_index)
-            start = (
-                sample.center[0] + geometry.hub_radius_mm * math.cos(angle),
-                sample.center[1] + geometry.hub_radius_mm * math.sin(angle),
-            )
+            inner_radius = 0.0 if params.trajectory_mode == TWO_MODE else geometry.hub_radius_mm
+            start = (sample.center[0] + inner_radius * math.cos(angle),
+                     sample.center[1] + inner_radius * math.sin(angle))
             end = (
                 sample.center[0] + geometry.arm_length_mm * math.cos(angle),
                 sample.center[1] + geometry.arm_length_mm * math.sin(angle),
@@ -663,7 +679,7 @@ def draw_preview_frame(app, report, index: int) -> None:
     配色与机构左右固定对应（不能搞混）：蓝=左足、橙=右足；摆动足
     用它自身左右侧的颜色——左侧换位蓝足移动、右侧换位橙足移动。
     支撑足站在支点低节点上，公转期间世界姿态不变；摆动足三爪按 ψ
-    反向自转。横梁两端缩进壳体半径，不贯穿足本体。动画只覆盖 S4
+    按选定模态自转。横梁两端缩进壳体半径，不贯穿足本体。动画只覆盖 S4
     旋转段；抬升/收腿/落位是直线动作，不在本图。
     """
 

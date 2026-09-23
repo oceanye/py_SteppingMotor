@@ -10,12 +10,14 @@ quit+destroy 并吞掉销毁期 TclError——2026-09-22 曾因收尾不干净�
 """
 import os
 import sys
+import math
 import tkinter as tk
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from motor_control.desktop_app import StepperGUI            # noqa: E402
+from motor_control.state_store import StateStore
 from motor_control.ui import stop_preview_animation         # noqa: E402
 from motor_control.ui.gait_tab import _gait_mode_selected   # noqa: E402
 
@@ -57,7 +59,10 @@ def run_smoke(app) -> None:
             assert report.route[0] != report.route[1] and report.route[1] == target, \
                 (mode, report.route)
             assert abs(report.samples[-1].phi_deg - arc) < 1e-6, (mode, arc)
-            assert report.min_margin_mm > 0, (mode, report.min_margin_mm)
+            # Uncalibrated defaults may correctly FAIL leg clearance. Layout /
+            # animation success is not evidence of physical collision safety.
+            assert math.isfinite(report.min_margin_mm), (mode, report.min_margin_mm)
+            assert report.feasible == (report.min_margin_mm > 0)
             playing = app.gait_widgets["preview_anim"].get("playing")
             assert playing, (mode, "动画未启动")
             print(f"{mode}: side={report.side:<5} {report.route[0]}->{report.route[1]}"
@@ -73,7 +78,8 @@ def main() -> int:
         root.withdraw()
     app = None
     try:
-        with patch("motor_control.desktop_app.messagebox"):
+        with patch("motor_control.desktop_app.messagebox"), \
+                patch.object(StateStore, "_save_object"):
             app = StepperGUI(root)
             run_smoke(app)
             root.update_idletasks()
