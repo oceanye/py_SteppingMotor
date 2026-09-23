@@ -256,6 +256,19 @@ def _build_run_column(app, parent) -> None:
     )
     canvas.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
     canvas.bind("<Configure>", lambda _e: draw_gait_preview(app))
+    # 2026-09-23 按用户要求：滚轮缩放采用"左键选中画面"模式——在画面内
+    # 点一下左键（蓝框）后滚轮只缩放画面；鼠标移出画面即自动取消选中，
+    # 滚轮交还给右侧页面滚动（此前缩放与页面滚动被同一滚轮同时触发）。
+    # 中键拖动平移、双击复位不变。视图状态挂在 gait_widgets，静态预览与
+    # 动画帧共用同一复合变换，切换报告/方向时复位。
+    app.gait_widgets["preview_view"] = {
+        "zoom": 1.0, "pan_x": 0.0, "pan_y": 0.0, "active": False}
+    canvas.bind("<MouseWheel>", lambda e: _preview_zoom(app, e))
+    canvas.bind("<Button-1>", lambda e: _preview_activate(app, e))
+    canvas.bind("<Leave>", lambda e: _preview_deactivate(app, e))
+    canvas.bind("<Button-2>", lambda e: _preview_pan_start(app, e))
+    canvas.bind("<B2-Motion>", lambda e: _preview_pan_move(app, e))
+    canvas.bind("<Double-Button-1>", lambda e: _preview_reset_view(app))
     # 2026-09-22 按用户要求：摆动侧与顺/逆方向合并为四个换位方式选项
     # （左顺移/左逆移/右顺移/右逆移）。切换即同步 side/arc 并静默重跑，
     # 预览图与【▶ 模拟动作】永远对应当前选择。
@@ -288,7 +301,11 @@ def _build_run_column(app, parent) -> None:
         preview,
         text="蓝=左足 橙=右足 绿点=低节点(落脚) 红点=高节点(避让)\n"
              "虚线=摆动中心轨迹；六边形按共边几何紧贴摆放\n"
-             "▶=逐帧模拟旋转段(不含抬升/下降)\n"
+             "彩线=三条爪端轨迹(青/紫/棕=腿1/2/3)\n"
+             "黄线=爪端-红杆最近距离(数值为到杆表面距离)\n"
+             "画面:左键点一下(蓝框)=选中,滚轮缩放;移出画面自动取消\n"
+             "中键拖动=平移 双击=复位视图\n"
+             "▶ 模拟=逐帧回放 再点=暂停/继续(可暂停后缩放细看)\n"
              "四个【开始…移】按钮与换位方式一一对应，点哪个走哪个",
         foreground="#666", justify="left", wraplength=260,
     )
@@ -484,6 +501,7 @@ def draw_gait_preview(app) -> None:
         return
     _draw_preview_pads(canvas, scene)
     _draw_preview_path(canvas, scene, report, app.gait_params)
+    _draw_tip_nearest(canvas, scene, app, report)
     worst = report.min_margin_sample
     if worst is not None:
         x, y = scene["to_canvas"](*worst.center)
@@ -493,6 +511,45 @@ def draw_gait_preview(app) -> None:
             PREVIEW_MARGIN + 4, PREVIEW_MARGIN + 10,
             text=f"最紧点 φ={worst.phi_deg:.1f}° ψ={worst.psi_deg:.1f}°",
             anchor="w", fill="#b45309", font=("Microsoft YaHei", 9))
+
+
+def _draw_tip_nearest(canvas, scene, app, report) -> None:
+    """全程爪端-红杆最近对：爪端/杆心各一圈 + 黄色连线 + 表面距离。
+
+    只看爪端点（用户目测爪部是否擦杆）；干跑放行门槛仍是整段腿
+    胶囊净间隙，两行文字并列展示、口径分开。
+    """
+    if not report.samples:
+        return
+    _tracks, _rods, stats = _tip_tracks_and_rods(app, report)
+    if stats is None:
+        return
+    surface, leg, index, label, tip, rod = stats
+    to_canvas = scene["to_canvas"]
+    tx, ty = to_canvas(*tip)
+    rx, ry = to_canvas(*rod)
+    canvas.create_line(tx, ty, rx, ry, fill="#f59e0b", width=1.5)
+    canvas.create_oval(tx - 4, ty - 4, tx + 4, ty + 4,
+                       outline=LEG_TRACK_COLORS[leg], width=2)
+    canvas.create_oval(rx - 4, ry - 4, rx + 4, ry + 4,
+                       outline="#f59e0b", width=1.5)
+    canvas.create_text(
+        (tx + rx) / 2, (ty + ry) / 2 - 9,
+        text=f"{surface:.1f}mm", fill="#b45309",
+        font=("Microsoft YaHei", 8, "bold"))
+    worst = report.min_margin_sample
+    line2 = f"爪端-红杆表面最近 {surface:.2f}mm（腿{leg + 1}，" \
+            f"φ={report.samples[index].phi_deg:.1f}°）"
+    line3 = f"整腿模型净间隙下界 {report.min_margin_mm:.2f}mm" \
+        if worst is not None else ""
+    canvas.create_text(
+        PREVIEW_MARGIN + 4, PREVIEW_MARGIN + 26,
+        text=line2, anchor="w", fill="#b45309", font=("Microsoft YaHei", 9))
+    if line3:
+        canvas.create_text(
+            PREVIEW_MARGIN + 4, PREVIEW_MARGIN + 42,
+            text=line3, anchor="w", fill="#92400e",
+            font=("Microsoft YaHei", 9))
 
 
 def _preview_scene(app, report, width, height):
@@ -538,14 +595,195 @@ def _preview_scene(app, report, width, height):
         max(1, height - 2 * PREVIEW_MARGIN) / span_y,
     )
 
+    # 用户视图（滚轮缩放/中键平移）叠加在自适应包围盒之上：
+    # 画布中心为缩放原点，pan 为画布像素平移；静态预览与动画帧同变换。
+    view = app.gait_widgets.get("preview_view") or {}
+    zoom = float(view.get("zoom", 1.0))
+    pan_x = float(view.get("pan_x", 0.0))
+    pan_y = float(view.get("pan_y", 0.0))
+    center_x, center_y = width / 2.0, height / 2.0
+
     def to_canvas(x, y):
-        return (
-            PREVIEW_MARGIN + (x - min_x) * scale
-            + (width - 2 * PREVIEW_MARGIN - span_x * scale) / 2,
-            height - PREVIEW_MARGIN - (y - min_y) * scale
-            - (height - 2 * PREVIEW_MARGIN - span_y * scale) / 2,
-        )
-    return {"to_canvas": to_canvas, "hexagon_nodes": hexagon_nodes}
+        base_x = (PREVIEW_MARGIN + (x - min_x) * scale
+                  + (width - 2 * PREVIEW_MARGIN - span_x * scale) / 2)
+        base_y = (height - PREVIEW_MARGIN - (y - min_y) * scale
+                  - (height - 2 * PREVIEW_MARGIN - span_y * scale) / 2)
+        return (center_x + (base_x - center_x) * zoom + pan_x,
+                center_y + (base_y - center_y) * zoom + pan_y)
+    return {"to_canvas": to_canvas, "hexagon_nodes": hexagon_nodes,
+            "zoom": zoom}
+
+
+# ── 爪端轨迹与爪-红杆最近距离（2026-09-23 目测观察用） ─────
+
+LEG_TRACK_COLORS = ("#0d9488", "#7c3aed", "#b45309")   # 腿1/2/3 爪端轨迹色
+
+
+def tip_track_points(samples, geometry, arm_index):
+    """第 arm_index 条爪臂末端沿整条轨迹的世界坐标折线（mm）。
+
+    爪端点 = 摆动中心 + R·dir(ψ+120°·k)，与动画/干跑同一 ψ 采样。
+    """
+    radius = geometry.arm_length_mm
+    track = []
+    for sample in samples:
+        angle = math.radians(sample.psi_deg + 120.0 * arm_index)
+        track.append((
+            sample.center[0] + radius * math.cos(angle),
+            sample.center[1] + radius * math.sin(angle),
+        ))
+    return track
+
+
+def _high_rods(hexagons, geometry):
+    """全部支座高杆 [(标签, 世界坐标), ...]，杆径=node_radius 参数。"""
+    rods = []
+    for pad in hexagons:
+        for j, node in enumerate(pad.high_nodes(geometry.arm_length_mm)):
+            rods.append((f"{pad.name}·{90 + 120.0 * j:g}°高杆", node))
+    return rods
+
+
+def tip_rod_clearance(tracks, hexagons, geometry):
+    """三爪末端折线对全部高杆的最近表面距离（mm）。
+
+    surface = 爪端到杆心距离 − node_radius（红杆直径 10mm → 扣 5）。
+    只看爪端点是否擦杆，供目测参考；放行门槛仍是干跑的整段腿
+    胶囊净间隙（leg_clearance，已扣腿半径与 δ），二者不可互相替代。
+    返回 (surface, leg_index, sample_index, rod_label, tip, rod) 或 None。
+    """
+    best = None
+    for leg, track in enumerate(tracks):
+        for index, tip in enumerate(track):
+            for label, rod in _high_rods(hexagons, geometry):
+                surface = math.dist(tip, rod) - geometry.node_radius_mm
+                if best is None or surface < best[0]:
+                    best = (surface, leg, index, label, tip, rod)
+    return best
+
+
+def _tip_tracks_and_rods(app, report):
+    """爪端三条折线 + 高杆表，按 report 身份缓存（动画逐帧复用）。"""
+    cache = getattr(app, "_gait_tip_cache", None)
+    if cache is not None and cache[0] is report:
+        return cache[1]
+    geometry = app.gait_params.geometry
+    tracks = tuple(tip_track_points(report.samples, geometry, k)
+                   for k in range(3))
+    rods = _high_rods(report.hexagons, geometry)
+    stats = tip_rod_clearance(tracks, report.hexagons, geometry)
+    result = (tracks, rods, stats)
+    app._gait_tip_cache = (report, result)
+    return result
+
+
+def frame_tip_clearance(report, geometry, index, rods):
+    """当前帧三爪端对全部高杆的最近表面距离（供距离连线绘制）。"""
+    sample = report.samples[index]
+    radius = geometry.arm_length_mm
+    best = None
+    for leg in range(3):
+        angle = math.radians(sample.psi_deg + 120.0 * leg)
+        tip = (sample.center[0] + radius * math.cos(angle),
+               sample.center[1] + radius * math.sin(angle))
+        for label, rod in rods:
+            surface = math.dist(tip, rod) - geometry.node_radius_mm
+            if best is None or surface < best[0]:
+                best = (surface, leg, tip, rod, label)
+    return best
+
+
+# ── 预览画布视图交互：滚轮缩放 / 中键平移 / 双击复位 ────────
+
+def _preview_redraw(app) -> None:
+    """视图变化后重画：动画播放/暂停中重画当前帧，否则画静态预览。"""
+    anim = app.gait_widgets.get("preview_anim")
+    report = getattr(app, "_gait_last_report", None)
+    if (anim is not None and (anim.get("playing") or anim.get("paused"))
+            and report is not None and report.samples):
+        draw_preview_frame(app, report, anim["frame"])
+    else:
+        draw_gait_preview(app)
+
+
+def _preview_zoom(app, event):
+    """滚轮缩放；画面处于左键选中状态（active）时才生效。
+
+    未激活返回 None，事件继续传给右侧滚动视口的页面滚动绑定；激活时
+    缩放并返回 "break" 阻断页面滚动。鼠标离开画面自动取消选中。
+    """
+    view = app.gait_widgets.get("preview_view")
+    if view is None or not view.get("active"):
+        return
+    factor = 1.1 ** (event.delta / 120.0)   # Windows 滚轮一格 ±120
+    old = float(view["zoom"])
+    new = min(50.0, max(0.2, old * factor))
+    if new == old:
+        return "break"
+    # 指针位置为不动点：T(v)=center+(v-center)·zoom+pan 仿射复合，
+    # 求新 pan 使指针所指的点缩放前后落在同一画布像素上。
+    cx = event.widget.winfo_width() / 2.0
+    cy = event.widget.winfo_height() / 2.0
+    view["pan_x"] = (event.x - cx) - new * (event.x - cx - view["pan_x"]) / old
+    view["pan_y"] = (event.y - cy) - new * (event.y - cy - view["pan_y"]) / old
+    view["zoom"] = new
+    _preview_redraw(app)
+    return "break"
+
+
+def _preview_activate(app, event) -> None:
+    """左键点一下画面：进入选中状态（蓝框），滚轮此后缩放画面。"""
+    view = app.gait_widgets.get("preview_view")
+    if view is not None:
+        view["active"] = True
+    try:
+        event.widget.configure(highlightbackground="#2563eb")
+    except tk.TclError:
+        pass
+
+
+def _preview_deactivate(app, event) -> None:
+    """鼠标离开画面：退出选中状态（灰框），滚轮交还页面滚动。"""
+    view = app.gait_widgets.get("preview_view")
+    if view is not None:
+        view["active"] = False
+    try:
+        event.widget.configure(highlightbackground="#cbd5e1")
+    except tk.TclError:
+        pass
+
+
+def _preview_pan_start(app, event) -> None:
+    view = app.gait_widgets.get("preview_view")
+    if view is not None:
+        view["pan_anchor"] = (event.x, event.y)
+
+
+def _preview_pan_move(app, event) -> None:
+    view = app.gait_widgets.get("preview_view")
+    anchor = view.get("pan_anchor") if view is not None else None
+    if anchor is None:
+        return
+    view["pan_x"] += event.x - anchor[0]
+    view["pan_y"] += event.y - anchor[1]
+    view["pan_anchor"] = (event.x, event.y)
+    _preview_redraw(app)
+
+
+def _preview_reset_view(app) -> None:
+    view = app.gait_widgets.get("preview_view")
+    if view is not None:
+        view.update(zoom=1.0, pan_x=0.0, pan_y=0.0)
+        view.pop("pan_anchor", None)
+    _preview_redraw(app)
+
+
+def reset_preview_view(app) -> None:
+    """新报告/新方向生成时由外部调用，避免旧视图卡住新包围盒。"""
+    view = app.gait_widgets.get("preview_view")
+    if view is not None:
+        view.update(zoom=1.0, pan_x=0.0, pan_y=0.0)
+        view.pop("pan_anchor", None)
 
 
 def _draw_preview_pads(canvas, scene) -> None:
@@ -583,7 +821,7 @@ def _draw_preview_pads(canvas, scene) -> None:
 
 
 def _draw_preview_path(canvas, scene, report, params) -> None:
-    """静态参考：整条摆动中心轨迹虚线 + 爪臂采样细线。"""
+    """静态参考：整条摆动中心轨迹虚线 + 爪臂采样细线 + 三条爪端轨迹。"""
 
     to_canvas = scene["to_canvas"]
     geometry = params.geometry
@@ -591,6 +829,18 @@ def _draw_preview_path(canvas, scene, report, params) -> None:
     for sample in report.samples:
         arc.extend(to_canvas(*sample.center))
     canvas.create_line(*arc, fill="#2563eb", width=2, dash=(6, 3))
+    # 2026-09-23 按用户要求：爪端（杆端）轨迹连成曲线，肉眼核对
+    # 摆动足三爪各自扫过的路线与红杆的最近关系。每条腿固定一色。
+    for leg in range(3):
+        points = []
+        for sample in report.samples:
+            angle = math.radians(sample.psi_deg + 120.0 * leg)
+            points.extend(to_canvas(
+                sample.center[0] + geometry.arm_length_mm * math.cos(angle),
+                sample.center[1] + geometry.arm_length_mm * math.sin(angle)))
+        if len(points) >= 4:
+            canvas.create_line(
+                *points, fill=LEG_TRACK_COLORS[leg], width=1.5)
     # 爪臂采样（按 swing_segments 抽稀，避免过密）
     step = max(1, len(report.samples) // int(params.swing_segments))
     for sample in report.samples[::step]:
@@ -611,7 +861,7 @@ def _draw_preview_path(canvas, scene, report, params) -> None:
 # ── 预览动作模拟（只动视图，不发任何命令） ─────────────────
 
 def play_preview_animation(app) -> None:
-    """沿最近一次干跑的 samples 逐帧回放摆动旋转段。"""
+    """沿最近一次干跑的 samples 从头逐帧回放摆动旋转段。"""
 
     report = getattr(app, "_gait_last_report", None)
     canvas = app.gait_widgets.get("preview_canvas")
@@ -620,19 +870,63 @@ def play_preview_animation(app) -> None:
         return
     stop_preview_animation(app)
     anim = app.gait_widgets.setdefault(
-        "preview_anim", {"job": None, "frame": 0, "playing": False})
-    anim.update(frame=0, playing=True)
+        "preview_anim", {"job": None, "frame": 0, "playing": False,
+                         "paused": False})
+    anim.update(frame=0, playing=True, paused=False)
     button = app.gait_widgets.get("play_btn")
     if button is not None:
-        button.configure(text="⏹ 停止模拟")
+        button.configure(text="⏸ 暂停模拟")
     start, target, pivot, _bearing = report.route
     app.log(f"▶ 预览模拟：{start}→{target} 绕{pivot}"
             f"（{len(report.samples)} 采样，仅视图动画，不动电机）")
     _preview_anim_tick(app)
 
 
+def pause_preview_animation(app) -> None:
+    """暂停：停掉计时回调但画面保留当前帧（2026-09-23 应用户要求，
+    点"停止模拟"整页闪回静态预览，改为暂停/继续）。"""
+
+    anim = app.gait_widgets.get("preview_anim")
+    if anim is None or not anim.get("playing"):
+        return
+    if anim.get("job") is not None:
+        try:
+            app.root.after_cancel(anim["job"])
+        except tk.TclError:
+            pass
+    anim.update(job=None, playing=False, paused=True)
+    button = app.gait_widgets.get("play_btn")
+    if button is not None:
+        button.configure(text="▶ 继续模拟")
+
+
+def resume_preview_animation(app) -> None:
+    """从暂停帧继续回放（不从头重播）。"""
+
+    anim = app.gait_widgets.get("preview_anim")
+    if anim is None or not anim.get("paused"):
+        return
+    anim.update(playing=True, paused=False)
+    button = app.gait_widgets.get("play_btn")
+    if button is not None:
+        button.configure(text="⏸ 暂停模拟")
+    _preview_anim_tick(app)
+
+
+def toggle_preview_animation(app) -> None:
+    """按钮三态入口：播放中→暂停；已暂停→继续；否则从头播放。"""
+
+    anim = app.gait_widgets.get("preview_anim")
+    if anim is not None and anim.get("playing"):
+        pause_preview_animation(app)
+    elif anim is not None and anim.get("paused"):
+        resume_preview_animation(app)
+    else:
+        play_preview_animation(app)
+
+
 def stop_preview_animation(app, *, redraw: bool = False) -> None:
-    """停止动画；redraw=True 时恢复静态预览图（Tk 线程调用）。"""
+    """彻底停止（轨迹变化/新报告/收尾用）；暂停状态一并清除。"""
 
     anim = app.gait_widgets.get("preview_anim")
     if anim is None:
@@ -642,7 +936,7 @@ def stop_preview_animation(app, *, redraw: bool = False) -> None:
             app.root.after_cancel(anim["job"])
         except tk.TclError:
             pass
-    anim.update(job=None, playing=False)
+    anim.update(job=None, playing=False, paused=False)
     button = app.gait_widgets.get("play_btn")
     if button is not None:
         button.configure(text="▶ 模拟动作")
@@ -665,8 +959,12 @@ def _preview_anim_tick(app) -> None:
         return
     step = max(1, round(len(samples) / ANIM_TARGET_FRAMES))
     anim["frame"] = min(index + step, len(samples) - 1)
+    # 计时器必须由 root 注册/取消（pause/stop 都用 root.after_cancel）。
+    # canvas.after 注册的 command 记在 canvas 名下，root.after_cancel 只会
+    # 从 root 的记录表移除——destroy(canvas) 时二次删除同一 command 抛
+    # "can't delete Tcl command"，销毁半途而废（2026-09-23 孤儿窗根源之一）。
     try:
-        anim["job"] = canvas.after(
+        anim["job"] = app.root.after(
             ANIM_FRAME_MS, lambda: _preview_anim_tick(app))
     except tk.TclError:
         anim["job"] = None
@@ -707,6 +1005,19 @@ def draw_preview_frame(app, report, index: int) -> None:
     if len(walked) >= 2:
         canvas.create_line(*walked, fill=swing_color, width=2)
 
+    # 2026-09-23 爪端轨迹：全程淡线（曲线全貌）+ 已走浓线，逐帧看
+    # 三爪各自沿曲线走到哪；与静态预览同一套 LEG_TRACK_COLORS。
+    tracks, rods, stats = _tip_tracks_and_rods(app, report)
+    for leg in range(3):
+        whole = []
+        for tip in tracks[leg]:
+            whole.extend(to_canvas(*tip))
+        if len(whole) >= 4:
+            canvas.create_line(*whole, fill=LEG_TRACK_COLORS[leg], width=1)
+        passed = whole[:2 * (index + 1)]
+        if len(passed) >= 4:
+            canvas.create_line(*passed, fill=LEG_TRACK_COLORS[leg], width=2)
+
     sample = samples[index]
     route = report.route
     pivot_center = None
@@ -744,6 +1055,23 @@ def draw_preview_frame(app, report, index: int) -> None:
         canvas.create_line(x, y, *to_canvas(*end), fill=swing_color, width=3)
     canvas.create_oval(x - 5, y - 5, x + 5, y + 5,
                        fill=swing_color, outline="")
+    # 当前帧爪端-红杆最近对：黄色连线 + 中点数值，肉眼直读路过距离
+    frame_stat = frame_tip_clearance(report, geometry, index, rods)
+    if frame_stat is not None:
+        surface, leg, tip, rod, _label = frame_stat
+        tx, ty = to_canvas(*tip)
+        rx, ry = to_canvas(*rod)
+        canvas.create_line(tx, ty, rx, ry, fill="#f59e0b", width=1.5)
+        canvas.create_text(
+            (tx + rx) / 2, (ty + ry) / 2 - 9,
+            text=f"{surface:.1f}mm", fill="#b45309",
+            font=("Microsoft YaHei", 8, "bold"))
+        canvas.create_text(
+            PREVIEW_MARGIN + 4, PREVIEW_MARGIN + 26,
+            text=(f"爪-红杆表面距 当前 {surface:.2f}mm"
+                  + (f" / 全程最小 {stats[0]:.2f}mm（腿{stats[1] + 1}）"
+                     if stats is not None else "")),
+            anchor="w", fill="#b45309", font=("Microsoft YaHei", 9))
     canvas.create_text(
         PREVIEW_MARGIN + 4, PREVIEW_MARGIN + 10,
         text=(f"模拟 φ={sample.phi_deg:.1f}° ψ={sample.psi_deg:.1f}°"
@@ -829,7 +1157,10 @@ __all__ = [
     "collect_gait_params",
     "draw_gait_preview",
     "load_gait_fields",
+    "pause_preview_animation",
     "play_preview_animation",
     "refresh_gait_panel",
+    "resume_preview_animation",
     "stop_preview_animation",
+    "toggle_preview_animation",
 ]

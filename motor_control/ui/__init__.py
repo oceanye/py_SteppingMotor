@@ -12,9 +12,13 @@ from .gait_tab import (
     collect_gait_params,
     draw_gait_preview,
     load_gait_fields,
+    pause_preview_animation,
     play_preview_animation,
     refresh_gait_panel,
+    reset_preview_view,
+    resume_preview_animation,
     stop_preview_animation,
+    toggle_preview_animation,
 )
 from .paired_tab import build_paired_tab
 from .stepper_tab import build_stepper_tab
@@ -32,9 +36,13 @@ __all__ = [
     "collect_gait_params",
     "draw_gait_preview",
     "load_gait_fields",
+    "pause_preview_animation",
     "play_preview_animation",
     "refresh_gait_panel",
+    "reset_preview_view",
+    "resume_preview_animation",
     "stop_preview_animation",
+    "toggle_preview_animation",
     "refresh_coordinated_tab",
     "sync_binding_editor",
 ]

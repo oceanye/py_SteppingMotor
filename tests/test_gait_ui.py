@@ -15,7 +15,131 @@ try:
 except ImportError:
     HAS_TK = False
 
-from motor_control.gait_planner import GaitParams
+from motor_control.gait_planner import (
+    GaitGeometry,
+    GaitParams,
+    HexPad,
+    SwingSample,
+    plan_swing_trajectory,
+)
+
+
+class TipTrackGeometryTests(unittest.TestCase):
+    """爪端轨迹折线与爪-红杆最近表面距离的纯几何（无需 Tk）。"""
+
+    GEOMETRY = GaitGeometry(arm_length_mm=10.0, hub_radius_mm=2.0)
+
+    def test_tip_track_points_follow_center_and_psi(self):
+        from motor_control.ui.gait_tab import tip_track_points
+        samples = (
+            SwingSample(s=0.0, phi_deg=0.0, psi_deg=30.0, beta_deg=0.0,
+                        center=(0.0, 0.0), margin_mm=None),
+            SwingSample(s=1.0, phi_deg=60.0, psi_deg=150.0, beta_deg=120.0,
+                        center=(5.0, 0.0), margin_mm=None),
+        )
+        track = tip_track_points(samples, self.GEOMETRY, 1)   # 腿2 = ψ+120°
+        self.assertAlmostEqual(track[0][0], -10.0 * math.cos(math.radians(30)))
+        self.assertAlmostEqual(track[0][1], 10.0 * math.sin(math.radians(30)))
+        # 终点 ψ+120°=270°：(5,0)+10·dir(270°)
+        self.assertAlmostEqual(track[1][0], 5.0, places=9)
+        self.assertAlmostEqual(track[1][1], -10.0, places=9)
+
+    def test_tip_rod_clearance_reports_nearest_rod_surface(self):
+        from motor_control.ui.gait_tab import tip_rod_clearance, tip_track_points
+        samples = (
+            SwingSample(s=0.0, phi_deg=0.0, psi_deg=30.0, beta_deg=0.0,
+                        center=(0.0, 0.0), margin_mm=None),
+            # ψ=90° 时腿1 爪端 (0,10) 正压 B 座 90° 高杆 (0,10)：
+            # 杆半径 5（Ø10 红杆）→ 表面距离 −5，必须选中这一对
+            SwingSample(s=1.0, phi_deg=60.0, psi_deg=90.0, beta_deg=120.0,
+                        center=(0.0, 0.0), margin_mm=None),
+        )
+        tracks = tuple(tip_track_points(samples, self.GEOMETRY, k)
+                       for k in range(3))
+        stats = tip_rod_clearance(tracks, (HexPad("B", (0.0, 0.0)),),
+                                  self.GEOMETRY)
+        surface, leg, index, label, tip, rod = stats
+        self.assertEqual((leg, index), (0, 1))
+        self.assertEqual(label, "B·90°高杆")
+        self.assertAlmostEqual(surface, -5.0, places=9)
+        self.assertAlmostEqual(math.dist(tip, rod), 0.0, places=9)
+
+    def test_tip_surface_never_tighter_than_leg_capsule_margin(self):
+        # 爪端点是整段腿胶囊的一端：爪-杆表面距离 ≥ 干跑净间隙+腿半径+δ
+        from motor_control.gait_avoidance import TWO_MODE
+        from motor_control.ui.gait_tab import tip_rod_clearance, tip_track_points
+        params = GaitParams(
+            trajectory_mode=TWO_MODE,
+            geometry=GaitGeometry(d_mm=104.0, arm_length_mm=60.0))
+        report = plan_swing_trajectory(params, side="left")
+        tracks = tuple(tip_track_points(report.samples, params.geometry, k)
+                       for k in range(3))
+        stats = tip_rod_clearance(tracks, report.hexagons, params.geometry)
+        self.assertIsNotNone(stats)
+        self.assertGreaterEqual(
+            stats[0],
+            report.min_margin_mm + params.geometry.arm_radius_mm
+            + params.geometry.safety_margin_mm - 1e-6)
+
+
+class PreviewViewTransformTests(unittest.TestCase):
+    """滚轮缩放/中键平移的视图复合变换（无需真实画布）。"""
+
+    WIDTH, HEIGHT = 800, 600
+
+    def setUp(self):
+        params = GaitParams(
+            trajectory_mode="two_mode_v1",
+            geometry=GaitGeometry(d_mm=104.0, arm_length_mm=60.0))
+        self.app = SimpleNamespace(
+            gait_params=params,
+            gait_widgets={"preview_view": {"zoom": 1.0, "pan_x": 0.0,
+                                           "pan_y": 0.0}},
+        )
+        self.report = plan_swing_trajectory(params, side="left")
+        self.canvas_stub = SimpleNamespace(
+            winfo_width=lambda: self.WIDTH,
+            winfo_height=lambda: self.HEIGHT)
+
+    def _to_canvas(self):
+        from motor_control.ui.gait_tab import _preview_scene
+        scene = _preview_scene(self.app, self.report, self.WIDTH, self.HEIGHT)
+        return scene["to_canvas"]
+
+    def test_zoom_requires_activation_and_keeps_pointer_point_fixed(self):
+        from motor_control.ui.gait_tab import _preview_zoom
+        world = self.report.samples[len(self.report.samples) // 2].center
+        view = self.app.gait_widgets["preview_view"]
+        # 未左键选中画面：滚轮不缩放，返回 None 让页面滚动绑定继续处理
+        idle = _preview_zoom(self.app, SimpleNamespace(
+            widget=self.canvas_stub, x=50, y=50, delta=120))
+        self.assertIsNone(idle)
+        self.assertEqual(view["zoom"], 1.0)
+        view["active"] = True
+        mx, my = self._to_canvas()(*world)
+        for delta in (120, 120, -120):
+            result = _preview_zoom(self.app, SimpleNamespace(
+                widget=self.canvas_stub, x=int(mx), y=int(my), delta=delta))
+            self.assertEqual(result, "break")   # 激活后阻断页面滚动
+        self.assertGreater(view["zoom"], 1.0)
+        nx, ny = self._to_canvas()(*world)
+        self.assertAlmostEqual(nx, mx, delta=0.2)
+        self.assertAlmostEqual(ny, my, delta=0.2)
+
+    def test_pan_drag_shifts_view_and_reset_restores(self):
+        from motor_control.ui.gait_tab import (
+            _preview_pan_move, _preview_pan_start, reset_preview_view)
+        world = self.report.samples[0].center
+        x0, y0 = self._to_canvas()(*world)
+        _preview_pan_start(self.app, SimpleNamespace(x=100, y=100))
+        _preview_pan_move(self.app, SimpleNamespace(x=140, y=75))
+        x1, y1 = self._to_canvas()(*world)
+        self.assertAlmostEqual(x1 - x0, 40.0, places=6)
+        self.assertAlmostEqual(y1 - y0, -25.0, places=6)
+        reset_preview_view(self.app)
+        x2, y2 = self._to_canvas()(*world)
+        self.assertAlmostEqual(x2, x0, places=6)
+        self.assertAlmostEqual(y2, y0, places=6)
 
 
 @unittest.skipUnless(HAS_TK, "real Tk unavailable")
@@ -33,6 +157,7 @@ class GaitLayoutTests(unittest.TestCase):
                                    _closing=False, _gait_run=None,
                                    _gait_angle_snapshot=lambda: None,
                                    _gait_hardware_fingerprint=lambda: "test")
+        self.app.log = lambda *_args, **_kwargs: None
         for name in ("_gait_record_zero_clicked", "_gait_save_params_clicked",
                      "_gait_reload_params_clicked", "_gait_reestablish_baseline",
                      "_gait_run_dry_run", "_gait_start_run_clicked",
@@ -122,6 +247,27 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertIsNone(self.app._gait_last_report)
         self.assertEqual(collect_gait_params(self.app, self.app.gait_params).trajectory_mode, TWO_MODE)
 
+    def test_pointer_click_focus_does_not_scroll_run_viewport(self):
+        # 2026-09-23 现场：焦点在其他程序后点 GUI 按钮，右侧视口跳回顶部。
+        # 修复：鼠标按下子树随后的 FocusIn 属于点击聚焦，不触发滚动露出；
+        # 键盘 Tab 的 FocusIn 保留"滚入聚焦控件"的可达性行为。
+        viewport = self.app.gait_widgets["run_viewport"]
+        canvas = viewport.canvas
+        self.root.geometry("720x460")
+        self.root.update()
+        advance = self.app.gait_widgets["advance"]
+        canvas.yview_moveto(1.0)
+        before = canvas.yview()
+        self.assertNotEqual(before, (0.0, 1.0), "右侧视口在此窗口尺寸下应可滚动")
+        advance.event_generate("<Button-1>")    # 鼠标按下：标记点击子树
+        advance.event_generate("<FocusIn>")     # 随后的点击聚焦
+        self.root.update()
+        self.assertEqual(canvas.yview(), before)   # 不得滚动
+        viewport._pointer_click = None             # 清除标记（等同 0.5s 后）
+        advance.event_generate("<FocusIn>")     # 键盘聚焦：应滚入 advance
+        self.root.update()
+        self.assertNotEqual(canvas.yview(), before)
+
     def test_wheel_over_direction_field_scrolls_without_changing_direction(self):
         page = self.app.gait_widgets["param_pages"]["calibration"]
         self.app.gait_widgets["params_book"].select(page)
@@ -136,10 +282,57 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertGreater(page.canvas.yview()[0], before[0])
         self.assertFalse(self.errors)
 
+    def test_preview_toggles_pause_resume_and_full_stop(self):
+        # 2026-09-23 现场要求："停止模拟"改为暂停——画面停在当前帧，
+        # 再点继续；只有轨迹变化才彻底停止回静态预览。
+        from motor_control.gait_avoidance import TWO_MODE
+        from motor_control.ui.gait_tab import (
+            _preview_redraw, pause_preview_animation, play_preview_animation,
+            resume_preview_animation, stop_preview_animation)
+        params = replace(
+            self.app.gait_params, trajectory_mode=TWO_MODE,
+            geometry=replace(self.app.gait_params.geometry,
+                             d_mm=math.sqrt(3) * 60, arm_length_mm=60))
+        report = plan_swing_trajectory(params, side="left")
+        self.app._gait_last_report = report
+        button = self.app.gait_widgets["play_btn"]
+
+        play_preview_animation(self.app)
+        anim = self.app.gait_widgets["preview_anim"]
+        self.assertTrue(anim["playing"])
+        self.assertEqual(button.cget("text"), "⏸ 暂停模拟")
+
+        pause_preview_animation(self.app)
+        self.assertFalse(anim["playing"])
+        self.assertTrue(anim["paused"])
+        self.assertGreater(anim["frame"], 0)
+        self.assertEqual(button.cget("text"), "▶ 继续模拟")
+
+        # 暂停中滚轮缩放：重画必须保持暂停帧（帧号不变、仍处暂停态）
+        self.app.gait_widgets["preview_view"].update(active=True, zoom=1.5)
+        _preview_redraw(self.app)
+        self.assertTrue(anim["paused"])
+        self.assertFalse(self.errors)
+
+        paused_frame = anim["frame"]
+        resume_preview_animation(self.app)
+        self.assertTrue(anim["playing"])
+        self.assertFalse(anim["paused"])
+        self.assertGreaterEqual(anim["frame"], paused_frame)
+        self.assertEqual(button.cget("text"), "⏸ 暂停模拟")
+
+        pause_preview_animation(self.app)
+        stop_preview_animation(self.app)
+        self.assertFalse(anim["playing"] or anim["paused"])
+        self.assertEqual(button.cget("text"), "▶ 模拟动作")
+
     def test_live_canvas_follows_pulses_and_freezes_on_disconnect(self):
         from motor_control import AxisMotionTelemetry
         from motor_control.ui.gait_twin import refresh_twin_panel
-        from test_gait_twin import linked_app
+        try:                       # discover 以 tests/ 为顶级目录，直跑则带包名
+            from test_gait_twin import linked_app
+        except ImportError:
+            from tests.test_gait_twin import linked_app
         controller = linked_app()
         run, _ = controller._gait_begin_run("left")
         run.rotation_start = {2: 0, 3: 0}

@@ -107,7 +107,9 @@ from motor_control.ui import (
     draw_gait_preview,
     load_gait_fields,
     play_preview_animation,
+    reset_preview_view,
     stop_preview_animation,
+    toggle_preview_animation,
     refresh_coordinated_tab as refresh_coordinated_tab_view,
     refresh_gait_panel as refresh_gait_panel_view,
     sync_binding_editor as sync_binding_editor_view,
@@ -1428,6 +1430,8 @@ class StepperGUI:
                      "预览退回固定 A→C/B→A 示意路由")
         report = plan_swing_trajectory(
             params, side=side, route=route, arc_deg=arc_deg)
+        # 新轨迹新包围盒：滚轮缩放/中键平移视图复位，避免旧视图卡住新图
+        reset_preview_view(self)
         self._gait_last_report = report
         self._gait_last_report_key = (side, arc_deg)
         self._gait_preview_stance = (getattr(self, "_gait_supports", ("A", "B")),
@@ -1448,11 +1452,13 @@ class StepperGUI:
                 report.message + "\n\n请修正几何/半径/间隙参数后再试。")
 
     def _gait_play_preview_clicked(self):
-        """▶ 模拟动作：沿当前选择的换位方式逐帧回放（只动视图）。"""
+        """▶ 模拟动作：逐帧回放（只动视图）；播放中点=暂停，暂停点=继续。"""
 
+        # 2026-09-23 应用户要求："停止模拟"会整页闪回静态预览，改为
+        # 暂停——画面停在当前帧，再点继续；只有轨迹/方向变化才彻底停。
         anim = self.gait_widgets.get("preview_anim")
-        if anim is not None and anim.get("playing"):
-            stop_preview_animation(self, redraw=True)
+        if anim is not None and (anim.get("playing") or anim.get("paused")):
+            toggle_preview_animation(self)
             return
         # 2026-09-22 修复：切换左/右或顺/逆后直接点播放会重播旧报告。
         # 播放前核对报告与当前选择，不一致先按当前选择重新干跑。
@@ -1493,6 +1499,7 @@ class StepperGUI:
         self._gait_last_report_key = (side, run.arc_deg)
         self._gait_preview_stance = (self._gait_supports, self._gait_beta_deg)
         self.gait_report_var.set(report.message)
+        reset_preview_view(self)
         stop_preview_animation(self)
         draw_gait_preview(self)
         self._refresh_gait_ui()

@@ -44,6 +44,7 @@ class ScrollableFrame(ttk.Frame):
             widget.bind("<MouseWheel>", self._wheel, add="+")
             widget.bind("<Button-4>", self._wheel, add="+")
             widget.bind("<Button-5>", self._wheel, add="+")
+            widget.bind("<Button-1>", self._mark_pointer_focus, add="+")
             widget.bind("<FocusIn>", self._reveal_focus, add="+")
             for child in widget.winfo_children():
                 bind_tree(child)
@@ -57,8 +58,27 @@ class ScrollableFrame(ttk.Frame):
             self.canvas.yview_scroll(direction * max(1, abs(delta) // 120), "units")
         return "break"  # Do not accidentally change a direction combobox.
 
+    def _mark_pointer_focus(self, event):
+        # 鼠标按下时 widget 级绑定先于 ttk class 绑定设置焦点执行，
+        # 记下 (控件, 时刻)；随后 0.5s 内该子树获得的 FocusIn 都是点击
+        # 聚焦，不参与键盘导航的滚动露出。
+        self._pointer_click = (event.widget, getattr(event, "time", 0))
+
     def _reveal_focus(self, event):
+        # 键盘 Tab 导航时把聚焦控件滚进视口。鼠标点击同样触发 FocusIn，
+        # 但 2026-09-23 现场表现为"每次点按钮右侧页面跳回顶部"（窗口
+        # 刚从后台激活、坐标未同步时滚动目标被算成 0）——点击聚焦直接
+        # 跳过，并且任何滚动前先同步几何。
+        click = getattr(self, "_pointer_click", None)
+        if click is not None and abs(
+                getattr(event, "time", 0) - click[1]) < 500:
+            node = event.widget
+            while node is not None:
+                if node is click[0]:
+                    return
+                node = node.master
         widget = event.widget
+        self.update_idletasks()
         bounds = self.canvas.bbox("all")
         if bounds is None:
             return
