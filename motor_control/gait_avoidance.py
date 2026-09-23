@@ -17,6 +17,13 @@ LOW = "low_junction"
 HIGH = "high_junction"
 MODE_NAMES = {LOW: "低节点侧·反向比例自转", HIGH: "高节点侧·同向变比例自转"}
 SEGMENTS = 60
+# 2026-09-23 应用户观察"爪-红杆最大富余不在公转30°处"做的形状扫描：
+# 把自转过渡集中在 φ=−30°±3° 的安全缝隙里快速完成。指数 6（缓变，
+# 峰速 0.75×公转）在缝隙两肩各穿一个浅坑；对称陡化到 18（峰速
+# 2.25×公转，仍在执行端 3× 限幅内）后整腿口径净间隙由 −3.99mm
+# 转正为 +1.8mm。不对称移动加速点（提前或推后）经网格扫描均单调
+# 变差：瓶颈是 (φ,ψ) 平面里缝隙两侧的固定杆位，不是速度分配。
+HIGH_EXPONENT = 18
 
 
 def lattice_coordinates(name):
@@ -68,7 +75,8 @@ def avoidance_path(bearing_deg: float, arc_deg: float) -> AvoidancePath:
     knots = []
     for i in range(n+1):
         u = i/n
-        f = u if modality == LOW else u**6/(u**6+(1-u)**6)
+        f = u if modality == LOW else (
+            u**HIGH_EXPONENT/(u**HIGH_EXPONENT+(1-u)**HIGH_EXPONENT))
         spin = sign*120*f*(1 if modality == LOW else -1)
         knots.append((u, arc_deg*u, spin))
     return AvoidancePath(modality, arc_deg, tuple(knots))
