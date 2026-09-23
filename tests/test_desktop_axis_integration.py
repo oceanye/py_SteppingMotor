@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 import threading
 import types
@@ -330,6 +331,9 @@ class DesktopAxisIntegrationTests(unittest.TestCase):
         self.assertEqual(commands, ["MOVE,0,1,1,6000000"])
 
     def test_compatibility_launcher_preserves_historical_constants(self):
+        # 单实例互斥会把"现场正开着的 GUI"当成已有实例而 SystemExit，
+        # 测试进程显式跳过保护（逃生门仅此用途）。
+        os.environ.setdefault("STEPPING_GUI_ALLOW_MULTI", "1")
         import pc_gui
 
         expected_names = (
