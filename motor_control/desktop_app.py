@@ -1168,6 +1168,11 @@ class StepperGUI:
         run = self._gait_run
         if run is None:
             return
+        if run.state == "done":
+            # 2026-09-24 走完一步后随手点【中止】不触发"须重建基准"：
+            # 流程已完成，站位/横梁角已更新、四轴已释放，没有东西可停。
+            self.log("步态流程已完成，无需中止；可直接开始下一次换位（或点【重置】清理显示）")
+            return
         run.request_stop()
         self._gait_needs_recovery = True
         run._fail("aborted", "步态已中止，须人工重建物理基准")

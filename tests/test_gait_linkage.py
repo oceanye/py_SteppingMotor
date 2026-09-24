@@ -146,6 +146,19 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         self.assertEqual(app._gait_owned, {})
         return run
 
+    def test_abort_after_completed_run_does_not_require_recovery(self):
+        # 2026-09-24 走完一步(done)后随手点【中止】是无效操作：站位/
+        # 横梁角已更新、四轴已释放，不得触发"须人工重建基准"的惩罚，
+        # 下一步换位可直接开始（用户实机连续行走的正确姿势）。
+        app = mechanism()
+        self.complete(app, "left")
+        self.assertEqual(app._gait_run.state, "done")
+        app._gait_abort_run()
+        self.assertFalse(app._gait_needs_recovery)
+        self.assertEqual(app._gait_supports, ("C", "B"))
+        run, _ = app._gait_begin_run("right")
+        self.assertIsNotNone(run)
+
     def test_real_bridge_completes_left_then_right_and_updates_world_beta(self):
         app = mechanism()
         self.complete(app, "left")
