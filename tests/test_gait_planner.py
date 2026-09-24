@@ -185,7 +185,7 @@ class StagePlanTests(unittest.TestCase):
         self.assertEqual(
             [s for s in stages if s.stage_id != "S3"],
             [by_id[key] for key in
-             ("S0", "S1", "S2", "S2B", "S4", "S5", "S6", "S7")],
+             ("S0", "S1", "S2", "S2B", "S4", "S5", "S5B", "S6", "S7")],
         )
         # 左摆动：摆动 Mr1 +180°（sign=+1），支撑 Mr2 −60°（sign=−1）
         swing_total = support_total = 0.0
@@ -202,18 +202,20 @@ class StagePlanTests(unittest.TestCase):
                     self.assertEqual(move.role, "Mr2")
         self.assertAlmostEqual(swing_total, 180.0, places=6)
         self.assertAlmostEqual(support_total, -60.0, places=6)
-        # 2026-09-21 新流程：S2 两轴同时抬升；S2B 摆动腿收起；
-        # S6 站立腿（Mup2）收回落位。结束后两直轴坐标都回到抬升前。
+        # 2026-09-24 落脚重构：S2 两轴同抬；S2B 摆动腿收起；S5B 摆动腿
+        # 先伸出到新支座踩实；S6 两轴同步降回原标高。直轴净位移为零。
         s2_deltas = {m.role: m.delta for m in by_id["S2"].move_groups[0]}
         self.assertAlmostEqual(s2_deltas["Mup1"], params.lift_mm)
         self.assertAlmostEqual(s2_deltas["Mup2"], params.lift_mm)
         s2b = by_id["S2B"].move_groups[0][0]
         self.assertEqual(s2b.role, "Mup1")           # left 摆动侧
         self.assertAlmostEqual(s2b.delta, -params.lift_mm)
-        s6 = by_id["S6"].move_groups[0][0]
-        self.assertEqual(s6.role, "Mup2")            # left 站立侧
-        self.assertAlmostEqual(s6.delta, -params.lift_mm)
-        self.assertAlmostEqual(s6.speed, params.settle_speed_mm_s)
+        s5b = by_id["S5B"].move_groups[0][0]
+        self.assertEqual(s5b.role, "Mup1")           # 摆动腿先落脚站好
+        self.assertAlmostEqual(s5b.delta, params.lift_mm)
+        self.assertAlmostEqual(s5b.speed, params.settle_speed_mm_s)
+        s6 = {m.role: m.delta for m in by_id["S6"].move_groups[0]}
+        self.assertEqual(s6, {"Mup1": -params.lift_mm, "Mup2": -params.lift_mm})
 
     def test_right_plan_swaps_roles(self):
         params = GaitParams(swing_segments=4, phase_gain=2.0).validated()
@@ -228,9 +230,11 @@ class StagePlanTests(unittest.TestCase):
         # 右摆动 Mr2，θ=0 解绕小步 +60°
         self.assertAlmostEqual(swing_total, 180.0, places=6)
         by_id = {stage.stage_id: stage for stage in stages}
-        # 右摆动：S2B 收 Mr2（摆动侧），S6 收 Mr1（站立侧）
+        # 右摆动：S2B/S5B 都是 Mup2（摆动侧）；S6 两轴同步下降
         self.assertEqual(by_id["S2B"].move_groups[0][0].role, "Mup2")
-        self.assertEqual(by_id["S6"].move_groups[0][0].role, "Mup1")
+        self.assertEqual(by_id["S5B"].move_groups[0][0].role, "Mup2")
+        self.assertEqual({m.role for m in by_id["S6"].move_groups[0]},
+                         {"Mup1", "Mup2"})
 
     def test_reverse_arc_mirrors_stage_deltas(self):
         # 2026-09-22 实机执行与预览同向：逆向 60° 的 S4 公转/自转

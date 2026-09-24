@@ -365,6 +365,11 @@ class StepperGUI:
         self._gait_beta_deg = 180.0
         self._gait_needs_recovery = False
         self._load_gait_params()
+        # 账本原点跟随保存的初始摆放（红杆在横梁左/右侧的镜像摆法）；
+        # 由 initial_placement 派生而非直接信 beam_reference_deg，防止
+        # 手工编辑 JSON 造成摆放与横梁基准互相矛盾。
+        self._gait_supports = tuple(self.gait_params.initial_supports)
+        self._gait_beta_deg = self.gait_params.initial_beam_deg
 
         self._build_ui()
         for warning in self._startup_warnings:
@@ -670,16 +675,22 @@ class StepperGUI:
         if getattr(self, "_gait_owned", {}):
             messagebox.showwarning("步态占用", "请先中止并确认四轴停止")
             return
-        if not messagebox.askokcancel("重建物理基准", "必须人工确认：左足在A、右足在B，三爪均踩低节点；四轴静止、位置已校准。\n此按钮不移动电机。确认后须重新记两侧旋转零位并确认标定。"):
+        supports = self.gait_params.initial_supports
+        stance_text = (f"左足在{supports[0]}、右足在{supports[1]}，三爪均踩低节点；"
+                       f"红杆在横梁{'左' if supports[0] == 'A' else '右'}侧"
+                       "（与步态页【初始摆放】选择一致）")
+        if not messagebox.askokcancel("重建物理基准", f"必须人工确认：{stance_text}；四轴静止、位置已校准。\n此按钮不移动电机。确认后须重新记两侧旋转零位并确认标定。"):
             return
         with self.state_lock:
             if any(self._axis_motion_active_locked(a) for a in self.control_bindings.bound_axes):
                 return
-            self._gait_supports, self._gait_beta_deg = ("A", "B"), 180.0
+            self._gait_supports = tuple(supports)
+            self._gait_beta_deg = self.gait_params.initial_beam_deg
             self._gait_needs_recovery = False
         self._gait_run = None
         self._save_gait_params(replace(self.gait_params, mr1_zero_deg=None, mr2_zero_deg=None,
-                                      calibration_confirmed=False, beam_reference_deg=180.0))
+                                      calibration_confirmed=False,
+                                      beam_reference_deg=self.gait_params.initial_beam_deg))
         load_gait_fields(self)
         self._refresh_gait_ui()
 

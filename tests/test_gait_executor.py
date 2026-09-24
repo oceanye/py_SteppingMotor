@@ -130,13 +130,20 @@ class HappyPathTests(unittest.TestCase):
         self.assertAlmostEqual(swing_total, 180.0, places=6)
         self.assertAlmostEqual(support_total, 60.0, places=6)
 
-        # S5 确认、S6 落脚（站立侧 Mup2 收回，速度 settle）、S7 确认 → done
+        # S5 确认、S5B 移位腿先落脚（摆动侧 Mup1 +lift @ settle 速度）、
+        # S6 两腿同步下降（两轴各 −lift @ settle）、S7 确认 → done
         self.assertTrue(run.advance_confirm())
         self.assertTrue(run.execute_current_stage())
-        settle = [e for e in host.sends()
-                  if e[1] == host.role_axes["Mup2"]][-1]
-        self.assertAlmostEqual(settle[2][0], -params.lift_mm)
-        self.assertAlmostEqual(settle[2][1], params.settle_speed_mm_s)
+        extend_leg = [e for e in host.sends()
+                      if e[1] == host.role_axes["Mup1"]][-1]
+        self.assertAlmostEqual(extend_leg[2][0], params.lift_mm)
+        self.assertAlmostEqual(extend_leg[2][1], params.settle_speed_mm_s)
+        self.assertTrue(run.execute_current_stage())
+        for role in ("Mup1", "Mup2"):
+            settle = [e for e in host.sends()
+                      if e[1] == host.role_axes[role]][-1]
+            self.assertAlmostEqual(settle[2][0], -params.lift_mm)
+            self.assertAlmostEqual(settle[2][1], params.settle_speed_mm_s)
         self.assertTrue(run.advance_confirm())
         self.assertEqual(run.state, "done")
         self.assertIsNone(run.current_stage())

@@ -12,7 +12,9 @@ import tkinter as tk
 from tkinter import ttk
 from dataclasses import replace
 
-from motor_control.gait_planner import GaitParams, LOW_NODE_PHASE_DEG
+from motor_control.gait_planner import (
+    GaitParams, INITIAL_PLACEMENTS, LOW_NODE_PHASE_DEG,
+)
 from motor_control.gait_avoidance import LEGACY, TWO_MODE
 from motor_control.ui.common import PAD
 from motor_control.ui.gait_twin import build_twin_panel, refresh_twin_panel
@@ -52,6 +54,34 @@ SIGN_FIELDS = (
     ("mup2_lift_sign", "Mup2 抬升方向", "轴坐标增大 = 抬起"),
 )
 INTEGER_FIELDS = {"swing_segments", "feasibility_samples"}
+
+# 2026-09-24 初始摆放（红杆在横梁左/右侧的镜像摆法）下拉：标签面向
+# 操作员，内部值进 params.initial_placement；β₀ 由摆放派生并联动覆写。
+PLACEMENT_LABELS = {
+    "red_left": "红杆在横梁左侧（左足A·右足B）",
+    "red_right": "红杆在横梁右侧（左足B·右足A）",
+}
+LABEL_TO_PLACEMENT = {label: key for key, label in PLACEMENT_LABELS.items()}
+
+
+def _gait_placement_changed(app) -> None:
+    """初始摆放切换：基准变更——账本重置、零位作废、标定失效。"""
+
+    if getattr(app, "_gait_loading_fields", False):
+        return
+    placement = LABEL_TO_PLACEMENT.get(app.gait_placement_var.get())
+    if placement is None or placement == app.gait_params.initial_placement:
+        return
+    _invalidate_calibration(app)
+    params = replace(app.gait_params, initial_placement=placement,
+                     beam_reference_deg=INITIAL_PLACEMENTS[placement][1],
+                     mr1_zero_deg=None, mr2_zero_deg=None)
+    app.gait_params = params
+    app.gait_field_vars["beam_reference_deg"].set(str(params.beam_reference_deg))
+    refresh_zero_labels(app)
+    # 机构此时必须已按新摆放就位（左A右B 或 左B右A），账本回新原点。
+    app._gait_supports = tuple(params.initial_supports)
+    app._gait_beta_deg = params.initial_beam_deg
 
 PREVIEW_MARGIN = 16
 
@@ -163,8 +193,23 @@ def _build_params_column(app, parent) -> None:
 
     inner = pages["calibration"].content
     note(inner, 0, "先在电机绑定页设置 PPR、减速比和升降导程，再点动验证方向。")
-    add_number_field(inner, 1, *CALIBRATION_FIELDS[0])
-    row = 2
+    ttk.Label(inner, text="初始摆放（俯视·从左足看向右足）",
+              wraplength=185, justify="left").grid(
+                  row=1, column=0, sticky="w", padx=6, pady=3)
+    app.gait_placement_var = tk.StringVar(
+        value=PLACEMENT_LABELS[app.gait_params.initial_placement])
+    app.gait_placement_var.trace_add(
+        "write", lambda *_: _gait_placement_changed(app))
+    ttk.Combobox(
+        inner, textvariable=app.gait_placement_var,
+        values=tuple(PLACEMENT_LABELS[key] for key in PLACEMENT_LABELS),
+        state="readonly", width=22,
+    ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+    note(inner, 2, "机构实际怎么摆就选什么：红杆在横梁哪一侧决定同一按钮\n"
+         "的模态序列（两摆法互为镜像）。切换即基准变更：零位作废，须重新\n"
+         "摆机构到该初始状态、重新记零并确认标定。")
+    add_number_field(inner, 3, *CALIBRATION_FIELDS[0])
+    row = 4
     for key, label, hint in SIGN_FIELDS:
         ttk.Label(inner, text=label).grid(
             row=row, column=0, sticky="w", padx=6, pady=3)
@@ -394,6 +439,7 @@ def load_gait_fields(app) -> None:
     params = app.gait_params
     app._gait_loading_fields = True
     app.gait_trajectory_var.set(params.trajectory_mode)
+    app.gait_placement_var.set(PLACEMENT_LABELS[params.initial_placement])
     for key, _label in GEOMETRY_FIELDS + GAP_FIELDS:
         value = getattr(params.geometry, key)
         # Preserve the saved value exactly (especially d = sqrt(3) * R).

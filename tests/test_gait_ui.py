@@ -251,6 +251,25 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertIsNone(self.app._gait_last_report)
         self.assertEqual(collect_gait_params(self.app, self.app.gait_params).trajectory_mode, TWO_MODE)
 
+    def test_changing_initial_placement_resets_ledger_and_zero(self):
+        # 2026-09-24 初始摆放（红杆在横梁左/右）= 坐标基准：切换即账本
+        # 回新原点、零位作废、标定失效；β₀ 字段联动为派生值。
+        from motor_control.ui.gait_tab import PLACEMENT_LABELS
+        self.app._gait_supports = ("C", "B")          # 模拟已走一步
+        self.app._gait_beta_deg = 119.925
+        self.app.gait_calibrated_var.set(True)
+        self.app.gait_params = replace(self.app.gait_params,
+                                       mr1_zero_deg=1.5, mr2_zero_deg=-0.5)
+        self.app.gait_placement_var.set(PLACEMENT_LABELS["red_right"])
+        self.assertFalse(self.app.gait_calibrated_var.get())
+        self.assertEqual(self.app._gait_supports, ("B", "A"))
+        self.assertAlmostEqual(self.app._gait_beta_deg, 0.0)
+        self.assertIsNone(self.app.gait_params.mr1_zero_deg)
+        self.assertIsNone(self.app.gait_params.mr2_zero_deg)
+        self.assertEqual(self.app.gait_field_vars["beam_reference_deg"].get(), "0.0")
+        self.assertEqual(self.app.gait_params.initial_placement, "red_right")
+        self.assertFalse(self.errors)
+
     def test_pointer_click_focus_does_not_scroll_run_viewport(self):
         # 2026-09-23 现场：焦点在其他程序后点 GUI 按钮，右侧视口跳回顶部。
         # 修复：鼠标按下子树随后的 FocusIn 属于点击聚焦，不触发滚动露出；

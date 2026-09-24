@@ -170,6 +170,14 @@ class GaitGeometry:
         return self
 
 
+# 初始摆放 → (左足/右足支座, 横梁基准角)。红杆在横梁左/右侧的两种
+# 镜像摆法；程序账本原点由它派生（无传感器，全靠人工按实际摆放选择）。
+INITIAL_PLACEMENTS: dict[str, tuple[tuple[str, str], float]] = {
+    "red_left": (("A", "B"), 180.0),
+    "red_right": (("B", "A"), 0.0),
+}
+
+
 @dataclass(frozen=True)
 class GaitParams:
     """统一预览与实际分阶段执行参数；旧v1文档须重新建立零位签名。"""
@@ -203,6 +211,12 @@ class GaitParams:
     # Preserve legacy programmatic callers/configurations. New desktop sessions
     # explicitly select TWO_MODE; existing saved gains are never reinterpreted.
     trajectory_mode: str = LEGACY
+    # 2026-09-24 初始摆放两种镜像：红杆在横梁哪一侧决定同一按钮走出
+    # 的模态序列。"red_left" = 左足A、右足B、横梁基准 180°（俯视、从
+    # 左足看向右足，红杆在左手边）——原有唯一摆法；"red_right" = 左足
+    # B、右足A、基准 0°（红杆在右手边），四按钮几何整体镜像。切换即
+    # 更换坐标基准：账本重置、零位作废，必须按新摆放重新记零标定。
+    initial_placement: str = "red_left"
     beam_reference_deg: float = 180.0  # 两个 Mr 同时记零时横梁世界角
     calibration_confirmed: bool = False  # 实测几何、方向、PPR、反力闭合已确认
     calibration_fingerprint: str | None = None
@@ -215,6 +229,8 @@ class GaitParams:
         self.geometry.validated()
         if self.trajectory_mode not in (LEGACY, TWO_MODE):
             raise ValueError("未知步态轨迹模式")
+        if self.initial_placement not in INITIAL_PLACEMENTS:
+            raise ValueError("initial_placement 必须是 red_left 或 red_right")
         if not 1 <= int(self.swing_segments) <= 200:
             raise ValueError("swing_segments 必须在 1..200")
         if not 1 <= int(self.feasibility_samples) <= 5000:
@@ -244,6 +260,12 @@ class GaitParams:
             raise ValueError("phase_gain 必须为 ±2/±4/±6/±8/±10；终点须对准三重对称低节点")
         if not math.isfinite(self.beam_reference_deg):
             raise ValueError("beam_reference_deg 必须是有限数值")
+        # 摆放与横梁基准必须成对：红杆左=β₀180°、红杆右=β₀0°。手工
+        # 改 JSON 或数字框造成的不一致直接拒绝，防止账本用混合基准推算。
+        if not math.isclose(self.beam_reference_deg,
+                            INITIAL_PLACEMENTS[self.initial_placement][1]):
+            raise ValueError("beam_reference_deg 必须与初始摆放一致"
+                             "（红杆左=180°、红杆右=0°）；请用【初始摆放】切换")
         if not isinstance(self.calibration_confirmed, bool):
             raise ValueError("calibration_confirmed 必须是布尔值")
         if self.calibration_fingerprint is not None and not isinstance(self.calibration_fingerprint, str):
@@ -259,6 +281,15 @@ class GaitParams:
     @property
     def swing_side_speed_deg_s(self) -> float:
         return abs(self.phase_gain + 1.0) * self.swing_speed_deg_s
+
+    # 初始摆放派生的账本原点（启动/重建基准时写入 _gait_supports/_gait_beta_deg）。
+    @property
+    def initial_supports(self) -> tuple[str, str]:
+        return INITIAL_PLACEMENTS[self.initial_placement][0]
+
+    @property
+    def initial_beam_deg(self) -> float:
+        return INITIAL_PLACEMENTS[self.initial_placement][1]
 
     def as_document(self) -> dict[str, Any]:
         geometry = self.geometry
@@ -292,6 +323,7 @@ class GaitParams:
             "mr2_zero_deg": self.mr2_zero_deg,
             "phase_gain": self.phase_gain,
             "trajectory_mode": self.trajectory_mode,
+            "initial_placement": self.initial_placement,
             "beam_reference_deg": self.beam_reference_deg,
             "calibration_confirmed": self.calibration_confirmed,
             "calibration_fingerprint": self.calibration_fingerprint,
@@ -356,6 +388,12 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         beam_radius_mm=float(geometry_raw.get("beam_radius_mm", 4.0)),
         surrounding_pads=geometry_raw.get("surrounding_pads", True),
     )
+    beam_reference_deg = _number("beam_reference_deg", 180.0)
+    # 旧文档无摆放键：按已保存的β₀推导（0°=红杆右摆法），避免
+    # "缺键默认 red_left"与旧β₀互相矛盾导致整个文档加载失败。
+    initial_placement = value.get(
+        "initial_placement",
+        "red_right" if math.isclose(beam_reference_deg, 0.0) else "red_left")
     params = GaitParams(
         geometry=geometry,
         swing_segments=int(_number("swing_segments",
@@ -379,7 +417,8 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         mr2_zero_deg=_opt_number("mr2_zero_deg"),
         phase_gain=_number("phase_gain", GaitParams.phase_gain),
         trajectory_mode=value.get("trajectory_mode", LEGACY),
-        beam_reference_deg=_number("beam_reference_deg", 180.0),
+        initial_placement=initial_placement,
+        beam_reference_deg=beam_reference_deg,
         calibration_confirmed=value.get("calibration_confirmed", False),
         calibration_fingerprint=value.get("calibration_fingerprint"),
         mr1_zero_signature=value.get("mr1_zero_signature"),
@@ -954,13 +993,11 @@ def plan_gait_stages(
         )
     )
 
-    # S6 落脚：站立腿收回（GUI"向下"），顶部带移位腿整体下降落位。
-    # 2026-09-21 按用户澄清：落脚由站立侧直轴执行，结束后两直轴都回到
-    # 抬升前的坐标（无标高差）；下降中标高差从 lift_mm 收敛到 0，
-    # 落地纠偏按设定阈值自动释放旋转电机。
-    support_lift_role = "Mup2" if side == "left" else "Mup1"
-    support_lift_sign = (params.mup2_lift_sign if support_lift_role == "Mup2"
-                         else params.mup1_lift_sign)
+    # S6 落脚：2026-09-24 应用户实机反馈重构——单靠站立腿下降时重心
+    # 已偏向移位侧，单轴硬顶明显卡顿。改为两段：S5B 先把移位腿伸出
+    # 踩实新支座（此时两腿同高、共同承载），S6 再两轴同步降回原标高。
+    # 落地纠偏的触发点随之从"站立侧向下"移到 S5B 的"悬空侧向上"
+    # （两条等价路径，desktop_app._land_release_tick 只评估单轴运动）。
     stages.extend(
         [
             GaitStage(
@@ -969,17 +1006,30 @@ def plan_gait_stages(
                 confirm_text="目视检查移位腿爪臂相位与目标六边形低节点一一对应。",
             ),
             GaitStage(
-                stage_id="S6",
-                title="落脚（站立腿收回，顶部下降）",
+                stage_id="S5B",
+                title="移位腿先落脚",
                 confirm_text=(
-                    "站立腿低速收回，顶部带移位腿整体下降；只有移位腿三个"
-                    "低节点接触均有效后才允许进入锁定。两轴标高差收敛到阈值"
-                    "时，落地纠偏自动释放旋转电机并延迟重锁。"
+                    "移位腿低速伸出到新支座低节点踩实站好；顶部暂由站立腿"
+                    "保持高度。标高差收敛到阈值时，落地纠偏自动释放旋转电机"
+                    "并延迟重锁——属正常纠偏，不是故障。"
                 ),
                 move_groups=(
-                    (RoleMove(support_lift_role,
-                              -support_lift_sign * params.lift_mm,
+                    (RoleMove(lift_role, lift_sign * params.lift_mm,
                               params.settle_speed_mm_s),),
+                ),
+            ),
+            GaitStage(
+                stage_id="S6",
+                title="顶部下降（两腿同时）",
+                confirm_text=(
+                    "两条腿已共同承载，两直轴同步低速降回原标高；确认无卡顿、"
+                    "无侧倾、移位腿三个低节点保持接触有效后才允许进入锁定。"
+                ),
+                move_groups=(
+                    (RoleMove("Mup1", -params.mup1_lift_sign * params.lift_mm,
+                              params.settle_speed_mm_s),
+                     RoleMove("Mup2", -params.mup2_lift_sign * params.lift_mm,
+                              params.settle_speed_mm_s)),
                 ),
             ),
             GaitStage(

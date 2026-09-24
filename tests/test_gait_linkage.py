@@ -17,7 +17,7 @@ from motor_control import AxisProfile, BindingSet, MODE_ROTARY
 from motor_control.desktop_app import StepperGUI
 from motor_control.gait_executor import GaitExecutorError
 from motor_control.gait_planner import (
-    GaitGeometry, GaitParams, angular_targets, default_hex_pads,
+    GaitGeometry, GaitParams, RoleMove, angular_targets, default_hex_pads,
     plan_gait_stages, plan_swing_trajectory, smoothstep5,
     LEFT_SWING, RIGHT_SWING,
 )
@@ -74,6 +74,34 @@ def mechanism(limit=720.0):
 
     app._send_and_read = controller
     return app
+
+
+class LandingSequenceTests(unittest.TestCase):
+    def test_landing_settles_swing_leg_before_dual_descent(self):
+        # 2026-09-24 应用户实机反馈重构落脚：单腿降顶部重心偏移、硬顶
+        # 卡顿。S5B 先伸移位腿踩实新支座（顶部由站立腿保持高度，落地
+        # 纠偏在此触发），S6 才两轴同步降回原标高；直线轴净位移为零。
+        p = GaitParams(lift_mm=35, phase_gain=2.0)
+        stages = plan_gait_stages(p, side="left")
+        order = [s.stage_id for s in stages]
+        self.assertLess(order.index("S5"), order.index("S5B"))
+        self.assertLess(order.index("S5B"), order.index("S6"))
+        by_id = {s.stage_id: s for s in stages}
+        # 左移：移位腿 = Mup1；S2B 收起 -lift、S5B 伸出 +lift 抵消。
+        self.assertEqual(
+            by_id["S5B"].move_groups,
+            ((RoleMove("Mup1", 35.0, p.settle_speed_mm_s),),))
+        self.assertEqual(
+            by_id["S6"].move_groups,
+            ((RoleMove("Mup1", -35.0, p.settle_speed_mm_s),
+              RoleMove("Mup2", -35.0, p.settle_speed_mm_s)),))
+        net = {}
+        for stage in stages:
+            for group in stage.move_groups:
+                for m in group:
+                    if m.role.startswith("Mup"):
+                        net[m.role] = net.get(m.role, 0.0) + m.delta
+        self.assertEqual(net, {"Mup1": 0.0, "Mup2": 0.0})
 
 
 class AngularLawTests(unittest.TestCase):
@@ -158,6 +186,32 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         self.assertEqual(app._gait_supports, ("C", "B"))
         run, _ = app._gait_begin_run("right")
         self.assertIsNotNone(run)
+
+    def test_mirror_placement_completes_left_swing_on_high_modality(self):
+        # 红杆右摆法(左足B右足A、β₀0°)下"左顺移"恰是红杆左摆法"右顺移"
+        # 的镜像：落点同为邻座(0,-1) 绕A、模态 HIGH；完整执行链路走通、
+        # 账本随之更新。
+        from motor_control.gait_avoidance import TWO_MODE, HIGH
+        app = mechanism()
+        app.gait_params = replace(
+            app.gait_params, trajectory_mode=TWO_MODE,
+            geometry=GaitGeometry(d_mm=math.sqrt(3)*40, arm_length_mm=40,
+                                  arm_radius_mm=.2, node_radius_mm=.2,
+                                  safety_margin_mm=.1),
+            initial_placement="red_right", beam_reference_deg=0.0,
+            calibration_fingerprint=app._gait_hardware_fingerprint())
+        app.gait_params = replace(app.gait_params,
+                                  mr1_zero_signature=app._gait_zero_signature("Mr1", app.gait_params),
+                                  mr2_zero_signature=app._gait_zero_signature("Mr2", app.gait_params))
+        app._gait_supports, app._gait_beta_deg = ("B", "A"), 0.0
+        route = app._gait_landing_route("left", app.gait_params)
+        self.assertEqual(route, ("B", "邻座(0,-1)", "A", 0.0))
+        report = plan_swing_trajectory(app.gait_params, side="left", route=route)
+        self.assertEqual(report.modality, HIGH)
+        self.assertTrue(report.feasible, report.message)
+        self.complete(app, "left")
+        self.assertEqual(app._gait_supports, ("邻座(0,-1)", "A"))
+        self.assertAlmostEqual(app._gait_beta_deg, -60.075, places=4)
 
     def test_real_bridge_completes_left_then_right_and_updates_world_beta(self):
         app = mechanism()
@@ -413,6 +467,27 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         self.assertFalse(app.axis_runtime[2].position_trusted)
         self.assertFalse(app.axis_runtime[3].position_trusted)
         self.assertEqual(set(app.stopped), {0, 1, 2, 3})
+
+
+class InitialPlacementTests(unittest.TestCase):
+    """2026-09-24 红杆在横梁左/右两种初始摆放（互为镜像）的账本与模态。"""
+
+    def test_placement_derives_supports_beam_and_roundtrips(self):
+        from motor_control.gait_planner import parse_gait_params
+        p = GaitParams(initial_placement="red_right",
+                       beam_reference_deg=0.0).validated()
+        self.assertEqual(p.initial_supports, ("B", "A"))
+        self.assertEqual(p.initial_beam_deg, 0.0)
+        doc = p.as_document()
+        self.assertEqual(doc["initial_placement"], "red_right")
+        self.assertEqual(parse_gait_params(doc).initial_placement, "red_right")
+        # 旧文档缺键时按β₀推导（0°=红杆右摆法）；摆放与β₀不一致拒绝
+        legacy_doc = {k: v for k, v in doc.items() if k != "initial_placement"}
+        self.assertEqual(parse_gait_params(legacy_doc).initial_placement, "red_right")
+        for beam in (180.0, 90.0):
+            with self.assertRaises(ValueError):
+                GaitParams(initial_placement="red_right",
+                           beam_reference_deg=beam).validated()
 
 
 class SyncProtocolTests(unittest.TestCase):
