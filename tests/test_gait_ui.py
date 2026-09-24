@@ -5,8 +5,12 @@ The embedded project Python can skip these checks when Tk is unavailable.
 """
 import unittest
 import math
+import os
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 裸名互导（discover/单跑都可用）
 
 try:
     import tkinter as tk
@@ -329,10 +333,7 @@ class GaitLayoutTests(unittest.TestCase):
     def test_live_canvas_follows_pulses_and_freezes_on_disconnect(self):
         from motor_control import AxisMotionTelemetry
         from motor_control.ui.gait_twin import refresh_twin_panel
-        try:                       # discover 以 tests/ 为顶级目录，直跑则带包名
-            from test_gait_twin import linked_app
-        except ImportError:
-            from tests.test_gait_twin import linked_app
+        from test_gait_twin import linked_app
         controller = linked_app()
         run, _ = controller._gait_begin_run("left")
         run.rotation_start = {2: 0, 3: 0}

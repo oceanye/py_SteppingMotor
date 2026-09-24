@@ -1,6 +1,10 @@
 """Two-mode legs-only sweep and real desktop execution bridge; no hardware IO."""
 import math
+import os
+import sys
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 裸名互导（discover/单跑都可用）
 from dataclasses import replace
 from unittest.mock import patch
 

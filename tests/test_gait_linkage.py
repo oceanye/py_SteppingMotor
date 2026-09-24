@@ -3,7 +3,11 @@
 No serial port, Tk window, network server or physical motor is opened.
 """
 import math
+import os
+import sys
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 裸名互导（discover/单跑都可用）
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
