@@ -1,0 +1,456 @@
+{
+  "baseline_commit": "57dc02bd1a0c40d41c7845e8940a3d7d9f5b4de3",
+  "current_exponent": 18,
+  "units": "All distances normalized by R; no site calibration; geometry only",
+  "rods_xy_over_R": [
+    [
+      -6.062177826491,
+      -3.5
+    ],
+    [
+      -5.196152422707,
+      -2.0
+    ],
+    [
+      -4.330127018922,
+      -3.5
+    ],
+    [
+      -4.330127018922,
+      -0.5
+    ],
+    [
+      -3.464101615138,
+      -2.0
+    ],
+    [
+      -3.464101615138,
+      1.0
+    ],
+    [
+      -2.598076211353,
+      -3.5
+    ],
+    [
+      -2.598076211353,
+      -0.5
+    ],
+    [
+      -2.598076211353,
+      2.5
+    ],
+    [
+      -1.732050807569,
+      -2.0
+    ],
+    [
+      -1.732050807569,
+      1.0
+    ],
+    [
+      -1.732050807569,
+      4.0
+    ],
+    [
+      -0.866025403784,
+      -3.5
+    ],
+    [
+      -0.866025403784,
+      -0.5
+    ],
+    [
+      -0.866025403784,
+      2.5
+    ],
+    [
+      -0.0,
+      -2.0
+    ],
+    [
+      0.0,
+      1.0
+    ],
+    [
+      0.0,
+      4.0
+    ],
+    [
+      0.866025403784,
+      -3.5
+    ],
+    [
+      0.866025403784,
+      -0.5
+    ],
+    [
+      0.866025403784,
+      2.5
+    ],
+    [
+      1.732050807569,
+      -2.0
+    ],
+    [
+      1.732050807569,
+      1.0
+    ],
+    [
+      1.732050807569,
+      4.0
+    ],
+    [
+      2.598076211353,
+      -3.5
+    ],
+    [
+      2.598076211353,
+      -0.5
+    ],
+    [
+      2.598076211353,
+      2.5
+    ],
+    [
+      3.464101615138,
+      -2.0
+    ],
+    [
+      3.464101615138,
+      1.0
+    ],
+    [
+      3.464101615138,
+      4.0
+    ],
+    [
+      4.330127018922,
+      -0.5
+    ],
+    [
+      4.330127018922,
+      2.5
+    ],
+    [
+      5.196152422707,
+      1.0
+    ],
+    [
+      5.196152422707,
+      4.0
+    ],
+    [
+      6.062177826491,
+      2.5
+    ]
+  ],
+  "d_over_R": 1.7320508075688772,
+  "initial_world_phase_deg": 30,
+  "initial_center_xy_over_R": [
+    -1.7320508075688772,
+    0
+  ],
+  "pivot_xy_over_R": [
+    0,
+    0
+  ],
+  "convention": "LEFT LOW phi=+x; LEFT HIGH phi=-x; world spin CCW positive",
+  "scalar_gap": "min distance over all three full radial legs and all high-rod axes",
+  "net_gap_formula": "R*g - r_leg - r_rod - delta - validated_error_allowance",
+  "illustrative_dimensions_not_site_calibration": {
+    "R_mm": 40,
+    "r_leg_mm": 4,
+    "r_rod_mm": 5,
+    "delta_mm": 2
+  },
+  "angle_space_grid": {
+    "orbit_step_deg": 0.5,
+    "phase_step_deg": 0.5,
+    "phase_range_deg": [
+      0,
+      120
+    ]
+  },
+  "relaxed_path_upper_bounds": {
+    "LOW": {
+      "orbit_abs_deg": 30.5,
+      "phase_grid_max": 0.23194126464287765,
+      "phase_discretization_allowance": 0.004363323129985824,
+      "relaxed_path_upper_bound": 0.2363045878728635,
+      "note": "Loose geometric upper bound only; pointwise winners may be disconnected"
+    },
+    "HIGH": {
+      "orbit_abs_deg": 17.0,
+      "phase_grid_max": 0.4332311890985221,
+      "phase_discretization_allowance": 0.004363323129985824,
+      "relaxed_path_upper_bound": 0.43759451232850793,
+      "note": "Loose geometric upper bound only; pointwise winners may be disconnected"
+    }
+  },
+  "current_midpoint_gap_over_R": {
+    "LOW": 0.23205080756893873,
+    "HIGH": 0.6339745962157807
+  },
+  "checks": {
+    "seed": 20260924,
+    "reference_cases": 240,
+    "max_error": 4.390654506636338e-13,
+    "production_paths_match": true,
+    "periodicity_checked": true,
+    "dense_bound_checked": true,
+    "right_action_mirror_cases": 122
+  },
+  "baselines": {
+    "LOW": {
+      "sampled_min": 0.2063168670828734,
+      "sampled_max": 0.8660254037842194,
+      "continuous_lower_bound": 0.20599118421065452,
+      "minimum_locations": [
+        {
+          "start": {
+            "orbit_abs_deg": 25.18,
+            "world_spin_delta_deg": 50.36,
+            "centerline_gap_over_R": 0.20631686708291636
+          },
+          "end": {
+            "orbit_abs_deg": 25.18,
+            "world_spin_delta_deg": 50.36,
+            "centerline_gap_over_R": 0.20631686708291636
+          }
+        },
+        {
+          "start": {
+            "orbit_abs_deg": 34.82,
+            "world_spin_delta_deg": 69.64,
+            "centerline_gap_over_R": 0.2063168670828734
+          },
+          "end": {
+            "orbit_abs_deg": 34.82,
+            "world_spin_delta_deg": 69.64,
+            "centerline_gap_over_R": 0.2063168670828734
+          }
+        }
+      ],
+      "maximum_locations": [
+        {
+          "start": {
+            "orbit_abs_deg": 0.0,
+            "world_spin_delta_deg": 0.0,
+            "centerline_gap_over_R": 0.8660254037841228
+          },
+          "end": {
+            "orbit_abs_deg": 0.0,
+            "world_spin_delta_deg": 0.0,
+            "centerline_gap_over_R": 0.8660254037841228
+          }
+        },
+        {
+          "start": {
+            "orbit_abs_deg": 60.0,
+            "world_spin_delta_deg": 120.0,
+            "centerline_gap_over_R": 0.8660254037842194
+          },
+          "end": {
+            "orbit_abs_deg": 60.0,
+            "world_spin_delta_deg": 120.0,
+            "centerline_gap_over_R": 0.8660254037842194
+          }
+        }
+      ],
+      "joint_min": 0.0,
+      "joint_max": 180.0,
+      "max_spin_orbit_ratio": 2.0,
+      "nominal_seconds": 18.75
+    },
+    "HIGH": {
+      "sampled_min": 0.11765641048909292,
+      "sampled_max": 0.8660254037842184,
+      "continuous_lower_bound": 0.1159502259726663,
+      "minimum_locations": [
+        {
+          "start": {
+            "orbit_abs_deg": 28.18,
+            "world_spin_delta_deg": 13.15563855716444,
+            "centerline_gap_over_R": 0.11765641048909292
+          },
+          "end": {
+            "orbit_abs_deg": 28.18,
+            "world_spin_delta_deg": 13.15563855716444,
+            "centerline_gap_over_R": 0.11765641048909292
+          }
+        },
+        {
+          "start": {
+            "orbit_abs_deg": 31.82,
+            "world_spin_delta_deg": 106.84436144283556,
+            "centerline_gap_over_R": 0.11765641048943451
+          },
+          "end": {
+            "orbit_abs_deg": 31.82,
+            "world_spin_delta_deg": 106.84436144283556,
+            "centerline_gap_over_R": 0.11765641048943451
+          }
+        }
+      ],
+      "maximum_locations": [
+        {
+          "start": {
+            "orbit_abs_deg": 0.0,
+            "world_spin_delta_deg": 0.0,
+            "centerline_gap_over_R": 0.8660254037841228
+          },
+          "end": {
+            "orbit_abs_deg": 0.0,
+            "world_spin_delta_deg": 0.0,
+            "centerline_gap_over_R": 0.8660254037841228
+          }
+        },
+        {
+          "start": {
+            "orbit_abs_deg": 60.0,
+            "world_spin_delta_deg": 120.0,
+            "centerline_gap_over_R": 0.8660254037842184
+          },
+          "end": {
+            "orbit_abs_deg": 60.0,
+            "world_spin_delta_deg": 120.0,
+            "centerline_gap_over_R": 0.8660254037842184
+          }
+        }
+      ],
+      "joint_min": -25.04803281085281,
+      "joint_max": 85.04803281085282,
+      "max_spin_orbit_ratio": 32.232466919706994,
+      "nominal_seconds": 28.092844478071427
+    }
+  },
+  "high_candidate": {
+    "sampled_min": 0.1197954321053129,
+    "sampled_max": 0.8660254037842184,
+    "continuous_lower_bound": 0.11812662767566141,
+    "minimum_locations": [
+      {
+        "start": {
+          "orbit_abs_deg": 28.28,
+          "world_spin_delta_deg": 13.034129941484782,
+          "centerline_gap_over_R": 0.1197954321053129
+        },
+        "end": {
+          "orbit_abs_deg": 28.28,
+          "world_spin_delta_deg": 13.034129941484782,
+          "centerline_gap_over_R": 0.1197954321053129
+        }
+      },
+      {
+        "start": {
+          "orbit_abs_deg": 31.72,
+          "world_spin_delta_deg": 106.96587005851525,
+          "centerline_gap_over_R": 0.11979543210565581
+        },
+        "end": {
+          "orbit_abs_deg": 31.72,
+          "world_spin_delta_deg": 106.96587005851525,
+          "centerline_gap_over_R": 0.11979543210565581
+        }
+      }
+    ],
+    "maximum_locations": [
+      {
+        "start": {
+          "orbit_abs_deg": 0.0,
+          "world_spin_delta_deg": 0.0,
+          "centerline_gap_over_R": 0.8660254037841228
+        },
+        "end": {
+          "orbit_abs_deg": 0.0,
+          "world_spin_delta_deg": 0.0,
+          "centerline_gap_over_R": 0.8660254037841228
+        }
+      },
+      {
+        "start": {
+          "orbit_abs_deg": 60.0,
+          "world_spin_delta_deg": 120.0,
+          "centerline_gap_over_R": 0.8660254037842184
+        },
+        "end": {
+          "orbit_abs_deg": 60.0,
+          "world_spin_delta_deg": 120.0,
+          "centerline_gap_over_R": 0.8660254037842184
+        }
+      }
+    ],
+    "joint_min": -25.37853440731438,
+    "joint_max": 85.37853440731439,
+    "max_spin_orbit_ratio": 34.44432174611279,
+    "nominal_seconds": 28.269852784857235,
+    "exponent": 19.6,
+    "center_deg": 30.0
+  },
+  "search": {
+    "family": "120*sigmoid(n*(logit(u)-logit(center/60))), 60 linear edges",
+    "coarse_exponents": "10..30 step 1",
+    "coarse_centers_deg": "28.25..31.75 step 0.25",
+    "refine": "top six seeds: exponent +/-0.5 step0.1; center +/-0.25 step0.05",
+    "objective": "maximize sampled whole-path minimum, not single-pose maximum",
+    "certification": "top eight refined candidates re-evaluated at 0.01deg, separate continuous lower bound",
+    "coarse_count": 315,
+    "refined_count": 616,
+    "finalists": [
+      [
+        0.1197954321053129,
+        19.6,
+        30.0,
+        0.11812662767566141
+      ],
+      [
+        0.11965884241251981,
+        19.5,
+        30.0,
+        0.11798722791156256
+      ],
+      [
+        0.11953765120991772,
+        19.4,
+        30.0,
+        0.11786328509539877
+      ],
+      [
+        0.11940351335147793,
+        19.3,
+        30.0,
+        0.11772645507302124
+      ],
+      [
+        0.11934949669252401,
+        19.7,
+        30.0,
+        0.11824908597094877
+      ],
+      [
+        0.11927293392246413,
+        19.2,
+        30.0,
+        0.11759324392773389
+      ],
+      [
+        0.11914981786464528,
+        19.1,
+        30.0,
+        0.11746755760539154
+      ],
+      [
+        0.11900937706358868,
+        19.0,
+        30.0,
+        0.11732460900157374
+      ]
+    ],
+    "guarantee": "bounded family search only; no global optimality or hardware feasibility guarantee"
+  },
+  "sources_sha256": {
+    "scripts\\research_gait_clearance.py": "6803fc9095cc3042e3ad620fede5bb020146c841d65499a7bf5d8bdd92ecf746",
+    "motor_control\\gait_avoidance.py": "99eec5b20fdebd3443bd5e504fc2bd9b3f3a3bc452d9addaf406b3def6119d31",
+    "motor_control\\gait_planner.py": "6170ed97b670570a5d8aace44dfdf6a1bde0f72ce88e0ee913f7ab4b2d9014fb"
+  }
+}

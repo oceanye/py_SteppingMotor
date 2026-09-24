@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="875" viewBox="0 0 1100 875">
+<title>04 | Pose sketches at tight and wide positions / 极值姿态示意</title>
+<rect width="100%" height="100%" fill="white"/>
+<g font-family="Segoe UI,Microsoft YaHei,Arial,sans-serif" fill="#0f172a">
+<text x="24.00" y="28.00" font-size="18" fill="#0f172a" text-anchor="start">04 | Pose sketches at tight and wide positions / 极值姿态示意</text>
+<text x="42.00" y="83.00" font-size="14" fill="#0f172a" text-anchor="start">LOW: minimum, |phi|=34.82, spin=69.64</text>
+<circle cx="95.46" cy="171.00" r="3.5" fill="#dc2626"/>
+<circle cx="159.54" cy="282.00" r="3.5" fill="#dc2626"/>
+<circle cx="223.63" cy="171.00" r="3.5" fill="#dc2626"/>
+<circle cx="287.71" cy="282.00" r="3.5" fill="#dc2626"/>
+<circle cx="351.80" cy="171.00" r="3.5" fill="#dc2626"/>
+<circle cx="415.89" cy="282.00" r="3.5" fill="#dc2626"/>
+<circle cx="479.97" cy="171.00" r="3.5" fill="#dc2626"/>
+<circle cx="544.06" cy="282.00" r="3.5" fill="#dc2626"/>
+<line x1="351.80" y1="245.00" x2="246.58" y2="171.81" stroke="#94a3b8" stroke-width="2" stroke-dasharray=""/>
+<circle cx="351.80" cy="245.00" r="5" fill="#111827"/>
+<line x1="246.58" y1="171.81" x2="234.19" y2="98.86" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="234.19" cy="98.86" r="3" fill="#2563eb"/>
+<line x1="246.58" y1="171.81" x2="189.59" y2="219.02" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="189.59" cy="219.02" r="3" fill="#2563eb"/>
+<line x1="246.58" y1="171.81" x2="315.95" y2="197.56" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="315.95" cy="197.56" r="3" fill="#2563eb"/>
+<circle cx="246.58" cy="171.81" r="5" fill="#2563eb"/>
+<line x1="233.37" y1="182.76" x2="223.63" y2="171.00" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="4 3"/>
+<text x="42.00" y="415.00" font-size="13" fill="#0f172a" text-anchor="start">Nearest whole-leg / high-rod axis gap = 0.206317 R</text>
+<text x="592.00" y="83.00" font-size="14" fill="#0f172a" text-anchor="start">LOW: maximum (start), |phi|=0.00, spin=0.00</text>
+<circle cx="645.46" cy="171.00" r="3.5" fill="#dc2626"/>
+<circle cx="709.54" cy="282.00" r="3.5" fill="#dc2626"/>
+<circle cx="773.63" cy="171.00" r="3.5" fill="#dc2626"/>
+<circle cx="837.71" cy="282.00" r="3.5" fill="#dc2626"/>
+<circle cx="901.80" cy="171.00" r="3.5" fill="#dc2626"/>
+<circle cx="965.89" cy="282.00" r="3.5" fill="#dc2626"/>
+<circle cx="1029.97" cy="171.00" r="3.5" fill="#dc2626"/>
+<circle cx="1094.06" cy="282.00" r="3.5" fill="#dc2626"/>
+<line x1="901.80" y1="245.00" x2="773.63" y2="245.00" stroke="#94a3b8" stroke-width="2" stroke-dasharray=""/>
+<circle cx="901.80" cy="245.00" r="5" fill="#111827"/>
+<line x1="773.63" y1="245.00" x2="837.71" y2="208.00" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="837.71" cy="208.00" r="3" fill="#2563eb"/>
+<line x1="773.63" y1="245.00" x2="709.54" y2="208.00" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="709.54" cy="208.00" r="3" fill="#2563eb"/>
+<line x1="773.63" y1="245.00" x2="773.63" y2="319.00" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="773.63" cy="319.00" r="3" fill="#2563eb"/>
+<circle cx="773.63" cy="245.00" r="5" fill="#2563eb"/>
+<line x1="773.63" y1="282.00" x2="709.54" y2="282.00" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="4 3"/>
+<text x="592.00" y="415.00" font-size="13" fill="#0f172a" text-anchor="start">Nearest whole-leg / high-rod axis gap = 0.866025 R</text>
+<text x="42.00" y="483.00" font-size="14" fill="#0f172a" text-anchor="start">HIGH: minimum, |phi|=28.18, spin=13.16</text>
+<circle cx="95.46" cy="571.00" r="3.5" fill="#dc2626"/>
+<circle cx="159.54" cy="682.00" r="3.5" fill="#dc2626"/>
+<circle cx="223.63" cy="571.00" r="3.5" fill="#dc2626"/>
+<circle cx="287.71" cy="682.00" r="3.5" fill="#dc2626"/>
+<circle cx="351.80" cy="571.00" r="3.5" fill="#dc2626"/>
+<circle cx="415.89" cy="682.00" r="3.5" fill="#dc2626"/>
+<circle cx="479.97" cy="571.00" r="3.5" fill="#dc2626"/>
+<circle cx="544.06" cy="682.00" r="3.5" fill="#dc2626"/>
+<line x1="351.80" y1="645.00" x2="238.82" y2="705.53" stroke="#94a3b8" stroke-width="2" stroke-dasharray=""/>
+<circle cx="351.80" cy="645.00" r="5" fill="#111827"/>
+<line x1="238.82" y1="705.53" x2="292.80" y2="654.91" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="292.80" cy="654.91" r="3" fill="#2563eb"/>
+<line x1="238.82" y1="705.53" x2="168.00" y2="684.09" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="168.00" cy="684.09" r="3" fill="#2563eb"/>
+<line x1="238.82" y1="705.53" x2="255.66" y2="777.59" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="255.66" cy="777.59" r="3" fill="#2563eb"/>
+<circle cx="238.82" cy="705.53" r="5" fill="#2563eb"/>
+<line x1="168.00" y1="684.09" x2="159.54" y2="682.00" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="4 3"/>
+<text x="42.00" y="815.00" font-size="13" fill="#0f172a" text-anchor="start">Nearest whole-leg / high-rod axis gap = 0.117656 R</text>
+<text x="592.00" y="483.00" font-size="14" fill="#0f172a" text-anchor="start">HIGH: maximum (start), |phi|=0.00, spin=0.00</text>
+<circle cx="645.46" cy="571.00" r="3.5" fill="#dc2626"/>
+<circle cx="709.54" cy="682.00" r="3.5" fill="#dc2626"/>
+<circle cx="773.63" cy="571.00" r="3.5" fill="#dc2626"/>
+<circle cx="837.71" cy="682.00" r="3.5" fill="#dc2626"/>
+<circle cx="901.80" cy="571.00" r="3.5" fill="#dc2626"/>
+<circle cx="965.89" cy="682.00" r="3.5" fill="#dc2626"/>
+<circle cx="1029.97" cy="571.00" r="3.5" fill="#dc2626"/>
+<circle cx="1094.06" cy="682.00" r="3.5" fill="#dc2626"/>
+<line x1="901.80" y1="645.00" x2="773.63" y2="645.00" stroke="#94a3b8" stroke-width="2" stroke-dasharray=""/>
+<circle cx="901.80" cy="645.00" r="5" fill="#111827"/>
+<line x1="773.63" y1="645.00" x2="837.71" y2="608.00" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="837.71" cy="608.00" r="3" fill="#2563eb"/>
+<line x1="773.63" y1="645.00" x2="709.54" y2="608.00" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="709.54" cy="608.00" r="3" fill="#2563eb"/>
+<line x1="773.63" y1="645.00" x2="773.63" y2="719.00" stroke="#2563eb" stroke-width="4" stroke-dasharray=""/>
+<circle cx="773.63" cy="719.00" r="3" fill="#2563eb"/>
+<circle cx="773.63" cy="645.00" r="5" fill="#2563eb"/>
+<line x1="773.63" y1="682.00" x2="709.54" y2="682.00" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="4 3"/>
+<text x="592.00" y="815.00" font-size="13" fill="#0f172a" text-anchor="start">Nearest whole-leg / high-rod axis gap = 0.866025 R</text>
+<text x="24.00" y="858.00" font-size="12" fill="#0f172a" text-anchor="start">Blue: three radial legs. Red: high-rod axes. Orange dashed: closest pair. Symbol sizes are NOT measured radii.</text>
+</g></svg>

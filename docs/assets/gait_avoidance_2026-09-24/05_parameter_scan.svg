@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="475" viewBox="0 0 940 475">
+<title>05 | Bounded HIGH parameter-family search / 有限参数族扫描</title>
+<rect width="100%" height="100%" fill="white"/>
+<g font-family="Segoe UI,Microsoft YaHei,Arial,sans-serif" fill="#0f172a">
+<text x="24.00" y="28.00" font-size="18" fill="#0f172a" text-anchor="start">05 | Bounded HIGH parameter-family search / 有限参数族扫描</text>
+<text x="80.00" y="85.00" font-size="15" fill="#0f172a" text-anchor="start">Center fixed at 30 deg, 60 executable edges</text>
+<line x1="80.00" y1="105.00" x2="80.00" y2="375.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="80.00" y="393.00" font-size="11" fill="#0f172a" text-anchor="middle">10</text>
+<line x1="210.00" y1="105.00" x2="210.00" y2="375.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="210.00" y="393.00" font-size="11" fill="#0f172a" text-anchor="middle">13.3333</text>
+<line x1="340.00" y1="105.00" x2="340.00" y2="375.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="340.00" y="393.00" font-size="11" fill="#0f172a" text-anchor="middle">16.6667</text>
+<line x1="470.00" y1="105.00" x2="470.00" y2="375.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="470.00" y="393.00" font-size="11" fill="#0f172a" text-anchor="middle">20</text>
+<line x1="600.00" y1="105.00" x2="600.00" y2="375.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="600.00" y="393.00" font-size="11" fill="#0f172a" text-anchor="middle">23.3333</text>
+<line x1="730.00" y1="105.00" x2="730.00" y2="375.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="730.00" y="393.00" font-size="11" fill="#0f172a" text-anchor="middle">26.6667</text>
+<line x1="860.00" y1="105.00" x2="860.00" y2="375.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="860.00" y="393.00" font-size="11" fill="#0f172a" text-anchor="middle">30</text>
+<line x1="80.00" y1="375.00" x2="860.00" y2="375.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="72.00" y="379.00" font-size="11" fill="#0f172a" text-anchor="end">0</text>
+<line x1="80.00" y1="307.50" x2="860.00" y2="307.50" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="72.00" y="311.50" font-size="11" fill="#0f172a" text-anchor="end">0.04</text>
+<line x1="80.00" y1="240.00" x2="860.00" y2="240.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="72.00" y="244.00" font-size="11" fill="#0f172a" text-anchor="end">0.08</text>
+<line x1="80.00" y1="172.50" x2="860.00" y2="172.50" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="72.00" y="176.50" font-size="11" fill="#0f172a" text-anchor="end">0.12</text>
+<line x1="80.00" y1="105.00" x2="860.00" y2="105.00" stroke="#e2e8f0" stroke-width="1" stroke-dasharray=""/>
+<text x="72.00" y="109.00" font-size="11" fill="#0f172a" text-anchor="end">0.16</text>
+<line x1="80.00" y1="375.00" x2="860.00" y2="375.00" stroke="#334155" stroke-width="1" stroke-dasharray=""/>
+<line x1="80.00" y1="105.00" x2="80.00" y2="375.00" stroke="#334155" stroke-width="1" stroke-dasharray=""/>
+<text x="470.00" y="417.00" font-size="12" fill="#0f172a" text-anchor="middle">Exponent n</text>
+<text x="80.00" y="101.00" font-size="11" fill="#475569" text-anchor="start">Bottleneck centerline gap / R</text>
+<polyline points="80.00,217.04 119.00,210.26 158.00,203.92 197.00,197.32 236.00,192.33 275.00,186.33 314.00,180.65 353.00,178.88 392.00,175.97 431.00,172.85 470.00,176.37 509.00,184.53 548.00,191.26 587.00,196.79 626.00,201.34 665.00,205.07 704.00,208.14 743.00,210.65 782.00,213.13 821.00,220.44 860.00,226.88" fill="none" stroke="#2563eb" stroke-width="2.5"/>
+<polyline points="80.00,235.45 119.00,228.36 158.00,221.51 197.00,214.23 236.00,208.45 275.00,211.29 314.00,209.77 353.00,207.91 392.00,204.76 431.00,201.28 470.00,199.97 509.00,195.84 548.00,200.59 587.00,205.44 626.00,209.36 665.00,212.52 704.00,219.17 743.00,227.76 782.00,235.23 821.00,241.71 860.00,247.32" fill="none" stroke="#94a3b8" stroke-width="2"/>
+<circle cx="454.40" cy="172.85" r="4" fill="#059669"/>
+<text x="80.00" y="63.00" font-size="12" fill="#0f172a" text-anchor="start">Blue: sampled minimum (0.1 deg grid). Gray: conservative bound on that grid.</text>
+<text x="80.00" y="440.00" font-size="12" fill="#0f172a" text-anchor="start">Green: refined candidate n=19.6, center=30 deg; local bounded search, NOT global optimum.</text>
+</g></svg>
