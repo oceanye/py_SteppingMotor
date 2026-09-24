@@ -15,7 +15,13 @@ LEGACY = "legacy_gain"
 TWO_MODE = "two_mode_v1"
 LOW = "low_junction"
 HIGH = "high_junction"
-MODE_NAMES = {LOW: "低节点侧·反向比例自转", HIGH: "高节点侧·同向变比例自转"}
+# 2026-09-24 用户实机连续行走后确认：转动逻辑不绑定"左顺移/左逆移"
+# 这类按钮名（那只说动哪条腿、往哪边转）。模态每一步按当前站位单独
+# 判定：连续前进（左顺移/右逆移交替选一）时横梁依次从低节点扇区和
+# 高节点扇区扫过，模态逐步交替；原路返回则与来时相同。名称直接写
+# 横梁几何，操作员看一眼就知道本步会不会跨红杆。
+MODE_NAMES = {LOW: "低节点侧·反向比例自转（本步横梁不跨红杆）",
+              HIGH: "高节点侧·同向变比例自转（本步横梁跨红杆，S4 分段慢速）"}
 SEGMENTS = 60
 # 2026-09-23/24 应用户观察"爪-红杆最大富余不在公转30°处"做的
 # (自转中心c, 斜率s) 全网格扫描：30° 是唯一安全缝隙的几何中心，
@@ -65,6 +71,10 @@ def avoidance_path(bearing_deg: float, arc_deg: float) -> AvoidancePath:
     Mid-sector bearings 30 mod120 face a shared LOW node; 90 mod120 face
     HIGH. +/-0.5deg permits the existing pulse-quantized stance tolerance.
     Only one adjacent-cell step (+/-60deg) is supported and validated.
+
+    No sensor is needed: the modality follows from the tracked stance and
+    beam angle alone (walking forward flips LOW/HIGH every step; stepping
+    back along the arrival path keeps the previous modality).
     """
     if not math.isfinite(bearing_deg) or not math.isfinite(arc_deg) or not math.isclose(abs(arc_deg), 60.0):
         raise ValueError("两模态避杆只支持相邻支座 ±60° 换位")
