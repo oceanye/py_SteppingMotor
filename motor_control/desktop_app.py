@@ -702,6 +702,89 @@ class StepperGUI:
         load_gait_fields(self)
         self._refresh_gait_ui()
 
+    # ── 电机绑定页：逐角色调试点动与真实方向标定（2026-09-28）─────
+    # 真实方向 vs 驱动方向：点动按"轴坐标 +/-"驱动单个角色绑定的轴，
+    # 操作员俯视观察机构真实运动后记录符号——+1=轴坐标增大即约定正方向
+    # （Mr: 俯视逆时针/ψ 增大；Mup: 抬起），−1=相反。
+    ROLE_SIGN_FIELD = {
+        "Mr1": "mr1_sign",
+        "Mr2": "mr2_sign",
+        "Mup1": "mup1_lift_sign",
+        "Mup2": "mup2_lift_sign",
+    }
+
+    def _role_positive_direction_text(self, role_name):
+        return "俯视逆时针" if role_name.startswith("Mr") else "抬起"
+
+    def _role_negative_direction_text(self, role_name):
+        return "俯视顺时针" if role_name.startswith("Mr") else "下降"
+
+    def _role_debug_move(self, role_name, axis_positive):
+        """电机绑定页单角色点动：按轴坐标 +/- 小步驱动（Mr 10°/Mup 1mm）。
+
+        与步进页点动共用同一条预约/守卫路径；步态执行期间四轴被预约，
+        点动自然被拒并提示"步态运行中"。axis_positive=True 表示让轴坐标
+        增大，DIR 映射与步态执行器同一定义（signed_delta·outward_sign>0
+        ⇒ OUTWARD）。
+        """
+        try:
+            axis = self._gait_role_axis(role_name)
+        except GaitExecutorError as exc:
+            self.log(f"⛔ {role_name} 调试点动不可用: {exc}")
+            return
+        if not self._is_serial_connected():
+            self.log("⛔ 调试点动需要串口已连接")
+            return
+        unit = "°" if role_name.startswith("Mr") else "mm"
+        amount = 10.0 if unit == "°" else 1.0
+        outward = outward_position_sign(axis) > 0
+        direction = (DIR_OUTWARD if outward else DIR_INWARD) if axis_positive \
+            else (DIR_INWARD if outward else DIR_OUTWARD)
+        drive_text = (self._role_positive_direction_text(role_name)
+                      if axis_positive
+                      else self._role_negative_direction_text(role_name))
+        self.log(f"🔧 {role_name} 调试点动：轴{AXIS_LABEL[axis]} 坐标"
+                 f"{'+' if axis_positive else '−'}{amount:g}{unit}"
+                 f"（程序驱动方向={drive_text}；请观察机构真实方向）")
+        self._quick_move(axis, amount, direction)
+
+    def _gait_record_direction_sign(self, role_name, real_is_positive):
+        """记录"真实方向 vs 驱动方向"标定结果：一致 +1 / 相反 −1。
+
+        real_is_positive：点动轴坐标 + 后机构真实运动是否为约定正方向。
+        符号变更立即保存并使步态标定失效（步态页同步显示）；Mr 符号
+        变更使该侧零位签名失配，执行前必须重新记零。符号未变则不动
+        参数（不打翻已确认的标定状态）。
+        """
+        field = self.ROLE_SIGN_FIELD.get(role_name)
+        if field is None:
+            raise GaitExecutorError(f"未知逻辑角色 {role_name}")
+        new_sign = 1 if real_is_positive else -1
+        old_sign = getattr(self.gait_params, field)
+        if old_sign == new_sign:
+            self.log(f"✓ {role_name} 方向标定：真实方向与轴坐标+ 一致，"
+                     f"符号保持 {new_sign:+d}，无变更")
+            return
+        try:
+            self._save_gait_params(replace(
+                self.gait_params, **{field: new_sign},
+                calibration_confirmed=False))
+        except (GaitExecutorError, ValueError, StateStoreError) as exc:
+            self.log(f"⛔ {role_name} 方向标定未保存: {exc}")
+            messagebox.showerror("方向标定未保存", str(exc))
+            return
+        sign_vars = getattr(self, "gait_sign_vars", None)
+        var = sign_vars.get(field) if isinstance(sign_vars, dict) else None
+        if var is not None:
+            var.set(f"{new_sign:+d}")   # 同步步态页下拉并触发标定失效
+        actual = (self._role_positive_direction_text(role_name) if new_sign > 0
+                  else self._role_negative_direction_text(role_name))
+        extra = ("；该侧旋转零位随之作废，须重新【记零】"
+                 if field in ("mr1_sign", "mr2_sign") else "")
+        self.log(f"✓ {role_name} 方向符号 {old_sign:+d} → {new_sign:+d} 已保存："
+                 f"轴坐标+ ⇒ 实际{actual}{extra}；步态页标定须重新确认")
+        self._refresh_gait_ui()
+
     def _gait_role_axis(self, role_name):
         """逻辑角色 → 物理轴；未绑定/模式不符抛 GaitExecutorError。"""
 

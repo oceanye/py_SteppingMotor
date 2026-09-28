@@ -227,8 +227,10 @@ def build_coordinated_tab(app, parent) -> None:
             "progress": progress,
         }
 
+    _build_direction_calibration(app, parent)
+
     readiness = ttk.LabelFrame(parent, text="自主步态就绪度（不替代分阶段人工确认联动）")
-    readiness.grid(row=3, column=0, sticky="ew", **PAD)
+    readiness.grid(row=4, column=0, sticky="ew", **PAD)
     ready_label = ttk.Label(
         readiness,
         text="未就绪",
@@ -242,6 +244,114 @@ def build_coordinated_tab(app, parent) -> None:
     app.coordinated_widgets["blocker_label"] = blocker_label
 
     sync_binding_editor(app, app.control_bindings)
+
+
+# ── 逐电机调试与方向标定（真实方向 vs 驱动方向，2026-09-28）────
+# 每个逻辑电机单独：小步点动（轴坐标 +/-）→ 俯视观察机构真实运动 →
+# 记录符号。符号写入步态参数并联动零位/标定失效，见 desktop_app。
+ROLE_SIGN_FIELD = {
+    "Mr1": "mr1_sign",
+    "Mr2": "mr2_sign",
+    "Mup1": "mup1_lift_sign",
+    "Mup2": "mup2_lift_sign",
+}
+
+
+def _direction_sign_text(role_value: str, sign: int) -> str:
+    """符号含义文案：+1=轴坐标增大即约定正方向，−1=相反。"""
+    rotary = role_value.startswith("Mr")
+    positive = "俯视逆时针(ψ增)" if rotary else "抬起"
+    negative = "俯视顺时针(ψ减)" if rotary else "下降"
+    return f"{sign:+d}：轴+ ⇒ 实际{positive if sign > 0 else negative}"
+
+
+def _build_direction_calibration(app, parent) -> None:
+    frame = ttk.LabelFrame(
+        parent, text="逐电机调试与方向标定（真实方向 vs 驱动方向）")
+    frame.grid(row=3, column=0, sticky="ew", **PAD)
+    headings = ("角色", "当前方向符号", "调试点动（驱动单个电机）",
+                "点动“轴+”后机构实际方向（记录）")
+    for column, text in enumerate(headings):
+        ttk.Label(frame, text=text,
+                  font=("Microsoft YaHei", 9, "bold")).grid(
+                      row=0, column=column, sticky="w", padx=4, pady=2)
+    app.coordinated_widgets["direction"] = {}
+    for row, role in enumerate(LOGICAL_ROLE_ORDER, start=1):
+        spec = ROLE_SPECS[role]
+        ttk.Label(frame, text=f"{role.value}·{spec.display_name}",
+                  font=("Consolas", 10, "bold")).grid(
+                      row=row, column=0, sticky="w", padx=4, pady=2)
+        sign = getattr(app.gait_params, ROLE_SIGN_FIELD[role.value])
+        sign_label = ttk.Label(
+            frame, text=_direction_sign_text(role.value, sign),
+            font=("Consolas", 10, "bold"),
+            foreground="#16803a" if sign > 0 else "#b42318")
+        sign_label.grid(row=row, column=1, sticky="w", padx=4, pady=2)
+        rotary = role.value.startswith("Mr")
+        unit, amount = ("°", 10) if rotary else ("mm", 1)
+        jog_frame = ttk.Frame(frame)
+        jog_frame.grid(row=row, column=2, sticky="w", padx=4, pady=2)
+        jog_plus = ttk.Button(
+            jog_frame, text=f"⟲ 轴+{amount}{unit}" if rotary else f"▲ 轴+{amount}{unit}",
+            width=9,
+            command=lambda r=role.value: app._role_debug_move(r, True))
+        jog_plus.pack(side="left", padx=2)
+        jog_minus = ttk.Button(
+            jog_frame, text=f"⟳ 轴−{amount}{unit}" if rotary else f"▼ 轴−{amount}{unit}",
+            width=9,
+            command=lambda r=role.value: app._role_debug_move(r, False))
+        jog_minus.pack(side="left", padx=2)
+        record_frame = ttk.Frame(frame)
+        record_frame.grid(row=row, column=3, sticky="w", padx=4, pady=2)
+        record_positive = ttk.Button(
+            record_frame,
+            text="俯视逆时针" if rotary else "抬起",
+            width=10,
+            command=lambda r=role.value: app._gait_record_direction_sign(r, True))
+        record_positive.pack(side="left", padx=2)
+        record_negative = ttk.Button(
+            record_frame,
+            text="俯视顺时针" if rotary else "下降",
+            width=10,
+            command=lambda r=role.value: app._gait_record_direction_sign(r, False))
+        record_negative.pack(side="left", padx=2)
+        app.coordinated_widgets["direction"][role.value] = {
+            "sign": sign_label,
+            "jog_plus": jog_plus,
+            "jog_minus": jog_minus,
+            "record_positive": record_positive,
+            "record_negative": record_negative,
+        }
+    ttk.Label(
+        frame, foreground="#555", justify="left", wraplength=760,
+        text=(
+            "每台电机单独标定：① 串口连接后点【轴+】小步驱动（旋转 10°/直线 1mm，"
+            "按钮箭头是程序判定的驱动方向）；② 俯视观察机构真实运动；"
+            "③ 点对应【实际…】按钮记录符号（+1=轴坐标增大即真实正向，−1=相反）。"
+            "符号变更立即保存并使步态标定失效；Mr 符号变更后该侧零位作废，"
+            "须重新记零。步态执行中四轴被占用，点动与改符号均被拒绝。"
+        ),
+    ).grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(2, 4))
+
+
+def _refresh_direction_calibration(app, by_role) -> None:
+    """按快照刷新方向标定区：符号文本/颜色 + 点动可用性（绑定有效且空闲）。"""
+
+    direction = app.coordinated_widgets.get("direction") or {}
+    params = getattr(app, "gait_params", None)
+    for role in LOGICAL_ROLE_ORDER:
+        widgets = direction.get(role.value)
+        if widgets is None or params is None:
+            continue
+        sign = getattr(params, ROLE_SIGN_FIELD[role.value])
+        widgets["sign"].configure(
+            text=_direction_sign_text(role.value, sign),
+            foreground="#16803a" if sign > 0 else "#b42318")
+        snapshot = by_role.get(role.value, {})
+        movable = (bool(snapshot.get("binding_valid"))
+                   and snapshot.get("state") == "IDLE")
+        for key in ("jog_plus", "jog_minus"):
+            widgets[key].configure(state="normal" if movable else "disabled")
 
 
 def _draw_linear(canvas, snapshot):
@@ -312,6 +422,7 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
     """Render a previously captured controller snapshot on the Tk thread."""
 
     by_role = {item["role"]: item for item in snapshots}
+    _refresh_direction_calibration(app, by_role)
     for role in LOGICAL_ROLE_ORDER:
         snapshot = by_role[role.value]
         widgets = app.coordinated_widgets["roles"][role.value]

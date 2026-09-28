@@ -194,7 +194,8 @@ def _build_params_column(app, parent) -> None:
          "腿/杆半径和δ必须实测，不能调小数值强行放行。抬高不能替代腿的平面避让。")
 
     inner = pages["calibration"].content
-    note(inner, 0, "先在电机绑定页设置 PPR、减速比和升降导程，再点动验证方向。")
+    note(inner, 0, "先在“电机绑定与状态”页设置 PPR、减速比和升降导程，\n"
+         "并用页内【逐电机调试与方向标定】点动验证、记录每个电机的真实方向。")
     ttk.Label(inner, text="初始摆放（俯视·从左足看向右足）",
               wraplength=185, justify="left").grid(
                   row=1, column=0, sticky="w", padx=6, pady=3)
