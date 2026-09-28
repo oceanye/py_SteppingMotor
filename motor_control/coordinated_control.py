@@ -55,13 +55,13 @@ ROLE_SPECS: Mapping[LogicalRole, RoleSpec] = MappingProxyType(
             LogicalRole.MUP1, "左侧升降", "left", "左侧直线升降", MODE_LINEAR
         ),
         LogicalRole.MR1: RoleSpec(
-            LogicalRole.MR1, "左侧旋转", "left", "左侧换位旋转", MODE_ROTARY
+            LogicalRole.MR1, "左侧旋转", "left", "左侧转动", MODE_ROTARY
         ),
         LogicalRole.MUP2: RoleSpec(
             LogicalRole.MUP2, "右侧升降", "right", "右侧直线升降", MODE_LINEAR
         ),
         LogicalRole.MR2: RoleSpec(
-            LogicalRole.MR2, "右侧旋转", "right", "右侧支撑切换旋转", MODE_ROTARY
+            LogicalRole.MR2, "右侧旋转", "right", "右侧转动", MODE_ROTARY
         ),
     }
 )
