@@ -677,7 +677,7 @@ class StepperGUI:
             return
         supports = self.gait_params.initial_supports
         stance_text = (f"左足在{supports[0]}、右足在{supports[1]}，三爪均踩低节点；"
-                       f"红杆在横梁{'左' if supports[0] == 'A' else '右'}侧"
+                       f"红杆在横梁{'右' if supports[0] == 'A' else '左'}侧"
                        "（与步态页【初始摆放】选择一致）")
         if not messagebox.askokcancel("重建物理基准", f"必须人工确认：{stance_text}；四轴静止、位置已校准。\n此按钮不移动电机。确认后须重新记两侧旋转零位并确认标定。"):
             return

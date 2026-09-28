@@ -188,9 +188,9 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         self.assertIsNotNone(run)
 
     def test_mirror_placement_completes_left_swing_on_high_modality(self):
-        # 红杆右摆法(左足B右足A、β₀0°)下"左顺移"恰是红杆左摆法"右顺移"
+        # 红杆左摆法(左足B右足A、β₀0°)下"左顺移"恰是红杆右摆法"右顺移"
         # 的镜像：落点同为邻座(0,-1) 绕A、模态 HIGH；完整执行链路走通、
-        # 账本随之更新。
+        # 账本随之更新。（2026-09-28 校正：左B右A=红杆在左手边。）
         from motor_control.gait_avoidance import TWO_MODE, HIGH
         app = mechanism()
         app.gait_params = replace(
@@ -198,7 +198,7 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
             geometry=GaitGeometry(d_mm=math.sqrt(3)*40, arm_length_mm=40,
                                   arm_radius_mm=.2, node_radius_mm=.2,
                                   safety_margin_mm=.1),
-            initial_placement="red_right", beam_reference_deg=0.0,
+            initial_placement="red_left", beam_reference_deg=0.0,
             calibration_fingerprint=app._gait_hardware_fingerprint())
         app.gait_params = replace(app.gait_params,
                                   mr1_zero_signature=app._gait_zero_signature("Mr1", app.gait_params),
@@ -474,20 +474,24 @@ class InitialPlacementTests(unittest.TestCase):
 
     def test_placement_derives_supports_beam_and_roundtrips(self):
         from motor_control.gait_planner import parse_gait_params
-        p = GaitParams(initial_placement="red_right",
+        # 2026-09-28 校正后：red_left = 左足B右足A、β₀0°（红杆在左手边）
+        p = GaitParams(initial_placement="red_left",
                        beam_reference_deg=0.0).validated()
         self.assertEqual(p.initial_supports, ("B", "A"))
         self.assertEqual(p.initial_beam_deg, 0.0)
         doc = p.as_document()
-        self.assertEqual(doc["initial_placement"], "red_right")
-        self.assertEqual(parse_gait_params(doc).initial_placement, "red_right")
-        # 旧文档缺键时按β₀推导（0°=红杆右摆法）；摆放与β₀不一致拒绝
+        self.assertEqual(doc["initial_placement"], "red_left")
+        self.assertEqual(parse_gait_params(doc).initial_placement, "red_left")
+        # 旧文档缺键时按β₀查配对（0°=红杆左摆法）；摆放与β₀不一致拒绝
         legacy_doc = {k: v for k, v in doc.items() if k != "initial_placement"}
-        self.assertEqual(parse_gait_params(legacy_doc).initial_placement, "red_right")
+        self.assertEqual(parse_gait_params(legacy_doc).initial_placement, "red_left")
         for beam in (180.0, 90.0):
             with self.assertRaises(ValueError):
-                GaitParams(initial_placement="red_right",
+                GaitParams(initial_placement="red_left",
                            beam_reference_deg=beam).validated()
+        # 原有默认摆法（左足A右足B、β₀180）现在叫 red_right，仍为默认
+        self.assertEqual(GaitParams().initial_placement, "red_right")
+        self.assertEqual(GaitParams().initial_supports, ("A", "B"))
 
 
 class SyncProtocolTests(unittest.TestCase):

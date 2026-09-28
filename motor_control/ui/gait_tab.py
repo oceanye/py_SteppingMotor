@@ -57,9 +57,11 @@ INTEGER_FIELDS = {"swing_segments", "feasibility_samples"}
 
 # 2026-09-24 初始摆放（红杆在横梁左/右侧的镜像摆法）下拉：标签面向
 # 操作员，内部值进 params.initial_placement；β₀ 由摆放派生并联动覆写。
+# 2026-09-28 实机校正：左右标注对调（初版误按"第三支座C在哪侧"判，
+# 与"紧挨横梁的红杆在哪侧"恰相反）。左足A·右足B=红杆右侧（原有默认）。
 PLACEMENT_LABELS = {
-    "red_left": "红杆在横梁左侧（左足A·右足B）",
-    "red_right": "红杆在横梁右侧（左足B·右足A）",
+    "red_left": "红杆在横梁左侧（左足B·右足A）",
+    "red_right": "红杆在横梁右侧（左足A·右足B）",
 }
 LABEL_TO_PLACEMENT = {label: key for key, label in PLACEMENT_LABELS.items()}
 
@@ -205,7 +207,8 @@ def _build_params_column(app, parent) -> None:
         values=tuple(PLACEMENT_LABELS[key] for key in PLACEMENT_LABELS),
         state="readonly", width=22,
     ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
-    note(inner, 2, "机构实际怎么摆就选什么：红杆在横梁哪一侧决定同一按钮\n"
+    note(inner, 2, "机构实际怎么摆就选什么：俯视、站在左足处看向右足，\n"
+         "紧挨横梁的那根红杆在哪只手边就选哪侧。红杆在哪侧决定同一按钮\n"
          "的模态序列（两摆法互为镜像）。切换即基准变更：零位作废，须重新\n"
          "摆机构到该初始状态、重新记零并确认标定。")
     add_number_field(inner, 3, *CALIBRATION_FIELDS[0])

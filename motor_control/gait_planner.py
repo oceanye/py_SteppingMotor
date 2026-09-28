@@ -172,9 +172,13 @@ class GaitGeometry:
 
 # 初始摆放 → (左足/右足支座, 横梁基准角)。红杆在横梁左/右侧的两种
 # 镜像摆法；程序账本原点由它派生（无传感器，全靠人工按实际摆放选择）。
+# 2026-09-28 实机校正左右：判据是"紧挨横梁的红杆"在从左足看向右足的
+# 哪只手边。左足A·右足B（原有默认，β₀180）两支座共享棱上北端是低节点、
+# 南端是红杆，从左足(西)看向右足(东)红杆在右手；镜像摆法左足B·右足A
+# （β₀0°）红杆在左手。初版误用"第三支座C在哪侧"判左右（恰相反），已对调。
 INITIAL_PLACEMENTS: dict[str, tuple[tuple[str, str], float]] = {
-    "red_left": (("A", "B"), 180.0),
-    "red_right": (("B", "A"), 0.0),
+    "red_left": (("B", "A"), 0.0),
+    "red_right": (("A", "B"), 180.0),
 }
 
 
@@ -212,11 +216,12 @@ class GaitParams:
     # explicitly select TWO_MODE; existing saved gains are never reinterpreted.
     trajectory_mode: str = LEGACY
     # 2026-09-24 初始摆放两种镜像：红杆在横梁哪一侧决定同一按钮走出
-    # 的模态序列。"red_left" = 左足A、右足B、横梁基准 180°（俯视、从
-    # 左足看向右足，红杆在左手边）——原有唯一摆法；"red_right" = 左足
-    # B、右足A、基准 0°（红杆在右手边），四按钮几何整体镜像。切换即
-    # 更换坐标基准：账本重置、零位作废，必须按新摆放重新记零标定。
-    initial_placement: str = "red_left"
+    # 的模态序列（2026-09-28 实机校正左右标注，初版判据反了已对调）。
+    # "red_left" = 左足B、右足A、基准 0°（俯视、从左足看向右足，红杆
+    # 在左手边）；"red_right" = 左足A、右足B、基准 180°（红杆在右手
+    # 边）——原有唯一摆法，故仍是默认。切换即更换坐标基准：账本重置、
+    # 零位作废，必须按新摆放重新记零标定。
+    initial_placement: str = "red_right"
     beam_reference_deg: float = 180.0  # 两个 Mr 同时记零时横梁世界角
     calibration_confirmed: bool = False  # 实测几何、方向、PPR、反力闭合已确认
     calibration_fingerprint: str | None = None
@@ -389,11 +394,14 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         surrounding_pads=geometry_raw.get("surrounding_pads", True),
     )
     beam_reference_deg = _number("beam_reference_deg", 180.0)
-    # 旧文档无摆放键：按已保存的β₀推导（0°=红杆右摆法），避免
-    # "缺键默认 red_left"与旧β₀互相矛盾导致整个文档加载失败。
-    initial_placement = value.get(
-        "initial_placement",
-        "red_right" if math.isclose(beam_reference_deg, 0.0) else "red_left")
+    # 旧文档无摆放键：按已保存的β₀查配对摆放，避免缺键默认与旧β₀矛盾
+    # 导致加载失败。对调校正前保存的旧文档（键与β₀按新表不一致）会被
+    # validated 拒绝并安全回退默认——在界面重选【初始摆放】并保存即可。
+    initial_placement = value.get("initial_placement")
+    if initial_placement is None:
+        matched = [name for name, (_sup, beam) in INITIAL_PLACEMENTS.items()
+                   if math.isclose(beam_reference_deg, beam)]
+        initial_placement = matched[0] if matched else "red_right"
     params = GaitParams(
         geometry=geometry,
         swing_segments=int(_number("swing_segments",

@@ -260,14 +260,15 @@ class GaitLayoutTests(unittest.TestCase):
         self.app.gait_calibrated_var.set(True)
         self.app.gait_params = replace(self.app.gait_params,
                                        mr1_zero_deg=1.5, mr2_zero_deg=-0.5)
-        self.app.gait_placement_var.set(PLACEMENT_LABELS["red_right"])
+        # 2026-09-28 校正后：红杆在左侧 = 左足B·右足A、β₀0°（镜像摆法）
+        self.app.gait_placement_var.set(PLACEMENT_LABELS["red_left"])
         self.assertFalse(self.app.gait_calibrated_var.get())
         self.assertEqual(self.app._gait_supports, ("B", "A"))
         self.assertAlmostEqual(self.app._gait_beta_deg, 0.0)
         self.assertIsNone(self.app.gait_params.mr1_zero_deg)
         self.assertIsNone(self.app.gait_params.mr2_zero_deg)
         self.assertEqual(self.app.gait_field_vars["beam_reference_deg"].get(), "0.0")
-        self.assertEqual(self.app.gait_params.initial_placement, "red_right")
+        self.assertEqual(self.app.gait_params.initial_placement, "red_left")
         self.assertFalse(self.errors)
 
     def test_pointer_click_focus_does_not_scroll_run_viewport(self):
