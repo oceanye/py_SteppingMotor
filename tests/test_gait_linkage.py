@@ -493,6 +493,46 @@ class InitialPlacementTests(unittest.TestCase):
         self.assertEqual(GaitParams().initial_placement, "red_right")
         self.assertEqual(GaitParams().initial_supports, ("A", "B"))
 
+    def test_legacy_pairing_document_migrates_keeping_zeros(self):
+        # 2026-09-28 对调校正迁移：eb308f4 写入的旧配对（red_left↔180°/
+        # red_right↔0°）加载时自动换键，β₀/零位/签名原样保留，无需重新
+        # 记零；无法识别的键仍被拒绝。
+        from motor_control.gait_planner import parse_gait_params
+        good = GaitParams(initial_placement="red_right",
+                          beam_reference_deg=180.0,
+                          mr1_zero_deg=3.5, mr2_zero_deg=-2.5,
+                          mr1_zero_signature="s1",
+                          mr2_zero_signature="s2").validated()
+        legacy = dict(good.as_document(), initial_placement="red_left")
+        self.assertEqual(parse_gait_params(legacy), good)
+        mirror = GaitParams(initial_placement="red_left",
+                            beam_reference_deg=0.0).validated()
+        legacy_mirror = dict(mirror.as_document(),
+                             initial_placement="red_right")
+        self.assertEqual(parse_gait_params(legacy_mirror), mirror)
+        with self.assertRaises(ValueError):
+            parse_gait_params(dict(good.as_document(),
+                                   initial_placement="middle"))
+
+    def test_startup_load_migrates_and_warns(self):
+        # 启动加载旧配对文档：迁移成功挂提示、零位保留；标定确认照启动
+        # 规则复位（勾选确认即可，不必重新记零）。
+        app = mechanism()
+        good = GaitParams(initial_placement="red_right",
+                          beam_reference_deg=180.0,
+                          mr1_zero_deg=3.5, mr2_zero_deg=-2.5).validated()
+        # headless 夹具跳过 __init__：挂 state_store 桩与启动警告列表
+        app.state_store = SimpleNamespace(
+            load_gait_params=lambda: dict(good.as_document(),
+                                          initial_placement="red_left"))
+        app._startup_warnings = []
+        app._load_gait_params()
+        self.assertEqual(app.gait_params.initial_placement, "red_right")
+        self.assertEqual(app.gait_params.mr1_zero_deg, 3.5)
+        self.assertEqual(app.gait_params.mr2_zero_deg, -2.5)
+        self.assertFalse(app.gait_params.calibration_confirmed)
+        self.assertTrue(any("迁移" in w for w in app._startup_warnings))
+
 
 class SyncProtocolTests(unittest.TestCase):
     def test_command_and_ack_match_both_axes_and_ignore_late_ena_reply(self):

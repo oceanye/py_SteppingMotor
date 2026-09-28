@@ -181,6 +181,14 @@ INITIAL_PLACEMENTS: dict[str, tuple[tuple[str, str], float]] = {
     "red_right": (("A", "B"), 180.0),
 }
 
+# eb308f4（对调前）按旧表写入摆放键：red_left↔180° / red_right↔0°。
+# c56f588 对调后同键要求相反的β₀；parse_gait_params 据此识别旧配对并
+# 自动换键（β₀、零位等原样保留——换的只是标签，不是几何）。
+LEGACY_PLACEMENT_PAIRING: dict[str, float] = {
+    "red_left": 180.0,
+    "red_right": 0.0,
+}
+
 
 @dataclass(frozen=True)
 class GaitParams:
@@ -394,14 +402,24 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         surrounding_pads=geometry_raw.get("surrounding_pads", True),
     )
     beam_reference_deg = _number("beam_reference_deg", 180.0)
-    # 旧文档无摆放键：按已保存的β₀查配对摆放，避免缺键默认与旧β₀矛盾
-    # 导致加载失败。对调校正前保存的旧文档（键与β₀按新表不一致）会被
-    # validated 拒绝并安全回退默认——在界面重选【初始摆放】并保存即可。
     initial_placement = value.get("initial_placement")
     if initial_placement is None:
+        # 旧文档无摆放键：按已保存的β₀查配对摆放，避免缺键默认与旧β₀
+        # 矛盾导致加载失败。
         matched = [name for name, (_sup, beam) in INITIAL_PLACEMENTS.items()
                    if math.isclose(beam_reference_deg, beam)]
         initial_placement = matched[0] if matched else "red_right"
+    elif initial_placement in LEGACY_PLACEMENT_PAIRING:
+        # 2026-09-28 左右对调校正的旧文档迁移：摆放键与β₀按 eb308f4 旧表
+        # 配对时自动换键（β₀不动），零位/标定原样保留，免于重新记零；
+        # 无法识别的组合仍交 validated 拒绝。
+        if (math.isclose(beam_reference_deg,
+                         LEGACY_PLACEMENT_PAIRING[initial_placement])
+                and not math.isclose(
+                    beam_reference_deg,
+                    INITIAL_PLACEMENTS[initial_placement][1])):
+            initial_placement = ("red_right" if initial_placement == "red_left"
+                                 else "red_left")
     params = GaitParams(
         geometry=geometry,
         swing_segments=int(_number("swing_segments",

@@ -642,8 +642,16 @@ class StepperGUI:
         if data is None:
             return
         try:
+            parsed = parse_gait_params(data)
+            raw_placement = data.get("initial_placement")
+            if (isinstance(raw_placement, str)
+                    and raw_placement != parsed.initial_placement):
+                # 2026-09-28 左右对调迁移：只是标签换名，几何/零位不变。
+                self._startup_warnings.append(
+                    f"ℹ️ 初始摆放 {raw_placement} 已按新对照表迁移为 "
+                    f"{parsed.initial_placement}（左右标注对调校正；几何与零位不变）")
             # Pulse coordinates do not establish physical support locations on restart.
-            self.gait_params = replace(parse_gait_params(data), calibration_confirmed=False)
+            self.gait_params = replace(parsed, calibration_confirmed=False)
         except ValueError as exc:
             self._startup_warnings.append(
                 f"⚠️ 步态参数无效（{exc}）；已回退为默认占位参数")
