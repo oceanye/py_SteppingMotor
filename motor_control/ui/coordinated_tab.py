@@ -514,7 +514,7 @@ def _draw_rotary(canvas, snapshot):
 
 
 def _draw_x42s(canvas, live):
-    """X42S 卡片：状态块 + 实测脉冲数；不画行程刻度（驱动器脉冲无行程语义）。"""
+    """X42S 卡片：状态块 + 驱动器实测角度；不画行程刻度（电机角度无行程语义）。"""
 
     canvas.delete("all")
     width, height = 92, 112
@@ -551,7 +551,7 @@ def _draw_x42s(canvas, live):
             font=("Consolas", 12, "bold"),
             fill="#1565c0" if trusted else "#b26a00",
         )
-    canvas.create_text(width / 2, height - 5, text="pulse", font=("Arial", 7), fill="#64748b")
+    canvas.create_text(width / 2, height - 5, text="deg", font=("Arial", 7), fill="#64748b")
 
 
 def refresh_coordinated_tab(app, control, snapshots) -> None:
@@ -591,7 +591,7 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
         binding = snapshot.get("binding")
         live = snapshot.get("x42s")
         if binding and live is not None:
-            detail = f"{snapshot.get('physical_label')} · 驱动器实测 · unit=pulse"
+            detail = f"{snapshot.get('physical_label')} · 驱动器实测 · unit=deg"
             fault = live.get("fault")
             if fault:
                 detail += f"\n故障: {fault}"

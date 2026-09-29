@@ -86,7 +86,7 @@
         if(typeof x.speed==='number')parts.push(`速度 ${formatNumber(x.speed,1)}`);
         if(x.fault)parts.push(`故障 ${x.fault}`);
         progress=parts.length?parts.join(' · '):(x.online?'无遥测字段':'无遥测');
-        modeLine=item.position_source==='x42s_driver'?'驱动器实测 (unit=pulse)':'X42S 后端待接入';
+        modeLine=item.position_source==='x42s_driver'?'驱动器实测 (unit=deg)':'X42S 后端待接入';
       }else{
         progress=item.progress_percent==null?(item.in_progress?'运动中，暂无中间进度帧':'空闲'):`进度 ${formatNumber(item.progress_percent,1)}% · ${item.executed_steps}/${item.requested_steps} 脉冲`;
         if(typeof item.target_position==='number'&&Number.isFinite(item.target_position))progress+=` · 目标 ${formatNumber(item.target_position)} ${unit}`;
@@ -94,7 +94,7 @@
       }
       detail.textContent=`${physical}\n${modeLine}\n${item.binding_error||progress}${item.stale?' · 数据陈旧':''}`;
       if(isX42s){
-        // X42S 脉冲位置无行程/角度刻度语义：不画刻度投影，避免误导。
+        // X42S 驱动器角度位置无行程刻度语义：不画刻度投影，避免误导。
         const fill=card.querySelector('.linear-fill'),marker=card.querySelector('.linear-marker'),needle=card.querySelector('.needle');
         if(fill){fill.style.height='0';marker.style.display='none';}
         if(needle){needle.style.opacity='.25';needle.style.transform='rotate(0deg)';}

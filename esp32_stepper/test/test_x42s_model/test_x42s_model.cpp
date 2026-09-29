@@ -1,6 +1,7 @@
 // esp32_stepper/test/test_x42s_model/test_x42s_model.cpp
 // X42S 遥测模型纯函数测试：新鲜度/掉线窗口、未知字段不回退 0、
-// 故障标签映射（位定义待手册核对，测试锁定当前假设的确定性行为）。
+// 故障标签映射。状态字位定义已按手册 V1.0.5 核对（5.4.4/5.5.15，
+// 测试值取自手册示例：3A 状态字 0x83 / 3B 回零状态字 0x03）。
 #include <unity.h>
 
 #include <string.h>
@@ -65,22 +66,32 @@ void test_offline_detection_boundaries(void) {
 }
 
 void test_fault_priority_and_tags(void) {
-    // 位映射当前假设：bit0 stall, bit1 over_current, bit2 over_temp,
-    // bit3 under_voltage, bit4 follow_error；多位置位取安全优先。
+    // 手册位定义（3C 应答 [回零状态][电机状态]）：过流/过热在回零状态字
+    // （bit5/bit4），堵转在电机状态字（bit3 保护 / bit2 标志）；多位置位
+    // 取安全优先：过流 > 过热 > 堵转。限位/掉电/编码器等是信息位不映射。
     TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kNone,
-                          (int)x42s::fault_from_status_word(0));
-    TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kStall,
-                          (int)x42s::fault_from_status_word(0x0001));
-    TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kStall,
-                          (int)x42s::fault_from_status_word(0x001F));  // 全置位
+                          (int)x42s::fault_from_status_words(0x03, 0x83));
     TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kOverCurrent,
-                          (int)x42s::fault_from_status_word(0x0002));
+                          (int)x42s::fault_from_status_words(
+                              x42s::kOrgOverCurrent, 0));
     TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kOverTemp,
-                          (int)x42s::fault_from_status_word(0x0004));
-    TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kUnderVoltage,
-                          (int)x42s::fault_from_status_word(0x0008));
-    TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kFollowError,
-                          (int)x42s::fault_from_status_word(0x0010));
+                          (int)x42s::fault_from_status_words(
+                              x42s::kOrgOverTemp, 0));
+    TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kStall,
+                          (int)x42s::fault_from_status_words(
+                              0, x42s::kStatusStallProt));
+    TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kStall,
+                          (int)x42s::fault_from_status_words(
+                              0, x42s::kStatusStallFlag));
+    // 过流+堵转同时置位：过流优先（保护类先报）。
+    TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kOverCurrent,
+                          (int)x42s::fault_from_status_words(
+                              x42s::kOrgOverCurrent, x42s::kStatusStallProt));
+    // 回零中/回零失败/限位/掉电是信息位，不产生故障标签。
+    TEST_ASSERT_EQUAL_INT((int)x42s::Fault::kNone,
+                          (int)x42s::fault_from_status_words(
+                              x42s::kOrgInProgress | x42s::kOrgFailed,
+                              x42s::kStatusLimitLeft | x42s::kStatusPowerLost));
     // 标签必须与 PC 端 KNOWN_X42S_FAULTS 集合一致（§12 共用状态模型）
     TEST_ASSERT_EQUAL_STRING("stall", x42s::fault_tag(x42s::Fault::kStall));
     TEST_ASSERT_EQUAL_STRING("over_current",
@@ -98,11 +109,25 @@ void test_fault_priority_and_tags(void) {
     TEST_ASSERT_EQUAL_STRING("none", x42s::fault_tag(x42s::Fault::kNone));
 }
 
+void test_status_word_bit_constants_match_manual(void) {
+    // 手册 5.5.15 示例：状态字 0x83 = Oac_TF + Prf_TF + Ens_TF。
+    const uint8_t word = 0x83;
+    TEST_ASSERT_TRUE(word & x42s::kStatusEnabled);
+    TEST_ASSERT_TRUE(word & x42s::kStatusReached);
+    TEST_ASSERT_FALSE(word & x42s::kStatusStallFlag);
+    // 手册 5.4.4 示例：回零状态字 0x03 = Cal_Rdy + Enc_Rdy。
+    const uint8_t org = 0x03;
+    TEST_ASSERT_TRUE(org & x42s::kOrgCalibrated);
+    TEST_ASSERT_TRUE(org & x42s::kOrgEncoderReady);
+    TEST_ASSERT_FALSE(org & x42s::kOrgInProgress);
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     UNITY_BEGIN();
     RUN_TEST(test_reset_clears_everything);
     RUN_TEST(test_freshness_window_matches_pc_contract);
     RUN_TEST(test_offline_detection_boundaries);
+    RUN_TEST(test_status_word_bit_constants_match_manual);
     RUN_TEST(test_fault_priority_and_tags);
     return UNITY_END();
 }

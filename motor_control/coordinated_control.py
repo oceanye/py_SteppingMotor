@@ -753,7 +753,8 @@ def build_coordinated_snapshot(
                         "projected_position": None,
                         "target_position": None,
                         "position_trusted": False,
-                        "unit": "pulse",
+                        # 手册 V1.0.5：X 固件遥测/命令均为角度制（0.1°）。
+                        "unit": "deg",
                         "progress_percent": None,
                         "executed_steps": None,
                         "requested_steps": None,
@@ -794,7 +795,7 @@ def build_coordinated_snapshot(
                     "projected_position": None,
                     "target_position": live["command_position"],
                     "position_trusted": bool(live["telemetry_trusted"]),
-                    "unit": "pulse",
+                    "unit": "deg",
                     "progress_percent": None,
                     "executed_steps": None,
                     "requested_steps": None,

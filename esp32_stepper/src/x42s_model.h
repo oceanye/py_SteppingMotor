@@ -6,7 +6,7 @@
 // - 新鲜度窗口 200ms（10~20Hz 轮询）、掉线窗口 500ms；
 // - 故障标签取自 §14 安全集。
 // 本文件 header-only 纯函数：ESP32 固件与主机 native 测试共用。
-// ⚠ 状态字 → 故障标签的位映射为假设，待《ZDT X42S 用户手册 V1.0.5》核对。
+// ✅ 状态字位定义已按手册 V1.0.5 核对（5.4.4 回零状态 / 5.5.15 电机状态）。
 #pragma once
 
 #include <stdint.h>
@@ -15,6 +15,23 @@ namespace x42s {
 
 constexpr uint32_t kTelemetryFreshMs = 200;   // 与 PC 端 FRESH_MAX_AGE 一致
 constexpr uint32_t kTelemetryOfflineMs = 500; // 与 PC 端 STALE_AGE 一致
+
+// 电机状态字（5.5.15，3C 应答第 2 字节）。
+constexpr uint8_t kStatusEnabled = 0x01;      // Ens_TF 使能状态
+constexpr uint8_t kStatusReached = 0x02;      // Prf_TF 位置到达标志
+constexpr uint8_t kStatusStallFlag = 0x04;    // Cgi_TF 堵转标志（未触发保护）
+constexpr uint8_t kStatusStallProt = 0x08;    // Cgp_TF 堵转保护已触发
+constexpr uint8_t kStatusLimitLeft = 0x10;    // Esi_LF 左限位电平
+constexpr uint8_t kStatusLimitRight = 0x20;   // Esi_RF 右限位电平
+constexpr uint8_t kStatusPowerLost = 0x80;    // Oac_TF 掉电标志（信息位）
+
+// 回零状态字（5.4.4，3C 应答第 1 字节）。
+constexpr uint8_t kOrgEncoderReady = 0x01;    // Enc_Rdy 编码器就绪
+constexpr uint8_t kOrgCalibrated = 0x02;      // Cal_Rdy 校准表就绪
+constexpr uint8_t kOrgInProgress = 0x04;      // Org_SF 正在回零
+constexpr uint8_t kOrgFailed = 0x08;          // Org_CF 回零失败
+constexpr uint8_t kOrgOverTemp = 0x10;        // Otp_TF 过热保护已触发
+constexpr uint8_t kOrgOverCurrent = 0x20;     // Ocp_TF 过流保护已触发
 
 // 故障标签（§14）。顺序即状态位检查优先级（安全优先）。
 enum class Fault : uint8_t {
@@ -42,14 +59,17 @@ inline const char* fault_tag(Fault fault) {
   return "none";
 }
 
-// 状态字 → 故障标签。TODO(手册 V1.0.5): 位定义待核对；当前假设
-// bit0=堵转 bit1=过流 bit2=过热 bit3=低压 bit4=跟随误差。
-inline Fault fault_from_status_word(uint16_t status_bits) {
-  if (status_bits & 0x0001) return Fault::kStall;
-  if (status_bits & 0x0002) return Fault::kOverCurrent;
-  if (status_bits & 0x0004) return Fault::kOverTemp;
-  if (status_bits & 0x0008) return Fault::kUnderVoltage;
-  if (status_bits & 0x0010) return Fault::kFollowError;
+// 双状态字 → 故障标签（手册 3C：[回零状态][电机状态]）。
+// 过流/过热保护位在回零状态字（5.4.4），堵转在电机状态字（5.5.15）；
+// 低压保护无独立状态位——触发低压警告/保护时驱动器以 E2 拒绝命令，
+// 由总线层按"命令被拒"失败处理（不猜具体故障，状态位说话）；
+// 限位电平与掉电标志是信息位，不映射故障。
+inline Fault fault_from_status_words(uint8_t org_bits, uint8_t status_bits) {
+  if (org_bits & kOrgOverCurrent) return Fault::kOverCurrent;
+  if (org_bits & kOrgOverTemp) return Fault::kOverTemp;
+  if (status_bits & (kStatusStallProt | kStatusStallFlag)) {
+    return Fault::kStall;
+  }
   return Fault::kNone;
 }
 

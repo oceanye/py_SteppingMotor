@@ -216,7 +216,7 @@ class SnapshotMergeTests(unittest.TestCase):
         self.assertTrue(card["position_trusted"])
         self.assertTrue(card["measured"])
         self.assertEqual(card["position_source"], "x42s_driver")
-        self.assertEqual(card["unit"], "pulse")
+        self.assertEqual(card["unit"], "deg")
         self.assertEqual(card["driver_id"], 2)
         self.assertIn("x42s", card)
         self.assertEqual(control["backend"], BACKEND_X42S_UART)
