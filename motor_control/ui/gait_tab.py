@@ -16,7 +16,7 @@ from motor_control.gait_planner import (
     GaitParams, INITIAL_PLACEMENTS, LOW_NODE_PHASE_DEG,
 )
 from motor_control.gait_avoidance import LEGACY, TWO_MODE
-from motor_control.ui.common import PAD
+from motor_control.ui.common import PAD, bind_canvas_view, reset_canvas_view
 from motor_control.ui.gait_twin import build_twin_panel, refresh_twin_panel
 
 GEOMETRY_FIELDS = (
@@ -308,16 +308,13 @@ def _build_run_column(app, parent) -> None:
     # 2026-09-23 按用户要求：滚轮缩放采用"左键选中画面"模式——在画面内
     # 点一下左键（蓝框）后滚轮只缩放画面；鼠标移出画面即自动取消选中，
     # 滚轮交还给右侧页面滚动（此前缩放与页面滚动被同一滚轮同时触发）。
-    # 中键拖动平移、双击复位不变。视图状态挂在 gait_widgets，静态预览与
-    # 动画帧共用同一复合变换，切换报告/方向时复位。
+    # 中键拖动平移、双击复位不变。2026-09-29 交互实现抽到 ui/common.py
+    # 与数字孪生画面共用；视图状态仍挂 gait_widgets，静态预览与动画帧
+    # 共用同一复合变换，切换报告/方向时复位。
     app.gait_widgets["preview_view"] = {
         "zoom": 1.0, "pan_x": 0.0, "pan_y": 0.0, "active": False}
-    canvas.bind("<MouseWheel>", lambda e: _preview_zoom(app, e))
-    canvas.bind("<Button-1>", lambda e: _preview_activate(app, e))
-    canvas.bind("<Leave>", lambda e: _preview_deactivate(app, e))
-    canvas.bind("<Button-2>", lambda e: _preview_pan_start(app, e))
-    canvas.bind("<B2-Motion>", lambda e: _preview_pan_move(app, e))
-    canvas.bind("<Double-Button-1>", lambda e: _preview_reset_view(app))
+    bind_canvas_view(canvas, app.gait_widgets["preview_view"],
+                     lambda: _preview_redraw(app))
     # 2026-09-22 按用户要求：摆动侧与顺/逆方向合并为四个换位方式选项
     # （左顺移/左逆移/右顺移/右逆移）。切换即同步 side/arc 并静默重跑，
     # 预览图与【▶ 模拟动作】永远对应当前选择。
@@ -410,6 +407,13 @@ def _build_run_column(app, parent) -> None:
     # 2026-09-22 修复：advance 原在 row=1 且 columnspan=2，与右顺/右逆
     # 两按钮同行同格，后 grid 者覆盖前者——右侧两按钮被整个遮住不可见。
     app.gait_widgets["advance"].grid(row=2, column=0, columnspan=2, sticky="ew", padx=3, pady=(6, 0))
+    # 2026-09-29 按用户要求：一键执行——本步剩余阶段自动连走，不再逐
+    # 阶段弹窗确认（录视频用）；执行中可【⛔ 中止】停车，再点本按钮
+    # 停在当前阶段后回到人工确认。
+    app.gait_widgets["auto"] = ttk.Button(
+        buttons, text="⚡ 一键执行", command=app._gait_auto_clicked,
+    )
+    app.gait_widgets["auto"].grid(row=3, column=0, columnspan=2, sticky="ew", padx=3, pady=(6, 0))
 
     app.gait_widgets["state"] = ttk.Label(
         stage, textvariable=app.gait_state_var,
@@ -744,6 +748,9 @@ def frame_tip_clearance(report, geometry, index, rods):
 
 
 # ── 预览画布视图交互：滚轮缩放 / 中键平移 / 双击复位 ────────
+# 事件绑定与几何算法在 ui/common.py 的 bind_canvas_view/canvas_view_*；
+# 这里只保留视图变化后的重画分派（动画播放/暂停中重画当前帧，否则画
+# 静态预览）与新报告生成时的视图复位。
 
 def _preview_redraw(app) -> None:
     """视图变化后重画：动画播放/暂停中重画当前帧，否则画静态预览。"""
@@ -756,84 +763,11 @@ def _preview_redraw(app) -> None:
         draw_gait_preview(app)
 
 
-def _preview_zoom(app, event):
-    """滚轮缩放；画面处于左键选中状态（active）时才生效。
-
-    未激活返回 None，事件继续传给右侧滚动视口的页面滚动绑定；激活时
-    缩放并返回 "break" 阻断页面滚动。鼠标离开画面自动取消选中。
-    """
-    view = app.gait_widgets.get("preview_view")
-    if view is None or not view.get("active"):
-        return
-    factor = 1.1 ** (event.delta / 120.0)   # Windows 滚轮一格 ±120
-    old = float(view["zoom"])
-    new = min(50.0, max(0.2, old * factor))
-    if new == old:
-        return "break"
-    # 指针位置为不动点：T(v)=center+(v-center)·zoom+pan 仿射复合，
-    # 求新 pan 使指针所指的点缩放前后落在同一画布像素上。
-    cx = event.widget.winfo_width() / 2.0
-    cy = event.widget.winfo_height() / 2.0
-    view["pan_x"] = (event.x - cx) - new * (event.x - cx - view["pan_x"]) / old
-    view["pan_y"] = (event.y - cy) - new * (event.y - cy - view["pan_y"]) / old
-    view["zoom"] = new
-    _preview_redraw(app)
-    return "break"
-
-
-def _preview_activate(app, event) -> None:
-    """左键点一下画面：进入选中状态（蓝框），滚轮此后缩放画面。"""
-    view = app.gait_widgets.get("preview_view")
-    if view is not None:
-        view["active"] = True
-    try:
-        event.widget.configure(highlightbackground="#2563eb")
-    except tk.TclError:
-        pass
-
-
-def _preview_deactivate(app, event) -> None:
-    """鼠标离开画面：退出选中状态（灰框），滚轮交还页面滚动。"""
-    view = app.gait_widgets.get("preview_view")
-    if view is not None:
-        view["active"] = False
-    try:
-        event.widget.configure(highlightbackground="#cbd5e1")
-    except tk.TclError:
-        pass
-
-
-def _preview_pan_start(app, event) -> None:
-    view = app.gait_widgets.get("preview_view")
-    if view is not None:
-        view["pan_anchor"] = (event.x, event.y)
-
-
-def _preview_pan_move(app, event) -> None:
-    view = app.gait_widgets.get("preview_view")
-    anchor = view.get("pan_anchor") if view is not None else None
-    if anchor is None:
-        return
-    view["pan_x"] += event.x - anchor[0]
-    view["pan_y"] += event.y - anchor[1]
-    view["pan_anchor"] = (event.x, event.y)
-    _preview_redraw(app)
-
-
-def _preview_reset_view(app) -> None:
-    view = app.gait_widgets.get("preview_view")
-    if view is not None:
-        view.update(zoom=1.0, pan_x=0.0, pan_y=0.0)
-        view.pop("pan_anchor", None)
-    _preview_redraw(app)
-
-
 def reset_preview_view(app) -> None:
     """新报告/新方向生成时由外部调用，避免旧视图卡住新包围盒。"""
     view = app.gait_widgets.get("preview_view")
     if view is not None:
-        view.update(zoom=1.0, pan_x=0.0, pan_y=0.0)
-        view.pop("pan_anchor", None)
+        reset_canvas_view(view)
 
 
 def _draw_preview_pads(canvas, scene) -> None:
@@ -1194,6 +1128,14 @@ def refresh_gait_panel(app, progress_text=None) -> None:
             state="disabled" if active else "normal")
     app.gait_widgets["advance"].configure(
         state="normal" if active and not executing and snapshot["stage_id"] is not None else "disabled")
+    # 一键执行：进行中始终可点（=停在当前阶段后回人工）；未在自动时
+    # 与单步 advance 同门槛（流程活着、当前无运动、还有剩余阶段）。
+    auto_running = bool(getattr(app, "_gait_auto_run", False))
+    app.gait_widgets["auto"].configure(
+        text="⏹ 停止自动（本阶段后）" if auto_running else "⚡ 一键执行",
+        state="normal" if (auto_running or (active and not executing
+                                            and snapshot["stage_id"] is not None))
+               else "disabled")
     app.gait_widgets["abort"].configure(
         state="normal" if active else "disabled")
     app.gait_widgets["reset"].configure(

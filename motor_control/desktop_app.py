@@ -360,6 +360,7 @@ class StepperGUI:
         # ── 三足轮换步态：参数（标定向导写入 .gait_params.json）+ 当前执行实例 ──
         self.gait_params = GaitParams(trajectory_mode=TWO_MODE)
         self._gait_run: GaitExecutor | None = None
+        self._gait_auto_run = False   # ⚡ 一键执行中（阶段间自动推进）
         self._gait_owned = {}
         self._gait_supports = ("A", "B")
         self._gait_beta_deg = 180.0
@@ -695,6 +696,7 @@ class StepperGUI:
             self._gait_supports = tuple(supports)
             self._gait_beta_deg = self.gait_params.initial_beam_deg
             self._gait_needs_recovery = False
+        self._gait_auto_run = False
         self._gait_run = None
         self._save_gait_params(replace(self.gait_params, mr1_zero_deg=None, mr2_zero_deg=None,
                                       calibration_confirmed=False,
@@ -1262,11 +1264,17 @@ class StepperGUI:
                 self._gait_needs_recovery = True
                 self.gait_params = replace(self.gait_params, calibration_confirmed=False)
                 self._gait_release_ownership()
-            self._post_ui(lambda: self._refresh_gait_ui())
+            self._post_ui(self._gait_stage_worker_done)
+
+    def _gait_stage_worker_done(self):
+        """阶段工作线程结束（UI 线程）：刷新面板；自动模式下推进下一阶段。"""
+        self._refresh_gait_ui()
+        self._gait_auto_step()
 
     def _gait_abort_run(self):
         """UI 线程：中止按钮——请求退出 + 立即停掉四个绑定轴。"""
 
+        self._gait_auto_run = False   # 中止即终止自动推进
         run = self._gait_run
         if run is None:
             return
@@ -1584,6 +1592,7 @@ class StepperGUI:
         play_preview_animation(self)
 
     def _gait_start_run_clicked(self, side, arc_deg=None):
+        self._gait_auto_run = False   # 新一次摆动从人工确认开始
         params = self._gait_params_from_ui()
         if params is None:
             return
@@ -1612,6 +1621,11 @@ class StepperGUI:
         self._refresh_gait_ui()
 
     def _gait_stage_confirmed(self):
+        self._gait_advance_stage()
+
+    def _gait_advance_stage(self, *, auto=False):
+        """推进当前阶段：单步确认（弹窗）与一键执行（auto 跳过弹窗）共用。"""
+
         run = self._gait_run
         if run is None:
             return
@@ -1625,36 +1639,114 @@ class StepperGUI:
         if stage is None:
             self._refresh_gait_ui()
             return
-        verb = "执行" if stage.is_motion_stage else "确认完成"
-        if not messagebox.askokcancel(
-                f"{stage.stage_id} {stage.title}",
-                stage.confirm_text + f"\n\n确定{verb}本阶段？"):
-            return
+        if not auto:
+            verb = "执行" if stage.is_motion_stage else "确认完成"
+            if not messagebox.askokcancel(
+                    f"{stage.stage_id} {stage.title}",
+                    stage.confirm_text + f"\n\n确定{verb}本阶段？"):
+                return
         if stage.is_motion_stage:
             self._gait_execute_stage()
+            if auto and run.state != "running":
+                # 工作线程没起来（控制器正在停止/急停）：自动链中断。
+                self._gait_auto_run = False
         elif run.advance_confirm():
-            self.log(f"✓ {stage.stage_id} {stage.title} 人工确认通过")
-            if run.state == "done":
-                start, target, pivot, _bearing = run.route
-                self._gait_supports = (target, pivot) if run.side == "left" else (pivot, target)
-                support_role = "Mr2" if run.side == "left" else "Mr1"
-                a = self._gait_role_axis(support_role)
-                support_sign = run.params.mr2_sign if run.side == "left" else run.params.mr1_sign
-                actual_phi = support_sign * self.axis_profiles[a].units_from_steps(
-                    self.axis_runtime[a].position_steps - run.rotation_start[a])
-                self._gait_beta_deg -= actual_phi
-                run.twin_final_positions = {
-                    role.value: self.axis_profiles[self._gait_role_axis(role.value)].units_from_steps(
-                        self.axis_runtime[self._gait_role_axis(role.value)].position_steps)
-                    for role in LOGICAL_ROLE_ORDER}
-                self._gait_release_ownership()
+            self.log(f"✓ {stage.stage_id} {stage.title} "
+                     f"{'自动' if auto else '人工'}确认通过")
+            self._gait_finish_if_done()
         self._refresh_gait_ui()
+
+    def _gait_finish_if_done(self):
+        """本步全部阶段完成后的账本收尾：站位/横梁角更新 + 释放四轴。"""
+
+        run = self._gait_run
+        if run is None or run.state != "done":
+            return
+        start, target, pivot, _bearing = run.route
+        self._gait_supports = (target, pivot) if run.side == "left" else (pivot, target)
+        support_role = "Mr2" if run.side == "left" else "Mr1"
+        a = self._gait_role_axis(support_role)
+        support_sign = run.params.mr2_sign if run.side == "left" else run.params.mr1_sign
+        actual_phi = support_sign * self.axis_profiles[a].units_from_steps(
+            self.axis_runtime[a].position_steps - run.rotation_start[a])
+        self._gait_beta_deg -= actual_phi
+        run.twin_final_positions = {
+            role.value: self.axis_profiles[self._gait_role_axis(role.value)].units_from_steps(
+                self.axis_runtime[self._gait_role_axis(role.value)].position_steps)
+            for role in LOGICAL_ROLE_ORDER}
+        self._gait_release_ownership()
+        if getattr(self, "_gait_auto_run", False):
+            self._gait_auto_run = False
+            self.log("✅ 一键执行完成：本步全部阶段已走完，可继续下一次换位")
+
+    def _gait_auto_clicked(self):
+        """⚡ 一键执行：本步剩余阶段自动连走，不再逐阶段弹窗（录视频用）。
+
+        自动进行中再点一次＝停止自动推进（当前阶段完成后回到人工确认）。
+        """
+
+        if getattr(self, "_gait_auto_run", False):
+            self._gait_auto_run = False
+            self.log("已停止自动推进：当前阶段结束后回到人工确认")
+            self._refresh_gait_ui()
+            return
+        run = self._gait_run
+        if run is None:
+            messagebox.showwarning("步态未开始", "请先选择方向并【开始】一次摆动")
+            return
+        if run.state == "running" or run._stop_requested:
+            return
+        stage = run.current_stage()
+        if stage is None:
+            return
+        if not messagebox.askyesno(
+                "一键执行",
+                f"将自动执行本步剩余全部阶段（当前 {stage.stage_id} 起），"
+                "不再逐阶段弹窗确认。\n"
+                "确认型检查（横梁过杆、落位、现场支撑）不再逐项人工核对，"
+                "开始前请先确认机构周围安全。\n\n"
+                "执行中随时可点【⛔ 中止】停车；再点本按钮可停在当前阶段后"
+                "回到人工确认。\n\n确定开始自动执行？"):
+            return
+        self._gait_auto_run = True
+        self._gait_auto_step()
+
+    def _gait_auto_step(self):
+        """自动推进：连过确认型阶段，运动阶段交给 worker 后等完成回调。
+
+        入口（一键按钮）与每个阶段工作线程结束后（UI 线程）都从这里
+        续链；done/aborted/failed 或用户停止自动时链自然终止。
+        """
+
+        while getattr(self, "_gait_auto_run", False):
+            run = self._gait_run
+            if run is None:
+                self._gait_auto_run = False
+                return
+            snapshot = run.describe()
+            if snapshot["state"] == "running":
+                return   # 下一运动阶段已排队，等它的完成回调续链
+            if snapshot["state"] != "ready" or snapshot["stage_id"] is None:
+                # done / aborted / failed：自动链结束（收尾/恢复各自已处理）。
+                self._gait_auto_run = False
+                self._refresh_gait_ui()
+                return
+            before = snapshot["stage_index"]
+            self._gait_advance_stage(auto=True)
+            after = run.describe()
+            if after["state"] == "running":
+                return   # 运动阶段已交工作线程，等完成回调
+            if after["stage_index"] == before:
+                # 未推进且未进入运动（异常防御）：终止自动链避免死循环。
+                self._gait_auto_run = False
+                return
 
     def _gait_abort_clicked(self):
         self._gait_abort_run()
         self._refresh_gait_ui()
 
     def _gait_reset_run(self):
+        self._gait_auto_run = False
         if getattr(self, "_gait_owned", {}):
             self._gait_abort_run()
         self._gait_run = None
@@ -2785,6 +2877,7 @@ class StepperGUI:
         with self.state_lock:
             if axis in getattr(self, "_gait_owned", {}):
                 self._gait_needs_recovery = True
+                self._gait_auto_run = False
                 if self._gait_run is not None:
                     self._gait_run.request_stop()
             self._axis_motion_generation[axis] += 1
@@ -4506,6 +4599,7 @@ class StepperGUI:
         with self.state_lock:
             if getattr(self, "_gait_owned", {}):
                 self._gait_needs_recovery = True
+                self._gait_auto_run = False
                 if self._gait_run is not None:
                     self._gait_run.request_stop()
                 self._gait_release_ownership()

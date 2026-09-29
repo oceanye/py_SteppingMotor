@@ -111,19 +111,20 @@ class PreviewViewTransformTests(unittest.TestCase):
         return scene["to_canvas"]
 
     def test_zoom_requires_activation_and_keeps_pointer_point_fixed(self):
-        from motor_control.ui.gait_tab import _preview_zoom
+        from motor_control.ui.common import canvas_view_zoom
         world = self.report.samples[len(self.report.samples) // 2].center
         view = self.app.gait_widgets["preview_view"]
         # 未左键选中画面：滚轮不缩放，返回 None 让页面滚动绑定继续处理
-        idle = _preview_zoom(self.app, SimpleNamespace(
-            widget=self.canvas_stub, x=50, y=50, delta=120))
+        idle = canvas_view_zoom(view, SimpleNamespace(
+            widget=self.canvas_stub, x=50, y=50, delta=120), lambda: None)
         self.assertIsNone(idle)
         self.assertEqual(view["zoom"], 1.0)
         view["active"] = True
         mx, my = self._to_canvas()(*world)
         for delta in (120, 120, -120):
-            result = _preview_zoom(self.app, SimpleNamespace(
-                widget=self.canvas_stub, x=int(mx), y=int(my), delta=delta))
+            result = canvas_view_zoom(view, SimpleNamespace(
+                widget=self.canvas_stub, x=int(mx), y=int(my), delta=delta),
+                lambda: None)
             self.assertEqual(result, "break")   # 激活后阻断页面滚动
         self.assertGreater(view["zoom"], 1.0)
         nx, ny = self._to_canvas()(*world)
@@ -131,19 +132,35 @@ class PreviewViewTransformTests(unittest.TestCase):
         self.assertAlmostEqual(ny, my, delta=0.2)
 
     def test_pan_drag_shifts_view_and_reset_restores(self):
-        from motor_control.ui.gait_tab import (
-            _preview_pan_move, _preview_pan_start, reset_preview_view)
+        from motor_control.ui.common import (
+            canvas_view_pan_move, canvas_view_pan_start, reset_canvas_view)
         world = self.report.samples[0].center
         x0, y0 = self._to_canvas()(*world)
-        _preview_pan_start(self.app, SimpleNamespace(x=100, y=100))
-        _preview_pan_move(self.app, SimpleNamespace(x=140, y=75))
+        canvas_view_pan_start(self.app.gait_widgets["preview_view"],
+                              SimpleNamespace(x=100, y=100))
+        canvas_view_pan_move(self.app.gait_widgets["preview_view"],
+                             SimpleNamespace(x=140, y=75), lambda: None)
         x1, y1 = self._to_canvas()(*world)
         self.assertAlmostEqual(x1 - x0, 40.0, places=6)
         self.assertAlmostEqual(y1 - y0, -25.0, places=6)
-        reset_preview_view(self.app)
+        reset_canvas_view(self.app.gait_widgets["preview_view"])
         x2, y2 = self._to_canvas()(*world)
         self.assertAlmostEqual(x2, x0, places=6)
         self.assertAlmostEqual(y2, y0, places=6)
+
+    def test_twin_pad_window_resolves_two_rings_of_neighbors(self):
+        # 2026-09-29 孪生画面固定晶格窗口：ABC+两圈邻座，名字必须能被
+        # pad_center 解析回同一坐标（与规划器同一几何），保证换 route
+        # 不跳视野的同时落点支座一定在画面内。
+        from motor_control.gait_twin import pad_center
+        from motor_control.ui.gait_twin import twin_pad_window
+        pads = twin_pad_window()
+        self.assertTrue(set("ABC") <= set(pads))
+        self.assertGreaterEqual(len(pads), 15)
+        xs = [x for x, _y in pads.values()]
+        self.assertGreaterEqual(max(xs) - min(xs), 4.0)   # 覆盖到两圈邻座
+        for name, xy in pads.items():
+            self.assertEqual(pad_center(name), xy)
 
 
 @unittest.skipUnless(HAS_TK, "real Tk unavailable")
@@ -166,7 +183,8 @@ class GaitLayoutTests(unittest.TestCase):
                      "_gait_reload_params_clicked", "_gait_reestablish_baseline",
                      "_gait_run_dry_run", "_gait_start_run_clicked",
                      "_gait_play_preview_clicked", "_gait_stage_confirmed",
-                     "_gait_abort_clicked", "_gait_reset_run"):
+                     "_gait_auto_clicked", "_gait_abort_clicked",
+                     "_gait_reset_run"):
             setattr(self.app, name, lambda *args: None)
         self.page = ttk.Frame(self.root)
         self.page.pack(fill="both", expand=True)
@@ -368,7 +386,8 @@ class GaitLayoutTests(unittest.TestCase):
         view = self.app.gait_widgets["twin"]
         canvas = view["canvas"]
         before = canvas.coords(canvas.find_withtag("live_left")[0])
-        self.assertTrue(canvas.find_withtag("target_left"))
+        # 2026-09-29 按用户要求：孪生画面不再画虚线指令目标（运动轨迹）
+        self.assertFalse(canvas.find_withtag("target_left"))
         controller._on_step_progress(2, 400, 800)
         controller._on_step_progress(3, 133, 267)
         refresh_twin_panel(self.app)
@@ -382,6 +401,48 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertEqual(canvas.itemcget(line, "fill"), "#94a3b8")
         self.assertFalse(canvas.find_withtag("target_left"))
         self.assertIn("断连", view["status"].cget("text"))
+        self.assertFalse(self.errors)
+
+    def test_twin_canvas_zoom_needs_click_activation(self):
+        # 2026-09-29 孪生画面与预览同一交互：左键点一下选中后滚轮缩放，
+        # 未选中时滚轮不抢（返回给页面滚动），移出画面自动取消选中。
+        # （event_generate 无法合成 Double 修饰，双击复位绑定仅断言存在，
+        # 复位几何本身由 PreviewViewTransformTests 的 reset 用例覆盖。）
+        canvas = self.app.gait_widgets["twin"]["canvas"]
+        view = self.app.gait_widgets["twin_view"]
+        self.root.geometry("1024x620")
+        self.root.update()
+        self.assertTrue(canvas.bind("<Double-Button-1>"))
+        canvas.event_generate("<MouseWheel>", delta=120)
+        self.root.update()
+        self.assertEqual(view["zoom"], 1.0)   # 未选中：不缩放
+        canvas.event_generate("<Button-1>")   # 点一下：选中（蓝框）
+        self.root.update()
+        self.assertTrue(view["active"])
+        canvas.event_generate("<MouseWheel>", delta=120)
+        self.root.update()
+        self.assertGreater(view["zoom"], 1.0)
+        canvas.event_generate("<Leave>")
+        self.root.update()
+        self.assertFalse(view["active"])
+        canvas.event_generate("<MouseWheel>", delta=-120)
+        self.root.update()
+        self.assertGreater(view["zoom"], 1.0)   # 已取消选中：不再缩放
+        self.assertFalse(self.errors)
+
+    def test_auto_button_state_follows_run_and_auto_flag(self):
+        # 2026-09-29 一键执行按钮：未开始流程时禁用；自动进行中始终可点
+        # （=停在当前阶段后回人工），文本切换为"停止自动"。
+        from motor_control.ui.gait_tab import refresh_gait_panel
+        auto = self.app.gait_widgets["auto"]
+        refresh_gait_panel(self.app)
+        self.assertEqual(str(auto.cget("state")), "disabled")
+        self.assertIn("一键执行", auto.cget("text"))
+        self.app._gait_auto_run = True
+        refresh_gait_panel(self.app)
+        self.assertEqual(str(auto.cget("state")), "normal")
+        self.assertIn("停止自动", auto.cget("text"))
+        self.app._gait_auto_run = False
         self.assertFalse(self.errors)
 
 

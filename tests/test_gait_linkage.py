@@ -469,7 +469,78 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         self.assertEqual(set(app.stopped), {0, 1, 2, 3})
 
 
-class InitialPlacementTests(unittest.TestCase):
+class AutoRunTests(unittest.TestCase):
+    """2026-09-29 ⚡ 一键执行：S0–S7 自动连走，不再逐阶段弹窗确认。"""
+
+    def auto_app(self):
+        app = mechanism()
+        app._rot_release_active = False
+        app.queued = []
+
+        def queue_worker(target, *args, **kwargs):
+            app.queued.append((target, args, kwargs))
+            return object()
+
+        app._start_control_worker = queue_worker
+        return app
+
+    def test_auto_run_completes_all_stages_without_per_stage_dialogs(self):
+        # 入口 askyesno 确认一次后自动连走全部阶段；逐阶段 askokcancel
+        # 一次都不出现；完成后站位/横梁角/四轴释放与人工逐步完全等价。
+        app = self.auto_app()
+        run, _ = app._gait_begin_run("left")
+        asked = []
+        with patch("motor_control.desktop_app.messagebox.askyesno",
+                   side_effect=lambda *a, **k: asked.append(("yesno", a)) or True), \
+             patch("motor_control.desktop_app.messagebox.askokcancel",
+                   side_effect=lambda *a, **k: asked.append(("okcancel", a)) or True):
+            app._gait_auto_clicked()
+            while app.queued:   # 阶段 worker 同步排空 → _post_ui 同步续推
+                target, args, kwargs = app.queued.pop(0)
+                target(*args, **kwargs)
+        self.assertEqual(run.state, "done")
+        self.assertFalse(app._gait_auto_run)
+        self.assertEqual(app._gait_owned, {})
+        self.assertEqual(app._gait_supports, ("C", "B"))
+        self.assertAlmostEqual(app._gait_beta_deg, 119.925)
+        self.assertEqual([kind for kind, _a in asked], ["yesno"])   # 仅入口一次
+        self.assertTrue(any("一键执行完成" in line for line in app._logs))
+
+    def test_second_click_stops_auto_before_next_stage(self):
+        # 自动进行中再点一次：停止自动推进，阶段不提前中断（当前阶段
+        # 完成后回人工确认）。入口先连过 S0/S1 两个确认型阶段，S2 运动
+        # 阶段已排队 worker；停止后该 worker 不再被自动续链。
+        app = self.auto_app()
+        run, _ = app._gait_begin_run("left")
+        with patch("motor_control.desktop_app.messagebox.askyesno", return_value=True):
+            app._gait_auto_clicked()
+            self.assertTrue(app._gait_auto_run)
+            self.assertEqual(len(app.queued), 1)   # S2 已排队未执行
+            app._gait_auto_clicked()   # 再点一次 = 停止自动
+        self.assertFalse(app._gait_auto_run)
+        self.assertEqual(run.state, "running")   # S2 已抢占进入运动态（worker 排队中）
+        self.assertEqual(run.stage_index, 2)   # S0/S1 已自动确认；S2 起留给人工
+        self.assertTrue(any("停止自动" in line for line in app._logs))
+
+    def test_auto_chain_ends_when_stage_fails(self):
+        # 运动阶段失败（aborted/failed）后自动链必须终止，不推下一阶段。
+        app = self.auto_app()
+        run, _ = app._gait_begin_run("left")
+        app._gait_auto_run = True
+        run._fail("aborted", "模拟阶段失败")
+        app._gait_auto_step()
+        self.assertFalse(app._gait_auto_run)
+
+    def test_abort_button_clears_auto_flag(self):
+        app = self.auto_app()
+        app._gait_begin_run("left")
+        app._gait_auto_run = True
+        app._gait_abort_run()
+        self.assertFalse(app._gait_auto_run)
+        self.assertTrue(app._gait_needs_recovery)
+
+
+
     """2026-09-24 红杆在横梁左/右两种初始摆放（互为镜像）的账本与模态。"""
 
     def test_placement_derives_supports_beam_and_roundtrips(self):
