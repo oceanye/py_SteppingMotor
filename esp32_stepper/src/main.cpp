@@ -9,6 +9,7 @@
 #include "track_motor.h"
 #include "stepper_encoders.h"
 #include "remote_stepper.h"
+#include "x42s_uart.h"  // X42S_UART_ENABLED=0 时为 inline 空实现
 #endif
 #if defined(DRIVE_MODE_FOC)
   static const int PIN_NFAULT[NUM_AXES] = { PIN_FOC_NFAULT_0, PIN_FOC_NFAULT_1 };
