@@ -193,6 +193,26 @@
   #error "RS485 remote steppers and GPIO42/47 diagnostic I2C cannot be enabled together"
 #endif
 
+// ── 可选 X42S TTL-UART 四轴闭环执行层（feature/x42s-uart-actuator-binding）──
+// 与 RS485 remote / 编码器诊断 I2C 共用 GPIO42/47，编译期互斥。
+// ⚠ 功能码与数据布局待《ZDT X42S 用户手册 V1.0.5》核对，核对前
+//   只允许编译验证，禁止上台架（见 x42s_uart.cpp 的 TODO(手册) 段）。
+#ifndef X42S_UART_ENABLED
+  #define X42S_UART_ENABLED  0
+#endif
+#define PIN_X42S_RX                   47
+#define PIN_X42S_TX                   42
+#define X42S_BAUD                 115200
+#define X42S_DRIVER_COUNT               4   // 首装建议 ID1..4（需求 §4）
+#define X42S_RESPONSE_TIMEOUT_MS       60   // TODO(手册): 单次应答窗口
+#define X42S_POLL_INTERVAL_MS          25   // 轮询节拍：4 台轮转 ≈ 10Hz/台
+#if X42S_UART_ENABLED && REMOTE_STEPPER_ENABLED
+  #error "X42S UART and RS485 remote steppers share GPIO42/47 — pick one"
+#endif
+#if X42S_UART_ENABLED && STEPPER_ENCODER_DIAGNOSTICS_ENABLED
+  #error "X42S UART and GPIO42/47 diagnostic I2C cannot be enabled together"
+#endif
+
 // ── 可选硬件急停输入（常闭 NC 接点：GPIO35 ↔ GND + 内部上拉）──
 // NC 接点在安全态导通，因此安全态=低；按下或断线后由内部上拉变高=触发。
 // 未安装 NC 回路时必须保持 0，否则悬空/未接线会按失效安全原则触发急停。

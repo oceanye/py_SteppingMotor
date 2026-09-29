@@ -75,6 +75,7 @@ void setup() {
   track_motor_init();
   stepper_encoders_init();
   remote_stepper_init();
+  x42s_uart_init();
 #if HW_ESTOP_ENABLED
   serial_tx_printf("  hw estop: GPIO%d%s", PIN_HW_ESTOP,
                    HW_ESTOP_ACTIVE_HIGH
@@ -105,7 +106,13 @@ void setup() {
 #else
   serial_tx_line("  RS485 Pico nodes: DISABLED (select a *_remote environment)");
 #endif
-  serial_tx_line("Protocol: MOVE/STOP/ESTOP | FOC | TRACK | ENC,<axis>,S | DIAG | STDIAG | MODE");
+#if X42S_UART_ENABLED
+  serial_tx_printf("  X42S UART: ENABLED, ID1..%d RX/TX=%d/%d baud=%d (function codes pending manual check)",
+                   X42S_DRIVER_COUNT, PIN_X42S_RX, PIN_X42S_TX, X42S_BAUD);
+#else
+  serial_tx_line("  X42S UART: DISABLED (select esp32s3_gear_x42s environment)");
+#endif
+  serial_tx_line("Protocol: MOVE/STOP/ESTOP | FOC | TRACK | ENC,<axis>,S | DIAG | STDIAG | X42S | MODE");
 #endif
 }
 
@@ -135,6 +142,7 @@ void loop() {
   }
 #elif defined(DRIVE_MODE_GEAR)
   remote_stepper_tick();
+  x42s_uart_tick();
   static uint32_t s_last_gear_safety_check = 0;
   uint32_t now = millis();
   if (now - s_last_gear_safety_check >= FAULT_POLL_MS) {

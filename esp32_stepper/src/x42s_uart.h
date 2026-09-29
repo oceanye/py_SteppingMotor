@@ -1,0 +1,55 @@
+// esp32_stepper/src/x42s_uart.h
+// X42S TTL-UART 总线驱动（§8.1 最低 API / §8.2 串口单 owner）。
+//
+// 串口所有权：所有 X42S 收发都发生在 Arduino 主任务上下文
+// （loop() 的 x42s_uart_tick() 与 protocol_handle_line() 的命令分发），
+// 同一执行流串行化 = 唯一写者，天然满足"两个 task 不得同时写同一
+// UART / 回复不错配"（§8.2 的硬性要求）。不引入第二个 FreeRTOS task。
+//
+// ⚠ 手册核对点（与 x42s_protocol.h 相同）：功能码与数据区布局、
+// 应答超时窗口、状态字位定义均待《ZDT X42S 用户手册 V1.0.5》核对，
+// 核对前禁止上台架。核对后只改 x42s_uart.cpp 内各 TODO(手册) 段。
+#pragma once
+
+#include <stdint.h>
+
+#include "config.h"
+#include "x42s_model.h"
+#include "x42s_protocol.h"
+
+#if defined(DRIVE_MODE_GEAR) && X42S_UART_ENABLED
+
+// 初始化 UART（GPIO42 TX / GPIO47 RX）。不自动扫描——用 X42S,SCAN 探测。
+void x42s_uart_init();
+
+// 主循环轮询：配置的台号轮转读状态（X42S_POLL_INTERVAL_MS 节拍，
+// 四台 ≈ 10Hz/台），并把超窗未应答的台降为 offline（带降沿事件行）。
+void x42s_uart_tick();
+
+// ---- §8.1 最低 API（返回 false 时查 x42s_last_error）----
+bool x42s_ping(uint8_t id);
+bool x42s_enable(uint8_t id, bool enable);
+bool x42s_stop(uint8_t id);
+void x42s_stop_all();   // 逐台单播停止；广播仅留给 x42s_estop/同步触发
+void x42s_estop();      // 停止 + 失能全部；此后必须显式重新使能（§14.1）
+bool x42s_zero_position(uint8_t id);
+bool x42s_move_relative(uint8_t id, int32_t steps, uint32_t speed_steps_s);
+bool x42s_sync_trigger();
+bool x42s_read_status(uint8_t id);  // 立即拉一次遥测并写缓存
+
+// ---- 状态查询 / PC 协议（X42S,S / X42S,SCAN / X42S,DIAG）----
+const x42s::Telemetry& x42s_telemetry(uint8_t id);
+const x42s::CommStats& x42s_comm_stats();
+void x42s_print_status_line(uint8_t id);  // X42S,<id>,S,...
+void x42s_print_scan();                   // 探测 ID1..X42S_DRIVER_COUNT
+void x42s_print_diag(uint8_t id);         // ping + 全量读 + 通讯统计
+const char* x42s_last_error();
+
+#else  // X42S 未启用：main.cpp / system_estop 的无条件调用点给空实现
+
+inline void x42s_uart_init() {}
+inline void x42s_uart_tick() {}
+inline void x42s_stop_all() {}
+inline void x42s_estop() {}
+
+#endif  // DRIVE_MODE_GEAR && X42S_UART_ENABLED

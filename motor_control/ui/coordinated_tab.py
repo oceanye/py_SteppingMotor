@@ -7,10 +7,13 @@ import tkinter as tk
 from tkinter import ttk
 
 from motor_control import (
+    BACKEND_STEPDIR,
+    BACKEND_X42S_UART,
     LOGICAL_ROLE_ORDER,
     LogicalRole,
     MODE_LINEAR,
     ROLE_SPECS,
+    SUGGESTED_X42S_ID_BY_ROLE,
     stepper_axis_topology,
 )
 from motor_control.ui.common import PAD
@@ -34,6 +37,12 @@ STATE_TEXT = {
     "ABORTED_UNTRUSTED": "已中止/需校准",
     "IDLE_UNTRUSTED": "空闲/需校准",
     "IDLE": "空闲",
+    # X42S UART 后端（feature/x42s-uart-actuator-binding）
+    "X42S_BACKEND_PENDING": "已绑定·X42S后端待接入",
+    "X42S_ONLINE": "X42S 在线",
+    "X42S_OFFLINE": "X42S 掉线",
+    "X42S_FAULT": "X42S 故障",
+    "X42S_STALE": "X42S 遥测超期",
 }
 
 STATE_COLORS = {
@@ -46,6 +55,11 @@ STATE_COLORS = {
     "NODE_UNKNOWN": "#b26a00",
     "IDLE_UNTRUSTED": "#b26a00",
     "ABORTED_UNTRUSTED": "#b26a00",
+    "X42S_ONLINE": "#16803a",
+    "X42S_BACKEND_PENDING": "#b26a00",
+    "X42S_STALE": "#b26a00",
+    "X42S_OFFLINE": "#b42318",
+    "X42S_FAULT": "#b42318",
 }
 
 BLOCKER_TEXT = {
@@ -81,17 +95,46 @@ def _axis_option(axis):
     )
 
 
+def apply_backend_editor_visibility(app) -> None:
+    """按后端单选切换每行编辑控件：stepdir 显示轴下拉，x42s 显示 ID 输入。"""
+
+    backend_var = getattr(app, "binding_backend_var", None)
+    widgets = getattr(app, "coordinated_widgets", {}).get("binding_editor") or {}
+    axis_widgets = widgets.get("axis")
+    id_widgets = widgets.get("driver_id")
+    if backend_var is None or not axis_widgets or not id_widgets:
+        return  # UI 未建成（headless 测试桩）时不做事
+    x42s = backend_var.get() == BACKEND_X42S_UART
+    for role in LOGICAL_ROLE_ORDER:
+        if x42s:
+            axis_widgets[role.value].grid_remove()
+            id_widgets[role.value].grid()
+        else:
+            id_widgets[role.value].grid_remove()
+            axis_widgets[role.value].grid()
+
+
 def sync_binding_editor(app, bindings) -> None:
     """Replace the editor with an applied snapshot after an explicit action."""
 
+    app.binding_backend_var.set(
+        BACKEND_X42S_UART if bindings.backend == BACKEND_X42S_UART
+        else BACKEND_STEPDIR
+    )
     for role in LOGICAL_ROLE_ORDER:
         binding = bindings.for_role(role)
-        option = (
-            UNBOUND_OPTION
-            if binding is None
-            else app._binding_option_by_axis[binding.axis]
-        )
+        if binding is None:
+            option = UNBOUND_OPTION
+            driver_id = ""
+        elif binding.kind == "x42s":
+            option = UNBOUND_OPTION
+            driver_id = str(binding.driver_id)
+        else:
+            option = app._binding_option_by_axis[binding.axis]
+            driver_id = ""
         app.control_binding_vars[role.value].set(option)
+        app.x42s_binding_vars[role.value].set(driver_id)
+    apply_backend_editor_visibility(app)
     app._binding_editor_dirty = False
     app._binding_editor_revision = bindings.revision
     dirty = app.coordinated_widgets.get("dirty_label")
@@ -118,12 +161,40 @@ def build_coordinated_tab(app, parent) -> None:
         justify="left",
     ).pack(anchor="w", padx=8, pady=5)
 
-    binding_frame = ttk.LabelFrame(parent, text="逻辑电机绑定（仅步进轴）")
+    binding_frame = ttk.LabelFrame(parent, text="逻辑电机绑定（步进轴 / X42S UART）")
     binding_frame.grid(row=1, column=0, sticky="ew", **PAD)
-    headings = ("角色", "固定动作", "要求模式", "物理步进轴", "校验", "定位")
+
+    # 后端单选：v1 stepdir（原样）或 v2 x42s_uart（schema v2 文档）。
+    backend_row = ttk.Frame(binding_frame)
+    backend_row.grid(row=0, column=0, columnspan=6, sticky="ew", padx=4, pady=(4, 0))
+    ttk.Label(backend_row, text="执行层后端:", font=("Microsoft YaHei", 9, "bold")).pack(
+        side="left"
+    )
+    app.binding_backend_var = tk.StringVar(value=BACKEND_STEPDIR)
+    ttk.Radiobutton(
+        backend_row,
+        text="步进轴 stepdir（v1，现状）",
+        variable=app.binding_backend_var,
+        value=BACKEND_STEPDIR,
+        command=app._on_binding_editor_change,
+    ).pack(side="left", padx=6)
+    ttk.Radiobutton(
+        backend_row,
+        text="X42S UART x42s_uart（v2）",
+        variable=app.binding_backend_var,
+        value=BACKEND_X42S_UART,
+        command=app._on_binding_editor_change,
+    ).pack(side="left", padx=6)
+    ttk.Label(
+        backend_row,
+        foreground="#b42318",
+        text="X42S 后端未过 M5 台架验证；切换后步态被拒（§19），且 v1→v2 迁移须确认",
+    ).pack(side="left", padx=8)
+
+    headings = ("角色", "固定动作", "要求模式", "物理执行器", "校验", "定位")
     for column, text in enumerate(headings):
         ttk.Label(binding_frame, text=text, font=("Microsoft YaHei", 9, "bold")).grid(
-            row=0, column=column, sticky="w", padx=4, pady=2
+            row=1, column=column, sticky="w", padx=4, pady=2
         )
     binding_frame.columnconfigure(3, weight=1)
 
@@ -137,7 +208,9 @@ def build_coordinated_tab(app, parent) -> None:
         app._binding_option_by_axis[axis] = option
 
     app.control_binding_vars = {}
-    for row, role in enumerate(LOGICAL_ROLE_ORDER, start=1):
+    app.x42s_binding_vars = {}
+    app.coordinated_widgets["binding_editor"] = {"axis": {}, "driver_id": {}}
+    for row, role in enumerate(LOGICAL_ROLE_ORDER, start=2):
         spec = ROLE_SPECS[role]
         ttk.Label(binding_frame, text=role.value, font=("Consolas", 10, "bold")).grid(
             row=row, column=0, sticky="w", padx=4, pady=2
@@ -160,6 +233,28 @@ def build_coordinated_tab(app, parent) -> None:
         )
         combo.grid(row=row, column=3, sticky="ew", padx=4, pady=2)
         combo.bind("<<ComboboxSelected>>", app._on_binding_editor_change)
+        app.coordinated_widgets["binding_editor"]["axis"][role.value] = combo
+
+        id_frame = ttk.Frame(binding_frame)
+        ttk.Label(id_frame, text="X42S 驱动器 ID:").pack(side="left")
+        id_var = tk.StringVar(value=str(SUGGESTED_X42S_ID_BY_ROLE[role.value]))
+        app.x42s_binding_vars[role.value] = id_var
+        id_spin = ttk.Spinbox(
+            id_frame,
+            from_=1,
+            to=255,
+            textvariable=id_var,
+            width=6,
+            command=app._on_binding_editor_change,
+        )
+        id_spin.pack(side="left", padx=2)
+        id_spin.bind("<KeyRelease>", app._on_binding_editor_change)
+        ttk.Label(id_frame, text="（1..255，0=广播禁绑）", foreground="#555").pack(
+            side="left", padx=2
+        )
+        # grid 时机由 apply_backend_editor_visibility 按 backend 决定。
+        app.coordinated_widgets["binding_editor"]["driver_id"][role.value] = id_frame
+
         status = ttk.Label(
             binding_frame,
             text="未绑定",
@@ -176,9 +271,9 @@ def build_coordinated_tab(app, parent) -> None:
         ).grid(row=row, column=5, padx=4, pady=2)
 
     button_row = ttk.Frame(binding_frame)
-    button_row.grid(row=5, column=0, columnspan=6, sticky="ew", padx=4, pady=5)
+    button_row.grid(row=6, column=0, columnspan=6, sticky="ew", padx=4, pady=5)
     ttk.Button(
-        button_row, text="填入建议映射 0/2/1/3", command=app._fill_suggested_bindings
+        button_row, text="填入建议映射", command=app._fill_suggested_bindings
     ).pack(side="left", padx=3)
     ttk.Button(
         button_row, text="验证并保存绑定", command=app._save_binding_editor
@@ -418,6 +513,47 @@ def _draw_rotary(canvas, snapshot):
         canvas.create_text(center_x, center_y, text="--", fill="#64748b", font=("Consolas", 12))
 
 
+def _draw_x42s(canvas, live):
+    """X42S 卡片：状态块 + 实测脉冲数；不画行程刻度（驱动器脉冲无行程语义）。"""
+
+    canvas.delete("all")
+    width, height = 92, 112
+    online = bool(live.get("online"))
+    fault = live.get("fault")
+    color = "#b42318" if (fault or not online) else "#16803a"
+    canvas.create_rectangle(6, 8, width - 6, 46, outline=color, width=2)
+    canvas.create_text(
+        width / 2, 19, text="X42S", font=("Consolas", 10, "bold"), fill=color
+    )
+    canvas.create_text(
+        width / 2, 36,
+        text=f"ID {live.get('driver_id', '?')}",
+        font=("Consolas", 9), fill="#334155",
+    )
+    canvas.create_text(
+        width / 2, 58, text="在线" if online else "掉线",
+        font=("Microsoft YaHei", 9), fill=color,
+    )
+    canvas.create_text(
+        width / 2, 72, text=fault or "无故障",
+        font=("Consolas", 8),
+        fill="#b42318" if fault else "#64748b",
+    )
+    measured = live.get("measured_position")
+    if measured is None:
+        canvas.create_text(
+            width / 2, 92, text="--", font=("Consolas", 12), fill="#64748b"
+        )
+    else:
+        trusted = bool(live.get("telemetry_trusted"))
+        canvas.create_text(
+            width / 2, 92, text=f"{float(measured):.0f}",
+            font=("Consolas", 12, "bold"),
+            fill="#1565c0" if trusted else "#b26a00",
+        )
+    canvas.create_text(width / 2, height - 5, text="pulse", font=("Arial", 7), fill="#64748b")
+
+
 def refresh_coordinated_tab(app, control, snapshots) -> None:
     """Render a previously captured controller snapshot on the Tk thread."""
 
@@ -453,6 +589,32 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
             widgets["position"].configure(text="--", foreground="#555")
 
         binding = snapshot.get("binding")
+        live = snapshot.get("x42s")
+        if binding and live is not None:
+            detail = f"{snapshot.get('physical_label')} · 驱动器实测 · unit=pulse"
+            fault = live.get("fault")
+            if fault:
+                detail += f"\n故障: {fault}"
+            widgets["detail"].configure(text=detail)
+            error = live.get("position_error")
+            speed = live.get("speed")
+            temperature = live.get("temperature_c")
+            progress_parts = []
+            if error is not None:
+                progress_parts.append(f"跟随误差 {float(error):.1f}")
+            if speed is not None:
+                progress_parts.append(f"速度 {float(speed):.1f}")
+            if temperature is not None:
+                progress_parts.append(f"{float(temperature):.0f}°C")
+            age = live.get("last_update_age_ms")
+            if age is not None:
+                progress_parts.append(f"{int(age)}ms 前")
+            progress = " · ".join(progress_parts) if progress_parts else "无遥测"
+            if live.get("stale"):
+                progress += " · 数据陈旧"
+            widgets["progress"].configure(text=progress)
+            _draw_x42s(widgets["canvas"], live)
+            continue
         if binding:
             axis = binding["axis"]
             route = (
@@ -501,6 +663,7 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
 
 __all__ = [
     "UNBOUND_OPTION",
+    "apply_backend_editor_visibility",
     "build_coordinated_tab",
     "refresh_coordinated_tab",
     "sync_binding_editor",

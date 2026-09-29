@@ -164,6 +164,35 @@ def build_node_status_command(node: Union[int, str] = "*") -> str:
     return command_line("NODE", _axis_token(node, wildcard=True), "S")
 
 
+def _x42s_driver_id(driver_id: int) -> int:
+    # 0 是广播地址，禁止作为查询/操作对象（需求 §10）。
+    return _integer(driver_id, "driver_id", 1, 255)
+
+
+def build_x42s_status_command(driver_id: int) -> str:
+    """Build ``X42S,S,<id>``：单台遥测（cmd/meas/err/valid 位等）。"""
+
+    return command_line("X42S", "S", _x42s_driver_id(driver_id))
+
+
+def build_x42s_diag_command(driver_id: int) -> str:
+    """Build ``X42S,DIAG,<id>``：ping + 全量读 + 通讯统计。"""
+
+    return command_line("X42S", "DIAG", _x42s_driver_id(driver_id))
+
+
+def build_x42s_scan_command() -> str:
+    """Build ``X42S,SCAN``：逐台探测 ID1..4。"""
+
+    return command_line("X42S", "SCAN")
+
+
+def build_x42s_sync_command() -> str:
+    """Build ``X42S,SYNC``：广播触发已缓存的多机同步动作。"""
+
+    return command_line("X42S", "SYNC")
+
+
 def build_encoder_status_command(axis: int) -> str:
     return command_line("ENC", _axis_token(axis), "S")
 
@@ -305,6 +334,77 @@ class NodeStatusReply(Reply):
     age_ms: int
 
 
+# 与固件 x42s::fault_tag 及 actuator_model.KNOWN_X42S_FAULTS 的并集（含
+# "none"）；测试锁定三处一致，防止标签漂移后遥测被静默丢弃。
+X42S_FAULT_TAGS: tuple[str, ...] = (
+    "none",
+    "stall",
+    "over_current",
+    "over_temp",
+    "under_voltage",
+    "follow_error",
+    "comm_error",
+    "addr_conflict",
+)
+
+# 遥测行尾 valid_mask 的位定义（与固件 print_status_line 一致）：
+# bit0=command bit1=measured bit2=error bit3=speed bit4=current bit5=temp。
+X42S_VALID_COMMAND = 0b000001
+X42S_VALID_MEASURED = 0b000010
+X42S_VALID_ERROR = 0b000100
+X42S_VALID_SPEED = 0b001000
+X42S_VALID_CURRENT = 0b010000
+X42S_VALID_TEMPERATURE = 0b100000
+
+
+@dataclass(frozen=True, slots=True)
+class X42sStatusReply(Reply):
+    """``X42S,<id>,S,...`` 单台遥测行。
+
+    未置 valid 位的数值字段为 None——未知绝不回退 0（需求 §12）。
+    """
+
+    driver_id: int
+    online: bool
+    enabled: bool
+    reached: bool
+    fault: Optional[str]  # "none" 已归一化为 None
+    command_position: Optional[float]
+    measured_position: Optional[float]
+    position_error: Optional[float]
+    speed: Optional[float]
+    current_a: Optional[float]
+    temperature_c: Optional[float]
+    age_ms: int
+    timeout_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class X42sDiagReply(Reply):
+    """``X42S,<id>,DIAG,<tx>,<rx>,<cksum>,<mismatch>,<unsolicited>,<timeout>``."""
+
+    driver_id: int
+    frames_sent: int
+    replies_matched: int
+    checksum_errors: int
+    mismatched_replies: int
+    unsolicited_frames: int
+    timeouts: int
+
+
+@dataclass(frozen=True, slots=True)
+class X42sScanReply(Reply):
+    driver_id: int
+    online: bool
+
+
+@dataclass(frozen=True, slots=True)
+class X42sOfflineEvent(AsyncEvent):
+    """固件检测到某台驱动器掉线（遥测超 500ms 无应答，§10）。"""
+
+    driver_id: int
+
+
 def _parse_nonnegative(text: str) -> Optional[int]:
     if not text or not text.isdecimal():
         return None
@@ -321,6 +421,84 @@ def _parse_bool(text: str) -> Optional[bool]:
 
 def _unknown(raw: str, reason: str) -> UnknownMessage:
     return UnknownMessage(raw=raw, reason=reason)
+
+
+def _parse_x42s_status(
+    raw: str, fields: list[str], driver_id: int
+) -> ProtocolMessage:
+    online = _parse_bool(fields[3])
+    enabled = _parse_bool(fields[4])
+    reached = _parse_bool(fields[5])
+    age_ms = _parse_nonnegative(fields[13])
+    timeout_count = _parse_nonnegative(fields[14])
+    valid_mask = _parse_nonnegative(fields[15])
+    if (
+        online is None
+        or enabled is None
+        or reached is None
+        or age_ms is None
+        or timeout_count is None
+        or valid_mask is None
+    ):
+        return _unknown(raw, "malformed x42s status flags")
+    fault_text = fields[6]
+    if fault_text not in X42S_FAULT_TAGS:
+        return _unknown(raw, "unknown x42s fault tag")
+    masked: dict[int, Optional[float]] = {}
+    for bit, index in (
+        (X42S_VALID_COMMAND, 7),
+        (X42S_VALID_MEASURED, 8),
+        (X42S_VALID_ERROR, 9),
+        (X42S_VALID_SPEED, 10),
+        (X42S_VALID_CURRENT, 11),
+        (X42S_VALID_TEMPERATURE, 12),
+    ):
+        try:
+            number = float(fields[index])
+        except ValueError:
+            return _unknown(raw, "malformed x42s status value")
+        if not math.isfinite(number):
+            return _unknown(raw, "non-finite x42s status value")
+        # 固件对未上报字段打印占位 0.0；valid 位未置的一律还原为 None。
+        masked[bit] = number if valid_mask & bit else None
+    return X42sStatusReply(
+        raw,
+        driver_id,
+        online,
+        enabled,
+        reached,
+        None if fault_text == "none" else fault_text,
+        masked[X42S_VALID_COMMAND],
+        masked[X42S_VALID_MEASURED],
+        masked[X42S_VALID_ERROR],
+        masked[X42S_VALID_SPEED],
+        masked[X42S_VALID_CURRENT],
+        masked[X42S_VALID_TEMPERATURE],
+        age_ms,
+        timeout_count,
+    )
+
+
+def _parse_x42s_line(raw: str, fields: list[str]) -> ProtocolMessage:
+    driver_id = _parse_nonnegative(fields[1])
+    if driver_id is None or driver_id == 0:
+        return _unknown(raw, "malformed x42s driver id")
+    if len(fields) == 3 and fields[2] == "OFFLINE":
+        return X42sOfflineEvent(raw, driver_id)
+    if (
+        len(fields) == 4
+        and fields[2] == "SCAN"
+        and fields[3] in ("ONLINE", "OFFLINE")
+    ):
+        return X42sScanReply(raw, driver_id, fields[3] == "ONLINE")
+    if len(fields) == 9 and fields[2] == "DIAG":
+        counters = tuple(_parse_nonnegative(value) for value in fields[3:])
+        if all(counter is not None for counter in counters):
+            return X42sDiagReply(raw, driver_id, *counters)  # type: ignore[arg-type]
+        return _unknown(raw, "malformed x42s diag counters")
+    if len(fields) == 16 and fields[2] == "S":
+        return _parse_x42s_status(raw, fields, driver_id)
+    return _unknown(raw, "unrecognised x42s line")
 
 
 def parse_line(data: Union[str, bytes]) -> ProtocolMessage:
@@ -375,6 +553,9 @@ def parse_line(data: Union[str, bytes]) -> ProtocolMessage:
         if node is not None and node > 0:
             return NodeOfflineEvent(raw, node)
         return _unknown(raw, "malformed node offline event")
+
+    if len(fields) >= 3 and fields[0] == "X42S":
+        return _parse_x42s_line(raw, fields)
 
     if len(fields) == 2 and fields[0] == "ACK":
         axis = _parse_nonnegative(fields[1])
@@ -537,6 +718,29 @@ def reply_matcher_for(command: str) -> ReplyMatcher:
             node = _parse_nonnegative(tokens[1])
             return isinstance(reply, NodeStatusReply) and (
                 tokens[1] == "*" or reply.node == node
+            )
+        if verb == "X42S" and len(tokens) >= 2:
+            if tokens[1] == "SCAN":
+                return isinstance(reply, X42sScanReply)
+            if tokens[1] == "SYNC":
+                return isinstance(reply, OkReply) and reply.values == ("X42S", "SYNC")
+            driver_id = _parse_nonnegative(tokens[1] if len(tokens) == 2 else tokens[2])
+            if tokens[1] == "S" and len(tokens) == 3:
+                return (
+                    isinstance(reply, X42sStatusReply)
+                    and reply.driver_id == driver_id
+                )
+            if tokens[1] == "DIAG" and len(tokens) == 3:
+                return (
+                    isinstance(reply, X42sDiagReply)
+                    and reply.driver_id == driver_id
+                )
+            # X42S,<id>,EN|STOP|ZERO 固件回 OK,X42S,<id>,<sub>[,..]。
+            return (
+                isinstance(reply, OkReply)
+                and len(reply.values) >= 2
+                and reply.values[0] == "X42S"
+                and reply.values[1] == tokens[1]
             )
         if verb in ("STDIAG", "DIAG"):
             return isinstance(reply, AckReply)

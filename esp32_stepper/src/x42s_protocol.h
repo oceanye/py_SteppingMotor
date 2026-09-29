@@ -44,6 +44,8 @@ enum FunctionCode : uint8_t {
   kFcSetZero = 0x93,        // 设置零点（待核对）
   kFcMoveRelative = 0xFD,   // 相对位置运动（待核对）
   kFcReadPosition = 0x36,   // 读取实测位置（待核对）
+  kFcReadTarget = 0x32,     // 读取目标位置（待核对）
+  kFcReadStatus = 0x3A,     // 读取状态/故障字（待核对）
   kFcReachedNotify = 0x42,  // 驱动器主动上报到位（待核对）
   kFcSyncCache = 0x20,      // 多机同步：缓存命令（待核对）
   kFcSyncTrigger = 0x21,    // 多机同步：广播触发（待核对）

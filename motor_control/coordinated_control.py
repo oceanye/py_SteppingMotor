@@ -673,9 +673,15 @@ def build_coordinated_snapshot(
     connected: bool,
     safety_state: str = "normal",
     pico_node_health: Mapping[int, str] | None = None,
+    x42s_states: Mapping[str, object] | None = None,
     now: float | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
-    """Build one coherent, JSON-compatible snapshot for desktop and web."""
+    """Build one coherent, JSON-compatible snapshot for desktop and web.
+
+    ``x42s_states`` 按角色值映射到 X42sActuatorState（actuator_model）。
+    为避免 coordinated_control ↔ actuator_model 循环导入，这里鸭子类型
+    调用其 as_snapshot_dict()/telemetry_trusted_at()/age_ms()。
+    """
 
     stamp = time.monotonic() if now is None else float(now)
     node_health = pico_node_health or {}
@@ -722,8 +728,54 @@ def build_coordinated_snapshot(
             continue
 
         if binding.kind == "x42s":
-            # 本轮尚无 X42S 后端运行时：如实投影"已绑定、后端待接入"，
-            # 不借用步进轴 profile，也不伪造位置。遥测字段自 M4 起补齐。
+            state = (
+                None if x42s_states is None else x42s_states.get(role.value)
+            )
+            if state is not None and getattr(
+                state, "driver_id", None
+            ) != binding.driver_id:
+                state = None  # 角色换绑后旧驱动器状态不得投到新角色上
+            if state is None:
+                # 尚无 X42S 后端运行时（未连接/未轮询）：如实投影
+                # "已绑定、后端待接入"，不借用步进轴 profile，也不伪造位置。
+                base.update(
+                    {
+                        "binding": binding.as_dict(),
+                        "bound": True,
+                        "binding_valid": True,
+                        "binding_error": None,
+                        "driver_id": binding.driver_id,
+                        "physical_label": f"X42S ID{binding.driver_id}",
+                        "position_source": "x42s_driver_pending",
+                        "state": "X42S_BACKEND_PENDING",
+                        "position": None,
+                        "committed_position": None,
+                        "projected_position": None,
+                        "target_position": None,
+                        "position_trusted": False,
+                        "unit": "pulse",
+                        "progress_percent": None,
+                        "executed_steps": None,
+                        "requested_steps": None,
+                        "last_update_age_ms": None,
+                        "stale": True,
+                    }
+                )
+                logical_motors.append(base)
+                continue
+            live = state.as_snapshot_dict(now=stamp)
+            if not connected:
+                card_state = "DISCONNECTED"
+            elif safety_state != "normal":
+                card_state = safety_state.upper()
+            elif not bool(live["online"]):
+                card_state = "X42S_OFFLINE"
+            elif live["fault"] is not None:
+                card_state = "X42S_FAULT"
+            elif bool(live["stale"]):
+                card_state = "X42S_STALE"
+            else:
+                card_state = "X42S_ONLINE"
             base.update(
                 {
                     "binding": binding.as_dict(),
@@ -731,20 +783,26 @@ def build_coordinated_snapshot(
                     "binding_valid": True,
                     "binding_error": None,
                     "driver_id": binding.driver_id,
-                    "physical_label": f"X42S ID{binding.driver_id}",
-                    "position_source": "x42s_driver_pending",
-                    "state": "X42S_BACKEND_PENDING",
-                    "position": None,
-                    "committed_position": None,
+                    "physical_label": live["label"],
+                    "position_source": "x42s_driver",
+                    # §12：位置必须是驱动器实测；指令位置单独放
+                    # committed/target，绝不互相冒充。
+                    "measured": live["measured_position"] is not None,
+                    "state": card_state,
+                    "position": live["measured_position"],
+                    "committed_position": live["command_position"],
                     "projected_position": None,
-                    "target_position": None,
-                    "position_trusted": False,
-                    "unit": "mm" if spec.required_mode == MODE_LINEAR else "°",
+                    "target_position": live["command_position"],
+                    "position_trusted": bool(live["telemetry_trusted"]),
+                    "unit": "pulse",
                     "progress_percent": None,
                     "executed_steps": None,
                     "requested_steps": None,
-                    "last_update_age_ms": None,
-                    "stale": True,
+                    "last_update_age_ms": live["last_update_age_ms"],
+                    "stale": bool(live["stale"]),
+                    "in_progress": False,
+                    "continuous": False,
+                    "x42s": live,
                 }
             )
             logical_motors.append(base)
