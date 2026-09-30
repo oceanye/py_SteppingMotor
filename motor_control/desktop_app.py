@@ -1358,6 +1358,24 @@ class StepperGUI:
         self.log("⛔ 步态已中止：四个逻辑轴都已发 STOP；"
                  "如有轴被 ABORT，位置不可信，需重新校准后才能继续")
 
+    def _twin_progress_refresh(self):
+        """脉冲进度帧驱动的态势图节流刷新（UI 线程）。
+
+        组级 progress 回调只在组边界刷面板——两腿同升/同降这类单组长
+        阶段会整段静止（ΔZ 停在起点，组完成瞬跳终点）。挂在每帧脉冲
+        进度上后 ΔZ/轨迹/曲线逐帧跟进；非步态运动不刷（点动与态势图
+        无关），0.1s 节流防高频帧刷爆 Tk。
+        """
+        if getattr(self, "_closing", False):
+            return
+        if not getattr(self, "_gait_owned", {}) and getattr(self, "_gait_run", None) is None:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_twin_progress_refresh_at", 0.0) < 0.1:
+            return
+        self._twin_progress_refresh_at = now
+        self._refresh_gait_ui()
+
     def _refresh_gait_ui(self, progress_text=None):
         """刷新步态面板（面板在协调页构建后存在）。"""
 
@@ -2047,6 +2065,7 @@ class StepperGUI:
             self.sw[axis]['progress']['value'] = pct
             self.sw[axis]['progress_label'].config(text=f"{pct}%  ({done}/{total} 步)")
         self._land_release_tick(axis)
+        self._twin_progress_refresh()
 
     def _reset_progress(self, axis):
         if axis < len(self.sw) and 'progress' in self.sw[axis]:

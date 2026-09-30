@@ -241,6 +241,20 @@ class TwinCurveGeometryTests(unittest.TestCase):
         StepperGUI._gait_set_view_mode(SimpleNamespace(), "live")
         StepperGUI._gait_set_view_mode(SimpleNamespace(gait_widgets={}), "plan")
 
+    def test_twin_progress_refresh_throttles_and_skips_non_gait(self):
+        # 脉冲帧驱动的态势图节流刷新：非步态运动不刷；步态中刷一次后
+        # 0.1s 内的后续帧被节流跳过（防高频进度帧刷爆 Tk）。
+        from motor_control.desktop_app import StepperGUI
+        calls = []
+        app = SimpleNamespace(_closing=False, _gait_owned={}, _gait_run=None,
+                              _refresh_gait_ui=lambda: calls.append(1))
+        StepperGUI._twin_progress_refresh(app)
+        self.assertEqual(calls, [])
+        app._gait_owned = {0: object()}
+        StepperGUI._twin_progress_refresh(app)
+        StepperGUI._twin_progress_refresh(app)
+        self.assertEqual(calls, [1])
+
 
 @unittest.skipUnless(HAS_TK, "real Tk unavailable")
 class GaitLayoutTests(unittest.TestCase):
@@ -482,6 +496,9 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertTrue(canvas.find_withtag("nearest_tip"))
         self.assertIn("6爪最近", canvas.itemcget(
             canvas.find_withtag("hud_nearest")[0], "text"))
+        # 实机轨迹与评估层同款：历史点带 ψ，画三爪端虚线轨迹（蓝系=左足）
+        self.assertTrue(canvas.find_withtag("history_tips_left_0"))
+        self.assertTrue(canvas.find_withtag("history_tips_right_0"))
         self.assertIn("90.00", view["rows"]["Mr1"][1].cget("text"))
         controller._is_serial_connected = lambda: False
         refresh_twin_panel(self.app)

@@ -275,7 +275,8 @@ def build_twin_panel(app, parent):
                        "画面:左键点一下(蓝框)=选中,滚轮缩放;移出自动取消 中键拖动=平移 双击=复位\n"
                        "固定5×5地图，B=(0,0)，上为+Y、右为+X；行号自下向上。\n"
                        "XY 为中心距=1的估算；Z 为本步位移，非接触检测。\n"
-                       "实线=已回报脉冲轨迹，圆点=完成步落脚；执行中不画计划层。\n"
+                       "虚线=已回报轨迹(中心+三爪端,蓝系=左足 橙系=右足)，圆点=完成步落脚。\n"
+                       "执行中不画计划层；ΔZ 竖线随脉冲进度逐帧升降。\n"
                        "▶ 模拟=逐帧回放 再点=暂停/继续；四个【开始…移】按钮与换位方式一一对应",
                        wraplength=260, justify="left", foreground="#64748b")
     legend.grid(row=9, column=0, sticky="ew", padx=6, pady=3)
@@ -519,13 +520,32 @@ def _draw(app, view):
 
     history = view["history"]
     if view["show_path"].get():
+        # 实机轨迹与评估层同款：中心虚线 + 三爪端虚线轨迹（左足蓝系/
+        # 右足橙系，与曲线图同一套爪色）。历史点带世界 ψ 才有爪线。
+        arm = app.gait_params.geometry.arm_length_mm / lattice_d_mm(app.gait_params)
         for segment in history.segments():
             if len(segment) < 2:
                 continue
             for index, side, color in ((1, "left", "#60a5fa"), (2, "right", "#fb923c"),
                                        (3, "center", "#94a3b8")):
                 coords = [v for point in segment for v in project(point[index])]
-                canvas.create_line(*coords, fill=color, width=1.5, tags=f"history_{side}")
+                canvas.create_line(*coords, fill=color, width=1.5, dash=(6, 3),
+                                   tags=f"history_{side}")
+            for index, side in ((1, "left"), (2, "right")):
+                for k in range(3):
+                    tips = []
+                    for point in segment:
+                        psi = point[4][0 if side == "left" else 1]
+                        if psi is None:
+                            continue
+                        a = math.radians(psi + 120.0 * k)
+                        cx, cy = point[index]
+                        tips.extend(project((cx + arm * math.cos(a),
+                                             cy + arm * math.sin(a))))
+                    if len(tips) >= 4:
+                        canvas.create_line(
+                            *tips, fill=CURVE_COLORS[0 if side == "left" else 1][k],
+                            width=1.2, dash=(5, 3), tags=f"history_tips_{side}_{k}")
         for step, left, right in history.landings:
             x, y = project(tuple((a+b)/2 for a, b in zip(left, right)))
             canvas.create_text(x, y-8, text=str(step), fill="#64748b", tags="step_number")

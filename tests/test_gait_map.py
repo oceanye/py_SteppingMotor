@@ -192,6 +192,18 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(h.points), 5)
         self.assertEqual(h.points[0][1][0], 20)
 
+    def test_points_carry_world_psi_for_tip_tracks(self):
+        # 2026-09-30 实机轨迹要与评估层同款（中心+三爪端折线）：历史点
+        # 必须带上世界 ψ；旧测试替身不带 psi_deg 时容忍为 None。
+        h = TwinHistory()
+        snap = sample()
+        snap['pose']['feet']['left']['psi_deg'] = 30.0
+        snap['pose']['feet']['right']['psi_deg'] = 57.5
+        h.observe(snap)
+        self.assertEqual(h.points[-1][4], (30.0, 57.5))
+        h.observe(sample(x=.5))
+        self.assertEqual(h.points[-1][4], (None, None))
+
 
 class MapExecutionTests(unittest.TestCase):
     def app(self):

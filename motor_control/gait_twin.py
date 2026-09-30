@@ -58,10 +58,13 @@ class TwinHistory:
         if not all(math.isfinite(v) for point in (left, right) for v in point):
             self._healthy = False
             return
+        # 世界 ψ（左右）随点记录：实机轨迹要画三爪端折线（与评估层同款），
+        # 只有中心点不够。旧测试替身不带 psi_deg → None，绘制时跳过爪线。
+        psis = tuple(pose["feet"][s].get("psi_deg") for s in ("left", "right"))
         ref = snapshot.get("reference_key")
         if not self._healthy or ref != self._last_reference:
             self._segment += 1
-        point = (self._segment, left, right, center)
+        point = (self._segment, left, right, center, psis)
         if not self.points or point != self.points[-1]:
             self.points.append(point)
         self._healthy, self._last_reference = True, ref
