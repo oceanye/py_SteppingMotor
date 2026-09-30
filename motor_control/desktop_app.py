@@ -933,6 +933,17 @@ class StepperGUI:
                 return (start, name, pivot, bearing)
         return None
 
+    def _gait_set_view_mode(self, mode):
+        """态势图数据源模式：plan=评估模拟(计划层) / live=实机脉冲。
+
+        无 GUI（headless 测试）时静默跳过。开始执行→live；干跑成功/
+        重置流程→plan；操作员也可在态势图工具栏手动切换。
+        """
+
+        view = (getattr(self, "gait_widgets", None) or {}).get("twin")
+        if view is not None:
+            view["mode_var"].set(mode)
+
     def _gait_begin_run(self, side, params=None, arc_deg=None):
         """UI 线程：前置检查 + 干跑 + 按当前相位建立执行器。
 
@@ -1175,6 +1186,7 @@ class StepperGUI:
         self._gait_run.twin_manual_invalid = False
         self.log(f"步态执行器就绪（{side}）：{len(stages)} 个阶段，"
                  f"当前 ψ={psi_now:.1f}°")
+        self._gait_set_view_mode("live")   # 执行开始：态势图切实机层，隐藏计划层
         if clearance_warnings:
             text = "\n".join(clearance_warnings)
             self.log(f"⚠️ 碰撞/避障校验未通过（仅提示，不拦截）：{text}")
@@ -1605,6 +1617,7 @@ class StepperGUI:
             f"步态角度预览（{side}·{direction}，{start}→{target} 绕{pivot}"
             f"{alt_text}，轨迹模式 {params.trajectory_mode}）：{report.message}")
         stop_preview_animation(self)
+        self._gait_set_view_mode("plan")   # 干跑成功：态势图切评估层（计划轨迹）
         draw_gait_preview(self)
         if not report.feasible and interactive:
             messagebox.showwarning(
@@ -1795,6 +1808,7 @@ class StepperGUI:
         if getattr(self, "_gait_owned", {}):
             self._gait_abort_run()
         self._gait_run = None
+        self._gait_set_view_mode("plan")   # 重置流程：回到评估层看计划
         self.log("步态流程已重置（执行器丢弃，重新开始前会重新干跑）")
         self._refresh_gait_ui()
 
