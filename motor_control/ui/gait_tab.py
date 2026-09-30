@@ -17,7 +17,7 @@ from motor_control.gait_planner import (
 )
 from motor_control.gait_avoidance import LEGACY, TWO_MODE
 from motor_control.ui.common import PAD, bind_canvas_view, reset_canvas_view
-from motor_control.ui.gait_twin import build_twin_panel, refresh_twin_panel
+from motor_control.ui.gait_twin import build_twin_panel, refresh_twin_panel, sync_twin_start_fields
 
 GEOMETRY_FIELDS = (
     ("d_mm", "旧中心距 d（两模态忽略）"),
@@ -66,24 +66,50 @@ PLACEMENT_LABELS = {
 LABEL_TO_PLACEMENT = {label: key for key, label in PLACEMENT_LABELS.items()}
 
 
+def _placement_label(params):
+    if params.initial_pad_pair is not None:
+        side = "左" if params.initial_placement == "red_left" else "右"
+        return f"地图起步 · 红杆{side}侧 · β₀={params.initial_beam_deg:g}°"
+    return PLACEMENT_LABELS[params.initial_placement]
+
+
 def _gait_placement_changed(app) -> None:
     """初始摆放切换：基准变更——账本重置、零位作废、标定失效。"""
 
     if getattr(app, "_gait_loading_fields", False):
         return
     placement = LABEL_TO_PLACEMENT.get(app.gait_placement_var.get())
-    if placement is None or placement == app.gait_params.initial_placement:
+    if placement is None or (placement == app.gait_params.initial_placement
+                             and app.gait_params.initial_pad_pair is None):
         return
-    _invalidate_calibration(app)
     params = replace(app.gait_params, initial_placement=placement,
+                     initial_pad_pair=None, calibration_confirmed=False,
                      beam_reference_deg=INITIAL_PLACEMENTS[placement][1],
                      mr1_zero_deg=None, mr2_zero_deg=None)
-    app.gait_params = params
+    # The legacy preset must use the same atomic idle check as map selection.
+    setter = getattr(app, "_gait_set_start_reference", None)
+    try:
+        if setter:
+            setter(params)
+        elif getattr(app, "_gait_owned", {}):
+            raise ValueError("步态执行中不能更改初始摆放")
+        else:  # Isolated view hosts (no controller / no physical axes).
+            app.gait_params = params
+            app._gait_supports = tuple(params.initial_supports)
+            app._gait_beta_deg = params.initial_beam_deg
+            app._gait_world_epoch = getattr(app, "_gait_world_epoch", 0) + 1
+            app._gait_run = None
+    except (ValueError, RuntimeError) as exc:
+        from tkinter import messagebox
+        app._gait_loading_fields = True
+        app.gait_placement_var.set(_placement_label(app.gait_params))
+        app._gait_loading_fields = False
+        messagebox.showwarning("基准未更改", str(exc))
+        return
+    _invalidate_calibration(app)
     app.gait_field_vars["beam_reference_deg"].set(str(params.beam_reference_deg))
     refresh_zero_labels(app)
-    # 机构此时必须已按新摆放就位（左A右B 或 左B右A），账本回新原点。
-    app._gait_supports = tuple(params.initial_supports)
-    app._gait_beta_deg = params.initial_beam_deg
+    sync_twin_start_fields(app)
 
 PREVIEW_MARGIN = 16
 
@@ -200,7 +226,7 @@ def _build_params_column(app, parent) -> None:
               wraplength=185, justify="left").grid(
                   row=1, column=0, sticky="w", padx=6, pady=3)
     app.gait_placement_var = tk.StringVar(
-        value=PLACEMENT_LABELS[app.gait_params.initial_placement])
+        value=_placement_label(app.gait_params))
     app.gait_placement_var.trace_add(
         "write", lambda *_: _gait_placement_changed(app))
     ttk.Combobox(
@@ -211,7 +237,8 @@ def _build_params_column(app, parent) -> None:
     note(inner, 2, "机构实际怎么摆就选什么：俯视、站在左足处看向右足，\n"
          "紧挨横梁的那根红杆在哪只手边就选哪侧。红杆在哪侧决定同一按钮\n"
          "的模态序列（两摆法互为镜像）。切换即基准变更：零位作废，须重新\n"
-         "摆机构到该初始状态、重新记零并确认标定。")
+         "摆机构到该初始状态、重新记零并确认标定。\n"
+         "任意两格在右侧数字孪生中选择；此下拉仅用于恢复 A/B 预设。")
     add_number_field(inner, 3, *CALIBRATION_FIELDS[0])
     row = 4
     for key, label, hint in SIGN_FIELDS:
@@ -247,7 +274,7 @@ def _build_params_column(app, parent) -> None:
                     text="已确认电机标定与现场支撑").grid(
                         row=row, column=0, columnspan=3, sticky="w", padx=6, pady=6)
     row += 1
-    ttk.Button(inner, text="人工重建 A/B 基准（不动电机）",
+    ttk.Button(inner, text="人工重建所选起步基准（不动电机）",
                command=app._gait_reestablish_baseline).grid(
                    row=row, column=0, columnspan=3, sticky="w", padx=6, pady=4)
 
@@ -447,7 +474,7 @@ def load_gait_fields(app) -> None:
     params = app.gait_params
     app._gait_loading_fields = True
     app.gait_trajectory_var.set(params.trajectory_mode)
-    app.gait_placement_var.set(PLACEMENT_LABELS[params.initial_placement])
+    app.gait_placement_var.set(_placement_label(params))
     for key, _label in GEOMETRY_FIELDS + GAP_FIELDS:
         value = getattr(params.geometry, key)
         # Preserve the saved value exactly (especially d = sqrt(3) * R).
@@ -464,6 +491,7 @@ def load_gait_fields(app) -> None:
     refresh_zero_labels(app)
     app.gait_calibrated_var.set(params.calibration_confirmed)
     app._gait_loading_fields = False
+    sync_twin_start_fields(app)
 
 
 def refresh_zero_labels(app) -> None:

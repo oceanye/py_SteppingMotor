@@ -148,17 +148,14 @@ class PreviewViewTransformTests(unittest.TestCase):
         self.assertAlmostEqual(x2, x0, places=6)
         self.assertAlmostEqual(y2, y0, places=6)
 
-    def test_twin_pad_window_resolves_two_rings_of_neighbors(self):
-        # 2026-09-29 孪生画面固定晶格窗口：ABC+两圈邻座，名字必须能被
-        # pad_center 解析回同一坐标（与规划器同一几何），保证换 route
-        # 不跳视野的同时落点支座一定在画面内。
+    def test_twin_pad_window_resolves_exactly_5_by_5(self):
         from motor_control.gait_twin import pad_center
         from motor_control.ui.gait_twin import twin_pad_window
         pads = twin_pad_window()
         self.assertTrue(set("ABC") <= set(pads))
-        self.assertGreaterEqual(len(pads), 15)
+        self.assertEqual(len(pads), 25)
         xs = [x for x, _y in pads.values()]
-        self.assertGreaterEqual(max(xs) - min(xs), 4.0)   # 覆盖到两圈邻座
+        self.assertGreaterEqual(max(xs) - min(xs), 4.0)
         for name, xy in pads.items():
             self.assertEqual(pad_center(name), xy)
 
@@ -443,6 +440,113 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertEqual(str(auto.cget("state")), "normal")
         self.assertIn("停止自动", auto.cget("text"))
         self.app._gait_auto_run = False
+        self.assertFalse(self.errors)
+
+    def test_map_click_after_zoom_selects_pad_without_changing_physical_reference(self):
+        from motor_control.ui.gait_twin import _draw
+        from motor_control.gait_map import map_label, map_pads
+        view = self.app.gait_widgets["twin"]
+        canvas = view["canvas"]
+        self.root.geometry("1024x620")
+        self.root.update()
+        self.assertEqual(len(canvas.find_withtag("map_hex")), 25)
+        original = self.app.gait_params
+        self.app.gait_widgets["twin_view"].update(zoom=1.5, pan_x=14, pan_y=-8)
+        _draw(self.app, view)
+        view["select_side"].set("left")
+        x, y = view["project"](map_pads()['C'])
+        canvas.event_generate('<Button-1>', x=round(x), y=round(y))
+        self.root.update()
+        self.assertEqual(view["start_left"].get(), map_label('C'))
+        self.assertIs(self.app.gait_params, original)
+        self.assertEqual(self.app.gait_params.initial_supports, ('A', 'B'))
+        self.assertFalse(self.errors)
+
+    def test_clear_path_preserves_live_pose_motor_ledger_and_zoom(self):
+        from motor_control.ui.gait_twin import refresh_twin_panel
+        from test_gait_twin import linked_app, DigitalTwinTests
+        controller = linked_app()
+        controller._gait_begin_run('left')
+        DigitalTwinTests().send_sync_without_terminal(controller)
+        self.app._gait_twin_snapshot = controller._gait_twin_snapshot
+        self.root.geometry('1024x620')
+        self.root.update()
+        refresh_twin_panel(self.app)
+        controller._on_step_progress(2, 400, 800)
+        controller._on_step_progress(3, 133, 267)
+        refresh_twin_panel(self.app)
+        view = self.app.gait_widgets['twin']
+        canvas = view['canvas']
+        self.assertTrue(canvas.find_withtag('history_left'))
+        self.assertEqual(str(view['apply_button'].cget('state')), 'disabled')
+        before = canvas.coords(canvas.find_withtag('left_center')[0])
+        ledger = [r.position_steps for r in controller.axis_runtime]
+        commands = list(controller.commands)
+        zoom = dict(self.app.gait_widgets['twin_view'])
+        view['clear_button'].invoke()
+        self.assertFalse(canvas.find_withtag('history_left'))
+        self.assertFalse(view['history'].points)
+        refresh_twin_panel(self.app)
+        self.assertFalse(canvas.find_withtag('history_left'))
+        self.assertEqual(canvas.coords(canvas.find_withtag('left_center')[0]), before)
+        self.assertEqual([r.position_steps for r in controller.axis_runtime], ledger)
+        self.assertEqual(controller.commands, commands)
+        self.assertEqual(self.app.gait_widgets['twin_view'], zoom)
+        self.assertFalse(self.errors)
+
+    def test_map_apply_cancel_and_invalid_pair_do_not_change_controller(self):
+        from unittest.mock import patch
+        from motor_control.ui.gait_twin import apply_twin_start
+        from motor_control.gait_map import map_label
+        from test_gait_twin import linked_app
+        controller = linked_app()
+        self.app.state_lock = controller.state_lock
+        self.app._gait_check_start_edit = controller._gait_check_start_edit
+        self.app._gait_apply_start_pair = controller._gait_apply_start_pair
+        view = self.app.gait_widgets['twin']
+        view['start_left'].set(map_label('C'))
+        view['start_right'].set(map_label('A'))
+        with patch('motor_control.ui.gait_twin.messagebox.askokcancel', return_value=False):
+            apply_twin_start(self.app)
+        self.assertEqual(controller._gait_supports, ('A', 'B'))
+        view['start_right'].set(map_label('C'))
+        with patch('motor_control.ui.gait_twin.messagebox.showwarning') as warning:
+            apply_twin_start(self.app)
+            warning.assert_called_once()
+        self.assertEqual(controller.commands, [])
+        self.assertFalse(self.errors)
+
+    def test_apply_map_pair_preserves_typed_parameters_and_refreshes_calibration(self):
+        from unittest.mock import patch
+        from motor_control.ui.gait_twin import apply_twin_start, refresh_twin_panel
+        from motor_control.gait_map import map_label
+        from test_gait_twin import linked_app
+        controller = linked_app()
+        saved = []
+        controller.state_store = SimpleNamespace(save_gait_params=saved.append)
+        self.app.state_lock = controller.state_lock
+        self.app._gait_check_start_edit = controller._gait_check_start_edit
+        def apply(left, right, **kwargs):
+            controller._gait_apply_start_pair(left, right, **kwargs)
+            self.app.gait_params = controller.gait_params
+        self.app._gait_apply_start_pair = apply
+        self.app._gait_twin_snapshot = controller._gait_twin_snapshot
+        self.app._refresh_gait_ui = lambda: refresh_twin_panel(self.app)
+        self.app.gait_field_vars['lift_mm'].set('42.5')
+        view = self.app.gait_widgets['twin']
+        view['start_left'].set(map_label('C'))
+        view['start_right'].set(map_label('A'))
+        with patch('motor_control.ui.gait_twin.messagebox.askokcancel', return_value=True):
+            apply_twin_start(self.app)
+        self.assertEqual(controller._gait_supports, ('C', 'A'))
+        self.assertEqual(controller.gait_params.lift_mm, 42.5)
+        self.assertEqual(self.app.gait_field_vars['beam_reference_deg'].get(), '60.0')
+        self.assertIn('地图起步', self.app.gait_placement_var.get())
+        self.assertFalse(self.app.gait_calibrated_var.get())
+        self.assertEqual(self.app.gait_zero_vars['Mr1'].get(), '未标定')
+        self.assertEqual(view['select_side'].get(), '')
+        self.assertEqual(controller.commands, [])
+        self.assertEqual(len(saved), 1)
         self.assertFalse(self.errors)
 
 

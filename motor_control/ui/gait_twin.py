@@ -1,47 +1,90 @@
 """Live pulse-estimated motor/foot view, separate from the planned path plot."""
 import math
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
-from motor_control.gait_avoidance import lattice_coordinates
-from motor_control.gait_twin import PAD_CENTERS, ROLES
-from motor_control.ui.common import bind_canvas_view
-
-# 2026-09-29 按用户要求：孪生画面固定画"ABC + 两圈邻座"的晶格窗口——
-# 完成一步继续走下一 route 时视野不再随 route 跳变，支座/节点（红点
-# 绿点及连线）始终在画面内；邻座名用 lattice 坐标格式，可被 pad_center
-# 解析，与规划器同一几何。
-_NEIGHBOR_STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, -1), (-1, 1))
+from motor_control.gait_twin import ROLES, TwinHistory
+from motor_control.gait_map import map_pads, map_label, start_pair_reference
+from motor_control.ui.common import bind_canvas_view, canvas_view_zoom, reset_canvas_view
 
 
-def twin_pad_window(extra_rings=2):
-    """ABC 三支座向外扩 extra_rings 圈的固定视野支座 {name: (x, y)}。"""
+def twin_pad_window():
+    """Fixed 5 rows x 5 columns, same world coordinates throughout a session."""
+    return map_pads()
 
-    base = {name: lattice_coordinates(name) for name in PAD_CENTERS}
-    seen = set(base.values())
-    frontier = set(seen)
-    for _ in range(extra_rings):
-        ring = {(i + di, j + dj) for i, j in frontier
-                for di, dj in _NEIGHBOR_STEPS} - seen
-        seen |= ring
-        frontier = ring
-    pads = dict(PAD_CENTERS)
-    for i, j in sorted(seen - set(base.values())):
-        pads[f"邻座({i},{j})"] = (i + j / 2, math.sqrt(3) * j / 2)
-    return pads
+
+def sync_twin_start_fields(app):
+    view = app.gait_widgets.get("twin")
+    if view:
+        for side, name in zip(("left", "right"), app.gait_params.initial_supports):
+            view[f"start_{side}"].set(map_label(name))
+
+
+def clear_twin_history(app):
+    """Display operation only: retain stance, calibration and pulse positions."""
+    view = app.gait_widgets["twin"]
+    view["history"].clear(view["snapshot"])
+    _draw(app, view)
+
+
+def apply_twin_start(app):
+    from motor_control.gait_executor import GaitExecutorError
+    from motor_control.state_store import StateStoreError
+    from motor_control.ui.gait_tab import collect_gait_params, load_gait_fields, stop_preview_animation
+    view = app.gait_widgets["twin"]
+    names = {map_label(n): n for n in map_pads()}
+    try:
+        left, right = (names[view[f"start_{s}"].get()] for s in ("left", "right"))
+        beta, _ = start_pair_reference((left, right))
+        with app.state_lock:
+            app._gait_check_start_edit()
+        params = collect_gait_params(app, app.gait_params)
+        if not messagebox.askokcancel(
+                "确认起步位置（不移动电机）",
+                f"左足：{map_label(left)}；右足：{map_label(right)}；横梁 β₀={beta:g}°。\n"
+                "请先人工摆到选定两格，三爪均踩低节点，所有轴静止。\n"
+                "应用后清除旧轨迹、旧旋转零位与标定确认；不会改变电机脉冲坐标。\n"
+                "随后须重新记两侧旋转零位并确认标定。"):
+            return
+        app._gait_apply_start_pair(left, right, params=params)  # Rechecks idle after the dialog.
+    except (ValueError, KeyError, GaitExecutorError, StateStoreError) as exc:
+        messagebox.showwarning("起步位置未更改", str(exc))
+        return
+    stop_preview_animation(app)
+    load_gait_fields(app)
+    view["select_side"].set("")
+    app._refresh_gait_ui()
+
+
+def _map_click(app, event):
+    view = app.gait_widgets["twin"]
+    side = view["select_side"].get()
+    if side not in ("left", "right") or view.get("start_busy"):
+        return
+    project = view.get("project")
+    if project is None:
+        return
+    pads = map_pads()
+    name = min(pads, key=lambda n: math.dist(project(pads[n]), (event.x, event.y)))
+    if math.dist(project(pads[name]), (event.x, event.y)) > view["map_scale"] / math.sqrt(3):
+        return
+    view[f"start_{side}"].set(map_label(name))
+    _draw(app, view)
 
 
 def build_twin_panel(app, parent):
     panel = ttk.LabelFrame(parent, text="实时数字孪生 · 脉冲估算（无编码器）")
     panel.grid(row=0, column=0, sticky="ew", padx=6, pady=3)
     panel.columnconfigure(0, weight=1)
-    canvas = tk.Canvas(panel, width=240, height=290, background="white",
+    canvas = tk.Canvas(panel, width=240, height=340, background="white",
                        highlightthickness=1, highlightbackground="#cbd5e1")
     canvas.grid(row=0, column=0, sticky="ew", padx=6, pady=5)
     status = ttk.Label(panel, text="等待电机绑定", wraplength=260, justify="left")
-    status.grid(row=1, column=0, sticky="ew", padx=6, pady=3)
+    status.grid(row=3, column=0, sticky="ew", padx=6, pady=3)
+    coordinates = ttk.Label(panel, text="", wraplength=260, justify="left")
+    coordinates.grid(row=4, column=0, sticky="ew", padx=6, pady=3)
     table = ttk.Frame(panel)
-    table.grid(row=2, column=0, sticky="ew", padx=6, pady=3)
+    table.grid(row=5, column=0, sticky="ew", padx=6, pady=3)
     table.columnconfigure((0, 1, 2), weight=1)
     for col, text in enumerate(("电机 / 轴", "估算坐标", "指令目标")):
         ttk.Label(table, text=text, foreground="#64748b").grid(row=0, column=col, sticky="w")
@@ -53,20 +96,65 @@ def build_twin_panel(app, parent):
     legend = ttk.Label(panel, text="蓝=左足  橙=右足  灰=断连冻结  绿点=低节点(落脚)  红点=高节点(红杆)\n"
                        "画面:左键点一下(蓝框)=选中,滚轮缩放;移出画面自动取消\n"
                        "中键拖动=平移 双击=复位视图\n"
-                       "XY 为中心距=1的示意；Z 为本步起点起算位移，非接触检测。",
+                       "固定5×5地图，B=(0,0)，上为+Y、右为+X；行号自下向上。\n"
+                       "XY 为中心距=1的估算；Z 为本步位移，非接触检测。\n"
+                       "实线=已回报脉冲轨迹，圆点=完成步落脚；不绘制未来目标轨迹。",
                        wraplength=260, justify="left", foreground="#64748b")
-    legend.grid(row=3, column=0, sticky="ew", padx=6, pady=3)
+    legend.grid(row=6, column=0, sticky="ew", padx=6, pady=3)
     view = {"canvas": canvas, "status": status, "rows": rows, "snapshot": {},
-            "last_pose": None, "reference_key": None}
+            "last_pose": None, "reference_key": None, "coordinates": coordinates,
+            "history": TwinHistory(), "show_path": tk.BooleanVar(value=True),
+            "select_side": tk.StringVar(value=""),
+            "start_left": tk.StringVar(), "start_right": tk.StringVar()}
     app.gait_widgets["twin"] = view
+    toolbar = ttk.Frame(panel)
+    toolbar.grid(row=1, column=0, sticky="ew", padx=6)
+    ttk.Checkbutton(toolbar, text="显示路径", variable=view["show_path"],
+                    command=lambda: _draw(app, view)).grid(row=0, column=0)
+    view["clear_button"] = ttk.Button(toolbar, text="清空路径", command=lambda: clear_twin_history(app))
+    view["clear_button"].grid(row=0, column=1, padx=3)
+
+    def zoom(delta):
+        from types import SimpleNamespace
+        state = app.gait_widgets["twin_view"]
+        state["active"] = True
+        canvas_view_zoom(state, SimpleNamespace(widget=canvas, delta=delta,
+                         x=canvas.winfo_width()/2, y=canvas.winfo_height()/2),
+                         lambda: _draw(app, view))
+
+    for col, (label, callback) in enumerate((
+            ("放大 +", lambda: zoom(240)), ("缩小 −", lambda: zoom(-240)),
+            ("全图", lambda: (reset_canvas_view(app.gait_widgets["twin_view"]), _draw(app, view))))):
+        ttk.Button(toolbar, text=label, width=8, command=callback).grid(row=1, column=col, pady=3)
+
+    start = ttk.LabelFrame(panel, text="起步两格（仅设置，不移动电机）")
+    start.grid(row=2, column=0, sticky="ew", padx=6, pady=3)
+    start.columnconfigure(1, weight=1)
+    options = tuple(map_label(n) for n in map_pads())
+    view["start_controls"] = []
+    for row, (side, label) in enumerate((("left", "左足"), ("right", "右足"))):
+        radio = ttk.Radiobutton(start, text=f"地图选{label}", variable=view["select_side"], value=side)
+        radio.grid(row=row, column=0, padx=3)
+        choice = ttk.Combobox(start, textvariable=view[f"start_{side}"], values=options,
+                              state="readonly", width=12)
+        choice.grid(row=row, column=1, sticky="ew", padx=3, pady=2)
+        choice.bind("<<ComboboxSelected>>", lambda _e: _draw(app, view))
+        view["start_controls"].extend(((radio, "normal"), (choice, "readonly")))
+    browse = ttk.Radiobutton(start, text="仅浏览", variable=view["select_side"], value="")
+    browse.grid(row=2, column=0)
+    view["apply_button"] = ttk.Button(start, text="应用起步位置", command=lambda: apply_twin_start(app))
+    view["apply_button"].grid(row=2, column=1, sticky="ew", padx=3, pady=3)
+    view["start_controls"].append((view["apply_button"], "normal"))
+    sync_twin_start_fields(app)
     # 视图状态与预览画面同一交互模式（左键选中+滚轮缩放+中键平移+双击复位）。
     app.gait_widgets["twin_view"] = {"zoom": 1.0, "pan_x": 0.0, "pan_y": 0.0,
                                      "active": False}
     bind_canvas_view(canvas, app.gait_widgets["twin_view"],
                      lambda: _draw(app, view))
+    canvas.bind("<Button-1>", lambda e: _map_click(app, e), add="+")
 
     def resized(event):
-        for label in (status, legend):
+        for label in (status, legend, coordinates):
             label.configure(wraplength=max(200, event.width - 8))
         _draw(app, view)
     canvas.bind("<Configure>", resized)
@@ -78,12 +166,19 @@ def refresh_twin_panel(app):
         return
     provider = getattr(app, "_gait_twin_snapshot", None)
     snapshot = provider() if provider else {"axes": {}, "pose": None, "message": "等待电机绑定"}
+    view["history"].observe(snapshot)
     if snapshot.get("reference_key") != view["reference_key"]:
         view["last_pose"] = None
         view["reference_key"] = snapshot.get("reference_key")
     if snapshot.get("pose") is not None:
         view["last_pose"] = snapshot["pose"]
     view["snapshot"] = snapshot
+    busy = bool(getattr(app, "_gait_owned", {})) or any(
+        a.get("target_position") is not None or a.get("state") in ("STARTING", "MOVING", "CONTINUOUS")
+        for a in snapshot.get("axes", {}).values())
+    view["start_busy"] = busy
+    for control, idle_state in view["start_controls"]:
+        control.configure(state="disabled" if busy else idle_state)
     healthy = snapshot.get("state") in ("estimated", "waiting")
     route = snapshot.get("pose", {}).get("route") if snapshot.get("pose") else None
     view["status"].configure(text=snapshot["message"] + (f"\n{route}" if route else ""),
@@ -125,28 +220,11 @@ def _draw(app, view):
     snapshot = view["snapshot"]
     live = snapshot.get("pose")
     pose = live or view["last_pose"]
-    if pose is None:
-        canvas.create_text(width/2, 24, text="世界姿态待建立 · 电机轴坐标仍可跟踪",
-                           width=width-12, fill="#64748b", tags="twin_placeholder")
-        for role, fraction in (("Mr1", 0.25), ("Mr2", 0.75)):
-            axis = snapshot.get("axes", {}).get(role, {})
-            x, y, radius = width*fraction, height/2, min(48, width/6)
-            canvas.create_oval(x-radius, y-radius, x+radius, y+radius, outline="#94a3b8")
-            angle = axis.get("position")
-            if axis.get("binding_valid") and isinstance(angle, (int, float)) and math.isfinite(angle):
-                theta = math.radians(angle)
-                canvas.create_line(x, y, x+radius*math.cos(theta), y-radius*math.sin(theta),
-                                   fill="#64748b", width=2, tags=f"axis_{role}")
-            canvas.create_text(x, y+radius+18, text=role, fill="#475569")
-        return
-
-    # 固定晶格窗口（ABC+两圈邻座），不随 route 变：完成一步继续走下一
-    # 步时画面不跳变；当前 route 的三个支座画重一点，邻座淡一些。
     all_pads = twin_pad_window()
-    route_pads = pose.get("route_pads", {})
+    route_pads = pose.get("route_pads", {}) if pose else {}
     xs, ys = zip(*all_pads.values())
-    xmin, xmax = min(xs)-.4, max(xs)+.4
-    ymin, ymax = min(ys)-.4, max(ys)+.4
+    xmin, xmax = min(xs)-.6, max(xs)+.6
+    ymin, ymax = min(ys)-.6, max(ys)+.6
     scale = min((width-26)/(xmax-xmin), (height-100)/(ymax-ymin))
     # 用户视图（滚轮缩放/中键平移）叠加在固定包围盒之上：画布中心为
     # 缩放原点；下方 ΔZ 条与角标是固定 HUD，不随缩放移动。
@@ -162,26 +240,62 @@ def _draw(app, view):
         return (width/2+(base_x-width/2)*zoom+pan_x,
                 height/2+(base_y-height/2)*zoom+pan_y)
 
+    view["project"], view["map_scale"] = project, scale*zoom
+    selected = {view[f"start_{side}"].get(): side for side in ("left", "right")}
+    applied = dict(zip(("left", "right"), app.gait_params.initial_supports))
+
     for name, center in all_pads.items():
         on_route = name in route_pads
-        named = name in PAD_CENTERS
+        selection = selected.get(map_label(name))
         nodes = [(center[0]+math.cos(math.radians(30+i*60))/math.sqrt(3),
                   center[1]+math.sin(math.radians(30+i*60))/math.sqrt(3)) for i in range(6)]
         canvas.create_polygon(*(v for node in nodes for v in project(node)),
-                              fill="", outline="#94a3b8" if on_route else "#d1d5db",
+                              fill=("#eff6ff" if selection == "left" else
+                                    "#fff7ed" if selection == "right" else ""),
+                              outline="#94a3b8" if on_route else "#d1d5db",
                               width=1.5 if on_route else 1,
-                              dash=() if on_route else (3, 3))
+                              dash=() if on_route else (3, 3), tags="map_hex")
         x, y = project(center)
-        if named:
-            canvas.create_text(x, y+12, text=name, fill="#475569")
+        canvas.create_text(x, y+10, text=map_label(name), fill="#475569",
+                           font=("Microsoft YaHei", 8), tags="map_label")
+        if selection:
+            caption = ("起步" if applied[selection] == name else "待应用") + ("左" if selection == "left" else "右")
+            canvas.create_text(x, y-9, text=caption,
+                               fill="#2563eb" if selection == "left" else "#ea580c", tags="start_pad")
         dot = 2.5 if on_route else 1.8
         for i, node in enumerate(nodes):
             nx, ny = project(node)
             canvas.create_oval(nx-dot, ny-dot, nx+dot, ny+dot,
                                fill="#16a34a" if i % 2 == 0 else "#dc2626", outline="")
 
-    # 2026-09-29 按用户要求：孪生画面只画当前实时姿态，不再显示虚线
-    # 指令目标（轨迹性辅助线全部去掉），便于录视频观察机构本身。
+    history = view["history"]
+    if view["show_path"].get():
+        for segment in history.segments():
+            if len(segment) < 2:
+                continue
+            for index, side, color in ((1, "left", "#60a5fa"), (2, "right", "#fb923c"),
+                                       (3, "center", "#94a3b8")):
+                coords = [v for point in segment for v in project(point[index])]
+                canvas.create_line(*coords, fill=color, width=1.5, tags=f"history_{side}")
+        for step, left, right in history.landings:
+            x, y = project(tuple((a+b)/2 for a, b in zip(left, right)))
+            canvas.create_text(x, y-8, text=str(step), fill="#64748b", tags="step_number")
+            for point, color in ((left, "#2563eb"), (right, "#ea580c")):
+                px, py = project(point)
+                canvas.create_oval(px-3, py-3, px+3, py+3, outline=color, tags="landing")
+    if pose is None:
+        canvas.create_text(width/2, 14, text="起步位置待确认 / 标定，非实测位置",
+                           width=width-12, fill="#b45309", tags="twin_placeholder")
+        view["coordinates"].configure(text=f"已记录完成步：{history.completed_steps}；世界位置尚不可用")
+        return
+
+    # Show only reported/settled pulses, never the command's future target.
+    left_xy, right_xy = (pose["feet"][s]["center"] for s in ("left", "right"))
+    mid = tuple((a+b)/2 for a, b in zip(left_xy, right_xy))
+    view["coordinates"].configure(text=(
+        f"{'估算' if live else '历史冻结'} XY（中心距=1）· 已记录完成步 {history.completed_steps}\n"
+        f"左 ({left_xy[0]:+.3f}, {left_xy[1]:+.3f})；右 ({right_xy[0]:+.3f}, {right_xy[1]:+.3f})\n"
+        f"机构中心 ({mid[0]:+.3f}, {mid[1]:+.3f})"))
     centers = [project(pose["feet"][side]["center"]) for side in ("left", "right")]
     canvas.create_line(*centers[0], *centers[1], fill="#64748b",
                        width=2, tags="live_beam")

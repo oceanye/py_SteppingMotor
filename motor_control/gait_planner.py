@@ -21,6 +21,7 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 from .gait_avoidance import LEGACY, TWO_MODE, MODE_NAMES, avoidance_path, leg_clearance, lattice_coordinates
+from .gait_map import start_pair_reference
 
 # ── 角度约定 ──────────────────────────────────────────────
 # 对外 API 一律用"度"；内部三角函数换算弧度。
@@ -230,6 +231,7 @@ class GaitParams:
     # 边）——原有唯一摆法，故仍是默认。切换即更换坐标基准：账本重置、
     # 零位作废，必须按新摆放重新记零标定。
     initial_placement: str = "red_right"
+    initial_pad_pair: tuple[str, str] | None = None  # None: legacy A/B placement
     beam_reference_deg: float = 180.0  # 两个 Mr 同时记零时横梁世界角
     calibration_confirmed: bool = False  # 实测几何、方向、PPR、反力闭合已确认
     calibration_fingerprint: str | None = None
@@ -273,12 +275,16 @@ class GaitParams:
             raise ValueError("phase_gain 必须为 ±2/±4/±6/±8/±10；终点须对准三重对称低节点")
         if not math.isfinite(self.beam_reference_deg):
             raise ValueError("beam_reference_deg 必须是有限数值")
-        # 摆放与横梁基准必须成对：红杆左=β₀180°、红杆右=β₀0°。手工
-        # 改 JSON 或数字框造成的不一致直接拒绝，防止账本用混合基准推算。
-        if not math.isclose(self.beam_reference_deg,
-                            INITIAL_PLACEMENTS[self.initial_placement][1]):
-            raise ValueError("beam_reference_deg 必须与初始摆放一致"
-                             "（红杆左=180°、红杆右=0°）；请用【初始摆放】切换")
+        expected_beam = self.initial_beam_deg
+        if self.initial_pad_pair is not None:
+            if not isinstance(self.initial_pad_pair, tuple):
+                raise ValueError("initial_pad_pair 必须是两个支座组成的 tuple")
+            _, placement = start_pair_reference(self.initial_pad_pair)
+            if self.initial_placement != placement:
+                raise ValueError("初始摆放与选定左右足支座不一致，请重新应用起步位置")
+        if not math.isclose(self.beam_reference_deg, expected_beam):
+            raise ValueError("beam_reference_deg 必须与起步支座及摆放一致；"
+                             "请用【应用起步位置】或【初始摆放】设置")
         if not isinstance(self.calibration_confirmed, bool):
             raise ValueError("calibration_confirmed 必须是布尔值")
         if self.calibration_fingerprint is not None and not isinstance(self.calibration_fingerprint, str):
@@ -298,10 +304,13 @@ class GaitParams:
     # 初始摆放派生的账本原点（启动/重建基准时写入 _gait_supports/_gait_beta_deg）。
     @property
     def initial_supports(self) -> tuple[str, str]:
-        return INITIAL_PLACEMENTS[self.initial_placement][0]
+        return (self.initial_pad_pair if self.initial_pad_pair is not None
+                else INITIAL_PLACEMENTS[self.initial_placement][0])
 
     @property
     def initial_beam_deg(self) -> float:
+        if self.initial_pad_pair is not None:
+            return start_pair_reference(self.initial_pad_pair)[0]
         return INITIAL_PLACEMENTS[self.initial_placement][1]
 
     def as_document(self) -> dict[str, Any]:
@@ -337,6 +346,8 @@ class GaitParams:
             "phase_gain": self.phase_gain,
             "trajectory_mode": self.trajectory_mode,
             "initial_placement": self.initial_placement,
+            "initial_pad_pair": (list(self.initial_pad_pair)
+                                 if self.initial_pad_pair is not None else None),
             "beam_reference_deg": self.beam_reference_deg,
             "calibration_confirmed": self.calibration_confirmed,
             "calibration_fingerprint": self.calibration_fingerprint,
@@ -403,7 +414,13 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
     )
     beam_reference_deg = _number("beam_reference_deg", 180.0)
     initial_placement = value.get("initial_placement")
-    if initial_placement is None:
+    pair = value.get("initial_pad_pair")
+    if pair is not None:
+        _, derived_placement = start_pair_reference(pair)
+        pair = tuple(pair)
+        if initial_placement is None:
+            initial_placement = derived_placement
+    elif initial_placement is None:
         # 旧文档无摆放键：按已保存的β₀查配对摆放，避免缺键默认与旧β₀
         # 矛盾导致加载失败。
         matched = [name for name, (_sup, beam) in INITIAL_PLACEMENTS.items()
@@ -444,6 +461,7 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         phase_gain=_number("phase_gain", GaitParams.phase_gain),
         trajectory_mode=value.get("trajectory_mode", LEGACY),
         initial_placement=initial_placement,
+        initial_pad_pair=pair,
         beam_reference_deg=beam_reference_deg,
         calibration_confirmed=value.get("calibration_confirmed", False),
         calibration_fingerprint=value.get("calibration_fingerprint"),
@@ -673,7 +691,7 @@ def effective_geometry(params: GaitParams) -> GaitGeometry:
 def gait_pads(params: GaitParams, pivot_name="B") -> dict[str, HexPad]:
     geometry = effective_geometry(params)
     pads = default_hex_pads(geometry)
-    if params.trajectory_mode == TWO_MODE:
+    if params.trajectory_mode == TWO_MODE or params.initial_pad_pair is not None:
         # Recenter the obstacle neighborhood after EVERY step; never lose an
         # outer rod just because the support left the original A/B/C patch.
         pi, pj = lattice_coordinates(pivot_name)
