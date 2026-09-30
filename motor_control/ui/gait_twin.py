@@ -269,7 +269,7 @@ def build_twin_panel(app, parent):
             label.grid(row=row, column=col, sticky="w", padx=(0, 5), pady=2)
     legend = ttk.Label(panel, text="蓝抬头=评估模拟(计划·不动电机) 红抬头=实机脉冲(无编码器)\n"
                        "足色:蓝=左足 橙=右足 灰=断连冻结 绿点=低节点(落脚) 红点=高节点(红杆)\n"
-                       "评估层:虚线=摆动中心轨迹 彩线=三爪端轨迹(青/紫/棕) 细足=动画帧\n"
+                       "评估层:实线=腿与横梁(蓝摆动/灰支撑) 虚线=中心与三爪端轨迹(青/紫/棕)\n"
                        "黄圈+数字=6爪中与红杆最近者(爪端到杆表面距离,mm)\n"
                        "曲线图:6爪距离-时间,粗线=最小值;0=杆表面,虚线=参考间隙δ\n"
                        "画面:左键点一下(蓝框)=选中,滚轮缩放;移出自动取消 中键拖动=平移 双击=复位\n"
@@ -645,7 +645,7 @@ def _draw_plan_layer(app, view, report, project):
         return project((point_mm[0] * k_norm, point_mm[1] * k_norm))
 
     samples = report.samples
-    # 摆动中心轨迹（蓝虚线）+ 三条爪端轨迹（彩线）
+    # 摆动中心轨迹（蓝虚线）+ 三条爪端轨迹（彩虚线）——历史路径一律虚线
     arc = [v for s in samples for v in to_map(s.center)]
     if len(arc) >= 4:
         canvas.create_line(*arc, fill="#2563eb", width=2, dash=(6, 3), tags="plan_center")
@@ -658,21 +658,23 @@ def _draw_plan_layer(app, view, report, project):
             points.extend(to_map(tip))
         if len(points) >= 4:
             canvas.create_line(*points, fill=LEG_TRACK_COLORS[leg], width=1.5,
-                               tags=f"plan_track_{leg}")
+                               dash=(5, 3), tags=f"plan_track_{leg}")
     index = len(samples) - 1 if frame is None else max(0, min(frame, len(samples) - 1))
     if frame is not None:
         walked = [v for s in samples[:index + 1] for v in to_map(s.center)]
         if len(walked) >= 4:
-            canvas.create_line(*walked, fill="#2563eb", width=2.5, tags="plan_walked")
+            canvas.create_line(*walked, fill="#2563eb", width=2.5, dash=(6, 3),
+                               tags="plan_walked")
     sample = samples[index]
-    # 摆动足 ghost（评估层一律细线/虚线观感，与实机实色区分）
+    # 摆动足当前帧：腿画实线——机构本体实线、历史轨迹一律虚线
+    # （2026-09-30 按用户要求把两类线型对调）。
     x, y = to_map(sample.center)
     for leg in range(3):
         a = math.radians(sample.psi_deg + 120.0 * leg)
         end = (sample.center[0] + geometry.arm_length_mm * math.cos(a),
                sample.center[1] + geometry.arm_length_mm * math.sin(a))
         canvas.create_line(x, y, *to_map(end), fill="#2563eb", width=2,
-                           dash=(4, 2), tags="plan_ghost")
+                           tags="plan_ghost")
     canvas.create_oval(x-5, y-5, x+5, y+5, outline="#2563eb", width=2,
                        fill="", tags="plan_ghost")
     # 支撑足（支点低节点基准）与横梁
