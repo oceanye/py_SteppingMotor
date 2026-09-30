@@ -13,6 +13,7 @@ from collections import deque
 from tkinter import ttk, messagebox
 
 from motor_control.gait_avoidance import lattice_coordinates
+from motor_control.gait_planner import effective_geometry
 from motor_control.gait_twin import ROLES, TwinHistory, pad_center
 from motor_control.gait_map import map_pads, map_label, start_pair_reference
 from motor_control.ui.common import bind_canvas_view, canvas_view_zoom, reset_canvas_view
@@ -60,10 +61,21 @@ def neighborhood_pads():
     return _NEIGHBORHOOD
 
 
+def lattice_d_mm(params):
+    """态势图换算用的晶格中心距——与 planner 同口径。
+
+    两模态认证在紧贴晶格上（d=√3×爪臂长，GUI 的 d_mm 字段忽略），旧模式
+    才用 d_mm。mm↔归一化（地图中心距=1）的一切换算必须走这里，否则两模态
+    下腿长/杆位/轨迹会被 d_mm 占位值（默认 220）整体缩放错位。
+    """
+
+    return effective_geometry(params).d_mm
+
+
 def high_rods_mm(params):
     """邻域全部高杆的 mm 坐标 [(name, j, x, y), ...]（含地图外一圈）。"""
 
-    d = params.geometry.d_mm
+    d = lattice_d_mm(params)
     arm = params.geometry.arm_length_mm
     rods = []
     for name, (nx, ny) in neighborhood_pads().items():
@@ -79,7 +91,7 @@ _ROD_CACHE = None
 
 def _rods_cached(params):
     global _ROD_CACHE
-    key = (params.geometry.d_mm, params.geometry.arm_length_mm)
+    key = (lattice_d_mm(params), params.geometry.arm_length_mm)
     if _ROD_CACHE is None or _ROD_CACHE[0] != key:
         _ROD_CACHE = (key, high_rods_mm(params))
     return _ROD_CACHE[1]
@@ -88,7 +100,7 @@ def _rods_cached(params):
 def foot_tips_mm(center_norm, psi_deg, params):
     """一足三爪端 mm 坐标：中心（归一化）+ 爪臂长·dir(ψ+120k)。"""
 
-    d = params.geometry.d_mm
+    d = lattice_d_mm(params)
     arm = params.geometry.arm_length_mm
     cx, cy = center_norm[0] * d, center_norm[1] * d
     tips = []
@@ -121,7 +133,7 @@ def plan_tip_series(report, params):
 
     node_r = params.geometry.node_radius_mm
     rods = _rods_cached(params)
-    d, arm = params.geometry.d_mm, params.geometry.arm_length_mm
+    d, arm = lattice_d_mm(params), params.geometry.arm_length_mm
     start, target, pivot, _bearing = report.route
     pxy = pad_center(pivot)
     px, py = pxy[0] * d, pxy[1] * d
@@ -548,7 +560,9 @@ def _draw(app, view):
         foot = pose["feet"][side]
         color = color if live else "#94a3b8"
         x, y = project(foot["center"])
-        arm = params.geometry.arm_length_mm / params.geometry.d_mm
+        # 腿长归一化 = 爪臂长/晶格中心距（planner 口径；两模态=1/√3，
+        # 爪端正好落在节点环/六边形顶点上）。
+        arm = params.geometry.arm_length_mm / lattice_d_mm(params)
         for i in range(3):
             theta = math.radians(foot["psi_deg"] + i*120)
             end = (foot["center"][0]+arm*math.cos(theta),
@@ -598,7 +612,7 @@ def _update_title(app, view, mode, snapshot, live):
 def _tip_surface(app, tip_norm, params, side, k):
     """单个爪端（归一化坐标）对邻域高杆的最近表面距离 mm。"""
 
-    d = params.geometry.d_mm
+    d = lattice_d_mm(params)
     node_r = params.geometry.node_radius_mm
     tip = (tip_norm[0] * d, tip_norm[1] * d)
     best = min(math.dist(tip, (r[2], r[3])) for r in _rods_cached(params))
@@ -619,7 +633,10 @@ def _draw_plan_layer(app, view, report, project):
     canvas = view["canvas"]
     params = app.gait_params
     geometry = params.geometry
-    d = geometry.d_mm
+    # report 是 mm 域、且基于 planner 的有效几何（两模态 d=√3×爪臂长）。
+    # 归一化必须同口径：换算后爪端=1/√3·dir(...)，正好站在六边形顶点
+    # （绿色低节点）上——用 GUI 的 d_mm 占位值会整体缩放错位。
+    d = lattice_d_mm(params)
     k_norm = 1.0 / d if d else 0.0
     anim = app.gait_widgets.get("preview_anim") or {}
     frame = anim.get("frame") if (anim.get("playing") or anim.get("paused")) else None

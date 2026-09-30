@@ -158,10 +158,37 @@ class PreviewViewTransformTests(unittest.TestCase):
 class TwinCurveGeometryTests(unittest.TestCase):
     """爪端-高杆距离的数值口径：邻域杆表 / live 6 爪 / 计划序列（无需 Tk）。"""
 
+    # d_mm 用占位默认 220（≠√3×60）：两模态下该字段被 planner 忽略，
+    # 态势图换算也必须走同一有效几何口径（2026-09-30 现场"腿很短、
+    # 支点不踩绿点"的根因就是误用了 d_mm 字段）。
     PARAMS = GaitParams(
         trajectory_mode="two_mode_v1",
-        geometry=GaitGeometry(d_mm=math.sqrt(3) * 60.0, arm_length_mm=60.0,
+        geometry=GaitGeometry(d_mm=220.0, arm_length_mm=60.0,
                               node_radius_mm=5.0))
+
+    def test_lattice_d_ignores_placeholder_d_in_two_mode(self):
+        from motor_control.gait_avoidance import LEGACY
+        from motor_control.ui.gait_twin import lattice_d_mm
+        self.assertAlmostEqual(lattice_d_mm(self.PARAMS), math.sqrt(3) * 60.0)
+        legacy = replace(self.PARAMS, trajectory_mode=LEGACY)
+        self.assertEqual(lattice_d_mm(legacy), 220.0)
+
+    def test_legs_and_rods_are_invariant_to_placeholder_d(self):
+        # 同一机构（臂长 60）无论 d_mm 填 220 还是 √3×60：杆表、6 爪
+        # 距离、计划序列必须逐点一致——口径只认有效几何。
+        from motor_control.ui.gait_twin import (
+            high_rods_mm, plan_tip_series, tip_surface_distances)
+        twin = replace(self.PARAMS, geometry=replace(
+            self.PARAMS.geometry, d_mm=math.sqrt(3) * 60.0))
+        self.assertEqual(high_rods_mm(self.PARAMS), high_rods_mm(twin))
+        pose = {"feet": {"left": {"center": (0.0, 0.0), "psi_deg": 90.0},
+                         "right": {"center": (1.0, 0.0), "psi_deg": 30.0}}}
+        self.assertEqual(tip_surface_distances(pose, self.PARAMS),
+                         tip_surface_distances(pose, twin))
+        report_a = plan_swing_trajectory(self.PARAMS, side="left")
+        report_b = plan_swing_trajectory(twin, side="left")
+        self.assertEqual(plan_tip_series(report_a, self.PARAMS),
+                         plan_tip_series(report_b, twin))
 
     def test_neighborhood_extends_one_ring_beyond_map(self):
         # "最近足/曲线"的杆表不因 5×5 画面裁剪：边缘支座旁的地图外高杆
