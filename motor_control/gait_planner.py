@@ -135,8 +135,8 @@ def point_segment_distance(
 class GaitGeometry:
     """俯视几何。所有长度 mm，占位默认值需现场实测后覆盖。"""
 
-    d_mm: float = 220.0             # AB = BC 六边形中心距（占位默认，需实测覆盖）
-    arm_length_mm: float = 40.0     # 爪臂长度 = 六边形节点环半径（落脚一致性）
+    d_mm: float = 220.0             # 旧策略中心距；两模态仅由投影边长派生，不使用此值
+    arm_length_mm: float = 40.0     # 正六边形投影边长 a = 中心到顶点 R = 腿投影长度
     hub_radius_mm: float = 12.0     # 三足中心壳体等效半径
     arm_radius_mm: float = 4.0      # 爪臂等效半径（胶囊粗细）
     node_radius_mm: float = 5.0     # 高节点等效半径
@@ -146,6 +146,11 @@ class GaitGeometry:
     beam_height_mm: float = 30.0    # 横梁中心线相对低节点高度，必须实测
     beam_radius_mm: float = 4.0    # 横梁/连接件保守胶囊包络
     surrounding_pads: bool = True  # 检查紧邻的六边形，不只 A/B/C
+
+    @property
+    def touching_center_distance_mm(self) -> float:
+        """Adjacent touching hexagons: projected center spacing d = sqrt(3)*a."""
+        return math.sqrt(3) * self.arm_length_mm
 
     def validated(self) -> "GaitGeometry":
         positive = (
@@ -158,7 +163,7 @@ class GaitGeometry:
                 raise ValueError(f"几何参数 {name} 必须是大于 0 的有限数值")
         if self.hub_radius_mm >= self.arm_length_mm:
             raise ValueError("壳体半径必须小于爪臂长度")
-        if self.d_mm + 1e-8 < math.sqrt(3) * self.arm_length_mm:
+        if self.d_mm + 1e-8 < self.touching_center_distance_mm:
             raise ValueError("六边形中心距小于紧贴正六边形要求，节点环模型重叠；请核实几何")
         for name in ("high_node_height_mm", "body_drop_mm"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
@@ -241,9 +246,15 @@ class GaitParams:
     SCHEMA = "gait-params-v1"
 
     def validated(self) -> "GaitParams":
-        self.geometry.validated()
         if self.trajectory_mode not in (LEGACY, TWO_MODE):
             raise ValueError("未知步态轨迹模式")
+        # Validate the SAME spacing used by two-mode planning. The saved d is
+        # legacy-only and must not reject a measured projected edge (e.g. 190
+        # with an old d=220). Preserve the document and all other checks,
+        # including surrounding_pads type; do not silently migrate legacy.
+        geometry = (replace(self.geometry, d_mm=self.geometry.touching_center_distance_mm)
+                    if self.trajectory_mode == TWO_MODE else self.geometry)
+        geometry.validated()
         if self.initial_placement not in INITIAL_PLACEMENTS:
             raise ValueError("initial_placement 必须是 red_left 或 red_right")
         if not 1 <= int(self.swing_segments) <= 200:
@@ -679,11 +690,12 @@ def angular_targets(params: GaitParams, phi_deg: float) -> tuple[float, float, f
 def effective_geometry(params: GaitParams) -> GaitGeometry:
     """Two-mode paths are certified on the requested touching-hexagon lattice.
 
-    Old d is retained in the config, never overwritten or used to pretend a
-    different site is certified. Radius/thickness remain measured quantities.
+    Projected hexagon edge = leg reach = node ring radius is the only scale.
+    Old d is retained for legacy, but never read by two-mode validation or
+    planning. Projected leg/rod widths and the safety gap remain independent.
     """
     if params.trajectory_mode == TWO_MODE:
-        return replace(params.geometry, d_mm=math.sqrt(3)*params.geometry.arm_length_mm,
+        return replace(params.geometry, d_mm=params.geometry.touching_center_distance_mm,
                        surrounding_pads=True)
     return params.geometry
 

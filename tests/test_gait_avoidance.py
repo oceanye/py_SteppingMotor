@@ -50,6 +50,52 @@ def complete(app, side, arc):
 
 
 class TwoModeGeometryTests(unittest.TestCase):
+    def test_projected_edge_190_is_the_only_scale_for_all_four_actions(self):
+        # User-confirmed planar edge. Intentionally leave the old d=220;
+        # validation, planning and stage construction must all derive sqrt(3)*a.
+        p = GaitParams(trajectory_mode=TWO_MODE,
+                       geometry=GaitGeometry(arm_length_mm=190))
+        self.assertIs(p.validated(), p)
+        self.assertEqual(p.geometry.d_mm, 220)
+        self.assertAlmostEqual(effective_geometry(p).d_mm, math.sqrt(3)*190)
+        sim = GaitSimulation(p)
+        for side, arc, family, end in MODES:
+            with self.subTest(side=side, arc=arc):
+                report = sim.preview(side, arc)
+                self.assertTrue(report.feasible, report.message)
+                self.assertEqual(report.modality, family)
+                self.assertAlmostEqual(report.min_margin_mm,
+                                       27.5815232377 if family == LOW else 8.1677273075, places=6)
+                stage = next(s for s in plan_gait_stages(p, side=side, arc_deg=arc,
+                    route=report.route, swing_psi_start_deg=30) if s.stage_id == "S4")
+                self.assertEqual(stage.sync_endpoints[-1], end)
+
+    def test_projected_scale_document_roundtrip_preserves_legacy_spacing_and_zeros(self):
+        p = GaitParams(trajectory_mode=TWO_MODE,
+                       geometry=GaitGeometry(arm_length_mm=190),
+                       mr1_zero_deg=12.3, mr2_zero_deg=-4.5,
+                       mr1_zero_signature="left", mr2_zero_signature="right")
+        restored = parse_gait_params(p.as_document())
+        self.assertEqual(restored, p)
+        self.assertAlmostEqual(effective_geometry(restored).d_mm, math.sqrt(3)*190)
+        # Legacy has an independent spacing and still rejects overlapping pads.
+        with self.assertRaisesRegex(ValueError, "中心距"):
+            replace(p, trajectory_mode=LEGACY).validated()
+        legacy = replace(p, trajectory_mode=LEGACY,
+                         geometry=replace(p.geometry, d_mm=350.123456789))
+        self.assertEqual(parse_gait_params(legacy.as_document()), legacy)
+        self.assertEqual(effective_geometry(legacy).d_mm, 350.123456789)
+
+    def test_derived_spacing_does_not_waive_other_geometry_checks(self):
+        p = GaitParams(trajectory_mode=TWO_MODE,
+                       geometry=GaitGeometry(arm_length_mm=190))
+        for field, value in (("arm_length_mm", 0), ("arm_length_mm", math.nan),
+                             ("arm_length_mm", 1.7e308), ("hub_radius_mm", 190),
+                             ("arm_radius_mm", -1), ("node_radius_mm", 0),
+                             ("safety_margin_mm", 0), ("surrounding_pads", "true")):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                replace(p, geometry=replace(p.geometry, **{field: value})).validated()
+
     def test_all_map_routes_classify_by_beam_swept_sector_not_button(self):
         # Independent geometric oracle: a high rod's center is inside the
         # signed sector swept by the beam segment. Do not reuse the classifier's
