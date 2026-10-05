@@ -173,7 +173,7 @@ def build_ui(app, log_dir, num_motor_axes):
     req_h = app.root.winfo_reqheight()
     screen_w = app.root.winfo_screenwidth()
     screen_h = app.root.winfo_screenheight()
-    win_w = min(req_w, screen_w - 40)
+    win_w = min(max(req_w, 1480), screen_w - 40)
     win_h = min(req_h, screen_h - 80)
     app.root.geometry(f"{int(win_w)}x{int(win_h)}")
     app.root.minsize(720, 480)

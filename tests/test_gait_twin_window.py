@@ -103,6 +103,99 @@ class TwinWindowTests(unittest.TestCase):
         self.app._gait_last_report = plan_swing_trajectory(self.app.gait_params, side="left")
         self.view["mode_var"].set("plan")
 
+    def assert_charts_side_by_side(self, view):
+        left, right = view["canvas"], view["curve_canvas"]
+        pane = view["chart_panes"]
+        self.assertEqual(str(pane.cget("orient")), "horizontal")
+        self.assertLess(left.winfo_rootx() + left.winfo_width(), right.winfo_rootx())
+        self.assertAlmostEqual(left.winfo_rooty(), right.winfo_rooty(), delta=1)
+        self.assertAlmostEqual(left.winfo_height(), right.winfo_height(), delta=1)
+        self.assertGreater(left.winfo_width(), 100)
+        self.assertGreater(right.winfo_width(), 100)
+        self.assertLessEqual(right.winfo_rootx() + right.winfo_width(),
+                             pane.winfo_rootx() + pane.winfo_width())
+
+    def test_main_charts_stay_beside_each_other_when_resized(self):
+        for size in ("720x480", "1280x720", "1480x820", "1700x900"):
+            with self.subTest(size=size):
+                self.root.geometry(size)
+                self.root.update()
+                self.assert_charts_side_by_side(self.view)
+                self.assertEqual(len(self.canvas.find_withtag("map_hex")), 25)
+        self.assertGreater(self.view["curve_canvas"].winfo_width(), 450)
+
+    def test_charts_side_by_side_at_high_dpi(self):
+        for size in ("720x480", "1480x820"):
+            with self.subTest(size=size):
+                self.root.geometry(size)
+                self.root.update()
+                self.assert_charts_side_by_side(self.view)
+
+    def test_sash_resize_changes_only_view_not_history_or_calibration(self):
+        self.root.geometry("1480x820")
+        self.root.update()
+        pane = self.view["chart_panes"]
+        params = self.app.gait_params
+        history = list(self.view["history"].points)
+        curve = list(self.view["curve_live"])
+        old_left = self.canvas.winfo_width()
+        old_right = self.view["curve_canvas"].winfo_width()
+        x, y = pane.sash_coord(0)
+        pane.sash_place(0, x + 70, y)
+        self.root.update()
+        self.assertAlmostEqual(self.canvas.winfo_width(), old_left + 70, delta=1)
+        self.assertAlmostEqual(self.view["curve_canvas"].winfo_width(), old_right - 70, delta=1)
+        self.assert_charts_side_by_side(self.view)
+        self.assertEqual(list(self.view["history"].points), history)
+        self.assertEqual(list(self.view["curve_live"]), curve)
+        self.assertIs(self.app.gait_params, params)
+
+    def test_curve_cursor_and_colours_match_plan_map_frame(self):
+        from motor_control.ui.gait_twin_window import open_twin_window
+        self.root.geometry("1480x820")
+        self.prepare_plan()
+        anim = self.app.gait_widgets.setdefault("preview_anim", {})
+        anim.update(playing=False, paused=True)
+        open_twin_window(self.app)
+        detail = self.view["large_window"]
+        detail["window"].attributes("-alpha", 0)
+        self.root.update()
+        for side in ("left", "right"):
+            report = plan_swing_trajectory(self.app.gait_params, side=side)
+            self.app._gait_last_report = report
+            times = plan_sample_times(report, self.app.gait_params)
+            for index in (0, len(report.samples)//3, len(report.samples)-1):
+                anim["frame"] = index
+                twin.draw_twin(self.app)
+                for view in (self.view, detail):
+                    curve = view["curve_canvas"]
+                    text_id = curve.find_withtag("curve_current_time")[0]
+                    self.assertEqual(curve.itemcget(text_id, "text"), f"当前 {times[index]:.1f}s")
+                    cursor_x = curve.coords(curve.find_withtag("curve_cursor")[0])[0]
+                    self.assertAlmostEqual(cursor_x, 42+(curve.winfo_width()-52)*times[index]/times[-1])
+                    self.assertEqual(len(curve.find_withtag("curve_legend")), 12)
+                    for leg in range(3):
+                        map_canvas = view["canvas"]
+                        track = map_canvas.find_withtag(f"plan_track_{leg}")[0]
+                        line = curve.find_withtag(f"curve_{side}_{leg}")[0]
+                        self.assertEqual(map_canvas.itemcget(track, "fill"), curve.itemcget(line, "fill"))
+
+    def test_large_toolbar_remains_reachable_at_high_dpi(self):
+        from motor_control.ui.gait_twin_window import open_twin_window
+        open_twin_window(self.app)
+        detail = self.view["large_window"]
+        window = detail["window"]
+        window.attributes("-alpha", 0)
+        for size in ("640x500", "1500x820"):
+            window.geometry(size)
+            self.root.update()
+            self.assert_charts_side_by_side(detail)
+            for button in detail["toolbar_controls"]:
+                self.assertTrue(button.winfo_viewable())
+                self.assertGreaterEqual(button.winfo_rootx(), window.winfo_rootx())
+                self.assertLessEqual(button.winfo_rootx()+button.winfo_width(),
+                                     window.winfo_rootx()+window.winfo_width())
+
     def test_plan_without_report_never_displays_live_pose_or_history(self):
         for report in (None, SimpleNamespace(samples=())):
             self.app._gait_last_report = report
@@ -228,9 +321,10 @@ class TwinWindowTests(unittest.TestCase):
         window.attributes("-alpha", 0)
         open_twin_window(self.app)
         self.assertIs(self.view["large_window"]["window"], window)
-        for size in ("640x500", "1100x820"):
+        for size in ("640x500", "1100x820", "1500x820"):
             window.geometry(size)
             self.root.update()
+            self.assert_charts_side_by_side(detail)
             self.assertEqual(len(detail["canvas"].find_withtag("map_hex")), 25)
             self.assertIs(detail["history"], self.view["history"])
             self.assertIs(detail["curve_live"], self.view["curve_live"])

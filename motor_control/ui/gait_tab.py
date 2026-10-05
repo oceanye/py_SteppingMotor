@@ -173,8 +173,8 @@ def build_gait_tab(app, parent) -> None:
                           borderwidth=0, opaqueresize=True)
     panes.grid(row=1, column=0, sticky="nsew", **PAD)
     left, right = ttk.Frame(panes), ttk.Frame(panes)
-    panes.add(left, minsize=350, width=350, stretch="always")
-    panes.add(right, minsize=260, width=500, stretch="always")
+    panes.add(left, minsize=350, width=350, stretch="never")
+    panes.add(right, minsize=260, width=950, stretch="always")
     app.gait_widgets["panes"] = panes
     _build_params_column(app, left)
     _build_run_column(app, right)

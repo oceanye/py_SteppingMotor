@@ -85,6 +85,7 @@ from motor_control.gait_planner import (
     LOW_NODE_PHASE_DEG,
     SWING_ARC_DEG,
     GaitParams,
+    default_gait_params,
     parse_gait_params,
     plan_gait_stages,
     plan_swing_trajectory,
@@ -358,7 +359,7 @@ class StepperGUI:
         self._load_control_bindings()
 
         # ── 三足轮换步态：参数（标定向导写入 .gait_params.json）+ 当前执行实例 ──
-        self.gait_params = GaitParams(trajectory_mode=TWO_MODE)
+        self.gait_params = default_gait_params()
         self._gait_run: GaitExecutor | None = None
         self._gait_auto_run = False   # ⚡ 一键执行中（阶段间自动推进）
         self._gait_owned = {}
@@ -633,14 +634,16 @@ class StepperGUI:
 
     # ═════════════ 三足轮换步态：参数 / 标定 / 分阶段执行 ═════════════
     def _load_gait_params(self):
-        """启动时读 .gait_params.json；坏数据安全回退为占位默认。"""
+        """本机配置优先；缺失/损坏时使用仓库190mm默认，仍未标定。"""
 
         try:
             data = self.state_store.load_gait_params()
         except StateStoreError as exc:
             self._startup_warnings.append(f"⚠️ 步态参数读取失败: {exc}")
+            self.gait_params = default_gait_params()
             return
         if data is None:
+            self.gait_params = default_gait_params()
             return
         try:
             parsed = parse_gait_params(data)
@@ -653,10 +656,10 @@ class StepperGUI:
                     f"{parsed.initial_placement}（左右标注对调校正；几何与零位不变）")
             # Pulse coordinates do not establish physical support locations on restart.
             self.gait_params = replace(parsed, calibration_confirmed=False)
-        except ValueError as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             self._startup_warnings.append(
-                f"⚠️ 步态参数无效（{exc}）；已回退为默认占位参数")
-            self.gait_params = GaitParams()
+                f"⚠️ 步态参数无效（{exc}）；已回退为190mm默认投影参数，须重新确认标定")
+            self.gait_params = default_gait_params()
 
     def _save_gait_params(self, params):
         """校验、原子写盘并发布到内存（UI 线程调用）。"""

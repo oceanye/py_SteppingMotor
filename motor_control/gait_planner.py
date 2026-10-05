@@ -30,6 +30,7 @@ SWING_ARC_DEG = 60.0        # 一次公转角
 SWING_SPIN_DEG = 120.0      # 摆动侧自转角（= 2×公转角）
 LOW_NODE_PHASE_DEG = 30.0   # 低节点起始相位 ψ10（同时是三根爪臂之一的方向）
 HIGH_NODE_PHASE_DEG = 90.0  # 高节点相位（与低节点相间 60°）
+DEFAULT_PROJECTED_EDGE_MM = 190.0  # 本机构确认的俯视投影边长；新桌面会话默认
 
 SWING_JOINT_DELTA_DEG = 180.0  # 摆动侧电机关节角总变化 Δq = 120-(-60)
 SUPPORT_JOINT_DELTA_DEG = 60.0  # 支撑侧电机补偿角总变化 Δq = 0-(-60)
@@ -367,6 +368,18 @@ class GaitParams:
         }
 
 
+def default_gait_params() -> GaitParams:
+    """Shipped desktop defaults, not a copy of any machine's calibration.
+
+    Keep the legacy dataclass/API defaults for older partial documents. New
+    desktop sessions use the confirmed 190 mm projection and automatic modes,
+    with no zero signatures, bindings or calibration confirmation.
+    """
+    return GaitParams(trajectory_mode=TWO_MODE, geometry=GaitGeometry(
+        arm_length_mm=DEFAULT_PROJECTED_EDGE_MM,
+        d_mm=math.sqrt(3)*DEFAULT_PROJECTED_EDGE_MM)).validated()
+
+
 def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
     """从 JSON 文档恢复参数；缺失字段用默认值，非法整体失败。"""
 
@@ -404,10 +417,14 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
     geometry_raw = value.get("geometry", {})
     if not isinstance(geometry_raw, Mapping):
         raise ValueError("geometry 必须是对象")
+    # Only fill missing two-mode geometry; explicit site values (including 40)
+    # always win. Documents without a mode retain historical legacy semantics.
+    geometry_defaults = (default_gait_params().geometry
+                         if value.get("trajectory_mode") == TWO_MODE else GaitGeometry())
     geometry = GaitGeometry(
-        d_mm=float(geometry_raw.get("d_mm", GaitGeometry.d_mm)),
+        d_mm=float(geometry_raw.get("d_mm", geometry_defaults.d_mm)),
         arm_length_mm=float(
-            geometry_raw.get("arm_length_mm", GaitGeometry.arm_length_mm)),
+            geometry_raw.get("arm_length_mm", geometry_defaults.arm_length_mm)),
         hub_radius_mm=float(
             geometry_raw.get("hub_radius_mm", GaitGeometry.hub_radius_mm)),
         arm_radius_mm=float(
