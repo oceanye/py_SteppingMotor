@@ -209,16 +209,18 @@ def _build_params_column(app, parent) -> None:
             row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
 
     inner = pages["run"].content
-    ttk.Label(inner, text="避杆轨迹模式").grid(row=0, column=0, sticky="w", padx=6)
-    ttk.Combobox(inner, textvariable=app.gait_trajectory_var,
-                 values=(TWO_MODE, LEGACY), state="readonly", width=16).grid(
-                     row=0, column=1, columnspan=2, sticky="ew", padx=6)
-    note(inner, 1, "two_mode_v1：低节点侧反向比例自转；高节点侧同向变比例自转。\n"
-         "按当前站位自动分类，四按钮均支持。分段双轴SYNC，换向时停稳。\n"
-         "legacy_gain：兼容旧固定k；不是已验证的腿避杆策略。")
-    for row, (key, label) in enumerate(RUN_FIELDS + GAP_FIELDS, 2):
+    ttk.Label(inner, text="运动模态").grid(row=0, column=0, sticky="w", padx=6)
+    app.gait_widgets["trajectory_status"] = ttk.Label(
+        inner, text="", wraplength=150, justify="left")
+    app.gait_widgets["trajectory_status"].grid(
+        row=0, column=1, columnspan=2, sticky="ew", padx=6)
+    note(inner, 1, "只选择左/右足与顺/逆动作，无需选择 HIGH / LOW。\n"
+         "后台按当前站位判断本步横梁扫掠：跨高杆 → HIGH；不跨 → LOW。\n"
+         "每次换步重新判断，不与按钮固定绑定；自动判定不代表避让校验通过。")
+    run_fields = tuple(field for field in RUN_FIELDS if field[0] != "phase_gain") + GAP_FIELDS
+    for row, (key, label) in enumerate(run_fields, 2):
         add_number_field(inner, row, key, label)
-    note(inner, 9, "两模态使用紧贴晶格 d=√3R，保留但不使用旧中心距。"
+    note(inner, len(run_fields)+2, "两模态使用紧贴晶格 d=√3R，保留但不使用旧中心距。"
          "腿/杆半径和δ必须实测，不能调小数值强行放行。抬高不能替代腿的平面避让。")
 
     inner = pages["calibration"].content
@@ -288,6 +290,18 @@ def _build_params_column(app, parent) -> None:
     note(inner, len(GEOMETRY_FIELDS + PREVIEW_FIELDS)+1,
          "两模态自动使用 d=√3×节点环半径。壳体/横梁参数为额外结构诊断，"
          "不用于豁免腿的平面冲突；壳体包络应包含电机、轴承和连接件。")
+    row = len(GEOMETRY_FIELDS + PREVIEW_FIELDS)+2
+    ttk.Label(inner, text="历史兼容策略（非模态选择）", wraplength=185).grid(
+        row=row, column=0, sticky="w", padx=6)
+    app.gait_widgets["trajectory_strategy"] = ttk.Combobox(
+        inner, textvariable=app.gait_trajectory_var,
+        values=(TWO_MODE, LEGACY), state="readonly", width=16)
+    app.gait_widgets["trajectory_strategy"].grid(
+        row=row, column=1, columnspan=2, sticky="ew", padx=6)
+    add_number_field(inner, row+1, "phase_gain", "旧模式增益 k（两模态忽略）")
+    note(inner, row+2, "正常避杆使用 two_mode_v1，由后台自动选 HIGH / LOW。"
+         "legacy_gain 仅兼容历史固定增益，不是另一种避杆模态，不能用它绕过避让失败。"
+         "保留旧配置，不静默更改既有标定。")
     for page in pages.values():
         page.bind_navigation()
 
@@ -346,14 +360,26 @@ def _build_run_column(app, parent) -> None:
     actions = ttk.Frame(preview)
     actions.grid(row=1, column=0, sticky="ew", pady=(2, 0))
     ttk.Button(
-        actions, text="预览 / 校验",
+        actions, text="单步预览 / 校验",
         command=app._gait_run_dry_run,
     ).pack(side="left", padx=4)
     app.gait_widgets["play_btn"] = ttk.Button(
-        actions, text="▶ 模拟动作",
+        actions, text="▶ 回放预览",
         command=app._gait_play_preview_clicked,
     )
     app.gait_widgets["play_btn"].pack(side="left", padx=4)
+    from .gait_simulation import toggle_simulation, reset_simulation, discard_simulation_step
+    simulation = ttk.Frame(preview)
+    simulation.grid(row=3, column=0, sticky="ew", pady=3)
+    app.gait_widgets["sim_btn"] = ttk.Button(
+        simulation, text="▶ 模拟下一步", command=lambda: toggle_simulation(app))
+    app.gait_widgets["sim_btn"].grid(row=0, column=0, padx=3)
+    ttk.Button(simulation, text="取消本步", command=lambda: discard_simulation_step(app)).grid(row=0, column=1, padx=3)
+    ttk.Button(simulation, text="重置模拟", command=lambda: reset_simulation(app)).grid(row=0, column=2, padx=3)
+    app.gait_widgets["sim_status"] = ttk.Label(
+        preview, text="累计模拟：使用所选起步两格，不改实机标定；清路径不重置站位。",
+        wraplength=260, foreground="#7c3aed", justify="left")
+    app.gait_widgets["sim_status"].grid(row=4, column=0, sticky="ew")
     result = ttk.Label(
         preview, textvariable=app.gait_report_var,
         wraplength=260, justify="left",
@@ -426,7 +452,7 @@ def _build_run_column(app, parent) -> None:
     def resize_text(event):
         width = max(220, event.width - 36)
         for label in (current, result, *(app.gait_widgets[key] for key in
-                      ("confirm_text", "progress", "angles", "state"))):
+                      ("confirm_text", "progress", "angles", "state", "sim_status"))):
             label.configure(wraplength=width)
     viewport.canvas.bind("<Configure>", resize_text, add="+")
     viewport.bind_navigation()
@@ -434,13 +460,25 @@ def _build_run_column(app, parent) -> None:
 
 # ── 参数字段 ↔ GaitParams ──────────────────────────────────
 
+def _refresh_trajectory_status(app):
+    label = getattr(app, "gait_widgets", {}).get("trajectory_status")
+    if label is not None:
+        automatic = app.gait_trajectory_var.get() == TWO_MODE
+        label.configure(
+            text="HIGH / LOW 后台自动判定" if automatic else "旧策略：未启用自动避杆",
+            foreground="#334155" if automatic else "#b42318")
+
+
 def _invalidate_calibration(app):
+    _refresh_trajectory_status(app)
     if not getattr(app, "_gait_loading_fields", False):
         app.gait_calibrated_var.set(False)
         # Changing the law/geometry must not replay a cached, different path.
         app._gait_last_report = None
         if getattr(app, "gait_widgets", {}).get("preview_anim"):
             stop_preview_animation(app)
+        from .gait_simulation import cancel_simulation
+        cancel_simulation(app)
 
 
 def load_gait_fields(app) -> None:
@@ -643,6 +681,10 @@ def reset_preview_view(app) -> None:
 def play_preview_animation(app) -> None:
     """沿最近一次干跑的 samples 从头逐帧回放摆动旋转段。"""
 
+    if getattr(app, "_gait_owned", {}):
+        return
+    from .gait_simulation import cancel_simulation
+    cancel_simulation(app)
     report = getattr(app, "_gait_last_report", None)
     if report is None or not report.samples:
         app.log("⚠️ 模拟动作：请先点【预览 / 校验】生成轨迹")
@@ -658,9 +700,9 @@ def play_preview_animation(app) -> None:
     anim.update(frame=0, playing=True, paused=False)
     button = app.gait_widgets.get("play_btn")
     if button is not None:
-        button.configure(text="⏸ 暂停模拟")
+        button.configure(text="⏸ 暂停回放")
     start, target, pivot, _bearing = report.route
-    app.log(f"▶ 预览模拟：{start}→{target} 绕{pivot}"
+    app.log(f"▶ 单步回放（不累计）：{start}→{target} 绕{pivot}"
             f"（{len(report.samples)} 采样，仅视图动画，不动电机）")
     _preview_anim_tick(app)
 
@@ -680,7 +722,7 @@ def pause_preview_animation(app) -> None:
     anim.update(job=None, playing=False, paused=True)
     button = app.gait_widgets.get("play_btn")
     if button is not None:
-        button.configure(text="▶ 继续模拟")
+        button.configure(text="▶ 继续回放")
 
 
 def resume_preview_animation(app) -> None:
@@ -692,7 +734,7 @@ def resume_preview_animation(app) -> None:
     anim.update(playing=True, paused=False)
     button = app.gait_widgets.get("play_btn")
     if button is not None:
-        button.configure(text="⏸ 暂停模拟")
+        button.configure(text="⏸ 暂停回放")
     _preview_anim_tick(app)
 
 
@@ -722,12 +764,15 @@ def stop_preview_animation(app, *, redraw: bool = False) -> None:
     anim.update(job=None, playing=False, paused=False)
     button = app.gait_widgets.get("play_btn")
     if button is not None:
-        button.configure(text="▶ 模拟动作")
+        button.configure(text="▶ 回放预览")
     if redraw:
         draw_gait_preview(app)
 
 
 def _preview_anim_tick(app) -> None:
+    if getattr(app, "_gait_owned", {}):
+        stop_preview_animation(app)
+        return
     anim = app.gait_widgets.get("preview_anim")
     report = getattr(app, "_gait_last_report", None)
     if (anim is None or report is None

@@ -267,6 +267,7 @@ class GaitLayoutTests(unittest.TestCase):
         self.addCleanup(self.root.destroy)
         self.errors = []
         self.root.report_callback_exception = lambda *error: self.errors.append(error)
+        self.addCleanup(lambda: self.assertFalse(self.errors, "Unhandled Tk callback exception"))
         self.app = SimpleNamespace(root=self.root, gait_params=GaitParams(),
                                    _closing=False, _gait_run=None,
                                    _gait_angle_snapshot=lambda: None,
@@ -282,6 +283,10 @@ class GaitLayoutTests(unittest.TestCase):
         self.page = ttk.Frame(self.root)
         self.page.pack(fill="both", expand=True)
         build_gait_tab(self.app, self.page)
+        from motor_control.ui.gait_tab import stop_preview_animation
+        from motor_control.ui.gait_simulation import cancel_simulation
+        self.addCleanup(lambda: stop_preview_animation(self.app))
+        self.addCleanup(lambda: cancel_simulation(self.app))
         self.root.deiconify()
 
     def test_parameter_entries_do_not_extend_past_scroll_viewport(self):
@@ -362,6 +367,21 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertIsNone(self.app._gait_last_report)
         self.assertEqual(collect_gait_params(self.app, self.app.gait_params).trajectory_mode, TWO_MODE)
 
+    def test_modalities_are_read_only_and_legacy_strategy_is_advanced(self):
+        from motor_control.gait_avoidance import TWO_MODE, LEGACY
+        widgets = self.app.gait_widgets
+        run = widgets["param_pages"]["run"].content
+        geometry = widgets["param_pages"]["geometry"].content
+        self.assertIsInstance(widgets["trajectory_status"], ttk.Label)
+        self.assertIs(widgets["trajectory_status"].master, run)
+        self.assertFalse(any(isinstance(w, ttk.Combobox) for w in run.winfo_children()))
+        self.assertIs(widgets["trajectory_strategy"].master, geometry)
+        self.assertEqual(tuple(widgets["trajectory_strategy"]["values"]), (TWO_MODE, LEGACY))
+        self.app.gait_trajectory_var.set(TWO_MODE)
+        self.assertIn("后台自动判定", widgets["trajectory_status"]["text"])
+        self.app.gait_trajectory_var.set(LEGACY)
+        self.assertIn("未启用自动避杆", widgets["trajectory_status"]["text"])
+
     def test_changing_initial_placement_resets_ledger_and_zero(self):
         # 2026-09-24 初始摆放（红杆在横梁左/右）= 坐标基准：切换即账本
         # 回新原点、零位作废、标定失效；β₀ 字段联动为派生值。
@@ -438,7 +458,7 @@ class GaitLayoutTests(unittest.TestCase):
         play_preview_animation(self.app)
         anim = self.app.gait_widgets["preview_anim"]
         self.assertTrue(anim["playing"])
-        self.assertEqual(button.cget("text"), "⏸ 暂停模拟")
+        self.assertEqual(button.cget("text"), "⏸ 暂停回放")
         # 播放=想看评估模拟：态势图自动切计划层（蓝抬头）
         self.assertEqual(self.app.gait_widgets["twin"]["mode_var"].get(), "plan")
 
@@ -446,7 +466,7 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertFalse(anim["playing"])
         self.assertTrue(anim["paused"])
         self.assertGreater(anim["frame"], 0)
-        self.assertEqual(button.cget("text"), "▶ 继续模拟")
+        self.assertEqual(button.cget("text"), "▶ 继续回放")
 
         # 暂停中滚轮缩放：重画必须保持暂停帧（帧号不变、仍处暂停态）
         self.app.gait_widgets["twin_view"].update(active=True, zoom=1.5)
@@ -459,12 +479,12 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertTrue(anim["playing"])
         self.assertFalse(anim["paused"])
         self.assertGreaterEqual(anim["frame"], paused_frame)
-        self.assertEqual(button.cget("text"), "⏸ 暂停模拟")
+        self.assertEqual(button.cget("text"), "⏸ 暂停回放")
 
         pause_preview_animation(self.app)
         stop_preview_animation(self.app)
         self.assertFalse(anim["playing"] or anim["paused"])
-        self.assertEqual(button.cget("text"), "▶ 模拟动作")
+        self.assertEqual(button.cget("text"), "▶ 回放预览")
 
     def test_live_canvas_follows_pulses_and_freezes_on_disconnect(self):
         from motor_control import AxisMotionTelemetry
@@ -560,7 +580,7 @@ class GaitLayoutTests(unittest.TestCase):
             self.assertTrue(canvas.find_withtag(tag), tag)
         self.assertFalse(canvas.find_withtag("twin_placeholder"))
         self.assertEqual(view["title"].cget("text"),
-                         "🔵 评估模拟 · 计划轨迹（不动电机）")
+                         "🔵 单步预览 · 候选轨迹（不累计/不动电机）")
         self.assertEqual(str(view["title"].cget("foreground")), "#1d4ed8")
         # 曲线图：6 条爪距曲线（左右各 3）+ 最小值包络
         for tag in ("curve_left_0", "curve_left_1", "curve_left_2",

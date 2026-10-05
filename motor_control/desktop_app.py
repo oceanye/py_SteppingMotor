@@ -1595,6 +1595,9 @@ class StepperGUI:
         self._refresh_gait_ui()
 
     def _gait_run_dry_run(self, interactive=True):
+        from motor_control.ui.gait_simulation import preview_from_simulation
+        if preview_from_simulation(self, interactive):
+            return
         params = self._gait_params_from_ui()
         if params is None:
             return
@@ -1623,6 +1626,7 @@ class StepperGUI:
         # 新轨迹新包围盒：滚轮缩放/中键平移视图复位，避免旧视图卡住新图
         reset_preview_view(self)
         self._gait_last_report = report
+        self._gait_plan_context = (report, params)
         self._gait_last_report_key = (side, arc_deg)
         self._gait_preview_stance = (getattr(self, "_gait_supports", ("A", "B")),
                                     getattr(self, "_gait_beta_deg", 180.0))
@@ -1660,6 +1664,10 @@ class StepperGUI:
             selection = None
         stance = (getattr(self, "_gait_supports", ("A", "B")),
                   getattr(self, "_gait_beta_deg", 180.0))
+        view = (getattr(self, "gait_widgets", None) or {}).get("twin", {})
+        sim = view.get("simulation")
+        if sim is not None and view["mode_var"].get() != "live":
+            stance = ("simulation", sim.supports, sim.beta)
         if (getattr(self, "_gait_last_report", None) is None
                 or selection is None
                 or getattr(self, "_gait_last_report_key", None) != selection
@@ -1668,6 +1676,8 @@ class StepperGUI:
         play_preview_animation(self)
 
     def _gait_start_run_clicked(self, side, arc_deg=None):
+        from motor_control.ui.gait_simulation import cancel_simulation
+        cancel_simulation(self)
         self._gait_auto_run = False   # 新一次摆动从人工确认开始
         params = self._gait_params_from_ui()
         if params is None:
@@ -4603,6 +4613,9 @@ class StepperGUI:
 
     def _on_close(self):
         """尽力停车，然后回收串口和网页服务器。"""
+        from motor_control.ui.gait_simulation import cancel_simulation
+        cancel_simulation(self)
+        stop_preview_animation(self)
         with self.state_lock:
             if self._closing:
                 return
