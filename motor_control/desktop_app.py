@@ -1187,6 +1187,13 @@ class StepperGUI:
         self._gait_run.twin_lift_start = twin_lift_start
         self._gait_run.twin_final_positions = None
         self._gait_run.twin_manual_invalid = False
+        # Read-only display reference: this run's validated plan, never an old
+        # virtual simulation. Preserve claw indices after any S3 phase setup.
+        swing_s4_psi = psi_now + (phase_stage.move_groups[0][0].delta * sign
+                                  if phase_stage is not None else 0.0)
+        self._gait_run.twin_report = report
+        self._gait_run.twin_psis = ((swing_s4_psi, support_psi) if side == "left"
+                                    else (support_psi, swing_s4_psi))
         self.log(f"步态执行器就绪（{side}）：{len(stages)} 个阶段，"
                  f"当前 ψ={psi_now:.1f}°")
         self._gait_set_view_mode("live")   # 执行开始：态势图切实机层，隐藏计划层
@@ -1839,7 +1846,9 @@ class StepperGUI:
         if getattr(self, "_gait_owned", {}):
             self._gait_abort_run()
         self._gait_run = None
-        self._gait_set_view_mode("plan")   # 重置流程：回到评估层看计划
+        self._gait_set_view_mode("live")   # 不恢复旧的独立预览；重新点选动作生成候选。
+        view = (getattr(self, "gait_widgets", None) or {}).get("twin", {})
+        view.pop("candidate", None)
         self.log("步态流程已重置（执行器丢弃，重新开始前会重新干跑）")
         self._refresh_gait_ui()
 

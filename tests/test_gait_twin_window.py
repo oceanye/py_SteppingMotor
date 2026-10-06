@@ -172,13 +172,16 @@ class TwinWindowTests(unittest.TestCase):
                     text_id = curve.find_withtag("curve_current_time")[0]
                     self.assertEqual(curve.itemcget(text_id, "text"), f"当前 {times[index]:.1f}s")
                     cursor_x = curve.coords(curve.find_withtag("curve_cursor")[0])[0]
-                    self.assertAlmostEqual(cursor_x, 42+(curve.winfo_width()-52)*times[index]/times[-1])
+                    display = view["curve_display"]
+                    self.assertAlmostEqual(cursor_x, 42+(curve.winfo_width()-52)*(
+                        times[index]-display["start"])/(display["end"]-display["start"]))
                     self.assertEqual(len(curve.find_withtag("curve_legend")), 12)
                     for leg in range(3):
                         map_canvas = view["canvas"]
                         track = map_canvas.find_withtag(f"plan_track_{leg}")[0]
                         line = curve.find_withtag(f"curve_{side}_{leg}")[0]
-                        self.assertEqual(map_canvas.itemcget(track, "fill"), curve.itemcget(line, "fill"))
+                        self.assertEqual(map_canvas.itemcget(track, "fill"), twin.CURVE_COLORS[0 if side == "left" else 1][leg])
+                        self.assertEqual(curve.itemcget(line, "fill"), "#b4b4b4")
 
     def test_large_toolbar_remains_reachable_at_high_dpi(self):
         from motor_control.ui.gait_twin_window import open_twin_window
@@ -269,11 +272,12 @@ class TwinWindowTests(unittest.TestCase):
             self.assertEqual(self.view["curve_live"][0][0], 0)
 
     def test_rolling_minimum_ignores_old_offscreen_collision(self):
-        self.view["curve_live"].clear()
-        self.view["curve_live"].extend(((0, [-100]*6, 0), (100, [12]*6, 0), (101, [15]*6, 0)))
+        self.view["mode_var"].set("sim")
+        self.view["simulation"] = SimpleNamespace(params=self.app.gait_params, active=False, paused=False, segment=5, step_started_s=0,
+            frame=SimpleNamespace(time_s=101), curve=((0, [-100]*6, 5), (11, [12]*6, 5), (101, [15]*6, 5)))
         twin._draw_curve(self.app, self.view)
         c = self.view["curve_canvas"]
-        self.assertEqual(c.itemcget(c.find_withtag("curve_best")[0], "text"), "窗口最低 12.00mm")
+        self.assertEqual(c.itemcget(c.find_withtag("curve_best")[0], "text"), "本步窗内最低 12.00mm")
         self.assertTrue(c.find_withtag("curve_delta"))
 
     def test_plan_checks_six_tips_and_updates_coordinates(self):

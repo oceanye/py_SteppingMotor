@@ -511,12 +511,12 @@ class GaitLayoutTests(unittest.TestCase):
                              d_mm=math.sqrt(3) * 60, arm_length_mm=60))
         report = plan_swing_trajectory(params, side="left")
         self.app._gait_last_report = report
-        button = self.app.gait_widgets["play_btn"]
+        # Old playback API remains callable, but its duplicate UI entry is gone.
+        self.assertNotIn("play_btn", self.app.gait_widgets)
 
         play_preview_animation(self.app)
         anim = self.app.gait_widgets["preview_anim"]
         self.assertTrue(anim["playing"])
-        self.assertEqual(button.cget("text"), "⏸ 暂停回放")
         # 播放=想看评估模拟：态势图自动切计划层（蓝抬头）
         self.assertEqual(self.app.gait_widgets["twin"]["mode_var"].get(), "plan")
 
@@ -524,7 +524,6 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertFalse(anim["playing"])
         self.assertTrue(anim["paused"])
         self.assertGreater(anim["frame"], 0)
-        self.assertEqual(button.cget("text"), "▶ 继续回放")
 
         # 暂停中滚轮缩放：重画必须保持暂停帧（帧号不变、仍处暂停态）
         self.app.gait_widgets["twin_view"].update(active=True, zoom=1.5)
@@ -537,12 +536,10 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertTrue(anim["playing"])
         self.assertFalse(anim["paused"])
         self.assertGreaterEqual(anim["frame"], paused_frame)
-        self.assertEqual(button.cget("text"), "⏸ 暂停回放")
 
         pause_preview_animation(self.app)
         stop_preview_animation(self.app)
         self.assertFalse(anim["playing"] or anim["paused"])
-        self.assertEqual(button.cget("text"), "▶ 回放预览")
 
     def test_live_canvas_follows_pulses_and_freezes_on_disconnect(self):
         from motor_control import AxisMotionTelemetry

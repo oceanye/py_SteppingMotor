@@ -26,7 +26,6 @@ CURVE_COLORS = (("#1d4ed8", "#3b82f6", "#93c5fd"),   # 左足 爪1/2/3
 _SIX_STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, -1), (-1, 1))
 CURVE_SAMPLE_INTERVAL_S = 0.15     # 实机曲线采样节流
 CURVE_MAX_POINTS = 1800            # 实机曲线有界缓存（≈4.5 分钟@0.15s）
-CURVE_WINDOW_S = 90.0              # 实机曲线显示滚动窗口
 
 
 def twin_pad_window():
@@ -233,7 +232,7 @@ def _map_click(app, event, view=None):
 
 
 def build_twin_panel(app, parent):
-    panel = ttk.LabelFrame(parent, text="态势图 · 5×5 地图（单步预览 / 累计模拟 / 实机）")
+    panel = ttk.LabelFrame(parent, text="态势图 · 5×5 地图（灰色候选 / 累计模拟 / 实机）")
     panel.grid(row=0, column=0, sticky="ew", padx=6, pady=3)
     panel.columnconfigure(0, weight=1)
     # 2026-09-30 按用户要求：抬头变色区分数据源——评估模拟（计划）蓝、
@@ -264,17 +263,19 @@ def build_twin_panel(app, parent):
         rows[role] = tuple(ttk.Label(table, text="—", font=("Consolas", 9)) for _ in range(3))
         for col, label in enumerate(rows[role]):
             label.grid(row=row, column=col, sticky="w", padx=(0, 5), pady=2)
-    legend = ttk.Label(panel, text="蓝=单步预览 紫=累计模拟(均不动电机) 红=实机脉冲(无编码器)\n"
+    legend = ttk.Label(panel, text="灰色落点=点选动作的候选位置 紫=累计模拟 红=实机脉冲(无编码器)\n"
                        "足色:蓝=左足 橙=右足 灰=断连冻结 绿点=低节点(落脚) 红点=高节点(红杆)\n"
-                       "评估层:实线=腿与横梁(蓝摆动/灰支撑) 虚线=中心与三爪端轨迹(左蓝系/右橙系，与曲线同色)\n"
+                       "实线=腿与横梁，虚线=已走路径；模拟曲线左蓝系/右橙系。\n"
                        "黄圈+数字=6爪中与红杆最近者(爪端到杆表面距离,mm)\n"
-                       "曲线图:6爪距离-时间,粗线=最小值;0=杆表面,虚线=参考间隙δ\n"
+                       "曲线仅当前步90秒滑窗；纵轴固定−20～200mm，0=杆表面，负值红底。\n"
+                       "爪端为正不能证明整腿避碰；完整校验不变。超量程提示，不自动缩放。\n"
                        "画面:左键点一下(蓝框)=选中,滚轮缩放;移出自动取消 中键拖动=平移 双击=复位\n"
                        "固定5×5地图，B=(0,0)，上为+Y、右为+X；行号自下向上。\n"
                        "XY 为中心距=1的估算；Z 为本步位移，非接触检测。\n"
                        "虚线=已回报轨迹(中心+三爪端,蓝系=左足 橙系=右足)，圆点=完成步落脚。\n"
-                       "执行中不画计划层；ΔZ 竖线随脉冲进度逐帧升降。\n"
-                       "回放预览=单步不累计；模拟下一步=完整阶段演示并累计站位/路径。\n"
+                       "执行中不画候选落点；灰色曲线=本次S4计划，随公转进度定位（非实测秒）。\n"
+                       "编码器未接入：不以指令估算生成实测曲线；地图ΔZ仍按脉冲估算。\n"
+                       "点选四动作即看候选；模拟下一步才演示完整阶段并累计站位/路径。\n"
                        "模拟有独立账本；轴表始终显示实机，不随模拟变化。\n"
                        "重置模拟才回起点。四个【开始…移】按钮是真机入口。",
                        wraplength=260, justify="left", foreground="#64748b")
@@ -298,7 +299,7 @@ def build_twin_panel(app, parent):
     view["clear_button"].grid(row=0, column=1, padx=3)
     # 模式切换（评估模拟/实机脉冲）短文本放首行尾部——整行请求宽度必须
     # 低于右列视口宽（第二行放满会把起步下拉框挤出滚动视口，布局测试覆盖）。
-    for col, (mode, text) in enumerate((("plan", "🔵 预览"), ("sim", "🟣 模拟"), ("live", "🔴 实机"))):
+    for col, (mode, text) in enumerate((("sim", "🟣 模拟"), ("live", "🔴 实机"))):
         control = ttk.Radiobutton(toolbar, text=text, variable=view["mode_var"], value=mode,
                                   command=lambda: _draw(app, view))
         control.grid(row=2, column=col, padx=3)
@@ -384,10 +385,12 @@ def refresh_twin_panel(app):
     if snapshot.get("reference_key") != view["reference_key"]:
         view["last_pose"] = None
         view["reference_key"] = snapshot.get("reference_key")
-        view["curve_seg"] += 1
+        _clear_live_curve(view)  # New physical step never includes older curves.
     if snapshot.get("pose") is not None:
         view["last_pose"] = snapshot["pose"]
     view["snapshot"] = snapshot
+    from .gait_curve import sync_live_reference
+    sync_live_reference(app, view)
     busy = bool(getattr(app, "_gait_owned", {})) or any(
         a.get("target_position") is not None or a.get("state") in ("STARTING", "MOVING", "CONTINUOUS")
         for a in snapshot.get("axes", {}).values())
@@ -396,6 +399,10 @@ def refresh_twin_panel(app):
         from .gait_simulation import cancel_simulation
         cancel_simulation(app)
         view["mode_var"].set("live")
+        view.pop("candidate", None)
+    sim = view.get("simulation")
+    for choice in app.gait_widgets.get("action_choices", ()):
+        choice.configure(state="disabled" if busy or (sim and sim.active) else "normal")
     for control in view.get("mode_controls", ()):
         control.configure(state="disabled" if busy else "normal")
     for control, idle_state in view["start_controls"]:
@@ -517,6 +524,8 @@ def _plan_psis(app, report):
 
 def _draw_map(app, view):
     _render_map(app, view)
+    from .gait_candidate import draw_candidate
+    draw_candidate(app, view)
     view["canvas"].addtag_all("twin_dynamic")
     view["canvas"].dtag("twin_background", "twin_dynamic")
 
@@ -847,130 +856,8 @@ def _draw_plan_layer(app, view, report, project):
 # ── 爪端-高杆距离曲线（评估/实机共用绘制） ────────────────
 
 def _draw_curve(app, view):
-    canvas = view["curve_canvas"]
-    canvas.delete("all")
-    width, height = canvas.winfo_width(), canvas.winfo_height()
-    if width < 40 or height < 30:
-        return
-    mode = _mode(app, view)
-    params = _view_params(app, view, mode)
-    margin_l, margin_r, margin_t, margin_b = 42, 10, 64, 42
-    plot_w = width - margin_l - margin_r
-    plot_h = height - margin_t - margin_b
-    if mode == "plan":
-        report = getattr(app, "_gait_last_report", None)
-        if report is None or not report.samples:
-            canvas.create_text(width/2, height/2, fill="#94a3b8",
-                               width=width-16, text="评估曲线：先点【预览 / 校验】生成轨迹")
-            return
-        curve_key = (params, _plan_psis(app, report))
-        if (not view["curve_plan"] or view.get("curve_plan_report") is not report
-                or view.get("curve_plan_key") != curve_key):
-            view["curve_plan"] = plan_tip_series(report, params, curve_key[1])
-            view["curve_plan_report"] = report
-            view["curve_plan_key"] = curve_key
-        data = [(t, tuple(v), 0) for t, v in view["curve_plan"]]
-    elif mode == "sim":
-        sim = view.get("simulation")
-        data = list(sim.curve) if sim is not None else []
-    else:
-        data = list(view["curve_live"])
-    if len(data) < 2:
-        canvas.create_text(width/2, height/2, fill="#94a3b8", width=width-16,
-                           text="实机曲线：开始步态后自动逐点记录（0.15s 采样）"
-                           if mode == "live" else "模拟曲线：完成模拟帧后记录" if mode == "sim" else "曲线数据不足")
-        return
-    t_max = max(t for t, _v, _s in data)
-    t_min = (max(0.0, t_max - CURVE_WINDOW_S) if mode == "live" else
-             min(t for t, _v, _s in data) if mode == "sim" else 0.0)
-    data = [point for point in data if point[0] >= t_min-1e-9]
-    if t_max - t_min < 1e-6:
-        t_max = t_min + 1.0
-    all_vals = [v for _t, vals, _s in data for v in vals]
-    y_top = max(1.0, params.geometry.safety_margin_mm, max(all_vals)) * 1.1
-    y_bot = min(0.0, min(all_vals)) - abs(min(0.0, min(all_vals))) * 0.1 - 1.0
-
-    def px(t):
-        return margin_l + (t - t_min) / (t_max - t_min) * plot_w
-
-    def py(v):
-        return margin_t + (y_top - v) / (y_top - y_bot) * plot_h
-
-    # Keep each leg's colour key beside the plot, including in the large window.
-    for slot in range(6):
-        col, row = slot % 3, slot // 3
-        x = 8 + col * (width-16)/3
-        color = CURVE_COLORS[row][col]
-        label = f"{'左' if row == 0 else '右'}{col+1}"
-        canvas.create_line(x, 12+row*17, x+10, 12+row*17, fill=color, width=2,
-                           tags="curve_legend")
-        canvas.create_text(x+13, 12+row*17, anchor="w", text=label, fill=color,
-                           font=("Microsoft YaHei", 8), tags="curve_legend")
-    for fraction in (.25, .5, .75):
-        v = y_bot + fraction*(y_top-y_bot)
-        canvas.create_line(margin_l, py(v), width-margin_r, py(v), fill="#f1f5f9",
-                           tags="curve_grid")
-        canvas.create_text(margin_l-4, py(v), anchor="e", text=f"{v:.0f}",
-                           fill="#64748b", font=("Microsoft YaHei", 8), tags="curve_grid")
-    # 参考线：0=杆表面（灰实线）、δ 参考安全间隙（橙虚线）
-    if y_bot < 0 <= y_top:
-        canvas.create_line(margin_l, py(0), width - margin_r, py(0),
-                           fill="#94a3b8", dash=(4, 3), tags="curve_zero")
-        canvas.create_text(margin_l-4, py(0), anchor="e", fill="#64748b",
-                           font=("Microsoft YaHei", 8), text="0")
-    delta = params.geometry.safety_margin_mm
-    if y_bot < delta < y_top:
-        canvas.create_line(margin_l, py(delta), width - margin_r, py(delta),
-                           fill="#f59e0b", dash=(2, 3), tags="curve_delta")
-        canvas.create_text(width-margin_r, height-4, anchor="se", fill="#b45309",
-                           font=("Microsoft YaHei", 8), text=f"δ={delta:g}mm", tags="curve_delta_label")
-    # 6 条爪曲线（分段：断连/换步 seg 变化处断线）
-    segments = _curve_segments(data, t_min)
-    for slot in range(6):
-        color = CURVE_COLORS[slot // 3][slot % 3]
-        for segment in segments:
-            points = [v for t, vals, _s in segment for v in (px(t), py(vals[slot]))]
-            if len(points) >= 4:
-                canvas.create_line(*points, fill=color, width=1,
-                                   tags=f"curve_{'left' if slot < 3 else 'right'}_{slot % 3}")
-    # 最小值包络加粗
-    for segment in segments:
-        points = [v for t, vals, _s in segment
-                  for v in (px(t), py(min(vals)))]
-        if len(points) >= 4:
-            canvas.create_line(*points, fill="#111827", width=2, tags="curve_min")
-    best = min(min(vals) for _t, vals, _s in data)
-    label = "全程最低" if mode == "plan" else "保留轨迹最低" if mode == "sim" else "窗口最低"
-    canvas.create_text(width - margin_r - 4, margin_t - 6, anchor="se",
-                       fill="#111827", font=("Microsoft YaHei", 8, "bold"),
-                       text=f"{label} {best:.2f}mm", tags="curve_best")
-    # Same sample/time as the map, no extra timer or sampling of physical axes.
-    if mode == "plan":
-        anim = app.gait_widgets.get("preview_anim") or {}
-        frame = anim.get("frame") if (anim.get("playing") or anim.get("paused")) else None
-        index = len(data)-1 if frame is None else max(0, min(frame, len(data)-1))
-        current_t = data[index][0]
-    else:
-        current_t = data[-1][0]
-    canvas.create_line(px(current_t), margin_t, px(current_t), height-margin_b,
-                       fill="#7c3aed" if mode == "sim" else "#64748b", dash=(3, 3),
-                       tags="curve_cursor")
-    canvas.create_text(8, height-4, anchor="sw", fill="#475569",
-                       font=("Microsoft YaHei", 8), text=f"当前 {current_t:.1f}s",
-                       tags="curve_current_time")
-    canvas.create_text(margin_l + 2, height - 27, anchor="w", fill="#64748b",
-                       font=("Microsoft YaHei", 7),
-                       text=f"t={t_min:.0f}s", tags="curve_axis")
-    canvas.create_text(width - margin_r, height - 27, anchor="e", fill="#64748b",
-                       font=("Microsoft YaHei", 7),
-                       text=f"t={t_max:.0f}s", tags="curve_axis")
-    canvas.create_text(4, margin_t + 4, anchor="w", fill="#64748b",
-                       font=("Microsoft YaHei", 7), text=f"{y_top:.0f}", tags="curve_axis")
-    if width >= 350:
-        clock = ("S4计划时间 (s)" if mode == "plan" else
-                 "累计模型时间 (s)" if mode == "sim" else "实机采样时间 (s)")
-        canvas.create_text(width/2, height-27, anchor="center", fill="#64748b",
-                           font=("Microsoft YaHei", 8), text=clock, tags="curve_clock")
+    from .gait_curve import draw_curve
+    draw_curve(app, view)
 
 
 def _curve_segments(data, t_min):

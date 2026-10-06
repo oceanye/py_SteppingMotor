@@ -117,11 +117,18 @@ PREVIEW_MARGIN = 16
 
 
 def _gait_mode_selected(app, value: str) -> None:
-    """四个换位方式 radio 的回调：同步 side/arc 变量并静默重跑预览。"""
+    """四动作只生成灰色候选，不写配置、不启动模拟或实机。"""
 
+    view = app.gait_widgets.get("twin", {})
+    sim = view.get("simulation")
+    if getattr(app, "_gait_owned", {}) or view.get("start_busy") or (sim and sim.active):
+        app.gait_mode_var.set(("L" if app.gait_side_var.get() == "left" else "R")
+                             + ("+" if float(app.gait_arc_var.get()) > 0 else "-"))
+        return
     app.gait_side_var.set("left" if value[0] == "L" else "right")
     app.gait_arc_var.set("60.0" if value[1] == "+" else "-60.0")
-    app._gait_run_dry_run(interactive=False)
+    from .gait_candidate import select_candidate
+    select_candidate(app)
 
 
 def build_gait_tab(app, parent) -> None:
@@ -358,24 +365,18 @@ def _build_run_column(app, parent) -> None:
     # 预览图与【▶ 模拟动作】永远对应当前选择。
     modes = ttk.Frame(preview)
     modes.grid(row=0, column=0, sticky="ew")
+    app.gait_widgets["action_choices"] = []
     for value, text in (("L+", "左顺移"), ("L-", "左逆移"),
                         ("R+", "右顺移"), ("R-", "右逆移")):
-        ttk.Radiobutton(
+        choice = ttk.Radiobutton(
             modes, text=text, value=value,
             variable=app.gait_mode_var,
             command=lambda v=value: _gait_mode_selected(app, v),
-        ).pack(side="left", padx=3)
-    actions = ttk.Frame(preview)
-    actions.grid(row=1, column=0, sticky="ew", pady=(2, 0))
-    ttk.Button(
-        actions, text="单步预览 / 校验",
-        command=app._gait_run_dry_run,
-    ).pack(side="left", padx=4)
-    app.gait_widgets["play_btn"] = ttk.Button(
-        actions, text="▶ 回放预览",
-        command=app._gait_play_preview_clicked,
-    )
-    app.gait_widgets["play_btn"].pack(side="left", padx=4)
+        )
+        choice.pack(side="left", padx=3)
+        app.gait_widgets["action_choices"].append(choice)
+    ttk.Label(preview, text="点选动作显示灰色候选落点；不会移动电机。", wraplength=260, foreground="#6b7280").grid(
+        row=1, column=0, sticky="w")
     from .gait_simulation import toggle_simulation, reset_simulation, discard_simulation_step
     simulation = ttk.Frame(preview)
     simulation.grid(row=3, column=0, sticky="ew", pady=3)
@@ -385,7 +386,7 @@ def _build_run_column(app, parent) -> None:
     ttk.Button(simulation, text="取消本步", command=lambda: discard_simulation_step(app)).grid(row=0, column=1, padx=3)
     ttk.Button(simulation, text="重置模拟", command=lambda: reset_simulation(app)).grid(row=0, column=2, padx=3)
     app.gait_widgets["sim_status"] = ttk.Label(
-        preview, text="累计模拟：使用所选起步两格，不改实机标定；清路径不重置站位。",
+        preview, text="模拟累计位置与路径，曲线只看当前步；清路径不重置站位。",
         wraplength=260, foreground="#7c3aed", justify="left")
     app.gait_widgets["sim_status"].grid(row=4, column=0, sticky="ew")
     result = ttk.Label(
@@ -505,6 +506,7 @@ def _invalidate_calibration(app):
     _refresh_trajectory_status(app)
     _refresh_geometry_fields(app)
     if not getattr(app, "_gait_loading_fields", False):
+        app.gait_widgets.get("twin", {}).pop("candidate", None)
         app.gait_calibrated_var.set(False)
         # Changing the law/geometry must not replay a cached, different path.
         app._gait_last_report = None
@@ -877,11 +879,11 @@ def refresh_gait_panel(app, progress_text=None) -> None:
     needs_recovery = getattr(app, "_gait_needs_recovery", False)
     app.gait_widgets["readiness"].configure(
         text="须人工重建物理基准" if needs_recovery else (
-            "标定已确认；启动前仍须完整预检" if verified else "未确认标定：仅可预览"),
+            "标定已确认；启动前仍须完整预检" if verified else "未确认标定：仅看候选/模拟"),
         foreground="#b42318" if needs_recovery or not verified else "#16803a")
     snapshot = run.describe() if run is not None else None
     if snapshot is None:
-        app.gait_stage_var.set("未开始（选好摆动侧 → 先干跑 → 再开始）")
+        app.gait_stage_var.set("未开始（点选动作看灰色候选 → 确认后开始；启动仍完整校验）")
         app.gait_widgets["confirm_text"].configure(text="")
         app.gait_widgets["state"].configure(text="", foreground="#555")
     else:

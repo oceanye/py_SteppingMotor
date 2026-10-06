@@ -86,8 +86,11 @@ def refresh_twin_window(app, main):
         return
     for key in ("snapshot", "last_pose", "history", "mode_var", "show_path", "start_left",
                 "start_right", "select_side", "start_busy", "curve_live", "curve_plan",
-                "curve_plan_report", "curve_plan_key", "simulation"):
+                "curve_plan_report", "curve_plan_key", "simulation", "candidate",
+                "live_curve_reference", "encoder_curve"):
         if key in main:
             detail[key] = main[key]
+        else:
+            detail.pop(key, None)
     detail["coordinates"].configure(wraplength=max(200, detail["window"].winfo_width()-24))
     _draw_map(app, detail)

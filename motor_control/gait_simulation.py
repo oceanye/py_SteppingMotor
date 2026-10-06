@@ -37,12 +37,14 @@ class GaitSimulation:
         self.psis = (30.0, 30.0)
         self.completed_steps = 0
         self.elapsed_s = 0.0
+        self.step_started_s = 0.0
         self.history = TwinHistory()
         self.curve = deque(maxlen=6000)
         self.segment = 0
         self.frames = ()
         self.index = -1
         self.report = None
+        self.swing_times = ()
         self.paused = False
         self.frame = SimulationFrame(0.0, "起步", self._rest_pose())
 
@@ -76,8 +78,11 @@ class GaitSimulation:
             raise ValueError("当前模拟未完成，请暂停/继续或取消本步")
         report = self.preview(side, arc)
         if not report.feasible:
-            raise ValueError("避让校验未通过，不能累计本步；可用单步回放检查。" + report.message)
+            raise ValueError("避让校验未通过，不能累计本步；点选动作查看灰色候选和校验原因。" + report.message)
+        self.step_started_s = self.elapsed_s
+        self.curve.clear()  # World paths accumulate; distance curves are step-local.
         self.report = report
+        self.swing_times = plan_sample_times(report, self.params)
         self.frames = self._frames(report, arc)
         self.index = -1
         self.segment += 1
@@ -88,7 +93,7 @@ class GaitSimulation:
         params, side = self.params, report.side
         d = effective_geometry(params).d_mm
         stages = plan_gait_stages(params, side=side, arc_deg=arc, route=report.route)
-        times = plan_sample_times(report, params)
+        times = self.swing_times
         elapsed, frames, z = self.elapsed_s, [], {"left": 0.0, "right": 0.0}
         sample = report.samples[0]
 

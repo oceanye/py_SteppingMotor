@@ -277,7 +277,7 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         self.assertEqual(run.route, ("A", "邻座(0,-1)", "B", 180.0))
         self.assertEqual(report.route[1], "邻座(0,-1)")
 
-    def test_gait_mode_radio_syncs_side_arc_and_preruns(self):
+    def test_gait_mode_radio_syncs_side_arc_and_requests_readonly_candidate(self):
         # 四个换位方式 radio（左顺/左逆/右顺/右逆）切换时同步
         # side/arc 变量并静默重跑预览。
         from motor_control.ui.gait_tab import _gait_mode_selected
@@ -294,15 +294,17 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
 
         calls = []
         app = SimpleNamespace(
-            gait_side_var=_Var(), gait_arc_var=_Var(),
+            gait_side_var=_Var(), gait_arc_var=_Var(), gait_widgets={},
             _gait_run_dry_run=lambda interactive=True: calls.append(interactive),
         )
         for value, side, arc in (("L+", "left", "60.0"), ("L-", "left", "-60.0"),
                                  ("R+", "right", "60.0"), ("R-", "right", "-60.0")):
-            _gait_mode_selected(app, value)
+            with patch("motor_control.ui.gait_candidate.select_candidate") as candidate:
+                _gait_mode_selected(app, value)
+                candidate.assert_called_once_with(app)
             self.assertEqual((app.gait_side_var.value, app.gait_arc_var.value),
                              (side, arc))
-        self.assertEqual(calls, [False] * 4)
+        self.assertEqual(calls, [])  # The old dry-run handler saved physical config.
 
     def test_play_preview_reruns_dry_run_when_selection_changed(self):
         # 2026-09-22 修复：切换左/右或顺/逆后直接点【▶ 模拟动作】必须
