@@ -331,7 +331,10 @@ class GaitLayoutTests(unittest.TestCase):
                     viewport_extent = getattr(page.canvas, f"winfo_{dimension}")()
                     self.assertGreaterEqual(pos, viewport_pos - 1)
                     self.assertLessEqual(pos + extent, viewport_pos + viewport_extent + 1)
-        # Motor-stop control is outside scrolling content.
+        # Motor-stop control lives at the top of the live operation group
+        # (2026-10-08) — outside scrolling content, in the fixed area.
+        self.app.gait_op_mode_var.set("live")
+        self.root.update()
         abort = self.app.gait_widgets["abort"]
         self.assertTrue(abort.winfo_viewable())
         self.assertLess(abort.winfo_rooty() + abort.winfo_height(),

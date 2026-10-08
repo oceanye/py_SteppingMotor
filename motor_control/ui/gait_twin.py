@@ -241,8 +241,8 @@ def build_twin_panel(app, parent):
     title = ttk.Label(panel, text="🔴 实机脉冲 · 无编码器估算",
                       foreground="#b91c1c", font=("Microsoft YaHei", 10, "bold"))
     title.grid(row=0, column=0, sticky="w", padx=8, pady=(4, 0))
-    # 计划控件槽位（换位方式 radio / 预览校验 / 模拟动作 / 干跑报告）由
-    # gait_tab 填充：参数与联动回调都在那一侧，本模块只提供容器。
+    # 计划控件槽位容器保留（历史上放换位方式/模拟按钮，2026-10-08 起
+    # 操作区移到右列顶层总开关下，此槽位暂空）。
     plan_slot = ttk.Frame(panel)
     plan_slot.grid(row=1, column=0, sticky="ew", padx=6)
     plan_slot.columnconfigure(0, weight=1)
