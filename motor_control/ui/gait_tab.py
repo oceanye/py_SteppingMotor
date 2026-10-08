@@ -378,97 +378,95 @@ def _build_run_column(app, parent) -> None:
     ttk.Label(preview, text="点选动作显示灰色候选落点；不会移动电机。", wraplength=260, foreground="#6b7280").grid(
         row=1, column=0, sticky="w")
     from .gait_simulation import toggle_simulation, reset_simulation, discard_simulation_step
-    # 2026-10-08 按用户要求：实操四个【开始…移】从最底部的阶段面板挪到
-    # 顶部模拟旁边——模拟块在左、实操块在右。按钮竖排/2×2 而非一条
-    # 长横行：720 窄窗下两块紧挨也不把右列撑出横向滚动（起步下拉被裁
-    # 的布局测试覆盖），宽窗下实操块贴右缘与换位方式一一对应。
-    actions = ttk.Frame(preview)
-    actions.grid(row=3, column=0, sticky="ew", pady=3)
-    actions.columnconfigure(1, weight=1)
-    simulation = ttk.Frame(actions)
-    simulation.grid(row=0, column=0, sticky="w")
+    # 2026-10-08 按用户要求：模拟与实操分成两个总开关，下方只显示所选
+    # 组的操作——整个原"S0–S7 分阶段执行"面板（阶段文字/确认清单/进度/
+    # 角度/单步确认/一键执行）挪进实操组，不再沉在页面最底部；两组同格
+    # grid/grid_remove 切换，选模拟时看不到实操按钮，反之亦然。
+    ops = ttk.Frame(preview)
+    ops.grid(row=2, column=0, sticky="ew", pady=(3, 0))
+    app.gait_op_mode_var = tk.StringVar(value="sim")
+    for value, text in (("sim", "🟣 模拟"), ("live", "🔴 S0–S7 分阶段执行")):
+        ttk.Radiobutton(ops, text=text, value=value,
+                        variable=app.gait_op_mode_var).pack(side="left", padx=3)
+    sim_group = ttk.Frame(preview)
+    live_group = ttk.Frame(preview)
+
+    def _select_operation_group(*_args):
+        show_sim = app.gait_op_mode_var.get() == "sim"
+        (sim_group if show_sim else live_group).grid(row=3, column=0, sticky="ew")
+        (live_group if show_sim else sim_group).grid_remove()
+    # var 写入即切组：radiobutton 点击与测试 var.set 走同一条路。
+    app.gait_op_mode_var.trace_add("write", _select_operation_group)
+
+    sim_buttons = ttk.Frame(sim_group)
+    sim_buttons.grid(row=0, column=0, sticky="w", pady=3)
     app.gait_widgets["sim_btn"] = ttk.Button(
-        simulation, text="▶ 模拟下一步", command=lambda: toggle_simulation(app))
-    app.gait_widgets["sim_btn"].grid(row=0, column=0, padx=3, pady=1, sticky="w")
-    ttk.Button(simulation, text="取消本步",
-               command=lambda: discard_simulation_step(app)).grid(
-                   row=1, column=0, padx=3, pady=1, sticky="w")
-    ttk.Button(simulation, text="重置模拟",
-               command=lambda: reset_simulation(app)).grid(
-                   row=2, column=0, padx=3, pady=1, sticky="w")
-    # 执行入口与四种换位方式一一对应，方向由按钮显式携带，不依赖预览区
-    # 当前选择（防止"看逆向、走顺向"误操作）。
-    live = ttk.Frame(actions)
-    live.grid(row=0, column=2, sticky="e")
-    for row, (key, text, side, arc) in enumerate((
-        ("start_left_cw", "开始左顺移", "left", 60.0),
-        ("start_left_ccw", "开始左逆移", "left", -60.0),
-    )):
-        app.gait_widgets[key] = ttk.Button(
-            live, text=text,
-            command=lambda s=side, a=arc: app._gait_start_run_clicked(s, a))
-        app.gait_widgets[key].grid(row=0, column=row, padx=3, pady=1, sticky="ew")
-    for row, (key, text, side, arc) in enumerate((
-        ("start_right_cw", "开始右顺移", "right", 60.0),
-        ("start_right_ccw", "开始右逆移", "right", -60.0),
-    )):
-        app.gait_widgets[key] = ttk.Button(
-            live, text=text,
-            command=lambda s=side, a=arc: app._gait_start_run_clicked(s, a))
-        app.gait_widgets[key].grid(row=1, column=row, padx=3, pady=1, sticky="ew")
+        sim_buttons, text="▶ 模拟下一步", command=lambda: toggle_simulation(app))
+    app.gait_widgets["sim_btn"].pack(side="left", padx=3)
+    ttk.Button(sim_buttons, text="取消本步",
+               command=lambda: discard_simulation_step(app)).pack(side="left", padx=3)
+    ttk.Button(sim_buttons, text="重置模拟",
+               command=lambda: reset_simulation(app)).pack(side="left", padx=3)
     app.gait_widgets["sim_status"] = ttk.Label(
-        preview, text="模拟累计位置与路径，曲线只看当前步；清路径不重置站位。",
+        sim_group, text="模拟累计位置与路径，曲线只看当前步；清路径不重置站位。",
         wraplength=260, foreground="#7c3aed", justify="left")
-    app.gait_widgets["sim_status"].grid(row=4, column=0, sticky="ew")
+    app.gait_widgets["sim_status"].grid(row=1, column=0, sticky="ew")
     result = ttk.Label(
-        preview, textvariable=app.gait_report_var,
+        sim_group, textvariable=app.gait_report_var,
         wraplength=260, justify="left",
     )
     result.grid(row=2, column=0, sticky="ew", pady=(2, 0))
     app.gait_widgets["report_label"] = result
 
-    stage = ttk.LabelFrame(right, text="S0–S7 分阶段执行（每按钮一阶段）")
-    stage.grid(row=1, column=0, sticky="ew", **PAD)
-    current = ttk.Label(
-        stage, textvariable=app.gait_stage_var,
-        font=("Microsoft YaHei", 10, "bold"), justify="left", wraplength=260,
-    )
-    current.pack(fill="x", padx=8, pady=(6, 2))
-    app.gait_widgets["confirm_text"] = ttk.Label(
-        stage, text="", wraplength=260, justify="left", foreground="#334155",
-    )
-    app.gait_widgets["confirm_text"].pack(fill="x", padx=8, pady=2)
-    app.gait_widgets["progress"] = ttk.Label(
-        stage, text="", foreground="#1565c0", font=("Consolas", 10, "bold"),
-        wraplength=260, justify="left",
-    )
-    app.gait_widgets["progress"].pack(fill="x", padx=8)
-    app.gait_widgets["angles"] = ttk.Label(stage, text="", foreground="#1565c0",
-                                           wraplength=260, justify="left")
-    app.gait_widgets["angles"].pack(fill="x", padx=8, pady=2)
-
-    buttons = ttk.Frame(stage)
-    buttons.pack(fill="x", padx=8, pady=8)
-    buttons.columnconfigure((0, 1), weight=1)
-    # 四个【开始…移】已在顶部模拟行右侧（2026-10-08）；这里只留阶段
-    # 推进：单步确认与一键执行并排。
+    # 实操组：四个开始按钮 2×2 + 单步确认/一键执行一行 + 阶段信息。
+    live = ttk.Frame(live_group)
+    live.grid(row=0, column=0, sticky="w", pady=3)
+    # 执行入口与四种换位方式一一对应，方向由按钮显式携带，不依赖预览区
+    # 当前选择（防止"看逆向、走顺向"误操作）。
+    for row, row_actions in enumerate((
+        (("start_left_cw", "开始左顺移", "left", 60.0),
+         ("start_left_ccw", "开始左逆移", "left", -60.0)),
+        (("start_right_cw", "开始右顺移", "right", 60.0),
+         ("start_right_ccw", "开始右逆移", "right", -60.0)),
+    )):
+        for col, (key, text, side, arc) in enumerate(row_actions):
+            app.gait_widgets[key] = ttk.Button(
+                live, text=text,
+                command=lambda s=side, a=arc: app._gait_start_run_clicked(s, a))
+            app.gait_widgets[key].grid(row=row, column=col, padx=3, pady=1, sticky="ew")
     app.gait_widgets["advance"] = ttk.Button(
-        buttons, text="✓ 确认并执行本阶段", command=app._gait_stage_confirmed,
-    )
-    app.gait_widgets["advance"].grid(row=0, column=0, sticky="ew", padx=3)
+        live, text="✓ 确认并执行本阶段", command=app._gait_stage_confirmed)
+    app.gait_widgets["advance"].grid(row=2, column=0, sticky="ew", padx=3)
     # 2026-09-29 按用户要求：一键执行——本步剩余阶段自动连走，不再逐
     # 阶段弹窗确认（录视频用）；执行中可【⛔ 中止】停车，再点本按钮
     # 停在当前阶段后回到人工确认。
     app.gait_widgets["auto"] = ttk.Button(
-        buttons, text="⚡ 一键执行", command=app._gait_auto_clicked,
-    )
-    app.gait_widgets["auto"].grid(row=0, column=1, sticky="ew", padx=3)
+        live, text="⚡ 一键执行", command=app._gait_auto_clicked)
+    app.gait_widgets["auto"].grid(row=2, column=1, sticky="ew", padx=3)
 
+    current = ttk.Label(
+        live_group, textvariable=app.gait_stage_var,
+        font=("Microsoft YaHei", 10, "bold"), justify="left", wraplength=260,
+    )
+    current.grid(row=1, column=0, sticky="ew", pady=(6, 2))
+    app.gait_widgets["confirm_text"] = ttk.Label(
+        live_group, text="", wraplength=260, justify="left", foreground="#334155",
+    )
+    app.gait_widgets["confirm_text"].grid(row=2, column=0, sticky="ew", pady=2)
+    app.gait_widgets["progress"] = ttk.Label(
+        live_group, text="", foreground="#1565c0", font=("Consolas", 10, "bold"),
+        wraplength=260, justify="left",
+    )
+    app.gait_widgets["progress"].grid(row=3, column=0, sticky="ew")
+    app.gait_widgets["angles"] = ttk.Label(live_group, text="", foreground="#1565c0",
+                                           wraplength=260, justify="left")
+    app.gait_widgets["angles"].grid(row=4, column=0, sticky="ew", pady=2)
     app.gait_widgets["state"] = ttk.Label(
-        stage, textvariable=app.gait_state_var,
+        live_group, textvariable=app.gait_state_var,
         font=("Microsoft YaHei", 10, "bold"), wraplength=260, justify="left",
     )
-    app.gait_widgets["state"].pack(fill="x", padx=8, pady=(0, 6))
+    app.gait_widgets["state"].grid(row=5, column=0, sticky="ew", pady=(0, 6))
+    _select_operation_group()
 
     def resize_text(event):
         width = max(220, event.width - 36)

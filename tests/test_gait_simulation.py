@@ -287,8 +287,10 @@ class SimulationUITests(unittest.TestCase):
         self.assertFalse(self.app._gait_last_report.feasible)
 
     def test_focus_time_strings_and_keyboard_navigation_after_recent_click(self):
+        # 2026-10-08 操作区上移后 advance 在页面顶部（聚焦无需滚动），
+        # 键盘滚动语义改用起步区底部的【应用起步位置】按钮验证。
         viewport = self.app.gait_widgets["run_viewport"]
-        button = self.app.gait_widgets["advance"]
+        button = self.app.gait_widgets["twin"]["apply_button"]
         viewport.canvas.yview_moveto(0)
         before = viewport.canvas.yview()
         with patch("motor_control.ui.scrollable.time.monotonic", return_value=100):

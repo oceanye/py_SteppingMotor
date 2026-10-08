@@ -464,23 +464,24 @@ class GaitLayoutTests(unittest.TestCase):
         # 2026-09-23 现场：焦点在其他程序后点 GUI 按钮，右侧视口跳回顶部。
         # 修复：鼠标按下子树随后的 FocusIn 属于点击聚焦，不触发滚动露出；
         # 键盘 Tab 的 FocusIn 保留"滚入聚焦控件"的可达性行为。
+        # 2026-10-08 操作区上移后 advance 在页面顶部（聚焦无需滚动），
+        # 键盘滚动语义改用起步区底部的【应用起步位置】按钮验证。
         viewport = self.app.gait_widgets["run_viewport"]
         canvas = viewport.canvas
         self.root.geometry("720x460")
         self.root.update()
-        advance = self.app.gait_widgets["advance"]
-        # 2026-09-30 预览并入态势图后右列内容变矮：滚到底部时 advance
-        # 已在视口内。改为滚到顶部——advance 远在下方，键盘聚焦必须下滚
-        # 露出，与具体布局高度解耦。
+        target = self.app.gait_widgets["twin"]["apply_button"]
+        # 滚到顶部——target 远在下方，键盘聚焦必须下滚露出，与具体布局
+        # 高度解耦。
         canvas.yview_moveto(0.0)
         before = canvas.yview()
         self.assertNotEqual(before, (0.0, 1.0), "右侧视口在此窗口尺寸下应可滚动")
-        advance.event_generate("<Button-1>")    # 鼠标按下：标记点击子树
-        advance.event_generate("<FocusIn>")     # 随后的点击聚焦
+        target.event_generate("<Button-1>")     # 鼠标按下：标记点击子树
+        target.event_generate("<FocusIn>")      # 随后的点击聚焦
         self.root.update()
         self.assertEqual(canvas.yview(), before)   # 不得滚动
         viewport._pointer_click = None             # 清除标记（等同 0.5s 后）
-        advance.event_generate("<FocusIn>")     # 键盘聚焦：应滚入 advance
+        target.event_generate("<FocusIn>")     # 键盘聚焦：应滚入 target
         self.root.update()
         self.assertNotEqual(canvas.yview(), before)
 
