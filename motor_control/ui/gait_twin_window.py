@@ -23,7 +23,7 @@ def open_twin_window(app):
     toolbar = ttk.Frame(window)
     toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=4)
     title = ttk.Label(toolbar, text="", wraplength=600, font=("Microsoft YaHei", 11, "bold"))
-    title.grid(row=0, column=0, columnspan=6, sticky="w")
+    title.grid(row=0, column=0, columnspan=7, sticky="w")
     charts = build_twin_charts(window, height=550)
     charts["chart_panes"].grid(row=1, column=0, sticky="nsew", padx=8)
     canvas, curve = charts["canvas"], charts["curve_canvas"]
@@ -57,6 +57,10 @@ def open_twin_window(app):
         controls.append(ttk.Button(toolbar, text=label, command=command))
     controls.append(ttk.Checkbutton(toolbar, text="显示路径", variable=main["show_path"],
                                    command=lambda: draw_twin(app)))
+    detail["rotate_map_control"] = ttk.Checkbutton(
+        toolbar, text="地图逆时针旋转60°", variable=main["rotate_map_var"],
+        command=lambda: draw_twin(app))
+    controls.append(detail["rotate_map_control"])
     detail["toolbar_controls"] = controls
 
     def resize_toolbar(event):
@@ -64,7 +68,7 @@ def open_twin_window(app):
         title.configure(wraplength=available)
         footer.configure(wraplength=available)
         # High DPI/narrow windows must keep the stop and close buttons visible.
-        cols = 6 if sum(w.winfo_reqwidth()+6 for w in controls) <= available else 3
+        cols = len(controls) if sum(w.winfo_reqwidth()+6 for w in controls) <= available else 3
         for index, control in enumerate(controls):
             control.grid(row=1+index//cols, column=index%cols, padx=3, pady=4)
 
@@ -87,7 +91,7 @@ def refresh_twin_window(app, main):
     for key in ("snapshot", "last_pose", "history", "mode_var", "show_path", "start_left",
                 "start_right", "select_side", "start_busy", "curve_live", "curve_plan",
                 "curve_plan_report", "curve_plan_key", "simulation", "candidate",
-                "live_curve_reference", "encoder_curve"):
+                "live_curve_reference", "live_curve_timeline", "encoder_curve", "rotate_map_var"):
         if key in main:
             detail[key] = main[key]
         else:

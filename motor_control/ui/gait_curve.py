@@ -1,6 +1,6 @@
-"""Current-step distance display, shared by main and inspection windows."""
+"""Cross-step sliding distance display, shared by both observation windows."""
 from motor_control.gait_curve import (
-    CURVE_Y_MIN_MM, CURVE_Y_MAX_MM, EncoderCurveBuffer,
+    CURVE_Y_MIN_MM, CURVE_Y_MAX_MM, CurveTimeline, EncoderCurveBuffer,
     clip_series, rolling_window, time_at_phi,
 )
 
@@ -16,20 +16,35 @@ def sync_live_reference(app, view):
              and snapshot.get("state") not in ("axis_only", "uncalibrated")
              and run.params.geometry == app.gait_params.geometry)
     key = (id(run), snapshot.get("world_key"), run.params) if valid else None
-    encoder.bind(key)
     if not valid:
+        encoder.bind(None)
         view.pop("live_curve_reference", None)
+        view.pop("live_curve_timeline", None)
+        view.pop("live_curve_scope", None)
         return
+    scope = (snapshot.get("world_key"), run.params.geometry)
+    if scope != view.get("live_curve_scope"):
+        view["live_curve_scope"] = scope
+        view["live_curve_timeline"] = CurveTimeline()
+        view.pop("live_curve_reference", None)
+        encoder.bind(None)
+    timeline = view["live_curve_timeline"]
     reference = view.get("live_curve_reference")
     if reference is None or reference["key"] != key:
+        if reference is not None:
+            timeline.archive(reference, encoder.samples)
+        timeline.step += 1
+        encoder.bind(key)
         psis = getattr(run, "twin_psis", (30., 30.))
         series = plan_tip_series(report, run.params, psis)
-        reference = {"key": key, "report": report, "series": series, "current_s": 0.0}
+        reference = {"key": key, "report": report, "series": series, "current_s": 0.0,
+                     "offset_s": timeline.elapsed_s, "segment": timeline.step}
         view["live_curve_reference"] = reference
         view.pop("candidate", None)
     pose = snapshot.get("pose")
     if pose is not None:
-        reference["current_s"] = time_at_phi(report, [p[0] for p in reference["series"]], pose["phi_deg"])
+        reference["current_s"] = max(reference["current_s"], time_at_phi(
+            report, [p[0] for p in reference["series"]], pose["phi_deg"]))
 
 
 def curve_payload(app, view):
@@ -38,20 +53,19 @@ def curve_payload(app, view):
     mode = _mode(app, view)
     params = _view_params(app, view, mode)
     candidate = current_candidate(app, view)
-    data, measured, grey = [], [], False
-    current, clock, status = 0., "本步时间 (s)", "等待选择动作或开始模拟"
-    if candidate is not None or mode == "plan":
-        report = candidate["report"] if candidate else getattr(app, "_gait_last_report", None)
+    data, measured, forecast, grey = [], [], [], False
+    current, clock, status = 0., "累计S4模型时间 (s)", "等待选择动作或开始模拟"
+    if mode == "plan":
+        report = getattr(app, "_gait_last_report", None)
         if report and report.samples:
-            params = candidate["params"] if candidate else params
-            psis = candidate["psis"] if candidate else _plan_psis(app, report)
+            psis = _plan_psis(app, report)
             key = (params, psis)
             if view.get("curve_plan_report") is not report or view.get("curve_plan_key") != key:
                 view["curve_plan"] = plan_tip_series(report, params, psis)
                 view.update(curve_plan_report=report, curve_plan_key=key)
             data = [(t, tuple(v), 0) for t, v in view["curve_plan"]]
             grey, clock, status = True, "S4模型进度 (s)", "灰色候选参考 · 不动电机"
-            if mode == "plan" and candidate is None:  # Old API playback compatibility.
+            if candidate is None:  # Old API playback compatibility.
                 anim = app.gait_widgets.get("preview_anim") or {}
                 frame = anim.get("frame") if anim.get("playing") or anim.get("paused") else None
                 index = len(data)-1 if frame is None else max(0, min(frame, len(data)-1))
@@ -59,24 +73,40 @@ def curve_payload(app, view):
     elif mode == "sim":
         sim = view.get("simulation")
         if sim is not None:
-            data = [(t, tuple(v), seg) for t, v, seg in sim.curve if seg == sim.segment]
-            current = data[-1][0] if data else 0.
-            clock, status = "S4模型进度 (s)", "模拟当前步 · 非实测"
+            data = list(sim.curve)
+            current = getattr(sim, "curve_time_s", data[-1][0] if data else 0.)
+            status = "模拟跨步滑窗 · 非实测"
     else:
         reference = view.get("live_curve_reference")
-        grey, clock, status = True, "S4模型进度 (s)", "灰色=本步计划 · 编码器未接入"
+        grey, status = True, "灰色=计划参考滑窗 · 编码器未接入"
         if reference:
-            data = [(t, tuple(v), 0) for t, v in reference["series"]]
-            current = reference["current_s"]
+            timeline = view["live_curve_timeline"]
+            offset, segment = reference["offset_s"], reference["segment"]
+            points = [(t, tuple(v), segment) for t, v in reference["series"]]
+            points = clip_series(points, reference.get("retain_from_s", 0.), reference["series"][-1][0])
+            data = list(timeline.history) + [(offset+t, v, seg) for t, v, seg in points]
+            current = offset + reference["current_s"]
+            measured = list(timeline.measured)
             encoder = view.get("encoder_curve")
             if encoder and encoder.step_key == reference["key"]:
-                measured = list(encoder.samples)
+                measured.extend((offset+t, v, (segment, seg)) for t, v, seg in encoder.samples)
                 if measured:
-                    status = "灰色=本步计划 · 彩色=编码器"
+                    status = "灰色=计划参考滑窗 · 彩色=编码器"
             if view.get("snapshot", {}).get("pose") is None:
                 status += " · 进度冻结"
+    if candidate is not None:
+        report, params, psis = candidate["report"], candidate["params"], candidate["psis"]
+        key = (params, psis)
+        if view.get("curve_plan_report") is not report or view.get("curve_plan_key") != key:
+            view["curve_plan"] = plan_tip_series(report, params, psis)
+            view.update(curve_plan_report=report, curve_plan_key=key)
+        # Candidate is a separate reference overlay, never a replacement for
+        # history and never a new clock origin or an executed sample.
+        forecast = [(current+t, tuple(v), "candidate") for t, v in view["curve_plan"]]
+        status += " · 候选参考（未执行）"
     start, end = rolling_window(current)
     return dict(data=clip_series(data, start, end), measured=clip_series(measured, start, end),
+                forecast=clip_series(forecast, start, end),
                 current=current, start=start, end=end, grey=grey, clock=clock,
                 status=status, delta=params.geometry.safety_margin_mm)
 
@@ -125,20 +155,21 @@ def draw_curve(app, view):
             canvas.create_line(*points, fill="#737373" if grey else "#111827", width=2,
                                dash=(4, 3) if grey else (), tags="curve_min")
     lines(payload["data"], grey=payload["grey"])
+    lines(payload["forecast"], grey=True)
     lines(payload["measured"], grey=False, measured=True)
-    values = [v for _, vals, _ in payload["data"]+payload["measured"] for v in vals]
+    values = [v for _, vals, _ in payload["data"]+payload["measured"]+payload["forecast"] for v in vals]
     if values:
         best = min(values)
         canvas.create_text(right-4, top-4, anchor="se", font=("Microsoft YaHei", 8, "bold"),
                            fill="#b91c1c" if best <= 0 else "#475569",
-                           text=f"本步窗内最低 {best:.2f}mm", tags="curve_best")
+                           text=f"窗口最低 {best:.2f}mm", tags="curve_best")
         if min(values) < low or max(values) > high:
             canvas.create_text(left+4, top+5, anchor="nw", width=right-left-8, fill="#b91c1c",
                                text=f"超出固定量程！实际 {min(values):.2f}～{max(values):.2f}mm",
                                tags="curve_overflow")
     else:
         canvas.create_text((left+right)/2, (top+bottom)/2, width=max(30, right-left-12),
-                           text="当前步暂无距离数据\n0线以下为爪端与杆投影重叠", fill="#64748b", tags="curve_empty")
+                           text="窗口内暂无距离数据\n0线以下为爪端与杆投影重叠", fill="#64748b", tags="curve_empty")
     canvas.create_line(px(payload["current"]), top, px(payload["current"]), bottom,
                        fill="#64748b", dash=(3, 3), tags="curve_cursor")
     canvas.create_text(8, height-4, anchor="sw", text=f"当前 {payload['current']:.1f}s",

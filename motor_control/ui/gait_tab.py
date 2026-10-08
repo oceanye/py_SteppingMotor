@@ -117,7 +117,7 @@ PREVIEW_MARGIN = 16
 
 
 def _gait_mode_selected(app, value: str) -> None:
-    """四动作只生成灰色候选，不写配置、不启动模拟或实机。"""
+    """四动作只生成虚线候选，不写配置、不启动模拟或实机。"""
 
     view = app.gait_widgets.get("twin", {})
     sim = view.get("simulation")
@@ -375,7 +375,7 @@ def _build_run_column(app, parent) -> None:
         )
         choice.pack(side="left", padx=3)
         app.gait_widgets["action_choices"].append(choice)
-    ttk.Label(sim_area, text="点选动作显示灰色候选落点；不会移动电机。",
+    ttk.Label(sim_area, text="点选动作显示虚线候选落点（左蓝/右橙）；不会移动电机。",
               wraplength=260, foreground="#6b7280").grid(row=1, column=0, sticky="w")
     from .gait_simulation import toggle_simulation, reset_simulation, discard_simulation_step
     sim_buttons = ttk.Frame(sim_area)
@@ -388,7 +388,7 @@ def _build_run_column(app, parent) -> None:
     ttk.Button(sim_buttons, text="重置模拟",
                command=lambda: reset_simulation(app)).pack(side="left", padx=3)
     app.gait_widgets["sim_status"] = ttk.Label(
-        sim_area, text="模拟累计位置与路径，曲线只看当前步；清路径不重置站位。",
+        sim_area, text="曲线跨步滑动；地图仅显示上步淡色、当前深色。清路径不重置站位。",
         wraplength=260, foreground="#7c3aed", justify="left")
     app.gait_widgets["sim_status"].grid(row=3, column=0, sticky="ew")
     result = ttk.Label(
@@ -889,7 +889,7 @@ def refresh_gait_panel(app, progress_text=None) -> None:
         foreground="#b42318" if needs_recovery or not verified else "#16803a")
     snapshot = run.describe() if run is not None else None
     if snapshot is None:
-        app.gait_stage_var.set("未开始（点选动作看灰色候选 → 确认后开始；启动仍完整校验）")
+        app.gait_stage_var.set("未开始（点选动作看虚线候选 → 确认后开始；启动仍完整校验）")
         app.gait_widgets["confirm_text"].configure(text="")
         app.gait_widgets["state"].configure(text="", foreground="#555")
     else:

@@ -182,6 +182,14 @@ def clear_twin_history(app):
         return
     view["history"].clear(view["snapshot"])
     _clear_live_curve(view)
+    timeline = view.get("live_curve_timeline")
+    if timeline is not None:
+        timeline.clear()
+    reference = view.get("live_curve_reference")
+    if reference is not None:
+        reference["retain_from_s"] = reference["current_s"]
+    if view.get("encoder_curve"):
+        view["encoder_curve"].samples.clear()
     _draw(app, view)
 
 
@@ -232,7 +240,7 @@ def _map_click(app, event, view=None):
 
 
 def build_twin_panel(app, parent):
-    panel = ttk.LabelFrame(parent, text="态势图 · 5×5 地图（灰色候选 / 累计模拟 / 实机）")
+    panel = ttk.LabelFrame(parent, text="态势图 · 5×5 地图（虚线候选 / 累计模拟 / 实机）")
     panel.grid(row=0, column=0, sticky="ew", padx=6, pady=3)
     panel.columnconfigure(0, weight=1)
     # 2026-09-30 按用户要求：抬头变色区分数据源——评估模拟（计划）蓝、
@@ -263,17 +271,18 @@ def build_twin_panel(app, parent):
         rows[role] = tuple(ttk.Label(table, text="—", font=("Consolas", 9)) for _ in range(3))
         for col, label in enumerate(rows[role]):
             label.grid(row=row, column=col, sticky="w", padx=(0, 5), pady=2)
-    legend = ttk.Label(panel, text="灰色落点=点选动作的候选位置 紫=累计模拟 红=实机脉冲(无编码器)\n"
+    legend = ttk.Label(panel, text="虚线落点=预估位置(左蓝/右橙) 紫=累计模拟 红=实机脉冲(无编码器)\n"
                        "足色:蓝=左足 橙=右足 灰=断连冻结 绿点=低节点(落脚) 红点=高节点(红杆)\n"
-                       "实线=腿与横梁，虚线=已走路径；模拟曲线左蓝系/右橙系。\n"
+                       "轨迹仅显示上一步淡色、当前步深色；虚线=预估位置。\n"
                        "黄圈+数字=6爪中与红杆最近者(爪端到杆表面距离,mm)\n"
-                       "曲线仅当前步90秒滑窗；纵轴固定−20～200mm，0=杆表面，负值红底。\n"
+                       "曲线跨步累计90秒滑窗；纵轴固定−20～200mm，0=杆表面，负值红底。\n"
                        "爪端为正不能证明整腿避碰；完整校验不变。超量程提示，不自动缩放。\n"
                        "画面:左键点一下(蓝框)=选中,滚轮缩放;移出自动取消 中键拖动=平移 双击=复位\n"
-                       "固定5×5地图，B=(0,0)，上为+Y、右为+X；行号自下向上。\n"
+                       "固定5×5地图，B=(0,0)；默认上+Y、右+X，可整体逆时针旋转60°。\n"
+                       "旋转仅改变视角，世界坐标/行列/动作方向不变；全图保留旋转选项。\n"
                        "XY 为中心距=1的估算；Z 为本步位移，非接触检测。\n"
-                       "虚线=已回报轨迹(中心+三爪端,蓝系=左足 橙系=右足)，圆点=完成步落脚。\n"
-                       "执行中不画候选落点；灰色曲线=本次S4计划，随公转进度定位（非实测秒）。\n"
+                       "轨迹为足中心+三爪端；隐藏更早路径、重复静止线及落脚编号。\n"
+                       "执行中显示虚线预计落点；真机灰线=跨步计划参考（非实测）。\n"
                        "编码器未接入：不以指令估算生成实测曲线；地图ΔZ仍按脉冲估算。\n"
                        "点选四动作即看候选；模拟下一步才演示完整阶段并累计站位/路径。\n"
                        "模拟有独立账本；轴表始终显示实机，不随模拟变化。\n"
@@ -283,6 +292,7 @@ def build_twin_panel(app, parent):
     view = {**charts, "status": status, "rows": rows, "snapshot": {},
             "last_pose": None, "reference_key": None, "coordinates": coordinates,
             "history": TwinHistory(), "show_path": tk.BooleanVar(value=True),
+            "rotate_map_var": tk.BooleanVar(value=False),
             "select_side": tk.StringVar(value=""),
             "start_left": tk.StringVar(), "start_right": tk.StringVar(),
             "title": title, "plan_slot": plan_slot,
@@ -320,6 +330,10 @@ def build_twin_panel(app, parent):
     from motor_control.ui.gait_twin_window import open_twin_window
     ttk.Button(toolbar, text="大图窗口", command=lambda: open_twin_window(app)).grid(
         row=3, column=0, columnspan=2, sticky="ew", pady=3)
+    view["rotate_map_control"] = ttk.Checkbutton(
+        toolbar, text="地图逆时针旋转60°", variable=view["rotate_map_var"],
+        command=lambda: _draw(app, view))
+    view["rotate_map_control"].grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
 
     # Same data stream beside the map, not below it. No second sampler.
     view["curve_canvas"].bind("<Configure>", lambda _e: _draw_curve(app, view))
@@ -385,7 +399,7 @@ def refresh_twin_panel(app):
     if snapshot.get("reference_key") != view["reference_key"]:
         view["last_pose"] = None
         view["reference_key"] = snapshot.get("reference_key")
-        _clear_live_curve(view)  # New physical step never includes older curves.
+        _clear_live_curve(view)  # Raw pulse diagnostics are step-local; reference timeline is separate.
     if snapshot.get("pose") is not None:
         view["last_pose"] = snapshot["pose"]
     view["snapshot"] = snapshot
@@ -471,21 +485,29 @@ def _coordinate(value, unit, estimated=False):
 
 
 def twin_projection(width, height, xmin, xmax, ymin, ymax,
-                    zoom=1.0, pan_x=0.0, pan_y=0.0):
-    """固定地图包围盒 → 画布投影（缩放/平移以画布中心为原点复合）。
+                    zoom=1.0, pan_x=0.0, pan_y=0.0, *, rotation_deg=0.0):
+    """World → rotated/fitted map → canvas zoom/pan; never mutate world data.
 
-    独立成纯函数供离线测试：滚轮缩放的"指针不动点"性质直接可验。
+    Positive angles are counterclockwise in world XY (screen Y points down).
+    Fit the rotated bounding box to retain all 25 cells at zoom=1. Pointer
+    zoom remains the same final screen-space transform at either angle.
     """
 
     top, bottom = 76.0, 74.0  # Keep map below HUD and above the live ΔZ bars.
     available_h = max(1.0, height-top-bottom)
-    scale = min(max(1.0, width-26)/(xmax-xmin), available_h/(ymax-ymin))
+    angle = math.radians(rotation_deg)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    span_x, span_y = xmax-xmin, ymax-ymin
+    rotated_w = abs(cosine)*span_x + abs(sine)*span_y
+    rotated_h = abs(sine)*span_x + abs(cosine)*span_y
+    scale = min(max(1.0, width-26)/rotated_w, available_h/rotated_h)
     map_cy = top+available_h/2
 
     def project(point):
-        x, y = point
-        base_x = width / 2 + (x - (xmin + xmax) / 2) * scale
-        base_y = map_cy+((ymin+ymax)/2-y)*scale
+        x, y = point[0]-(xmin+xmax)/2, point[1]-(ymin+ymax)/2
+        rx, ry = cosine*x-sine*y, sine*x+cosine*y
+        base_x = width/2 + rx*scale
+        base_y = map_cy - ry*scale
         return (width / 2 + (base_x - width / 2) * zoom + pan_x,
                 height / 2 + (base_y - height / 2) * zoom + pan_y)
     return project, scale
@@ -558,15 +580,17 @@ def _render_map(app, view):
     zoom = float(twin_view.get("zoom", 1.0))
     pan_x = float(twin_view.get("pan_x", 0.0))
     pan_y = float(twin_view.get("pan_y", 0.0))
+    rotation_var = view.get("rotate_map_var")
+    rotation_deg = 60.0 if rotation_var is not None and rotation_var.get() else 0.0
     project, scale = twin_projection(width, height, xmin, xmax, ymin, ymax,
-                                     zoom, pan_x, pan_y)
+                                     zoom, pan_x, pan_y, rotation_deg=rotation_deg)
 
     view["project"], view["map_scale"] = project, scale*zoom
     _update_title(app, view, mode, snapshot, live)
     selected = {view[f"start_{side}"].get(): side for side in ("left", "right")}
     applied = dict(zip(("left", "right"), app.gait_params.initial_supports))
 
-    background_key = (width, height, zoom, pan_x, pan_y, tuple(route_pads),
+    background_key = (width, height, zoom, pan_x, pan_y, rotation_deg, tuple(route_pads),
                       tuple(selected.items()), tuple(applied.items()))
     if view.get("background_key") != background_key:
         canvas.delete("all")
@@ -599,41 +623,15 @@ def _render_map(app, view):
         canvas.addtag_all("twin_background")
         view["background_key"] = background_key
 
+    canvas.create_text(8, 43, anchor="nw", width=width-16, fill="#64748b",
+                       text="视角 ↺60°" if rotation_deg else "视角 0°",
+                       font=("Microsoft YaHei", 8), tags="map_orientation")
     history = sim.history if sim is not None else view["history"]
     path_prefix = "sim_history" if mode == "sim" else "history"
     if (mode == "live" or sim is not None) and view["show_path"].get():
-        # 实机轨迹与评估层同款：中心虚线 + 三爪端虚线轨迹（左足蓝系/
-        # 右足橙系，与曲线图同一套爪色）。历史点带世界 ψ 才有爪线。
-        arm = params.geometry.arm_length_mm / lattice_d_mm(params)
-        for segment in history.segments():
-            if len(segment) < 2:
-                continue
-            for index, side, color in ((1, "left", "#60a5fa"), (2, "right", "#fb923c"),
-                                       (3, "center", "#94a3b8")):
-                coords = [v for point in segment for v in project(point[index])]
-                canvas.create_line(*coords, fill=color, width=1.5, dash=(6, 3),
-                                   tags=f"{path_prefix}_{side}")
-            for index, side in ((1, "left"), (2, "right")):
-                for k in range(3):
-                    tips = []
-                    for point in segment:
-                        psi = point[4][0 if side == "left" else 1]
-                        if psi is None:
-                            continue
-                        a = math.radians(psi + 120.0 * k)
-                        cx, cy = point[index]
-                        tips.extend(project((cx + arm * math.cos(a),
-                                             cy + arm * math.sin(a))))
-                    if len(tips) >= 4:
-                        canvas.create_line(
-                            *tips, fill=CURVE_COLORS[0 if side == "left" else 1][k],
-                            width=1.2, dash=(5, 3), tags=f"{path_prefix}_tips_{side}_{k}")
-        for step, left, right in history.landings:
-            x, y = project(tuple((a+b)/2 for a, b in zip(left, right)))
-            canvas.create_text(x, y-8, text=str(step), fill="#64748b", tags="step_number")
-            for point, color in ((left, "#2563eb"), (right, "#ea580c")):
-                px, py = project(point)
-                canvas.create_oval(px-3, py-3, px+3, py+3, outline=color, tags="landing")
+        from .gait_paths import draw_recent_paths
+        draw_recent_paths(canvas, history, project,
+                          params.geometry.arm_length_mm/lattice_d_mm(params), path_prefix)
 
     if plan_report is not None:
         _draw_plan_layer(app, view, plan_report, project)

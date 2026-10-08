@@ -277,7 +277,7 @@ class TwinWindowTests(unittest.TestCase):
             frame=SimpleNamespace(time_s=101), curve=((0, [-100]*6, 5), (11, [12]*6, 5), (101, [15]*6, 5)))
         twin._draw_curve(self.app, self.view)
         c = self.view["curve_canvas"]
-        self.assertEqual(c.itemcget(c.find_withtag("curve_best")[0], "text"), "本步窗内最低 12.00mm")
+        self.assertEqual(c.itemcget(c.find_withtag("curve_best")[0], "text"), "窗口最低 12.00mm")
         self.assertTrue(c.find_withtag("curve_delta"))
 
     def test_plan_checks_six_tips_and_updates_coordinates(self):

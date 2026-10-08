@@ -1,4 +1,4 @@
-"""Four action buttons produce a grey landing candidate without side effects."""
+"""Side-coloured dashed landing forecasts, independent of current position."""
 import math
 import tkinter as tk
 
@@ -58,7 +58,7 @@ def select_candidate(app):
             psis = tuple(pose["feet"][s]["psi_deg"] for s in ("left", "right")) if pose else (30., 30.)
         view["candidate"] = {"report": report, "params": params, "psis": psis,
                              "source": source, "stance": stance_key(app, source)}
-        app.gait_report_var.set("灰色落点候选（未移动） · " + report.message)
+        app.gait_report_var.set("虚线落点候选（未移动） · " + report.message)
     except (ValueError, KeyError, tk.TclError) as exc:
         app.gait_report_var.set(f"候选未生成：{exc}")
     draw_twin(app)
@@ -76,8 +76,18 @@ def current_candidate(app, view):
 
 
 def draw_candidate(app, view):
-    from .gait_twin import lattice_d_mm
+    from .gait_twin import _mode, lattice_d_mm
+    from .gait_paths import FOOT_COLORS
     candidate = current_candidate(app, view)
+    tag, caption = "candidate_ghost", "候选落点"
+    if candidate is None:
+        mode, sim = _mode(app, view), view.get("simulation")
+        if mode == "sim" and sim is not None and sim.active:
+            candidate = {"report": sim.report, "params": sim.params, "psis": sim.step_psis}
+        elif mode == "live" and getattr(app, "_gait_owned", {}) and view.get("live_curve_reference"):
+            run = app._gait_run
+            candidate = {"report": run.twin_report, "params": run.params, "psis": run.twin_psis}
+        tag, caption = "forecast_ghost", "预计落点"
     if candidate is None or "project" not in view:
         return
     report, params = candidate["report"], candidate["params"]
@@ -86,17 +96,28 @@ def draw_candidate(app, view):
     psi = sample.psi_deg + candidate["psis"][slot] - 30
     d, project, canvas = lattice_d_mm(params), view["project"], view["canvas"]
     center = (sample.center[0]/d, sample.center[1]/d)
+    color = FOOT_COLORS[report.side]
+    # At the endpoint the dashed target would just cover the current solid
+    # foot, adding clutter without information. Keep only the real/current body.
+    if tag == "forecast_ghost":
+        sim = view.get("simulation") if _mode(app, view) == "sim" else None
+        pose = sim.frame.pose if sim else view.get("snapshot", {}).get("pose")
+        if pose:
+            foot = pose["feet"][report.side]
+            aligned = abs((foot["psi_deg"]-psi+60) % 120-60) < .1
+            if math.dist(foot["center"], center) < 1e-5 and aligned:
+                return
     x, y = project(center)
     for leg in range(3):
         angle = math.radians(psi+120*leg)
         arm = params.geometry.arm_length_mm/d
         end = (center[0]+arm*math.cos(angle), center[1]+arm*math.sin(angle))
-        canvas.create_line(x, y, *project(end), fill="#9ca3af", width=3, dash=(4, 3),
-                           tags="candidate_ghost")
-    canvas.create_line(x, y, *project(pad_center(report.route[2])), fill="#9ca3af",
-                       width=2, dash=(4, 3), tags="candidate_ghost")
-    canvas.create_oval(x-6, y-6, x+6, y+6, outline="#6b7280", width=2, tags="candidate_ghost")
-    canvas.create_text(x, y+20, text="候选落点", fill="#6b7280", tags="candidate_ghost")
+        canvas.create_line(x, y, *project(end), fill=color, width=2, dash=(4, 3), tags=tag)
+    canvas.create_line(x, y, *project(pad_center(report.route[2])), fill=color,
+                       width=1.2, dash=(4, 3), tags=tag)
+    canvas.create_oval(x-6, y-6, x+6, y+6, outline=color, width=2, dash=(4, 3), tags=tag)
+    canvas.create_text(x, y+20, text=caption, fill=color, tags=tag)
     canvas.create_text(8, 58, anchor="nw", width=canvas.winfo_width()-16,
-                       text="灰色候选 · " + ("待执行确认" if report.feasible else "校验未通过，禁止执行"),
-                       fill="#6b7280" if report.feasible else "#b91c1c", tags="candidate_ghost")
+                       text=caption + "（虚线，非当前位置） · " + ("左足" if report.side == "left" else "右足")
+                            + ("" if report.feasible else " · 校验未通过，禁止执行"),
+                       fill=color if report.feasible else "#b91c1c", tags=tag)

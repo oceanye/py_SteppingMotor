@@ -7,6 +7,7 @@ from .gait_map import map_pads, start_pair_reference
 from .gait_planner import effective_geometry, plan_gait_stages, plan_swing_trajectory
 from .gait_twin import TwinHistory, pad_center
 from .gait_twin_timing import plan_sample_times
+from .gait_curve import time_at_phi
 
 
 def simulation_key(params):
@@ -38,6 +39,9 @@ class GaitSimulation:
         self.completed_steps = 0
         self.elapsed_s = 0.0
         self.step_started_s = 0.0
+        self.curve_elapsed_s = 0.0  # Committed S4 model time, excludes lifts/waits.
+        self.curve_step_start_s = 0.0
+        self.step_psis = self.psis
         self.history = TwinHistory()
         self.curve = deque(maxlen=6000)
         self.segment = 0
@@ -51,6 +55,13 @@ class GaitSimulation:
     @property
     def active(self):
         return bool(self.frames)
+
+    @property
+    def curve_time_s(self):
+        if not self.active:
+            return self.curve_elapsed_s
+        local = time_at_phi(self.report, self.swing_times, self.frame.pose["phi_deg"]) if self.index >= 0 else 0.
+        return self.curve_step_start_s + local
 
     def _rest_pose(self):
         return {"phi_deg": 0.0, "beta_deg": self.beta, "route_pads": {},
@@ -78,14 +89,19 @@ class GaitSimulation:
             raise ValueError("当前模拟未完成，请暂停/继续或取消本步")
         report = self.preview(side, arc)
         if not report.feasible:
-            raise ValueError("避让校验未通过，不能累计本步；点选动作查看灰色候选和校验原因。" + report.message)
+            raise ValueError("避让校验未通过，不能累计本步；点选动作查看虚线候选和校验原因。" + report.message)
         self.step_started_s = self.elapsed_s
-        self.curve.clear()  # World paths accumulate; distance curves are step-local.
+        self.curve_step_start_s = self.curve_elapsed_s
+        self.step_psis = self.psis
         self.report = report
         self.swing_times = plan_sample_times(report, self.params)
         self.frames = self._frames(report, arc)
         self.index = -1
         self.segment += 1
+        self.history.current_step = self.segment
+        self.history.segment_steps[self.segment] = self.segment
+        retained = {p[0] for p in self.history.points} | {self.segment}
+        self.history.segment_steps = {k: v for k, v in self.history.segment_steps.items() if k in retained}
         self.paused = False
         return report
 
@@ -151,6 +167,7 @@ class GaitSimulation:
             self.beta = self.frame.pose["beta_deg"]
             self.psis = tuple(feet[s]["psi_deg"] for s in ("left", "right"))
             self.elapsed_s = self.frame.time_s
+            self.curve_elapsed_s = self.curve_step_start_s + self.swing_times[-1]
             self.completed_steps += 1
             self.history.landings.append((self.completed_steps, left, right))
             self.frames = ()
@@ -166,5 +183,7 @@ class GaitSimulation:
             return
         self.history.points = deque((p for p in self.history.points if p[0] != self.segment), maxlen=6000)
         self.curve = deque((p for p in self.curve if p[2] != self.segment), maxlen=6000)
+        self.history.current_step = max((self.history.segment_steps.get(p[0], p[0])
+                                         for p in self.history.points), default=0)
         self.frames, self.paused = (), False
         self.frame = SimulationFrame(self.elapsed_s, "已取消本步", self._rest_pose())

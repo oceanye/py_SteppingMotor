@@ -563,6 +563,7 @@ class GaitLayoutTests(unittest.TestCase):
         view = self.app.gait_widgets["twin"]
         canvas = view["canvas"]
         before = canvas.coords(canvas.find_withtag("live_left")[0])
+        fixed_right = canvas.coords(canvas.find_withtag("live_right")[0])
         # 2026-09-29 按用户要求：孪生画面不再画虚线指令目标（运动轨迹）
         self.assertFalse(canvas.find_withtag("target_left"))
         controller._on_step_progress(2, 400, 800)
@@ -575,9 +576,10 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertTrue(canvas.find_withtag("nearest_tip"))
         self.assertIn("6爪最近", canvas.itemcget(
             canvas.find_withtag("hud_nearest")[0], "text"))
-        # 实机轨迹与评估层同款：历史点带 ψ，画三爪端虚线轨迹（蓝系=左足）
+        # 运动足画三爪端轨迹；世界姿态未动的支撑足不画重复零长线。
         self.assertTrue(canvas.find_withtag("history_tips_left_0"))
-        self.assertTrue(canvas.find_withtag("history_tips_right_0"))
+        self.assertEqual(canvas.coords(canvas.find_withtag("live_right")[0]), fixed_right)
+        self.assertFalse(canvas.find_withtag("history_tips_right_0"))
         self.assertIn("90.00", view["rows"]["Mr1"][1].cget("text"))
         controller._is_serial_connected = lambda: False
         refresh_twin_panel(self.app)
