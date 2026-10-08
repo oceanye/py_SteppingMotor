@@ -378,13 +378,44 @@ def _build_run_column(app, parent) -> None:
     ttk.Label(preview, text="点选动作显示灰色候选落点；不会移动电机。", wraplength=260, foreground="#6b7280").grid(
         row=1, column=0, sticky="w")
     from .gait_simulation import toggle_simulation, reset_simulation, discard_simulation_step
-    simulation = ttk.Frame(preview)
-    simulation.grid(row=3, column=0, sticky="ew", pady=3)
+    # 2026-10-08 按用户要求：实操四个【开始…移】从最底部的阶段面板挪到
+    # 顶部模拟旁边——模拟块在左、实操块在右。按钮竖排/2×2 而非一条
+    # 长横行：720 窄窗下两块紧挨也不把右列撑出横向滚动（起步下拉被裁
+    # 的布局测试覆盖），宽窗下实操块贴右缘与换位方式一一对应。
+    actions = ttk.Frame(preview)
+    actions.grid(row=3, column=0, sticky="ew", pady=3)
+    actions.columnconfigure(1, weight=1)
+    simulation = ttk.Frame(actions)
+    simulation.grid(row=0, column=0, sticky="w")
     app.gait_widgets["sim_btn"] = ttk.Button(
         simulation, text="▶ 模拟下一步", command=lambda: toggle_simulation(app))
-    app.gait_widgets["sim_btn"].grid(row=0, column=0, padx=3)
-    ttk.Button(simulation, text="取消本步", command=lambda: discard_simulation_step(app)).grid(row=0, column=1, padx=3)
-    ttk.Button(simulation, text="重置模拟", command=lambda: reset_simulation(app)).grid(row=0, column=2, padx=3)
+    app.gait_widgets["sim_btn"].grid(row=0, column=0, padx=3, pady=1, sticky="w")
+    ttk.Button(simulation, text="取消本步",
+               command=lambda: discard_simulation_step(app)).grid(
+                   row=1, column=0, padx=3, pady=1, sticky="w")
+    ttk.Button(simulation, text="重置模拟",
+               command=lambda: reset_simulation(app)).grid(
+                   row=2, column=0, padx=3, pady=1, sticky="w")
+    # 执行入口与四种换位方式一一对应，方向由按钮显式携带，不依赖预览区
+    # 当前选择（防止"看逆向、走顺向"误操作）。
+    live = ttk.Frame(actions)
+    live.grid(row=0, column=2, sticky="e")
+    for row, (key, text, side, arc) in enumerate((
+        ("start_left_cw", "开始左顺移", "left", 60.0),
+        ("start_left_ccw", "开始左逆移", "left", -60.0),
+    )):
+        app.gait_widgets[key] = ttk.Button(
+            live, text=text,
+            command=lambda s=side, a=arc: app._gait_start_run_clicked(s, a))
+        app.gait_widgets[key].grid(row=0, column=row, padx=3, pady=1, sticky="ew")
+    for row, (key, text, side, arc) in enumerate((
+        ("start_right_cw", "开始右顺移", "right", 60.0),
+        ("start_right_ccw", "开始右逆移", "right", -60.0),
+    )):
+        app.gait_widgets[key] = ttk.Button(
+            live, text=text,
+            command=lambda s=side, a=arc: app._gait_start_run_clicked(s, a))
+        app.gait_widgets[key].grid(row=1, column=row, padx=3, pady=1, sticky="ew")
     app.gait_widgets["sim_status"] = ttk.Label(
         preview, text="模拟累计位置与路径，曲线只看当前步；清路径不重置站位。",
         wraplength=260, foreground="#7c3aed", justify="left")
@@ -419,38 +450,19 @@ def _build_run_column(app, parent) -> None:
     buttons = ttk.Frame(stage)
     buttons.pack(fill="x", padx=8, pady=8)
     buttons.columnconfigure((0, 1), weight=1)
-    # 2026-09-22 按用户要求：执行入口与四种换位方式一一对应，方向由
-    # 按钮显式携带，不依赖预览区当前选择（防止“看逆向、走顺向”误操作）。
-    for key, text, side, arc in (
-        ("start_left_cw", "开始左顺移", "left", 60.0),
-        ("start_left_ccw", "开始左逆移", "left", -60.0),
-        ("start_right_cw", "开始右顺移", "right", 60.0),
-        ("start_right_ccw", "开始右逆移", "right", -60.0),
-    ):
-        app.gait_widgets[key] = ttk.Button(
-            buttons, text=text,
-            command=lambda s=side, a=arc: app._gait_start_run_clicked(s, a),
-        )
-    app.gait_widgets["start_left_cw"].grid(row=0, column=0, sticky="ew", padx=3)
-    app.gait_widgets["start_left_ccw"].grid(row=0, column=1, sticky="ew", padx=3)
-    app.gait_widgets["start_right_cw"].grid(
-        row=1, column=0, sticky="ew", padx=3, pady=(3, 0))
-    app.gait_widgets["start_right_ccw"].grid(
-        row=1, column=1, sticky="ew", padx=3, pady=(3, 0))
+    # 四个【开始…移】已在顶部模拟行右侧（2026-10-08）；这里只留阶段
+    # 推进：单步确认与一键执行并排。
     app.gait_widgets["advance"] = ttk.Button(
         buttons, text="✓ 确认并执行本阶段", command=app._gait_stage_confirmed,
     )
-    # row=2：四个方向按钮占 2×2（row0/row1），advance 独占下一行。
-    # 2026-09-22 修复：advance 原在 row=1 且 columnspan=2，与右顺/右逆
-    # 两按钮同行同格，后 grid 者覆盖前者——右侧两按钮被整个遮住不可见。
-    app.gait_widgets["advance"].grid(row=2, column=0, columnspan=2, sticky="ew", padx=3, pady=(6, 0))
+    app.gait_widgets["advance"].grid(row=0, column=0, sticky="ew", padx=3)
     # 2026-09-29 按用户要求：一键执行——本步剩余阶段自动连走，不再逐
     # 阶段弹窗确认（录视频用）；执行中可【⛔ 中止】停车，再点本按钮
     # 停在当前阶段后回到人工确认。
     app.gait_widgets["auto"] = ttk.Button(
         buttons, text="⚡ 一键执行", command=app._gait_auto_clicked,
     )
-    app.gait_widgets["auto"].grid(row=3, column=0, columnspan=2, sticky="ew", padx=3, pady=(6, 0))
+    app.gait_widgets["auto"].grid(row=0, column=1, sticky="ew", padx=3)
 
     app.gait_widgets["state"] = ttk.Label(
         stage, textvariable=app.gait_state_var,
