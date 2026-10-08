@@ -9,7 +9,7 @@ CURVE_WINDOW_S = 90.0
 
 
 def rolling_window(current_s):
-    """Constant-width window, reset to zero for each new step."""
+    """Constant-width window on a cumulative, cross-step model clock."""
     end = max(CURVE_WINDOW_S, current_s)
     return end-CURVE_WINDOW_S, end
 
@@ -50,6 +50,33 @@ def time_at_phi(report, times, phi):
     index = bisect_left(angles, progress)
     fraction = (progress-angles[index-1])/(angles[index]-angles[index-1])
     return times[index-1]+fraction*(times[index]-times[index-1])
+
+
+class CurveTimeline:
+    """Bounded cross-step display history, isolated from all motor state.
+
+    Only the reached portion of a previous plan is archived. Future planned
+    points must never be presented as an executed historical reference.
+    """
+    def __init__(self):
+        self.history = deque(maxlen=6000)
+        self.measured = deque(maxlen=1800)
+        self.elapsed_s = 0.0
+        self.step = 0
+
+    def archive(self, reference, measured=()):
+        reached = reference["current_s"]
+        data = [(t, tuple(values), self.step) for t, values in reference["series"]]
+        for t, values, segment in clip_series(data, reference.get("retain_from_s", 0.), reached):
+            self.history.append((self.elapsed_s+t, values, segment))
+        for t, values, segment in clip_series(list(measured), 0., reached):
+            self.measured.append((self.elapsed_s+t, values, (self.step, segment)))
+        self.elapsed_s += reached
+
+    def clear(self):
+        """Clear display trails without rewinding the current world/clock."""
+        self.history.clear()
+        self.measured.clear()
 
 
 class EncoderCurveBuffer:

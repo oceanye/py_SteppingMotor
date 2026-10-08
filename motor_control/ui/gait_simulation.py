@@ -65,7 +65,7 @@ def reset_simulation(app):
     view["simulation"] = sim
     view.pop("candidate", None)
     app._gait_last_report = None
-    app.gait_report_var.set("模拟已重置；点选动作显示灰色候选，模拟下一步才累计站位")
+    app.gait_report_var.set("模拟已重置；点选动作显示虚线候选，模拟下一步才累计站位")
     view["mode_var"].set("sim")
     _message(app, f"模拟起步：左 {supports[0]} / 右 {supports[1]} · 0 步（不改实机标定）")
     app.log(f"模拟重置：左 {supports[0]} / 右 {supports[1]}；仅虚拟站位，不移动电机")
@@ -162,7 +162,7 @@ def _tick(app):
     done = sim.advance()
     # Planar distance changes during S4. Lifting/confirmation time must not
     # scroll the relevant swing off screen; use the same model clock as live.
-    curve_t = time_at_phi(sim.report, sim.swing_times, sim.frame.pose["phi_deg"])
+    curve_t = sim.curve_step_start_s + time_at_phi(sim.report, sim.swing_times, sim.frame.pose["phi_deg"])
     point = (curve_t, tip_surface_distances(sim.frame.pose, sim.params), sim.segment)
     if not sim.curve or sim.curve[-1] != point:
         sim.curve.append(point)

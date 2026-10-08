@@ -1,4 +1,4 @@
-"""Current-step fixed-scale curves and grey action candidates, offline only."""
+"""Fixed-scale sliding curves and action candidates, offline only."""
 import os
 import sys
 import unittest
@@ -35,17 +35,19 @@ class StepCurveTests(unittest.TestCase):
                     self.assertAlmostEqual(time_at_phi(report, times, report.samples[index].phi_deg), times[index])
                 self.assertEqual(time_at_phi(report, times, arc*2), times[-1])
 
-    def test_simulation_starts_new_curve_but_preserves_world_path(self):
+    def test_simulation_retains_curves_and_world_path_across_steps(self):
         sim = GaitSimulation(default_gait_params())
         for step in range(2):
+            previous = list(sim.curve)
             sim.begin("left", 60)
-            self.assertFalse(sim.curve)
+            self.assertEqual(list(sim.curve), previous)
             self.assertEqual(sim.step_started_s, sim.elapsed_s)
             while sim.active:
                 sim.advance()
-                sim.curve.append((sim.frame.time_s, [50]*6, sim.segment))
+                sim.curve.append((sim.curve_time_s, [50]*6, sim.segment))
             self.assertEqual(len(sim.history.landings), step+1)
-        self.assertEqual({p[2] for p in sim.curve}, {2})
+        self.assertEqual({p[2] for p in sim.curve}, {1, 2})
+        self.assertEqual([p[0] for p in sim.curve], sorted(p[0] for p in sim.curve))
 
     def test_encoder_boundary_never_accepts_command_data_or_old_steps(self):
         buffer = EncoderCurveBuffer()
@@ -91,7 +93,7 @@ class StepCurveUITests(unittest.TestCase):
         twin.refresh_twin_panel(self.app)
         return run
 
-    def test_four_choices_make_grey_landing_without_save_motion_or_preview_button(self):
+    def test_four_choices_make_dashed_landing_without_save_motion_or_preview_button(self):
         from motor_control.ui.gait_tab import _gait_mode_selected
         self.assertNotIn("play_btn", self.app.gait_widgets)
         self.assertEqual([str(c.cget("value")) for c in self.view["mode_controls"]], ["sim", "live"])
@@ -161,7 +163,7 @@ class StepCurveUITests(unittest.TestCase):
         self.assertTrue(all(v > -999 for _, vals, _ in self.view["curve_display"]["data"] for v in vals))
         self.assertTrue(self.view["curve_live"])  # Command telemetry exists, but is never measured data.
         self.assertTrue(all(str(b["state"]) == "disabled" for b in self.app.gait_widgets["action_choices"]))
-        # Actual new step replaces the grey reference and all old sensor data.
+        # A new step replaces the active reference; only reached history is archived.
         encoder = self.view["encoder_curve"]
         encoder.append(encoder.step_key, 0, [2]*6, source="encoder")
         encoder.append(encoder.step_key, 1, [-1]*6, source="encoder")

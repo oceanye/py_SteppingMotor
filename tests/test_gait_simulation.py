@@ -199,8 +199,8 @@ class SimulationUITests(unittest.TestCase):
         self.assertFalse(c.find_withtag("live_left"))
         self.assertFalse(self.view["curve_live"])
         self.assertTrue(sim.curve)
-        self.assertEqual({point[2] for point in sim.curve}, {sim.segment})
-        self.assertAlmostEqual(sim.curve[-1][0], sim.swing_times[-1])
+        self.assertEqual({point[2] for point in sim.curve}, {1, 2})
+        self.assertAlmostEqual(sim.curve[-1][0], sim.curve_elapsed_s)
         self.assertLess(sim.curve[-1][0], sim.frame.time_s)  # Lifts/waits do not scroll S4 away.
         open_twin_window(self.app)
         detail = self.view["large_window"]
