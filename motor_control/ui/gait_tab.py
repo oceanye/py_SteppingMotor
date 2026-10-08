@@ -934,6 +934,13 @@ def refresh_gait_panel(app, progress_text=None) -> None:
         state="normal" if snapshot is not None else "disabled")
     app.gait_widgets["progress"].configure(text=progress_text or "")
     refresh_twin_panel(app)
+    # 2026-10-08 阶段标签没内容时是空行，把 5×5 图压出视口（实操区比
+    # 模拟区高出一截的"空行"来源）。空文字收起（grid_remove 不占行），
+    # 有文字再展开——未开始时实操区高度与模拟区基本一致，执行时阶段
+    # 文字/确认清单/进度/角度/状态逐项出现。
+    for key in ("confirm_text", "progress", "angles", "state"):
+        label = app.gait_widgets[key]
+        label.grid() if label.cget("text") else label.grid_remove()
 
 
 __all__ = [
