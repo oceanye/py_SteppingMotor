@@ -244,12 +244,14 @@ inline bool parse_signed_u16(const uint8_t* payload, size_t len,
   return true;
 }
 
-// [温度符号 u8][温度 u8]：00=负 / 01=正——注意与上两者相反（5.5.12）。
+// [温度符号 u8][温度 u8]：00=正 / 01=负。手册 5.5.12 标称与其他命令相反
+// （00=负），2026-10-10 实机 X 固件证伪：室温下应答 00 1D（=29℃），
+// 符号位与其余命令一致，00=正、01=负。
 inline bool parse_temp(const uint8_t* payload, size_t len, int32_t* out) {
   if (payload == nullptr || len < 2 || out == nullptr) {
     return false;
   }
-  *out = (payload[0] == 0x00) ? -(int32_t)payload[1] : (int32_t)payload[1];
+  *out = (payload[0] == 0x01) ? -(int32_t)payload[1] : (int32_t)payload[1];
   return true;
 }
 

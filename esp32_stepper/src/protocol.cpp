@@ -435,6 +435,7 @@ static void handle_node(const String tok[], int n) {
 //   X42S,SCAN                      逐台探测 ID1..4
 //   X42S,S,<id>                    遥测行（online/cmd/meas/err/valid 位）
 //   X42S,DIAG,<id>                 ping + 全量读 + 通讯统计
+//   X42S,RAW,<hex>                 台架排障直通（原样发帧+原始回包 hex）
 //   X42S,<id>,EN,<0|1> | STOP | ZERO | SYNC   使能/停/零点/广播触发
 //   X42S,<id>,MOVE,<steps>,<speed> 相对运动（M1 台架用，非步态路径）
 // 业务动作最终走逻辑角色/统一 motion API，不鼓励 GUI 直接拼这些帧。
@@ -457,6 +458,29 @@ static void handle_x42s(const String tok[], int n) {
     if (reject_if_hardware_estop_active()) return;
     if (x42s_sync_trigger()) serial_tx_line("OK,X42S,SYNC");
     else reply_err(x42s_last_error());
+    return;
+  }
+  // X42S,RAW,<hex>：偶数位 hex（6..64 字符=3..32 字节，含校验字节），
+  // 原样发送并回 X42S,RAW,RX,<n>,<hex>。诊断命令，不走急停闸/使能闸。
+  if (n == 3 && tok[1] == "RAW") {
+    const String& hex = tok[2];
+    const size_t hex_len = hex.length();
+    if (hex_len < 6 || hex_len > 64 || (hex_len & 1u) != 0) {
+      reply_err("bad hex length"); return;
+    }
+    uint8_t frame[x42s::kMaxFrameBytes];
+    for (size_t i = 0; i < hex_len; i += 2) {
+      auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+      };
+      const int hi = nibble(hex[i]), lo = nibble(hex[i + 1]);
+      if (hi < 0 || lo < 0) { reply_err("bad hex"); return; }
+      frame[i / 2] = (uint8_t)((hi << 4) | lo);
+    }
+    x42s_raw_probe(frame, hex_len / 2);
     return;
   }
   // 以下均为 X42S,<id>,<sub>[,<args>]

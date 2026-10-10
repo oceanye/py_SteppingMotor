@@ -214,11 +214,12 @@ void test_read_parsers_follow_manual_layout(void) {
     TEST_ASSERT_TRUE(
         x42s::parse_signed_u16(speed_neg, sizeof(speed_neg), &value));
     TEST_ASSERT_EQUAL_INT32(-100, value);
-    // 39 温度：符号 00=负 / 01=正（与其他命令相反，手册 5.5.12）。
-    const uint8_t warm[] = {0x01, 0x2A};
+    // 39 温度：符号 00=正 / 01=负——与其他命令一致（2026-10-10 实机修正，
+    // 手册 5.5.12 的"相反"说法被实机证伪）。
+    const uint8_t warm[] = {0x00, 0x2A};
     TEST_ASSERT_TRUE(x42s::parse_temp(warm, sizeof(warm), &value));
     TEST_ASSERT_EQUAL_INT32(42, value);
-    const uint8_t cold[] = {0x00, 0x0A};
+    const uint8_t cold[] = {0x01, 0x0A};
     TEST_ASSERT_TRUE(x42s::parse_temp(cold, sizeof(cold), &value));
     TEST_ASSERT_EQUAL_INT32(-10, value);
     // 26 总线电流：u16 mA。

@@ -459,6 +459,30 @@ void x42s_print_diag(uint8_t id) {
                    (unsigned long)s.timeouts);
 }
 
+void x42s_raw_probe(const uint8_t* frame, size_t len) {
+  while (s_x42s.available()) (void)s_x42s.read();  // 清残留
+  write_frame(frame, len);
+  // 固定 300ms 采集窗：比单次事务宽，迟到应答也照收；期间不解读，
+  // 收到的每个字节原样上报——诊断语义与 transact 的严格匹配相反。
+  const uint32_t deadline = millis() + 300;
+  uint8_t buf[64];
+  size_t fill = 0;
+  while ((int32_t)(millis() - deadline) < 0) {
+    while (s_x42s.available() && fill < sizeof(buf)) {
+      buf[fill++] = (uint8_t)s_x42s.read();
+    }
+    delay(1);
+  }
+  char hex[2 * sizeof(buf) + 1];
+  for (size_t i = 0; i < fill; ++i) {
+    static const char kHex[] = "0123456789abcdef";
+    hex[2 * i] = kHex[buf[i] >> 4];
+    hex[2 * i + 1] = kHex[buf[i] & 0x0F];
+  }
+  hex[2 * fill] = '\0';
+  serial_tx_printf("X42S,RAW,RX,%u,%s", (unsigned)fill, hex);
+}
+
 const char* x42s_last_error() { return s_last_error; }
 
 #endif  // DRIVE_MODE_GEAR && X42S_UART_ENABLED

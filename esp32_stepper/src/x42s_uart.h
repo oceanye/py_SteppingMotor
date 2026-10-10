@@ -43,6 +43,12 @@ const x42s::CommStats& x42s_comm_stats();
 void x42s_print_status_line(uint8_t id);  // X42S,<id>,S,...
 void x42s_print_scan();                   // 探测 ID1..X42S_DRIVER_COUNT
 void x42s_print_diag(uint8_t id);         // ping + 全量读 + 通讯统计
+
+// 台架排障直通（X42S,RAW,<hex>）：原样发送任意帧，固定窗口收全部原始
+// 回包并以 hex 打印（X42S,RAW,RX,<n>,<hex>）。绕过帧层解码——迟到的/
+// 不匹配的应答在这里不会丢，专查"电机到底回了什么"。诊断用途，不走
+// §15 业务闸；运动类帧经此发送时同样绕过使能检查，仅台架用。
+void x42s_raw_probe(const uint8_t* frame, size_t len);
 const char* x42s_last_error();
 
 #else  // X42S 未启用：main.cpp / system_estop 的无条件调用点给空实现
