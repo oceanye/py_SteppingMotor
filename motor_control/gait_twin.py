@@ -40,7 +40,13 @@ def build_twin_snapshot(
     Future encoder integration can provide a separate measured pose/source.
     """
     motors = {str(a["role"]): dict(a) for a in axes}
-    result = {"source": "commanded_pulses", "measured": False,
+    # X42S 后端：位置为驱动器实测（快照层已 ÷gear_ratio 换算输出轴），
+    # 与步进轴的脉冲估算分列标注，UI 不得混淆两种来源。
+    all_x42s = bool(axes) and all(
+        str(a.get("position_source", "")).startswith("x42s") for a in axes
+    )
+    result = {"source": "x42s_measured" if all_x42s else "commanded_pulses",
+              "measured": all_x42s,
               "xy_unit": "beam_length", "axes": motors,
               "pose": None, "target_pose": None, "state": "unavailable",
               "message": "等待四个电机绑定", "reference_key": None}
@@ -48,8 +54,12 @@ def build_twin_snapshot(
         return result
     if context is not None:
         result["reference_key"] = context.get("reference_key")
+    # X42S_ONLINE 与步进轴的运行态同级放行（2026-10-10 接入真实遥测）：
+    # X42S 后端的 position 已在快照层 ÷gear_ratio 换算为输出轴角度；
+    # X42S_OFFLINE/FAULT/STALE/BACKEND_PENDING/DISCONNECTED 不在白名单，
+    # 走 untrusted 保留最近有效估算。
     bad_states = {str(a.get("state", "")) for a in motors.values()} - {
-        "IDLE", "STARTING", "MOVING", "CONTINUOUS"}
+        "IDLE", "STARTING", "MOVING", "CONTINUOUS", "X42S_ONLINE"}
     if bad_states or any(not motors[r].get("position_trusted") for r in ROLES):
         result.update(state="untrusted", message="断连 / 停止 / 位置失信；保留最近有效估算")
         return result
@@ -61,7 +71,12 @@ def build_twin_snapshot(
                       message="轴坐标可查看；世界姿态需完成零位及方向标定")
         return result
     if context is None or context.get("manual_invalid", False):
-        result.update(state="axis_only", message="显示电机轴坐标；开始步态后按已确认支点推算公转")
+        result.update(
+            state="axis_only",
+            message=("显示输出轴坐标；开始步态后按已确认支点推算公转"
+                     if all_x42s else
+                     "显示电机轴坐标；开始步态后按已确认支点推算公转"),
+        )
         return result
     pending = [motors[r] for r in ROLES if motors[r].get("target_position") is not None]
     if any(a.get("stale") for a in pending):
@@ -79,10 +94,17 @@ def build_twin_snapshot(
         targets = {r: (float(motors[r]["target_position"])
                        if _finite(motors[r].get("target_position")) else positions[r]) for r in ROLES}
         result["target_pose"] = _pose(params, targets, context)
-    waiting = any(a.get("executed_steps") is None for a in pending)
-    result.update(state="waiting" if waiting else "estimated",
-                  message=("指令目标已显示，等待首帧脉冲进度" if waiting else
-                           "脉冲估算 · 无编码器 · 不包含失步或机械滑动"))
+    waiting = (not all_x42s) and any(
+        a.get("executed_steps") is None for a in pending
+    )
+    if all_x42s:
+        # 实测位置无需"脉冲进度"确认，直接进入实测态。
+        result.update(state="estimated",
+                      message="X42S 实测位置 · 已按减速比换算为输出轴角度")
+    else:
+        result.update(state="waiting" if waiting else "estimated",
+                      message=("指令目标已显示，等待首帧脉冲进度" if waiting else
+                               "脉冲估算 · 无编码器 · 不包含失步或机械滑动"))
     return result
 
 

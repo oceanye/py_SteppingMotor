@@ -211,8 +211,13 @@ class SnapshotMergeTests(unittest.TestCase):
                                          now=1.0)
         card = motors["Mr1"]
         self.assertEqual(card["state"], "X42S_ONLINE")
-        self.assertEqual(card["position"], 1198.0)
-        self.assertEqual(card["target_position"], 1200.0)
+        # 驱动器遥测是电机轴角度；快照统一 ÷gear_ratio（默认 21.5，
+        # 2026-10-10 实机确认）换算为输出轴角度（§12 语义不变：仍是实测）。
+        self.assertEqual(card["gear_ratio"], 21.5)
+        self.assertAlmostEqual(card["position"], 1198.0 / 21.5)
+        self.assertAlmostEqual(card["target_position"], 1200.0 / 21.5)
+        # 原始电机轴遥测完整保留在 x42s 子字典，不做有损覆盖。
+        self.assertEqual(card["x42s"]["measured_position"], 1198.0)
         self.assertTrue(card["position_trusted"])
         self.assertTrue(card["measured"])
         self.assertEqual(card["position_source"], "x42s_driver")
@@ -220,6 +225,32 @@ class SnapshotMergeTests(unittest.TestCase):
         self.assertEqual(card["driver_id"], 2)
         self.assertIn("x42s", card)
         self.assertEqual(control["backend"], BACKEND_X42S_UART)
+
+    def test_gear_ratio_converts_motor_shaft_to_output(self):
+        # 实机验收值：输出轴 90° = 电机轴 1935°（1:21.5）。自定义减速比
+        # 绑定换算 1935/21.5=90.0；直驱（gear_ratio=1）原样透传。
+        role = next(r for r in LOGICAL_ROLE_ORDER if r.value == "Mr1")
+        state = X42sActuatorState(
+            role=role, driver_id=2).with_telemetry(
+            now=0.9, measured_position=1935.0, command_position=1935.0)
+        bindings = BindingSet.from_driver_id_mapping(
+            {"Mup1": None, "Mr1": 2, "Mup2": None, "Mr2": None},
+            gear_ratios={"Mr1": 21.5},
+        )
+        _, motors = _x42s_snapshot(self.fixture, bindings,
+                                   {"Mr1": state}, now=1.0)
+        card = motors["Mr1"]
+        self.assertEqual(card["gear_ratio"], 21.5)
+        self.assertAlmostEqual(card["position"], 90.0)
+        self.assertAlmostEqual(card["target_position"], 90.0)
+
+        direct = BindingSet.from_driver_id_mapping(
+            {"Mup1": None, "Mr1": 2, "Mup2": None, "Mr2": None},
+            gear_ratios={"Mr1": 1.0},
+        )
+        _, motors = _x42s_snapshot(self.fixture, direct,
+                                   {"Mr1": state}, now=1.0)
+        self.assertAlmostEqual(motors["Mr1"]["position"], 1935.0)
 
     def test_partial_validity_does_not_invent_numbers(self):
         # 只有 enabled/reached，无任何位置字段（valid 位全未置）。

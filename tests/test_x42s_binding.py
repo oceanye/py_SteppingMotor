@@ -42,8 +42,11 @@ class X42sBindingSchemaTests(unittest.TestCase):
         document = bindings.as_document()
         self.assertEqual(document["schema_version"], BINDING_SCHEMA_VERSION)
         self.assertEqual(document["backend"], "x42s_uart")
+        # gear_ratio（2026-10-10 实机 1:21.5）随绑定持久化；缺省即默认值。
+        self.assertEqual(bindings.for_role(LogicalRole.MR1).gear_ratio, 21.5)
         self.assertEqual(
-            document["bindings"]["Mr1"], {"kind": "x42s", "driver_id": 2}
+            document["bindings"]["Mr1"],
+            {"kind": "x42s", "driver_id": 2, "gear_ratio": 21.5},
         )
         self.assertEqual(
             json.loads(json.dumps(document)), document  # JSON 可序列化
@@ -57,6 +60,49 @@ class X42sBindingSchemaTests(unittest.TestCase):
         parsed = parse_binding_document(bindings.as_document())
         self.assertEqual(parsed, bindings)
         self.assertEqual(parsed.revision, 7)
+
+    def test_gear_ratio_default_and_round_trip(self):
+        # 2026-10-10 实机确认 1:21.5 减速：缺省=DEFAULT，显式值往返不丢。
+        self.assertEqual(
+            ActuatorBinding(kind="x42s", driver_id=2).gear_ratio, 21.5
+        )
+        bindings = BindingSet.from_driver_id_mapping(
+            {"Mup1": 1, "Mr1": 2, "Mup2": 3, "Mr2": 4},
+            gear_ratios={"Mr1": 10.0},
+        )
+        self.assertEqual(bindings.for_role(LogicalRole.MR1).gear_ratio, 10.0)
+        self.assertEqual(bindings.for_role(LogicalRole.MUP1).gear_ratio, 21.5)
+        self.assertEqual(
+            parse_binding_document(bindings.as_document()), bindings
+        )
+
+    def test_gear_ratio_legacy_document_defaults(self):
+        # 旧 v2 文档无 gear_ratio 字段：解析后取默认 21.5（字段级向后兼容）。
+        document = {
+            "schema_version": 2,
+            "revision": 3,
+            "backend": "x42s_uart",
+            "bindings": {
+                "Mup1": {"kind": "x42s", "driver_id": 1},
+                "Mr1": {"kind": "x42s", "driver_id": 2},
+                "Mup2": {"kind": "x42s", "driver_id": 3},
+                "Mr2": {"kind": "x42s", "driver_id": 4},
+            },
+        }
+        parsed = parse_binding_document(document)
+        for role in (LogicalRole.MUP1, LogicalRole.MR1,
+                     LogicalRole.MUP2, LogicalRole.MR2):
+            self.assertEqual(parsed.for_role(role).gear_ratio, 21.5)
+
+    def test_gear_ratio_rejects_invalid_values(self):
+        for bad in (0, -1, 0.0, 1001.0, float("inf"), float("nan"), True, "21.5"):
+            with self.assertRaises(BindingValidationError) as ctx:
+                ActuatorBinding(kind="x42s", driver_id=2, gear_ratio=bad)
+            self.assertEqual(ctx.exception.code, "invalid_gear_ratio")
+        # stepper 绑定不得携带减速比（字段语义按后端严格区分）。
+        with self.assertRaises(BindingValidationError) as ctx:
+            ActuatorBinding(axis=0, gear_ratio=21.5)
+        self.assertEqual(ctx.exception.code, "binding_fields")
 
     def test_driver_id_boundaries(self):
         self.assertEqual(ActuatorBinding(kind="x42s", driver_id=1).driver_id, 1)

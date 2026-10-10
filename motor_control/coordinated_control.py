@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+import math
 import time
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -26,6 +27,13 @@ BACKEND_STEPDIR = "stepdir"
 BACKEND_X42S_UART = "x42s_uart"
 X42S_DRIVER_ID_MIN = 1
 X42S_DRIVER_ID_MAX = 255
+# X42S 减速比（2026-10-10 用户实机确认 1:21.5 减速电机）：驱动器 X 固件
+# 遥测/命令均为电机轴角度（0.1°），输出轴 = 电机轴 ÷ gear_ratio（PPR
+# 3200 电机轴细分不变）。绑定字段级可选，缺省 DEFAULT；快照层统一换算
+# 到输出轴，显示/孪生拿到的是机械输出角度。
+DEFAULT_X42S_GEAR_RATIO = 21.5
+X42S_GEAR_RATIO_MIN = 0.1
+X42S_GEAR_RATIO_MAX = 1000.0
 POSITION_SOURCE = "host_pulse_accounting"
 
 
@@ -126,18 +134,24 @@ class ActuatorBinding:
 
     kind="stepper"：v1 STEP/DIR 物理步进轴（axis 必填，不得携带 driver_id）。
     kind="x42s"：ZDT X42S 闭环驱动器挂 UART 总线（driver_id 1..255 必填，
-    不得携带 axis；0 仅作广播地址，禁止绑定）。
+    不得携带 axis；0 仅作广播地址，禁止绑定）。gear_ratio 为减速电机
+    电机轴→输出轴减速比（缺省 21.5，2026-10-10 实机确认），仅 x42s 有效。
     """
 
     axis: int | None = None
     kind: str = "stepper"
     driver_id: int | None = None
+    gear_ratio: float | None = None
 
     def __post_init__(self) -> None:
         if self.kind == "stepper":
             if self.driver_id is not None:
                 raise BindingValidationError(
                     "binding_fields", "stepper 绑定不得携带 driver_id"
+                )
+            if self.gear_ratio is not None:
+                raise BindingValidationError(
+                    "binding_fields", "stepper 绑定不得携带 gear_ratio"
                 )
             if isinstance(self.axis, bool) or not isinstance(self.axis, int):
                 raise BindingValidationError("invalid_axis", "axis 必须是整数")
@@ -162,6 +176,21 @@ class ActuatorBinding:
                     "driver_id 必须在 1..255；0 为广播地址，禁止绑定",
                 )
             object.__setattr__(self, "driver_id", driver_id)
+            gear = self.gear_ratio
+            if gear is None:
+                gear = DEFAULT_X42S_GEAR_RATIO
+            if (
+                isinstance(gear, bool)
+                or not isinstance(gear, (int, float))
+                or not math.isfinite(gear)
+                or not X42S_GEAR_RATIO_MIN <= gear <= X42S_GEAR_RATIO_MAX
+            ):
+                raise BindingValidationError(
+                    "invalid_gear_ratio",
+                    f"gear_ratio 必须是 {X42S_GEAR_RATIO_MIN}.."
+                    f"{X42S_GEAR_RATIO_MAX} 的数（减速比，1=直驱）",
+                )
+            object.__setattr__(self, "gear_ratio", float(gear))
         else:
             raise BindingValidationError(
                 "unsupported_kind", "绑定 kind 只支持 stepper 或 x42s"
@@ -169,7 +198,11 @@ class ActuatorBinding:
 
     def as_dict(self) -> dict[str, object]:
         if self.kind == "x42s":
-            return {"kind": "x42s", "driver_id": self.driver_id}
+            return {
+                "kind": "x42s",
+                "driver_id": self.driver_id,
+                "gear_ratio": self.gear_ratio,
+            }
         return {"kind": "stepper", "axis": self.axis}
 
 
@@ -261,15 +294,30 @@ class BindingSet:
         values: Mapping[LogicalRole | str, int | None],
         *,
         revision: int = 0,
+        gear_ratios: Mapping[LogicalRole | str, float] | None = None,
     ) -> "BindingSet":
         normalized = _normalized_role_mapping(values)
+        ratios = (
+            {}
+            if gear_ratios is None
+            else {
+                LogicalRole(role) if isinstance(role, str) else role: ratio
+                for role, ratio in gear_ratios.items()
+            }
+        )
         assignments: list[ActuatorBinding | None] = []
         for role in LOGICAL_ROLE_ORDER:
             driver_id = normalized[role.value]
+            if driver_id is None:
+                assignments.append(None)
+                continue
+            ratio = ratios.get(role)
             assignments.append(
-                None
-                if driver_id is None
-                else ActuatorBinding(kind="x42s", driver_id=driver_id)
+                ActuatorBinding(
+                    kind="x42s",
+                    driver_id=driver_id,
+                    **({"gear_ratio": ratio} if ratio is not None else {}),
+                )
             )
         return cls(tuple(assignments), revision=revision, backend=BACKEND_X42S_UART)
 
@@ -434,6 +482,7 @@ def _parse_stepper_binding_map(raw: Any, revision: int) -> BindingSet:
 def _parse_x42s_binding_map(raw: Any, revision: int) -> BindingSet:
     raw_bindings = _require_role_map(raw)
     parsed: dict[str, int | None] = {}
+    gear_ratios: dict[str, float] = {}
     for role in LOGICAL_ROLE_ORDER:
         item = raw_bindings[role.value]
         if item is None:
@@ -441,15 +490,17 @@ def _parse_x42s_binding_map(raw: Any, revision: int) -> BindingSet:
             continue
         if not isinstance(item, Mapping) or "kind" not in item:
             raise BindingValidationError(
-                "binding_fields", f"{role.value} 绑定必须只包含 kind 和 driver_id"
+                "binding_fields",
+                f"{role.value} 绑定必须只包含 kind、driver_id 和 gear_ratio",
             )
         if item.get("kind") != "x42s":
             raise BindingValidationError(
                 "unsupported_kind", f"{role.value} 在 x42s_uart 后端仅支持 kind=x42s"
             )
-        if set(item) != {"kind", "driver_id"}:
+        if not set(item) <= {"kind", "driver_id", "gear_ratio"}:
             raise BindingValidationError(
-                "binding_fields", f"{role.value} 绑定必须只包含 kind 和 driver_id"
+                "binding_fields",
+                f"{role.value} 绑定必须只包含 kind、driver_id 和 gear_ratio",
             )
         driver_id = item.get("driver_id")
         if isinstance(driver_id, bool) or not isinstance(driver_id, int):
@@ -457,7 +508,13 @@ def _parse_x42s_binding_map(raw: Any, revision: int) -> BindingSet:
                 "invalid_driver_id", f"{role.value} 的 driver_id 必须是整数"
             )
         parsed[role.value] = driver_id
-    return BindingSet.from_driver_id_mapping(parsed, revision=revision)
+        # gear_ratio 可选（2026-10-10 加入）：旧文档缺省 DEFAULT_X42S_GEAR_RATIO。
+        gear = item.get("gear_ratio")
+        if gear is not None:
+            gear_ratios[role.value] = gear
+    return BindingSet.from_driver_id_mapping(
+        parsed, revision=revision, gear_ratios=gear_ratios
+    )
 
 
 def parse_binding_document(value: Mapping[str, Any]) -> BindingSet:
@@ -657,6 +714,12 @@ def projected_step_position(
     return float(committed_steps) + float(pending_signed_steps) * fraction
 
 
+def _to_output_shaft(value: float | None, gear_ratio: float) -> float | None:
+    """电机轴角度 → 输出轴角度；未知（None）原样透传，绝不回退 0。"""
+
+    return None if value is None else value / gear_ratio
+
+
 def build_coordinated_snapshot(
     *,
     bindings: BindingSet,
@@ -735,6 +798,7 @@ def build_coordinated_snapshot(
                 state, "driver_id", None
             ) != binding.driver_id:
                 state = None  # 角色换绑后旧驱动器状态不得投到新角色上
+            gear = binding.gear_ratio
             if state is None:
                 # 尚无 X42S 后端运行时（未连接/未轮询）：如实投影
                 # "已绑定、后端待接入"，不借用步进轴 profile，也不伪造位置。
@@ -755,6 +819,7 @@ def build_coordinated_snapshot(
                         "position_trusted": False,
                         # 手册 V1.0.5：X 固件遥测/命令均为角度制（0.1°）。
                         "unit": "deg",
+                        "gear_ratio": gear,
                         "progress_percent": None,
                         "executed_steps": None,
                         "requested_steps": None,
@@ -787,15 +852,22 @@ def build_coordinated_snapshot(
                     "physical_label": live["label"],
                     "position_source": "x42s_driver",
                     # §12：位置必须是驱动器实测；指令位置单独放
-                    # committed/target，绝不互相冒充。
+                    # committed/target，绝不互相冒充。角度族统一 ÷gear_ratio
+                    # 换算到输出轴（驱动器遥测是电机轴 0.1°，2026-10-10
+                    # 实机 1:21.5 确认）；电流/温度无量纲不换算。
                     "measured": live["measured_position"] is not None,
                     "state": card_state,
-                    "position": live["measured_position"],
-                    "committed_position": live["command_position"],
+                    "position": _to_output_shaft(live["measured_position"], gear),
+                    "committed_position": _to_output_shaft(
+                        live["command_position"], gear
+                    ),
                     "projected_position": None,
-                    "target_position": live["command_position"],
+                    "target_position": _to_output_shaft(
+                        live["command_position"], gear
+                    ),
                     "position_trusted": bool(live["telemetry_trusted"]),
                     "unit": "deg",
+                    "gear_ratio": gear,
                     "progress_percent": None,
                     "executed_steps": None,
                     "requested_steps": None,

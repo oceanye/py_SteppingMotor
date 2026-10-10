@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 
 from motor_control import AxisMotionTelemetry
+from motor_control.gait_twin import ROLES, build_twin_snapshot
 import test_gait_linkage as linkage
 
 
@@ -12,6 +13,51 @@ def linked_app():
     app = linkage.mechanism()
     app._hardware_estop_active = app._estop_in_progress = app._estop_unconfirmed = False
     return app
+
+
+def x42s_axis(role, **overrides):
+    """build_coordinated_snapshot 的 X42S 卡片形状（位置已换算输出轴）。"""
+    card = {
+        "role": role,
+        "binding_valid": True,
+        "state": "X42S_ONLINE",
+        "position_source": "x42s_driver",
+        "position_trusted": True,
+        "position": 90.0,
+        "target_position": 90.0,
+        "stale": False,
+        "continuous": False,
+        "executed_steps": None,
+    }
+    card.update(overrides)
+    return card
+
+
+class X42sTwinSourceTests(unittest.TestCase):
+    """2026-10-10 X42S 实测接入：来源标注为实测，在线态不判 untrusted。"""
+
+    def test_online_x42s_axes_report_measured_source(self):
+        params = linked_app().gait_params
+        axes = [x42s_axis(role) for role in ROLES]
+        snapshot = build_twin_snapshot(
+            params, axes, context=None, calibration_valid=True
+        )
+        self.assertEqual(snapshot["source"], "x42s_measured")
+        self.assertTrue(snapshot["measured"])
+        # X42S_ONLINE 在白名单内：正常显示轴坐标，而不是 untrusted。
+        self.assertEqual(snapshot["state"], "axis_only")
+        self.assertIn("输出轴", snapshot["message"])
+
+    def test_offline_x42s_axis_is_untrusted(self):
+        params = linked_app().gait_params
+        axes = [x42s_axis(role) for role in ROLES]
+        axes[1] = x42s_axis(
+            "Mr1", state="X42S_OFFLINE", position_trusted=False, position=None
+        )
+        snapshot = build_twin_snapshot(
+            params, axes, context=None, calibration_valid=True
+        )
+        self.assertEqual(snapshot["state"], "untrusted")
 
 
 class DigitalTwinTests(unittest.TestCase):

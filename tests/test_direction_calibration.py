@@ -200,6 +200,7 @@ class DirectionCalibrationLayoutTests(unittest.TestCase):
             _jump_to_binding_axis=lambda *a: None,
             _fill_suggested_bindings=lambda *a: None,
             _save_binding_editor=lambda *a: None,
+            _verify_x42s_ids=lambda *a: None,
             _clear_binding_editor=lambda *a: None,
             _role_debug_move=lambda role, positive: jogs.append(
                 (role, positive)),

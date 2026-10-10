@@ -9,11 +9,14 @@ from tkinter import ttk
 from motor_control import (
     BACKEND_STEPDIR,
     BACKEND_X42S_UART,
+    DEFAULT_X42S_GEAR_RATIO,
     LOGICAL_ROLE_ORDER,
     LogicalRole,
     MODE_LINEAR,
     ROLE_SPECS,
     SUGGESTED_X42S_ID_BY_ROLE,
+    X42S_GEAR_RATIO_MAX,
+    X42S_GEAR_RATIO_MIN,
     stepper_axis_topology,
 )
 from motor_control.ui.common import PAD
@@ -126,14 +129,20 @@ def sync_binding_editor(app, bindings) -> None:
         if binding is None:
             option = UNBOUND_OPTION
             driver_id = ""
+            gear = str(DEFAULT_X42S_GEAR_RATIO)
         elif binding.kind == "x42s":
             option = UNBOUND_OPTION
             driver_id = str(binding.driver_id)
+            gear = str(binding.gear_ratio)
         else:
             option = app._binding_option_by_axis[binding.axis]
             driver_id = ""
+            gear = str(DEFAULT_X42S_GEAR_RATIO)
         app.control_binding_vars[role.value].set(option)
         app.x42s_binding_vars[role.value].set(driver_id)
+        gear_var = getattr(app, "x42s_gear_vars", {}).get(role.value)
+        if gear_var is not None:
+            gear_var.set(gear)
     apply_backend_editor_visibility(app)
     app._binding_editor_dirty = False
     app._binding_editor_revision = bindings.revision
@@ -209,6 +218,7 @@ def build_coordinated_tab(app, parent) -> None:
 
     app.control_binding_vars = {}
     app.x42s_binding_vars = {}
+    app.x42s_gear_vars = {}
     app.coordinated_widgets["binding_editor"] = {"axis": {}, "driver_id": {}}
     for row, role in enumerate(LOGICAL_ROLE_ORDER, start=2):
         spec = ROLE_SPECS[role]
@@ -249,6 +259,21 @@ def build_coordinated_tab(app, parent) -> None:
         )
         id_spin.pack(side="left", padx=2)
         id_spin.bind("<KeyRelease>", app._on_binding_editor_change)
+        # 减速比（2026-10-10 实机 1:21.5）：遥测显示/孪生角度按此换算到输出轴。
+        ttk.Label(id_frame, text="减速比:").pack(side="left", padx=(8, 0))
+        gear_var = tk.StringVar(value=str(DEFAULT_X42S_GEAR_RATIO))
+        app.x42s_gear_vars[role.value] = gear_var
+        gear_spin = ttk.Spinbox(
+            id_frame,
+            from_=X42S_GEAR_RATIO_MIN,
+            to=X42S_GEAR_RATIO_MAX,
+            increment=0.5,
+            textvariable=gear_var,
+            width=7,
+            command=app._on_binding_editor_change,
+        )
+        gear_spin.pack(side="left", padx=2)
+        gear_spin.bind("<KeyRelease>", app._on_binding_editor_change)
         ttk.Label(id_frame, text="（1..255，0=广播禁绑）", foreground="#555").pack(
             side="left", padx=2
         )
@@ -277,6 +302,11 @@ def build_coordinated_tab(app, parent) -> None:
     ).pack(side="left", padx=3)
     ttk.Button(
         button_row, text="验证并保存绑定", command=app._save_binding_editor
+    ).pack(side="left", padx=3)
+    ttk.Button(
+        button_row,
+        text="校验总线 ID",
+        command=app._verify_x42s_ids,
     ).pack(side="left", padx=3)
     ttk.Button(
         button_row, text="全部解除绑定", command=app._clear_binding_editor

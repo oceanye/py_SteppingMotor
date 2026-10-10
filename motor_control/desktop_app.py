@@ -21,6 +21,7 @@ from motor_control import (
     DEFAULT_GEAR_RATIO,
     DEFAULT_LEAD_MM,
     DEFAULT_PULSE_PER_REV,
+    DEFAULT_X42S_GEAR_RATIO,
     MODE_LINEAR,
     MODE_ROTARY,
     MOTOR_AXIS_LABELS,
@@ -526,8 +527,14 @@ class StepperGUI:
         backend = self.binding_backend_var.get()
         if backend == BACKEND_X42S_UART:
             values = {}
+            gear_vars = getattr(self, "x42s_gear_vars", None) or {}
+            gear_ratios = {}
             for role in LOGICAL_ROLE_ORDER:
                 text = self.x42s_binding_vars[role.value].get().strip()
+                gear_text = (
+                    gear_vars[role.value].get().strip()
+                    if role.value in gear_vars else ""
+                )
                 if text == "":
                     values[role.value] = None
                     continue
@@ -538,7 +545,26 @@ class StepperGUI:
                         "invalid_driver_id",
                         f"{role.value} 的 X42S 驱动器 ID 必须是整数（1..255）",
                     )
-            return BindingSet.from_driver_id_mapping(values)
+                # 减速比：留空=默认 21.5（2026-10-10 实机 1:21.5）；1=直驱。
+                if gear_text == "":
+                    continue
+                try:
+                    gear = float(gear_text)
+                except ValueError:
+                    raise BindingValidationError(
+                        "invalid_gear_ratio",
+                        f"{role.value} 的减速比必须是数字（"
+                        f"{DEFAULT_X42S_GEAR_RATIO} 默认，1=直驱）",
+                    )
+                if not (0.1 <= gear <= 1000.0):
+                    raise BindingValidationError(
+                        "invalid_gear_ratio",
+                        f"{role.value} 的减速比必须在 0.1..1000",
+                    )
+                gear_ratios[role.value] = gear
+            return BindingSet.from_driver_id_mapping(
+                values, gear_ratios=gear_ratios
+            )
         values = {}
         for role in LOGICAL_ROLE_ORDER:
             selected = self.control_binding_vars[role.value].get()
@@ -587,10 +613,13 @@ class StepperGUI:
 
     def _fill_suggested_bindings(self):
         if self.binding_backend_var.get() == BACKEND_X42S_UART:
+            gear_vars = getattr(self, "x42s_gear_vars", None) or {}
             for role in LOGICAL_ROLE_ORDER:
                 self.x42s_binding_vars[role.value].set(
                     str(SUGGESTED_X42S_ID_BY_ROLE[role.value])
                 )
+                if role.value in gear_vars:
+                    gear_vars[role.value].set(str(DEFAULT_X42S_GEAR_RATIO))
         else:
             suggested = BindingSet.suggested()
             for role in LOGICAL_ROLE_ORDER:
@@ -609,9 +638,12 @@ class StepperGUI:
         ):
             return
         self.binding_backend_var.set(BACKEND_STEPDIR)
+        gear_vars = getattr(self, "x42s_gear_vars", None) or {}
         for role in LOGICAL_ROLE_ORDER:
             self.control_binding_vars[role.value].set("未绑定")
             self.x42s_binding_vars[role.value].set("")
+            if role.value in gear_vars:
+                gear_vars[role.value].set(str(DEFAULT_X42S_GEAR_RATIO))
         self._on_binding_editor_change()
         self._save_binding_editor()
 
@@ -623,7 +655,7 @@ class StepperGUI:
             if binding is None:
                 text = "未绑定"
             elif binding.kind == "x42s":
-                text = f"X42S ID{binding.driver_id}"
+                text = f"X42S ID{binding.driver_id} ×{binding.gear_ratio:g}"
             else:
                 text = f"步进轴 {binding.axis}"
             parts.append(f"{role.value}→{text}")
@@ -668,6 +700,69 @@ class StepperGUI:
         self.log(f"✓ 逻辑电机绑定已保存（backend={applied.backend}）: "
                  f"{self._binding_summary(applied)}")
         self._refresh_coordinated_ui(reschedule=False)
+
+    # ── 绑定 ↔ 总线 ID 一致性校验（2026-10-10：X42S 台架链路打通后）──
+    # 绑定保存只查静态合法性（范围/重复）；拨码与绑定是否真的对得上，
+    # 要问总线本身：逐台发遥测查询，绑定的每台 ID 都应答在线才算一致。
+
+    def _verify_x42s_ids(self):
+        if self.control_bindings.backend != BACKEND_X42S_UART:
+            messagebox.showinfo(
+                "校验总线 ID", "当前后端是步进轴 stepdir，无 X42S ID 需要校验。"
+            )
+            return
+        if not self._is_serial_connected():
+            messagebox.showwarning(
+                "校验总线 ID", "串口未连接：请先连接 ESP32 再校验。"
+            )
+            return
+        if self._start_control_worker(self._verify_x42s_ids_worker) is None:
+            self.log("⛔ 控制器忙，稍后再校验总线 ID")
+
+    def _verify_x42s_ids_worker(self):
+        """控制工作线程：对每个绑定的 driver_id 发一次遥测查询。"""
+
+        with self.state_lock:
+            targets = [
+                (role.value, binding.driver_id, binding.gear_ratio)
+                for role in LOGICAL_ROLE_ORDER
+                if (binding := self.control_bindings.for_role(role)) is not None
+            ]
+        if not targets:
+            self._post_ui(lambda: self.log("ℹ️ 尚未绑定 X42S 驱动器，无可校验 ID"))
+            return
+        results = []
+        for role_value, driver_id, gear in targets:
+            resp = self._send_and_read(
+                build_x42s_status_command(driver_id), soft_timeout=True
+            )
+            reply = parse_line(resp) if resp else None
+            ok = (
+                isinstance(reply, X42sStatusReply)
+                and reply.driver_id == driver_id
+                and reply.online
+            )
+            results.append((role_value, driver_id, gear, ok, reply is not None))
+        self._post_ui(lambda: self._report_x42s_id_check(results))
+
+    def _report_x42s_id_check(self, results):
+        lines = []
+        for role_value, driver_id, gear, ok, answered in results:
+            if ok:
+                lines.append(f"✓ {role_value} → ID{driver_id} 在线（减速比 ×{gear:g}）")
+            elif answered:
+                lines.append(f"✗ {role_value} → ID{driver_id} 应答但报告离线")
+            else:
+                lines.append(f"✗ {role_value} → ID{driver_id} 无应答（查拨码/接线/电源）")
+        summary = "\n".join(lines)
+        self.log("总线 ID 校验：\n" + summary)
+        if all(ok for _role, _id, _gear, ok, _answered in results):
+            messagebox.showinfo("校验总线 ID", "绑定与总线一致：\n" + summary)
+        else:
+            messagebox.showwarning(
+                "校验总线 ID",
+                "绑定与总线不一致（检查驱动器拨码 ID、接线与供电）：\n" + summary,
+            )
         return True
 
     def _jump_to_binding_axis(self, role=None):
