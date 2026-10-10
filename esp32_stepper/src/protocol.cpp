@@ -10,6 +10,7 @@
 #include "track_motor.h"
 #include "stepper_encoders.h"
 #include "remote_stepper.h"
+#include "x42s_uart.h"
 #endif
 
 static constexpr int MAX_TOKENS = 6;
@@ -181,6 +182,8 @@ void system_estop() {
   for (int axis = 0; axis < NUM_AXES; ++axis) stepper_abort(axis);
   // 急停后不留失能态：全部恢复锁定，机构不会长期处于可被外力扭动状态。
   for (int axis = 0; axis < NUM_AXES; ++axis) stepper_set_ena(axis, true);
+  // X42S：停止 + 失能全部，且不自动恢复（须显式重新使能，§14.1）。
+  x42s_estop();
 #if defined(DRIVE_MODE_GEAR)
   #if REMOTE_STEPPER_ENABLED
   remote_stepper_estop();
@@ -427,6 +430,101 @@ static void handle_node(const String tok[], int n) {
   reply_err("remote steppers disabled");
 #endif
 }
+
+// X42S 查询/诊断/台架最小运动命令（§15）：
+//   X42S,SCAN                      逐台探测 ID1..4
+//   X42S,S,<id>                    遥测行（online/cmd/meas/err/valid 位）
+//   X42S,DIAG,<id>                 ping + 全量读 + 通讯统计
+//   X42S,RAW,<hex>                 台架排障直通（原样发帧+原始回包 hex）
+//   X42S,<id>,EN,<0|1> | STOP | ZERO | SYNC   使能/停/零点/广播触发
+//   X42S,<id>,MOVE,<steps>,<speed> 相对运动（M1 台架用，非步态路径）
+// 业务动作最终走逻辑角色/统一 motion API，不鼓励 GUI 直接拼这些帧。
+static void handle_x42s(const String tok[], int n) {
+#if X42S_UART_ENABLED
+  if (n == 2 && tok[1] == "SCAN") { x42s_print_scan(); return; }
+  if (n == 3 && tok[1] == "S") {
+    int id = 0;
+    if (!protocol_parse_int(tok[2].c_str(), 1, 255, id)) { reply_err("bad driver id"); return; }
+    x42s_print_status_line((uint8_t)id);
+    return;
+  }
+  if (n == 3 && tok[1] == "DIAG") {
+    int id = 0;
+    if (!protocol_parse_int(tok[2].c_str(), 1, 255, id)) { reply_err("bad driver id"); return; }
+    x42s_print_diag((uint8_t)id);
+    return;
+  }
+  if (n == 2 && tok[1] == "SYNC") {
+    if (reject_if_hardware_estop_active()) return;
+    if (x42s_sync_trigger()) serial_tx_line("OK,X42S,SYNC");
+    else reply_err(x42s_last_error());
+    return;
+  }
+  // X42S,RAW,<hex>：偶数位 hex（6..64 字符=3..32 字节，含校验字节），
+  // 原样发送并回 X42S,RAW,RX,<n>,<hex>。诊断命令，不走急停闸/使能闸。
+  if (n == 3 && tok[1] == "RAW") {
+    const String& hex = tok[2];
+    const size_t hex_len = hex.length();
+    if (hex_len < 6 || hex_len > 64 || (hex_len & 1u) != 0) {
+      reply_err("bad hex length"); return;
+    }
+    uint8_t frame[x42s::kMaxFrameBytes];
+    for (size_t i = 0; i < hex_len; i += 2) {
+      auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+      };
+      const int hi = nibble(hex[i]), lo = nibble(hex[i + 1]);
+      if (hi < 0 || lo < 0) { reply_err("bad hex"); return; }
+      frame[i / 2] = (uint8_t)((hi << 4) | lo);
+    }
+    x42s_raw_probe(frame, hex_len / 2);
+    return;
+  }
+  // 以下均为 X42S,<id>,<sub>[,<args>]
+  int id = 0;
+  if (n < 3 || !protocol_parse_int(tok[1].c_str(), 1, 255, id)) { reply_err("bad driver id"); return; }
+  if (tok[2] == "EN" && n == 4) {
+    int value = 0;
+    if (!protocol_parse_int(tok[3].c_str(), 0, 1, value)) { reply_err("bad value"); return; }
+    if (value == 1 && reject_if_hardware_estop_active()) return;
+    if (!x42s_enable((uint8_t)id, value == 1)) { reply_err(x42s_last_error()); return; }
+    serial_tx_printf("OK,X42S,%d,EN,%d", id, value);
+    return;
+  }
+  if (tok[2] == "STOP" && n == 3) {
+    // 停止命令在急停态也放行（急停链本身就要停机）。
+    if (!x42s_stop((uint8_t)id)) { reply_err(x42s_last_error()); return; }
+    serial_tx_printf("OK,X42S,%d,STOP", id);
+    return;
+  }
+  if (tok[2] == "ZERO" && n == 3) {
+    if (reject_if_hardware_estop_active()) return;
+    if (!x42s_zero_position((uint8_t)id)) { reply_err(x42s_last_error()); return; }
+    serial_tx_printf("OK,X42S,%d,ZERO", id);
+    return;
+  }
+  if (tok[2] == "MOVE" && n == 5) {
+    if (reject_if_hardware_estop_active()) return;
+    int steps = 0, speed = 0;
+    if (!protocol_parse_int(tok[3].c_str(), -MAX_MOVE_STEPS, MAX_MOVE_STEPS, steps) ||
+        !protocol_parse_int(tok[4].c_str(), 1, 1000000, speed)) {
+      reply_err("bad value"); return;
+    }
+    if (!x42s_move_relative((uint8_t)id, (int32_t)steps, (uint32_t)speed)) {
+      reply_err(x42s_last_error()); return;
+    }
+    serial_tx_printf("ACK,X42S,%d,MOVE,%d,%d", id, steps, speed);
+    return;
+  }
+  reply_err("bad format");
+#else
+  (void)tok; (void)n;
+  reply_err("x42s uart disabled");
+#endif
+}
 #endif
 
 void protocol_handle_line(const String& command) {
@@ -458,6 +556,7 @@ void protocol_handle_line(const String& command) {
   else if (tok[0] == "TRACK") handle_track(tok, n);
   else if (tok[0] == "ENC") handle_encoder(tok, n);
   else if (tok[0] == "NODE") handle_node(tok, n);
+  else if (tok[0] == "X42S") handle_x42s(tok, n);
 #endif
   else reply_err("unknown command");
 }

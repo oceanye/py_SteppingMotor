@@ -19,7 +19,13 @@ from .axis_model import AxisProfile, AxisRuntime
 from .topology import NUM_STEPPER_AXES, stepper_axis_topology, validate_stepper_axis
 
 
-BINDING_SCHEMA_VERSION = 1
+BINDING_SCHEMA_VERSION = 2
+# v1 文档（无 backend 键、纯 stepper 绑定）仍按原样解析与写出；v2 文档
+# 显式携带 backend。2026-09-28 X42S UART 执行层改造（feature 分支）。
+BACKEND_STEPDIR = "stepdir"
+BACKEND_X42S_UART = "x42s_uart"
+X42S_DRIVER_ID_MIN = 1
+X42S_DRIVER_ID_MAX = 255
 POSITION_SOURCE = "host_pulse_accounting"
 
 
@@ -75,6 +81,18 @@ SUGGESTED_AXIS_BY_ROLE: Mapping[LogicalRole, int] = MappingProxyType(
     }
 )
 
+# X42S 建议 ID（feature/x42s-uart-actuator-binding，需求 §5.2/§5.3）：与建议
+# 轴按角色一一对应（Mup1→ID1、Mr1→ID2、Mup2→ID3、Mr2→ID4）。ID 0 为广播
+# 地址，禁止绑定；迁移只生成"建议"，现场仍须逐台核对驱动器拨码。
+SUGGESTED_X42S_ID_BY_ROLE: Mapping[LogicalRole, int] = MappingProxyType(
+    {
+        LogicalRole.MUP1: 1,
+        LogicalRole.MR1: 2,
+        LogicalRole.MUP2: 3,
+        LogicalRole.MR2: 4,
+    }
+)
+
 AUTOMATION_BLOCKERS: tuple[str, ...] = (
     "direction_and_zero_unverified",
     "contact_feedback_unavailable",
@@ -104,24 +122,55 @@ class BindingIssue:
 
 @dataclass(frozen=True, slots=True)
 class ActuatorBinding:
-    """One logical role's v1 binding to a physical stepper axis."""
+    """One logical role's binding to a physical actuator.
 
-    axis: int
+    kind="stepper"：v1 STEP/DIR 物理步进轴（axis 必填，不得携带 driver_id）。
+    kind="x42s"：ZDT X42S 闭环驱动器挂 UART 总线（driver_id 1..255 必填，
+    不得携带 axis；0 仅作广播地址，禁止绑定）。
+    """
+
+    axis: int | None = None
     kind: str = "stepper"
+    driver_id: int | None = None
 
     def __post_init__(self) -> None:
-        if self.kind != "stepper":
+        if self.kind == "stepper":
+            if self.driver_id is not None:
+                raise BindingValidationError(
+                    "binding_fields", "stepper 绑定不得携带 driver_id"
+                )
+            if isinstance(self.axis, bool) or not isinstance(self.axis, int):
+                raise BindingValidationError("invalid_axis", "axis 必须是整数")
+            try:
+                normalized = validate_stepper_axis(self.axis)
+            except (TypeError, ValueError) as exc:
+                raise BindingValidationError("invalid_axis", str(exc)) from exc
+            object.__setattr__(self, "axis", normalized)
+        elif self.kind == "x42s":
+            if self.axis is not None:
+                raise BindingValidationError(
+                    "binding_fields", "x42s 绑定不得携带 axis"
+                )
+            driver_id = self.driver_id
+            if isinstance(driver_id, bool) or not isinstance(driver_id, int):
+                raise BindingValidationError(
+                    "invalid_driver_id", "x42s 绑定的 driver_id 必须是整数"
+                )
+            if not X42S_DRIVER_ID_MIN <= driver_id <= X42S_DRIVER_ID_MAX:
+                raise BindingValidationError(
+                    "invalid_driver_id",
+                    "driver_id 必须在 1..255；0 为广播地址，禁止绑定",
+                )
+            object.__setattr__(self, "driver_id", driver_id)
+        else:
             raise BindingValidationError(
-                "unsupported_kind", "v1 逻辑电机绑定只支持 kind=stepper"
+                "unsupported_kind", "绑定 kind 只支持 stepper 或 x42s"
             )
-        try:
-            normalized = validate_stepper_axis(self.axis)
-        except (TypeError, ValueError) as exc:
-            raise BindingValidationError("invalid_axis", str(exc)) from exc
-        object.__setattr__(self, "axis", normalized)
 
     def as_dict(self) -> dict[str, object]:
-        return {"kind": self.kind, "axis": self.axis}
+        if self.kind == "x42s":
+            return {"kind": "x42s", "driver_id": self.driver_id}
+        return {"kind": "stepper", "axis": self.axis}
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +179,7 @@ class BindingSet:
 
     assignments: tuple[ActuatorBinding | None, ...] = (None, None, None, None)
     revision: int = 0
+    backend: str = BACKEND_STEPDIR
 
     def __post_init__(self) -> None:
         if len(self.assignments) != len(LOGICAL_ROLE_ORDER):
@@ -149,10 +199,34 @@ class BindingSet:
             or self.revision < 0
         ):
             raise BindingValidationError("invalid_revision", "revision 必须是非负整数")
-        axes = [item.axis for item in self.assignments if item is not None]
-        if len(axes) != len(set(axes)):
+        if self.backend not in (BACKEND_STEPDIR, BACKEND_X42S_UART):
             raise BindingValidationError(
-                "duplicate_axis", "同一物理步进轴不能绑定多个逻辑角色"
+                "unsupported_backend", "backend 只支持 stepdir 或 x42s_uart"
+            )
+        expected_kind = (
+            "stepper" if self.backend == BACKEND_STEPDIR else "x42s"
+        )
+        for binding in self.assignments:
+            if binding is not None and binding.kind != expected_kind:
+                raise BindingValidationError(
+                    "backend_kind_mismatch",
+                    f"{self.backend} 后端只接受 kind={expected_kind} 绑定",
+                )
+        identifiers: list[int] = []
+        for binding in self.assignments:
+            if binding is None:
+                continue
+            if binding.kind == "stepper":
+                identifiers.append(binding.axis)
+            else:
+                identifiers.append(binding.driver_id)
+        if len(identifiers) != len(set(identifiers)):
+            if self.backend == BACKEND_STEPDIR:
+                raise BindingValidationError(
+                    "duplicate_axis", "同一物理步进轴不能绑定多个逻辑角色"
+                )
+            raise BindingValidationError(
+                "duplicate_driver_id", "同一 X42S driver_id 不能绑定多个逻辑角色"
             )
 
     @classmethod
@@ -164,36 +238,40 @@ class BindingSet:
         return cls.from_axis_mapping(SUGGESTED_AXIS_BY_ROLE)
 
     @classmethod
+    def suggested_x42s(cls) -> "BindingSet":
+        return cls.from_driver_id_mapping(SUGGESTED_X42S_ID_BY_ROLE)
+
+    @classmethod
     def from_axis_mapping(
         cls,
         values: Mapping[LogicalRole | str, int | None],
         *,
         revision: int = 0,
     ) -> "BindingSet":
-        normalized: dict[str, int | None] = {}
-        for key, value in values.items():
-            name = key.value if isinstance(key, LogicalRole) else key
-            if not isinstance(name, str):
-                raise BindingValidationError("unknown_role", "逻辑角色名称必须是字符串")
-            normalized[name] = value
-        expected = {role.value for role in LOGICAL_ROLE_ORDER}
-        actual = set(normalized)
-        if actual != expected:
-            missing = sorted(expected - actual)
-            unknown = sorted(actual - expected)
-            detail = []
-            if missing:
-                detail.append("缺少 " + ", ".join(missing))
-            if unknown:
-                detail.append("未知 " + ", ".join(unknown))
-            raise BindingValidationError(
-                "role_set", "绑定角色集合无效：" + "；".join(detail)
-            )
+        normalized = _normalized_role_mapping(values)
         assignments: list[ActuatorBinding | None] = []
         for role in LOGICAL_ROLE_ORDER:
             axis = normalized[role.value]
             assignments.append(None if axis is None else ActuatorBinding(axis=axis))
         return cls(tuple(assignments), revision=revision)
+
+    @classmethod
+    def from_driver_id_mapping(
+        cls,
+        values: Mapping[LogicalRole | str, int | None],
+        *,
+        revision: int = 0,
+    ) -> "BindingSet":
+        normalized = _normalized_role_mapping(values)
+        assignments: list[ActuatorBinding | None] = []
+        for role in LOGICAL_ROLE_ORDER:
+            driver_id = normalized[role.value]
+            assignments.append(
+                None
+                if driver_id is None
+                else ActuatorBinding(kind="x42s", driver_id=driver_id)
+            )
+        return cls(tuple(assignments), revision=revision, backend=BACKEND_X42S_UART)
 
     def for_role(self, role: LogicalRole | str) -> ActuatorBinding | None:
         try:
@@ -209,6 +287,20 @@ class BindingSet:
                 return role
         return None
 
+    def role_for_driver_id(self, driver_id: int) -> LogicalRole | None:
+        if (
+            isinstance(driver_id, bool)
+            or not isinstance(driver_id, int)
+            or not X42S_DRIVER_ID_MIN <= driver_id <= X42S_DRIVER_ID_MAX
+        ):
+            raise BindingValidationError(
+                "invalid_driver_id", "driver_id 必须在 1..255"
+            )
+        for role, binding in zip(LOGICAL_ROLE_ORDER, self.assignments):
+            if binding is not None and binding.driver_id == driver_id:
+                return role
+        return None
+
     @property
     def is_complete(self) -> bool:
         return all(binding is not None for binding in self.assignments)
@@ -216,7 +308,17 @@ class BindingSet:
     @property
     def bound_axes(self) -> tuple[int, ...]:
         return tuple(
-            binding.axis for binding in self.assignments if binding is not None
+            binding.axis
+            for binding in self.assignments
+            if binding is not None and binding.kind == "stepper"
+        )
+
+    @property
+    def bound_driver_ids(self) -> tuple[int, ...]:
+        return tuple(
+            binding.driver_id
+            for binding in self.assignments
+            if binding is not None and binding.kind == "x42s"
         )
 
     def with_revision(self, revision: int) -> "BindingSet":
@@ -228,40 +330,84 @@ class BindingSet:
             for role, binding in zip(LOGICAL_ROLE_ORDER, self.assignments)
         }
 
+    def as_driver_id_mapping(self) -> dict[str, int | None]:
+        return {
+            role.value: None if binding is None else binding.driver_id
+            for role, binding in zip(LOGICAL_ROLE_ORDER, self.assignments)
+        }
+
     def as_document(self) -> dict[str, object]:
+        bindings = {
+            role.value: None if binding is None else binding.as_dict()
+            for role, binding in zip(LOGICAL_ROLE_ORDER, self.assignments)
+        }
+        if self.backend == BACKEND_STEPDIR:
+            # v1 格式原样写出：既有文件与旧版本 GUI 保持完全兼容。
+            return {
+                "schema_version": 1,
+                "revision": self.revision,
+                "bindings": bindings,
+            }
         return {
             "schema_version": BINDING_SCHEMA_VERSION,
             "revision": self.revision,
-            "bindings": {
-                role.value: None if binding is None else binding.as_dict()
-                for role, binding in zip(LOGICAL_ROLE_ORDER, self.assignments)
-            },
+            "backend": self.backend,
+            "bindings": bindings,
         }
 
 
-def parse_binding_document(value: Mapping[str, Any]) -> BindingSet:
-    """Parse persisted JSON without accepting ambiguous or partial schemas."""
+def _normalized_role_mapping(
+    values: Mapping[LogicalRole | str, object]
+) -> dict[str, object]:
+    normalized: dict[str, object] = {}
+    for key, value in values.items():
+        name = key.value if isinstance(key, LogicalRole) else key
+        if not isinstance(name, str):
+            raise BindingValidationError("unknown_role", "逻辑角色名称必须是字符串")
+        normalized[name] = value
+    expected = {role.value for role in LOGICAL_ROLE_ORDER}
+    actual = set(normalized)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        detail = []
+        if missing:
+            detail.append("缺少 " + ", ".join(missing))
+        if unknown:
+            detail.append("未知 " + ", ".join(unknown))
+        raise BindingValidationError(
+            "role_set", "绑定角色集合无效：" + "；".join(detail)
+        )
+    return normalized
 
-    if not isinstance(value, Mapping):
-        raise BindingValidationError("document_type", "绑定配置顶层必须是对象")
-    expected_top = {"schema_version", "revision", "bindings"}
-    actual_top = set(value)
-    if actual_top != expected_top:
+
+def _require_document_fields(
+    value: Mapping[str, Any], expected: set[str]
+) -> None:
+    if set(value) != expected:
         raise BindingValidationError("document_fields", "绑定配置顶层字段不完整或未知")
-    if value.get("schema_version") != BINDING_SCHEMA_VERSION:
-        raise BindingValidationError("schema_version", "不支持的绑定配置版本")
+
+
+def _parse_revision(value: Mapping[str, Any]) -> int:
     revision = value.get("revision")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         raise BindingValidationError("invalid_revision", "revision 必须是非负整数")
-    raw_bindings = value.get("bindings")
-    if not isinstance(raw_bindings, Mapping):
+    return revision
+
+
+def _require_role_map(raw: Any) -> Mapping[str, Any]:
+    if not isinstance(raw, Mapping):
         raise BindingValidationError("bindings_type", "bindings 必须是对象")
     expected_roles = {role.value for role in LOGICAL_ROLE_ORDER}
-    if set(raw_bindings) != expected_roles:
+    if set(raw) != expected_roles:
         raise BindingValidationError(
             "role_set", "绑定必须恰好包含 Mup1、Mr1、Mup2、Mr2"
         )
+    return raw
 
+
+def _parse_stepper_binding_map(raw: Any, revision: int) -> BindingSet:
+    raw_bindings = _require_role_map(raw)
     parsed: dict[str, int | None] = {}
     for role in LOGICAL_ROLE_ORDER:
         item = raw_bindings[role.value]
@@ -285,6 +431,91 @@ def parse_binding_document(value: Mapping[str, Any]) -> BindingSet:
     return BindingSet.from_axis_mapping(parsed, revision=revision)
 
 
+def _parse_x42s_binding_map(raw: Any, revision: int) -> BindingSet:
+    raw_bindings = _require_role_map(raw)
+    parsed: dict[str, int | None] = {}
+    for role in LOGICAL_ROLE_ORDER:
+        item = raw_bindings[role.value]
+        if item is None:
+            parsed[role.value] = None
+            continue
+        if not isinstance(item, Mapping) or "kind" not in item:
+            raise BindingValidationError(
+                "binding_fields", f"{role.value} 绑定必须只包含 kind 和 driver_id"
+            )
+        if item.get("kind") != "x42s":
+            raise BindingValidationError(
+                "unsupported_kind", f"{role.value} 在 x42s_uart 后端仅支持 kind=x42s"
+            )
+        if set(item) != {"kind", "driver_id"}:
+            raise BindingValidationError(
+                "binding_fields", f"{role.value} 绑定必须只包含 kind 和 driver_id"
+            )
+        driver_id = item.get("driver_id")
+        if isinstance(driver_id, bool) or not isinstance(driver_id, int):
+            raise BindingValidationError(
+                "invalid_driver_id", f"{role.value} 的 driver_id 必须是整数"
+            )
+        parsed[role.value] = driver_id
+    return BindingSet.from_driver_id_mapping(parsed, revision=revision)
+
+
+def parse_binding_document(value: Mapping[str, Any]) -> BindingSet:
+    """Parse persisted JSON without accepting ambiguous or partial schemas.
+
+    v1（schema_version=1，无 backend 键）按原样解析为 stepdir 绑定；
+    v2（schema_version=2，backend=stepdir|x42s_uart）按 backend 严格区分
+    绑定 kind，混合或不完整的文档显式拒绝，不静默猜测。
+    """
+
+    if not isinstance(value, Mapping):
+        raise BindingValidationError("document_type", "绑定配置顶层必须是对象")
+    version = value.get("schema_version")
+    if isinstance(version, bool) or version not in (1, BINDING_SCHEMA_VERSION):
+        raise BindingValidationError("schema_version", "不支持的绑定配置版本")
+    if version == 1:
+        _require_document_fields(value, {"schema_version", "revision", "bindings"})
+        return _parse_stepper_binding_map(
+            value.get("bindings"), _parse_revision(value)
+        )
+    _require_document_fields(
+        value, {"schema_version", "revision", "backend", "bindings"}
+    )
+    revision = _parse_revision(value)
+    backend = value.get("backend")
+    if backend == BACKEND_X42S_UART:
+        return _parse_x42s_binding_map(value.get("bindings"), revision)
+    if backend == BACKEND_STEPDIR:
+        return _parse_stepper_binding_map(value.get("bindings"), revision)
+    raise BindingValidationError(
+        "unsupported_backend", "backend 只支持 stepdir 或 x42s_uart"
+    )
+
+
+def propose_x42s_migration(bindings: BindingSet, *, confirmed: bool) -> BindingSet:
+    """按建议映射生成 v2 x42s 绑定提案（需求 §5.3）。
+
+    仅允许在用户显式确认后生成——不能仅凭旧轴号自动假设现场接线符合
+    建议拨码。建议按角色固定（Mup1→1、Mr1→2、Mup2→3、Mr2→4），与需求
+    在建议轴绑定下的 axis→ID 表等价；迁移保留 revision，生成后仍须逐台
+    核对驱动器实际 ID 并重新走步态零位标定。
+    """
+
+    if not confirmed:
+        raise BindingValidationError(
+            "migration_unconfirmed",
+            "v1→x42s 迁移必须经用户显式确认后才生成建议映射",
+        )
+    if bindings.backend != BACKEND_STEPDIR or not bindings.is_complete:
+        raise BindingValidationError(
+            "migration_incomplete",
+            "迁移要求 v1 stepper 绑定完整（四角色均已绑定且全为 stepper）",
+        )
+    return BindingSet.from_driver_id_mapping(
+        SUGGESTED_X42S_ID_BY_ROLE, revision=bindings.revision
+    )
+
+
 def binding_compatibility_issues(
     bindings: BindingSet,
     profiles: Sequence[AxisProfile],
@@ -295,7 +526,9 @@ def binding_compatibility_issues(
     issues: list[BindingIssue] = []
     for role in LOGICAL_ROLE_ORDER:
         binding = bindings.for_role(role)
-        if binding is None:
+        if binding is None or binding.kind != "stepper":
+            # x42s 绑定没有本地步进轴 profile；其可用性由 X42S 后端遥测
+            # （actuator_model，M4 起）提供，这里不做伪校验。
             continue
         axis = binding.axis
         spec = ROLE_SPECS[role]
@@ -440,9 +673,15 @@ def build_coordinated_snapshot(
     connected: bool,
     safety_state: str = "normal",
     pico_node_health: Mapping[int, str] | None = None,
+    x42s_states: Mapping[str, object] | None = None,
     now: float | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
-    """Build one coherent, JSON-compatible snapshot for desktop and web."""
+    """Build one coherent, JSON-compatible snapshot for desktop and web.
+
+    ``x42s_states`` 按角色值映射到 X42sActuatorState（actuator_model）。
+    为避免 coordinated_control ↔ actuator_model 循环导入，这里鸭子类型
+    调用其 as_snapshot_dict()/telemetry_trusted_at()/age_ms()。
+    """
 
     stamp = time.monotonic() if now is None else float(now)
     node_health = pico_node_health or {}
@@ -460,6 +699,7 @@ def build_coordinated_snapshot(
             "action": spec.action,
             "required_mode": spec.required_mode,
             "binding_revision": bindings.revision,
+            "backend": bindings.backend,
             "position_source": POSITION_SOURCE,
             "measured": False,
         }
@@ -469,7 +709,7 @@ def build_coordinated_snapshot(
                     "binding": None,
                     "bound": False,
                     "binding_valid": False,
-                    "binding_error": "未绑定物理步进轴",
+                    "binding_error": "未绑定物理执行器",
                     "state": "UNBOUND",
                     "position": None,
                     "committed_position": None,
@@ -482,6 +722,88 @@ def build_coordinated_snapshot(
                     "requested_steps": None,
                     "last_update_age_ms": None,
                     "stale": True,
+                }
+            )
+            logical_motors.append(base)
+            continue
+
+        if binding.kind == "x42s":
+            state = (
+                None if x42s_states is None else x42s_states.get(role.value)
+            )
+            if state is not None and getattr(
+                state, "driver_id", None
+            ) != binding.driver_id:
+                state = None  # 角色换绑后旧驱动器状态不得投到新角色上
+            if state is None:
+                # 尚无 X42S 后端运行时（未连接/未轮询）：如实投影
+                # "已绑定、后端待接入"，不借用步进轴 profile，也不伪造位置。
+                base.update(
+                    {
+                        "binding": binding.as_dict(),
+                        "bound": True,
+                        "binding_valid": True,
+                        "binding_error": None,
+                        "driver_id": binding.driver_id,
+                        "physical_label": f"X42S ID{binding.driver_id}",
+                        "position_source": "x42s_driver_pending",
+                        "state": "X42S_BACKEND_PENDING",
+                        "position": None,
+                        "committed_position": None,
+                        "projected_position": None,
+                        "target_position": None,
+                        "position_trusted": False,
+                        # 手册 V1.0.5：X 固件遥测/命令均为角度制（0.1°）。
+                        "unit": "deg",
+                        "progress_percent": None,
+                        "executed_steps": None,
+                        "requested_steps": None,
+                        "last_update_age_ms": None,
+                        "stale": True,
+                    }
+                )
+                logical_motors.append(base)
+                continue
+            live = state.as_snapshot_dict(now=stamp)
+            if not connected:
+                card_state = "DISCONNECTED"
+            elif safety_state != "normal":
+                card_state = safety_state.upper()
+            elif not bool(live["online"]):
+                card_state = "X42S_OFFLINE"
+            elif live["fault"] is not None:
+                card_state = "X42S_FAULT"
+            elif bool(live["stale"]):
+                card_state = "X42S_STALE"
+            else:
+                card_state = "X42S_ONLINE"
+            base.update(
+                {
+                    "binding": binding.as_dict(),
+                    "bound": True,
+                    "binding_valid": True,
+                    "binding_error": None,
+                    "driver_id": binding.driver_id,
+                    "physical_label": live["label"],
+                    "position_source": "x42s_driver",
+                    # §12：位置必须是驱动器实测；指令位置单独放
+                    # committed/target，绝不互相冒充。
+                    "measured": live["measured_position"] is not None,
+                    "state": card_state,
+                    "position": live["measured_position"],
+                    "committed_position": live["command_position"],
+                    "projected_position": None,
+                    "target_position": live["command_position"],
+                    "position_trusted": bool(live["telemetry_trusted"]),
+                    "unit": "deg",
+                    "progress_percent": None,
+                    "executed_steps": None,
+                    "requested_steps": None,
+                    "last_update_age_ms": live["last_update_age_ms"],
+                    "stale": bool(live["stale"]),
+                    "in_progress": False,
+                    "continuous": False,
+                    "x42s": live,
                 }
             )
             logical_motors.append(base)
@@ -612,6 +934,7 @@ def build_coordinated_snapshot(
         blockers.insert(0, "logical_motor_bindings_incomplete_or_invalid")
     control = {
         "binding_revision": bindings.revision,
+        "backend": bindings.backend,
         "configuration_valid": configuration_valid,
         "automation_ready": False,
         "edit_scope": "desktop_only",
@@ -626,6 +949,8 @@ __all__ = [
     "AUTOMATION_BLOCKERS",
     "ActuatorBinding",
     "AxisMotionTelemetry",
+    "BACKEND_STEPDIR",
+    "BACKEND_X42S_UART",
     "BINDING_SCHEMA_VERSION",
     "BindingIssue",
     "BindingSet",
@@ -636,8 +961,12 @@ __all__ = [
     "ROLE_SPECS",
     "RoleSpec",
     "SUGGESTED_AXIS_BY_ROLE",
+    "SUGGESTED_X42S_ID_BY_ROLE",
+    "X42S_DRIVER_ID_MAX",
+    "X42S_DRIVER_ID_MIN",
     "binding_compatibility_issues",
     "build_coordinated_snapshot",
     "parse_binding_document",
     "projected_step_position",
+    "propose_x42s_migration",
 ]

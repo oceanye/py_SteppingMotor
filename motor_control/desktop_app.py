@@ -16,6 +16,8 @@ from dataclasses import replace
 
 from motor_control import (
     AXIS_LABEL,
+    BACKEND_STEPDIR,
+    BACKEND_X42S_UART,
     DEFAULT_GEAR_RATIO,
     DEFAULT_LEAD_MM,
     DEFAULT_PULSE_PER_REV,
@@ -28,6 +30,7 @@ from motor_control import (
     PICO_AXES_PER_NODE,
     SPEED_DEFAULT,
     STEPPER_PINS,
+    SUGGESTED_X42S_ID_BY_ROLE,
     AxisProfile,
     AxisRuntime,
     AxisMotionTelemetry,
@@ -42,6 +45,7 @@ from motor_control import (
     convert_axis_value,
     direction_label_parts,
     outward_position_sign,
+    propose_x42s_migration,
     speed_to_delay_ms,
     step_delay_ms_to_pulse_rate,
     step_speed_clamps_delay,
@@ -66,12 +70,17 @@ from motor_control.protocol import (
     TrackTimeout,
     UnknownMessage,
     ProtocolEncodingError,
+    X42sOfflineEvent,
+    X42sStatusReply,
     build_ena_command,
     build_move_command,
     build_sync_command,
     build_stop_command,
     build_track_command,
+    build_x42s_status_command,
+    parse_line,
 )
+from motor_control.actuator_model import X42sActuatorState
 from motor_control.serial_session import (
     RequestCancelled,
     RequestTimeout,
@@ -111,6 +120,7 @@ from motor_control.ui import (
     reset_preview_view,
     stop_preview_animation,
     toggle_preview_animation,
+    apply_backend_editor_visibility,
     refresh_coordinated_tab as refresh_coordinated_tab_view,
     refresh_gait_panel as refresh_gait_panel_view,
     sync_binding_editor as sync_binding_editor_view,
@@ -252,6 +262,10 @@ class StepperGUI:
         self.pico_node_health = {
             node: "unknown" for node in range(1, NUM_PICO_NODES + 1)
         }
+        # X42S UART 后端：按角色值缓存最近一次遥测（None 字段=未知，
+        # 绝不回退 0，§12）；连接且 backend=x42s_uart 时由轮询线程刷新。
+        self._x42s_states: dict[str, X42sActuatorState] = {}
+        self.x42s_poll_running = False
         self._binding_editor_dirty = False
         self._binding_editor_revision = 0
         self._coordinated_refresh_after = None
@@ -459,6 +473,7 @@ class StepperGUI:
             connected=self._is_serial_connected(),
             safety_state=self._safety_state_locked(),
             pico_node_health=self.pico_node_health,
+            x42s_states=getattr(self, "_x42s_states", {}),
             now=now,
         )
 
@@ -468,7 +483,10 @@ class StepperGUI:
         if not isinstance(candidate, BindingSet):
             candidate = BindingSet.from_axis_mapping(candidate)
         with self.state_lock:
-            if candidate.assignments == self.control_bindings.assignments:
+            if getattr(self, "_gait_owned", {}):
+                raise RuntimeError("步态执行中禁止换绑（含后端切换）；请先中止或完成步态")
+            if (candidate.assignments == self.control_bindings.assignments
+                    and candidate.backend == self.control_bindings.backend):
                 return self.control_bindings
             issues = binding_compatibility_issues(
                 candidate, self.axis_profiles, self.axis_param_valid
@@ -507,6 +525,22 @@ class StepperGUI:
         return applied
 
     def _binding_draft(self):
+        backend = self.binding_backend_var.get()
+        if backend == BACKEND_X42S_UART:
+            values = {}
+            for role in LOGICAL_ROLE_ORDER:
+                text = self.x42s_binding_vars[role.value].get().strip()
+                if text == "":
+                    values[role.value] = None
+                    continue
+                try:
+                    values[role.value] = int(text)
+                except ValueError:
+                    raise BindingValidationError(
+                        "invalid_driver_id",
+                        f"{role.value} 的 X42S 驱动器 ID 必须是整数（1..255）",
+                    )
+            return BindingSet.from_driver_id_mapping(values)
         values = {}
         for role in LOGICAL_ROLE_ORDER:
             selected = self.control_binding_vars[role.value].get()
@@ -546,36 +580,83 @@ class StepperGUI:
 
     def _on_binding_editor_change(self, _event=None):
         self._binding_editor_dirty = True
+        # 后端单选切换后，编辑器行内控件可见性随之切换（轴下拉 ↔ ID 输入）。
+        apply_backend_editor_visibility(self)
         dirty = self.coordinated_widgets.get("dirty_label")
         if dirty is not None:
             dirty.configure(text="草稿未应用", foreground="#b26a00")
         self._show_binding_draft_validation()
 
     def _fill_suggested_bindings(self):
-        suggested = BindingSet.suggested()
-        for role in LOGICAL_ROLE_ORDER:
-            binding = suggested.for_role(role)
-            self.control_binding_vars[role.value].set(
-                self._binding_option_by_axis[binding.axis]
-            )
+        if self.binding_backend_var.get() == BACKEND_X42S_UART:
+            for role in LOGICAL_ROLE_ORDER:
+                self.x42s_binding_vars[role.value].set(
+                    str(SUGGESTED_X42S_ID_BY_ROLE[role.value])
+                )
+        else:
+            suggested = BindingSet.suggested()
+            for role in LOGICAL_ROLE_ORDER:
+                binding = suggested.for_role(role)
+                self.control_binding_vars[role.value].set(
+                    self._binding_option_by_axis[binding.axis]
+                )
         self._on_binding_editor_change()
 
     def _clear_binding_editor(self):
         if not messagebox.askyesno(
             "解除逻辑绑定",
-            "将解除 Mup1/Mr1/Mup2/Mr2 的全部物理步进轴绑定。\n"
+            "将解除 Mup1/Mr1/Mup2/Mr2 的全部执行器绑定并回到步进轴后端。\n"
             "此操作不会移动电机，也不会清除轴校准。是否继续？",
             icon="warning",
         ):
             return
+        self.binding_backend_var.set(BACKEND_STEPDIR)
         for role in LOGICAL_ROLE_ORDER:
             self.control_binding_vars[role.value].set("未绑定")
+            self.x42s_binding_vars[role.value].set("")
         self._on_binding_editor_change()
         self._save_binding_editor()
+
+    @staticmethod
+    def _binding_summary(bindings):
+        parts = []
+        for role in LOGICAL_ROLE_ORDER:
+            binding = bindings.for_role(role)
+            if binding is None:
+                text = "未绑定"
+            elif binding.kind == "x42s":
+                text = f"X42S ID{binding.driver_id}"
+            else:
+                text = f"步进轴 {binding.axis}"
+            parts.append(f"{role.value}→{text}")
+        return ", ".join(parts)
 
     def _save_binding_editor(self):
         try:
             candidate = self._binding_draft()
+            if (candidate.backend == BACKEND_X42S_UART
+                    and self.control_bindings.backend == BACKEND_STEPDIR
+                    and self.control_bindings.is_complete):
+                # §5.3：v1→v2 迁移必须显式确认；建议映射文案直接取
+                # propose_x42s_migration 的提案，保证与库行为一字不差。
+                proposal = propose_x42s_migration(
+                    self.control_bindings, confirmed=True)
+                suggested_text = ", ".join(
+                    f"{role}→ID{driver_id}"
+                    for role, driver_id in proposal.as_driver_id_mapping().items()
+                    if driver_id is not None
+                )
+                if not messagebox.askyesno(
+                    "v1→v2 绑定迁移确认",
+                    "当前文件是 v1 步进轴绑定；保存为 X42S UART 后端将生成"
+                    " schema v2 文档并覆盖旧 v1 文件（revision 保留递增）。\n"
+                    f"建议映射：{suggested_text}\n\n"
+                    "X42S 台号必须与驱动器实际拨码一致；迁移后步态被拒"
+                    "（未过 M5 台架验证，§19），且须重新做零位标定。是否继续？",
+                    icon="warning",
+                ):
+                    self.log("ℹ️ 已取消 v1→x42s_uart 迁移，绑定未保存")
+                    return False
             applied = self._apply_control_bindings(candidate)
         except (BindingValidationError, RuntimeError, StateStoreError) as exc:
             self.log(f"⛔ 逻辑电机绑定未保存: {exc}")
@@ -583,18 +664,11 @@ class StepperGUI:
             self._show_binding_draft_validation()
             return False
         sync_binding_editor_view(self, applied)
-        self.log(
-            "✓ 逻辑电机绑定已保存: "
-            + ", ".join(
-                f"{role.value}→"
-                + (
-                    "未绑定"
-                    if applied.for_role(role) is None
-                    else f"步进轴 {applied.for_role(role).axis}"
-                )
-                for role in LOGICAL_ROLE_ORDER
-            )
-        )
+        # 后端切换后旧 X42S 遥测不得残留投到新角色/新后端。
+        with self.state_lock:
+            self._x42s_states.clear()
+        self.log(f"✓ 逻辑电机绑定已保存（backend={applied.backend}）: "
+                 f"{self._binding_summary(applied)}")
         self._refresh_coordinated_ui(reschedule=False)
         return True
 
@@ -834,6 +908,12 @@ class StepperGUI:
         binding = self.control_bindings.for_role(role)
         if binding is None:
             raise GaitExecutorError(f"{role_name} 未绑定物理步进轴")
+        if binding.kind != "stepper":
+            # X42S 后端（§19 未过 M5 台架验证）：干跑/记零/点动全部拒绝，
+            # 不允许在没有步进轴坐标的绑定上做步态几何换算。
+            raise GaitExecutorError(
+                f"{role_name} 绑定的是 X42S 驱动器（ID{binding.driver_id}）；"
+                "步态/零位标定仅支持步进轴后端")
         axis = binding.axis
         spec = ROLE_SPECS[role]
         with self.state_lock:
@@ -981,6 +1061,14 @@ class StepperGUI:
             raise GaitExecutorError("两模态避杆只支持相邻支座 ±60° 换位")
         if not self._is_serial_connected():
             raise GaitExecutorError("串口未连接")
+        # §19：X42S UART 后端未过 M5 台架验证前，步态只允许步进轴后端。
+        with self.state_lock:
+            active_backend = self.control_bindings.backend
+        if active_backend != BACKEND_STEPDIR:
+            raise GaitExecutorError(
+                "当前绑定后端为 X42S UART（未过 M5 台架验证）；"
+                "步态仅支持步进轴后端，请先在逻辑电机页切回 stepdir 并重绑"
+            )
         with self.state_lock:
             if any(getattr(self, key, False) for key in ("_closing", "_disconnecting",
                    "_estop_in_progress", "_hardware_estop_active", "_estop_unconfirmed")):
@@ -2491,6 +2579,14 @@ class StepperGUI:
                 args=(generation, new_session),
                 daemon=True,
             ).start()
+            # X42S 遥测轮询：后台端不是 x42s_uart 时循环内空转（0.5s 一查），
+            # 不发任何总线命令；换绑后无需重连即生效。
+            self.x42s_poll_running = True
+            threading.Thread(
+                target=self._x42s_poll_loop,
+                args=(generation, new_session),
+                daemon=True,
+            ).start()
             # 自动查固件模式，并根据模式灰掉另一组 tab + 下发对应模式的 tune
             self._query_mode_and_apply()
         except Exception as e:
@@ -2525,6 +2621,7 @@ class StepperGUI:
             if is_error:
                 self._serial_failure_handled = True
             self.foc_poll_running = False
+            self.x42s_poll_running = False
             with self.state_lock:
                 self._serial_generation += 1
                 disconnect_generation = self._serial_generation
@@ -2737,6 +2834,24 @@ class StepperGUI:
                     self.pico_node_health[event.node] = "offline"
             post_ui(lambda e=event: self.log(
                 f"⚠️ Pico 节点 {e.node} 离线；对应远端轴暂不可用"))
+            return
+        if isinstance(event, X42sOfflineEvent):
+            role = None
+            with self.state_lock:
+                if not self._serial_source_is_current(generation, session):
+                    return
+                try:
+                    role = self.control_bindings.role_for_driver_id(
+                        event.driver_id)
+                except BindingValidationError:
+                    role = None
+                if role is not None:
+                    self._x42s_states[role.value] = X42sActuatorState.offline(
+                        role, event.driver_id)
+            post_ui(lambda e=event, r=role: self.log(
+                f"⚠️ X42S 驱动器 ID{e.driver_id} 掉线"
+                + (f"（{r.value}）" if r is not None else "")
+                + "；对应执行器暂停使用直到恢复应答"))
             return
         post_ui(lambda e=event: self.log(f"⚠️ 未处理串口事件: {e.raw}"))
 
@@ -3423,8 +3538,10 @@ class StepperGUI:
         axes = []
         for role_name in ("Mr1", "Mr2"):
             binding = self.control_bindings.for_role(LogicalRole(role_name))
-            if binding is None:
-                self.log(f"⚠️ 落地纠偏：{role_name} 未绑定物理轴，本次跳过释放"
+            if binding is None or binding.kind != "stepper":
+                # X42S 后端没有本地步进轴 ENA 可释放；纠偏链只在
+                # stepdir 后端下有意义，与未绑定同样整体跳过。
+                self.log(f"⚠️ 落地纠偏：{role_name} 未绑定物理步进轴，本次跳过释放"
                          "（纠偏需要两侧旋转轴同时释放）")
                 return
             axes.append(binding.axis)
@@ -4216,6 +4333,71 @@ class StepperGUI:
                             else None
                         )
                 time.sleep(FOC_POLL_INTERVAL_S / NUM_MOTOR_AXES)  # 总周期仍 ~100ms
+
+    # ═════════════ X42S UART 遥测轮询（feature/x42s-uart-actuator-binding）═════════════
+    # PC 只通过 ESP32 的 X42S,S,<id> 行读遥测，绝不直接碰 X42S 总线（§15）。
+    # ~2Hz/台：10–20Hz 的高频轮询由 ESP32 固件侧承担，PC 只汇总显示。
+    X42S_POLL_INTERVAL_S = 0.5
+
+    def _x42s_poll_loop(self, generation, session):
+        while (self.x42s_poll_running
+               and self._serial_source_is_current(generation, session)):
+            with self.state_lock:
+                bindings = self.control_bindings
+                polled = [
+                    (role, binding.driver_id)
+                    for role in LOGICAL_ROLE_ORDER
+                    if (binding := bindings.for_role(role)) is not None
+                    and binding.kind == "x42s"
+                ]
+            if not polled:
+                time.sleep(self.X42S_POLL_INTERVAL_S)
+                continue
+            for role, driver_id in polled:
+                if not (self.x42s_poll_running
+                        and self._serial_source_is_current(generation, session)):
+                    break
+                # 只读状态轮询用软超时：总线瞬时无应答只跳过本轮。
+                resp = self._send_and_read(
+                    build_x42s_status_command(driver_id),
+                    guard=lambda: self._serial_source_is_current(
+                        generation, session
+                    ),
+                    soft_timeout=True,
+                )
+                if resp:
+                    message = parse_line(resp)
+                    # 固件可能回 ERR（如 x42s uart disabled）或错配行；
+                    # 只有台号对上的遥测行才计入状态。
+                    if (isinstance(message, X42sStatusReply)
+                            and message.driver_id == driver_id):
+                        self._apply_x42s_reply(role, driver_id, message)
+                time.sleep(self.X42S_POLL_INTERVAL_S / len(polled))
+            time.sleep(0.05)
+
+    def _apply_x42s_reply(self, role, driver_id, reply):
+        """把一次成功遥测并入状态缓存；未知字段保持 None（§12）。"""
+
+        if reply.driver_id != driver_id:
+            return  # 错台号回复不得并入该角色（调用方已查，这里兜底）
+        fields = {
+            "enabled": reply.enabled,
+            "reached": reply.reached,
+            "fault": reply.fault,
+        }
+        for name in ("command_position", "measured_position",
+                     "position_error", "speed", "current_a", "temperature_c"):
+            value = getattr(reply, name)
+            if value is not None:
+                fields[name] = value
+        with self.state_lock:
+            current = self._x42s_states.get(role.value)
+            base = (
+                current
+                if current is not None and current.driver_id == driver_id
+                else X42sActuatorState(role=role, driver_id=driver_id)
+            )
+            self._x42s_states[role.value] = base.with_telemetry(**fields)
 
     def _update_foc_display(self, axis, state, cur, tgt, fault):
         self.v_focstate[axis].set(FOC_STATE_NAMES.get(state, "?"))

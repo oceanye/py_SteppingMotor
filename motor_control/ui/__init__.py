@@ -2,6 +2,7 @@
 
 from .main_window import build_ui
 from .coordinated_tab import (
+    apply_backend_editor_visibility,
     build_coordinated_tab,
     refresh_coordinated_tab,
     sync_binding_editor,
@@ -25,6 +26,7 @@ from .stepper_tab import build_stepper_tab
 from .track_tab import build_track_tab
 
 __all__ = [
+    "apply_backend_editor_visibility",
     "build_ui",
     "build_coordinated_tab",
     "build_stepper_tab",
