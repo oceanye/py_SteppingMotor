@@ -201,6 +201,50 @@ bool fetch_telemetry(uint8_t id) {
   return true;
 }
 
+// 广播读取 ID（手册 5.6.30）：发 00 15 6B，应答 [Addr][15][Addr][6B]——
+// 地址位与数据位各报一遍真实 ID。不依赖任何预置 ID，台架排查零应答时
+// 用它一步定位"驱动器在不在答、答的是几号"。应答地址是电机的真实 ID
+// （非发送的广播 0），与 transact 的严格匹配不符，故独立收帧循环；
+// 多台同时挂网会撞应答，手册本条即按"单独接线该电机"设计。
+int broadcast_read_id() {
+  while (s_x42s.available()) (void)s_x42s.read();  // 清残留
+  uint8_t frame[x42s::kMaxFrameBytes];
+  const size_t len = x42s::encode_command(
+      x42s::kBroadcastId, x42s::kFcReadId, nullptr, 0, frame, sizeof(frame));
+  if (len == 0) {
+    set_error("encode failed");
+    return -1;
+  }
+  write_frame(frame, len);
+  // 应答窗口比单次事务放宽（3×）：SCAN 是一次性阻塞命令，多等换命中。
+  const uint32_t deadline = millis() + 3 * X42S_RESPONSE_TIMEOUT_MS;
+  uint8_t buf[x42s::kMaxFrameBytes];
+  size_t fill = 0;
+  x42s::ReplyFrame reply;
+  while ((int32_t)(millis() - deadline) < 0) {
+    while (s_x42s.available()) {
+      buf[fill++] = (uint8_t)s_x42s.read();
+      if (fill < 4) continue;  // 应答定长 4 字节（见 expected_reply_frame_len）
+      const x42s::DecodeStatus status = x42s::decode_reply(buf, 4, &reply);
+      if (status == x42s::DecodeStatus::kOk &&
+          reply.function == x42s::kFcReadId && reply.payload_len >= 1 &&
+          reply.payload[0] == reply.driver_id) {
+        ++s_stats.replies_matched;
+        return (int)reply.driver_id;
+      }
+      if (status != x42s::DecodeStatus::kOk) {
+        x42s::note_decode_failure(&s_stats, status);
+      } else {
+        ++s_stats.mismatched_replies;
+      }
+      memmove(buf, buf + 1, fill - 1);  // 丢首字节滑窗重同步
+      --fill;
+    }
+    delay(1);
+  }
+  return -1;
+}
+
 }  // namespace
 
 void x42s_uart_init() {
@@ -383,12 +427,16 @@ void x42s_print_status_line(uint8_t id) {
 }
 
 void x42s_print_scan() {
-  // §10：启动扫描 1..4 + 唯一性由"每台单独 ping 应答"天然保证——
-  // 两台误拨同号时，第二次 ping 也会得到该号应答，但总线上只有
-  // 一个号在答：无法从协议层直接区分，必须在 X42S 上机初始化（§7）
-  // 逐台设置唯一 ID 时避免。扫描结果逐台报行。
-  for (uint8_t i = 0; i < X42S_DRIVER_COUNT; ++i) {
-    const uint8_t id = kDriverIds[i];
+  // 2026-10-10 台架排查零应答，扫描改两级（用户要求 0-9）：
+  // ① 广播读 ID（5.6.30）——id 0 是广播地址不可单播 ping，其探测语义
+  //    由这一步覆盖：不问"0 号在不在"，问"你是几号"。
+  // ② 逐个 ping 1..9（读固件版本 1F，应答即在线）。唯一性由"每台单独
+  //    ping 应答"天然保证（§10 原注释）；两台同号须在上机初始化（§7）
+  //    逐台设置时避免。扫描结果逐台报行。
+  const int found = broadcast_read_id();
+  serial_tx_printf("X42S,SCAN,BCAST_ID,%s",
+                   found > 0 ? String(found).c_str() : "NONE");
+  for (uint8_t id = 1; id <= 9; ++id) {
     const bool online = x42s_ping(id);
     serial_tx_printf("X42S,%u,SCAN,%s", (unsigned)id,
                      online ? "ONLINE" : "OFFLINE");

@@ -39,6 +39,7 @@ constexpr size_t kMaxPayloadBytes = kMaxFrameBytes - kFrameOverhead;
 
 // ---- 功能码表（手册第 5 章已核对，X42S= X 固件）----
 enum FunctionCode : uint8_t {
+  kFcReadId = 0x15,        // 5.6.30 广播读取ID地址（发 00 15 6B，应答报真实ID）
   kFcReadVersion = 0x1F,   // 5.5.2 读固件/硬件版本（兼作 ping 在线探测）
   kFcReadCurrent = 0x26,   // 5.5.5 读总线电流 mA（X42S）
   kFcReadSpeed = 0x35,     // 5.5.11 读实时转速 0.1RPM
@@ -71,6 +72,7 @@ constexpr uint8_t kAckUnsolicited = 0x9F; // 动作完成主动上报
 inline size_t expected_reply_frame_len(uint8_t function) {
   switch (function) {
     // 触发类：返回数据只有 1 字节状态码。
+    case kFcReadId:          // 5.6.30 应答 [Addr][15][Addr]（ID 报两遍）
     case kFcEnable:
     case kFcMoveTrap:
     case kFcStop:
