@@ -80,8 +80,8 @@ inline size_t expected_reply_frame_len(uint8_t function) {
     case kFcSetZero:
       return 4;
     // 读取类：返回数据长度按手册字段表。
-    case kFcReadVersion:      // FW_Ver u16 + HW_Series + HW_Type + HW_Ver
-      return 3 + 6;
+    case kFcReadVersion:      // 5.5.2 FW_Ver u16 + HW u16(Series/Type/Ver)
+      return 3 + 4;           // 2026-10-10 实机：原 3+6 数错，应答 7 字节
     case kFcReadCurrent:      // u16 mA
     case kFcReadTemp:         // 温度符号 + u8 ℃
     case kFcReadStatusPair:   // 回零状态 + 电机状态

@@ -105,8 +105,11 @@ void test_expected_reply_lengths_match_manual(void) {
                              x42s::expected_reply_frame_len(x42s::kFcReadTemp));
     TEST_ASSERT_EQUAL_size_t(5,
                              x42s::expected_reply_frame_len(x42s::kFcReadCurrent));
-    TEST_ASSERT_EQUAL_size_t(9,
+    // 01 1F <FW u16><HW u16> 6B → 7 字节（2026-10-10 实机修正：原 9 数错）。
+    TEST_ASSERT_EQUAL_size_t(7,
                              x42s::expected_reply_frame_len(x42s::kFcReadVersion));
+    TEST_ASSERT_EQUAL_size_t(4,
+                             x42s::expected_reply_frame_len(x42s::kFcReadId));
     // 未知功能码：0 —— 无帧尾协议下无法断帧，禁止发起事务。
     TEST_ASSERT_EQUAL_size_t(0, x42s::expected_reply_frame_len(0x42));
 }
