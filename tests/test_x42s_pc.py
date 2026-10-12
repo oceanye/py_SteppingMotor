@@ -29,17 +29,23 @@ from motor_control.coordinated_control import build_coordinated_snapshot
 from motor_control.desktop_app import StepperGUI
 from motor_control.gait_executor import GaitExecutorError
 from motor_control.protocol import (
+    OkReply,
     ProtocolEncodingError,
     UnknownMessage,
     X42S_FAULT_TAGS,
     X42sDiagReply,
+    X42sMoveAck,
     X42sOfflineEvent,
     X42sScanReply,
     X42sStatusReply,
     build_x42s_diag_command,
+    build_x42s_enable_command,
+    build_x42s_move_command,
     build_x42s_scan_command,
     build_x42s_status_command,
+    build_x42s_stop_command,
     build_x42s_sync_command,
+    build_x42s_zero_command,
     parse_line,
     reply_matcher_for,
 )
@@ -187,6 +193,54 @@ class X42sProtocolTests(unittest.TestCase):
         for bad in (0, -1, 256, True):
             with self.assertRaises(ProtocolEncodingError):
                 build_x42s_status_command(bad)
+
+    def test_motion_builders_and_move_ack_round_trip(self):
+        # 2026-10-12 手动调试命令族：EN/MOVE/STOP/ZERO 与固件分发一一对齐。
+        self.assertEqual(build_x42s_enable_command(1, True), "X42S,1,EN,1")
+        self.assertEqual(build_x42s_enable_command(2, False), "X42S,2,EN,0")
+        # 台架基准值：输出轴 90° = 17200 脉冲 @1600pps。
+        self.assertEqual(
+            build_x42s_move_command(1, 17200, 1600), "X42S,1,MOVE,17200,1600")
+        self.assertEqual(
+            build_x42s_move_command(1, -17200, 1600), "X42S,1,MOVE,-17200,1600")
+        self.assertEqual(build_x42s_stop_command(3), "X42S,3,STOP")
+        self.assertEqual(build_x42s_zero_command(4), "X42S,4,ZERO")
+        for bad in (0, -1, 256, True):
+            with self.assertRaises(ProtocolEncodingError):
+                build_x42s_enable_command(bad, True)
+            with self.assertRaises(ProtocolEncodingError):
+                build_x42s_stop_command(bad)
+            with self.assertRaises(ProtocolEncodingError):
+                build_x42s_zero_command(bad)
+        # steps/speed 校验：0、负速、bool、浮点全拒（固件同规则）。
+        for bad_steps in (0, True, 17200.0, "17200"):
+            with self.assertRaises(ProtocolEncodingError):
+                build_x42s_move_command(1, bad_steps, 1600)
+        for bad_speed in (0, -1, True, 1600.5, "1600"):
+            with self.assertRaises(ProtocolEncodingError):
+                build_x42s_move_command(1, 17200, bad_speed)
+
+    def test_move_ack_parses_and_rejects_malformed(self):
+        ack = parse_line("ACK,X42S,1,MOVE,17200,1600")
+        self.assertIsInstance(ack, X42sMoveAck)
+        self.assertEqual((ack.driver_id, ack.steps, ack.speed),
+                         (1, 17200, 1600))
+        reverse = parse_line("ACK,X42S,1,MOVE,-17200,1600")
+        self.assertEqual(reverse.steps, -17200)
+        # 固件不会 ACK 零步/零速：此类行按未知处理，不得冒充成功。
+        for line in (
+            "ACK,X42S,1,MOVE,0,1600",
+            "ACK,X42S,1,MOVE,17200,0",
+            "ACK,X42S,0,MOVE,17200,1600",
+            "ACK,X42S,1,MOVE,abc,1600",
+            "ACK,X42S,1,MOVE,17200",
+            "ACK,X42S,1,HOME,17200,1600",
+        ):
+            self.assertIsInstance(parse_line(line), UnknownMessage, line)
+        # EN/STOP/ZERO 的应答走通用 OK 行（回归：现有解析路径不变）。
+        ok = parse_line("OK,X42S,1,EN,1")
+        self.assertIsInstance(ok, OkReply)
+        self.assertEqual(ok.values, ("X42S", "1", "EN", "1"))
 
 
 class SnapshotMergeTests(unittest.TestCase):

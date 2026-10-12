@@ -187,7 +187,7 @@ class DirectionCalibrationLayoutTests(unittest.TestCase):
         from motor_control import AxisProfile
         from motor_control.gait_planner import GaitParams
         from motor_control.ui.coordinated_tab import build_coordinated_tab
-        jogs, records = [], []
+        jogs, records, manual = [], [], []
         root = tk.Tk()
         root.withdraw()
         self.addCleanup(root.destroy)
@@ -202,6 +202,7 @@ class DirectionCalibrationLayoutTests(unittest.TestCase):
             _save_binding_editor=lambda *a: None,
             _verify_x42s_ids=lambda *a: None,
             _clear_binding_editor=lambda *a: None,
+            _x42s_manual_action=lambda action: manual.append(action),
             _role_debug_move=lambda role, positive: jogs.append(
                 (role, positive)),
             _gait_record_direction_sign=lambda role, positive: records.append(
@@ -221,6 +222,51 @@ class DirectionCalibrationLayoutTests(unittest.TestCase):
         self.assertEqual(records, [(r, p) for r in
                                    ("Mup1", "Mr1", "Mup2", "Mr2")
                                    for p in (True, False)])
+        # X42S 手动调试按钮组：六个 action 各自接线，接错即测出。
+        for action in ("enable", "disable", "plus", "minus", "stop", "zero"):
+            app.coordinated_widgets["x42s_manual_buttons"][action].invoke()
+        self.assertEqual(
+            manual, ["enable", "disable", "plus", "minus", "stop", "zero"])
+
+    def test_x42s_manual_panel_visibility_follows_backend(self):
+        # 手动调试区随后端切换显隐：stepdir 隐藏、x42s_uart 显示。
+        from motor_control import AxisProfile
+        from motor_control.gait_planner import GaitParams
+        from motor_control.ui.coordinated_tab import (
+            BACKEND_STEPDIR,
+            BACKEND_X42S_UART,
+            apply_backend_editor_visibility,
+            build_coordinated_tab,
+        )
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        app = SimpleNamespace(
+            root=root,
+            axis_profiles=[AxisProfile() for _ in range(6)],
+            control_bindings=BindingSet.suggested(),
+            gait_params=GaitParams(),
+            binding_backend_var=tk.StringVar(value=BACKEND_STEPDIR),
+            _on_binding_editor_change=lambda *a: None,
+            _jump_to_binding_axis=lambda *a: None,
+            _fill_suggested_bindings=lambda *a: None,
+            _save_binding_editor=lambda *a: None,
+            _verify_x42s_ids=lambda *a: None,
+            _clear_binding_editor=lambda *a: None,
+            _x42s_manual_action=lambda *a: None,
+            _role_debug_move=lambda *a: None,
+            _gait_record_direction_sign=lambda *a: None,
+        )
+        page = ttk.Frame(root)
+        page.pack(fill="both", expand=True)
+        build_coordinated_tab(app, page)
+        panel = app.coordinated_widgets["x42s_manual"]
+        app.binding_backend_var.set(BACKEND_X42S_UART)
+        apply_backend_editor_visibility(app)
+        self.assertTrue(panel.winfo_manager())      # x42s 后端：显示
+        app.binding_backend_var.set(BACKEND_STEPDIR)
+        apply_backend_editor_visibility(app)
+        self.assertEqual(panel.winfo_manager(), "")  # stepdir：grid_remove
 
 
 if __name__ == "__main__":

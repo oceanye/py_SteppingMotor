@@ -71,6 +71,9 @@ from motor_control.protocol import (
     TrackTimeout,
     UnknownMessage,
     ProtocolEncodingError,
+    ErrorReply,
+    OkReply,
+    X42sMoveAck,
     X42sOfflineEvent,
     X42sStatusReply,
     build_ena_command,
@@ -78,7 +81,11 @@ from motor_control.protocol import (
     build_sync_command,
     build_stop_command,
     build_track_command,
+    build_x42s_enable_command,
+    build_x42s_move_command,
     build_x42s_status_command,
+    build_x42s_stop_command,
+    build_x42s_zero_command,
     parse_line,
 )
 from motor_control.actuator_model import X42sActuatorState
@@ -149,6 +156,11 @@ DELAY_DEFAULT_MS = [
 ]
 DIR_OUTWARD = 1
 DIR_INWARD  = 0
+
+# X42S 驱动器细分（电机轴脉冲/圈）。必须与固件 config.h 的
+# X42S_PULSE_PER_REV 一致，手动调试的角度/速度换算用它：
+# 电机轴脉冲 = 输出轴角度 × 减速比 × X42S_PULSE_PER_REV / 360。
+X42S_PULSE_PER_REV = 3200
 # 每轴方向翻转标志（电机安装方向不同时用）
 # 0 = 不翻转, 1 = 翻转 DIR 信号。两轴原始方向均正确，不翻转。
 DIR_INVERT = [0] * NUM_STEPPER_AXES
@@ -764,6 +776,98 @@ class StepperGUI:
                 "绑定与总线不一致（检查驱动器拨码 ID、接线与供电）：\n" + summary,
             )
         return True
+
+    # ── X42S 手动调试（2026-10-12：单台运动测试入口）──
+    # 角度/速度按输出轴（用户思维：填 90 = 输出轴转 90°），发令前按该
+    # 绑定的减速比换算成电机轴脉冲。手动运动不走步态路径，不适用 §19
+    # 步态闸；硬件急停激活时由固件端拒绝（EN/MOVE 闸，双保险）。
+
+    def _x42s_manual_action(self, action):
+        """UI 线程入口：action ∈ enable/disable/plus/minus/stop/zero。"""
+        title = "X42S 手动调试"
+        if self.control_bindings.backend != BACKEND_X42S_UART:
+            messagebox.showinfo(title, "当前后端不是 x42s_uart：请先在绑定页切换后端。")
+            return
+        if not self._is_serial_connected():
+            messagebox.showwarning(title, "串口未连接：请先连接 ESP32。")
+            return
+        role_value = self.x42s_manual_role_var.get()
+        role = LogicalRole(role_value)
+        binding = self.control_bindings.for_role(role)
+        if binding is None or binding.kind != "x42s":
+            messagebox.showwarning(title, f"{role_value} 未绑定 X42S 驱动器。")
+            return
+
+        angle_deg = speed_deg_s = None
+        if action in ("plus", "minus"):
+            try:
+                angle_deg = float(self.x42s_manual_angle_var.get())
+                speed_deg_s = float(self.x42s_manual_speed_var.get())
+            except ValueError:
+                messagebox.showwarning(title, "角度/速度必须是数字。")
+                return
+            if not (math.isfinite(angle_deg) and math.isfinite(speed_deg_s)):
+                messagebox.showwarning(title, "角度/速度必须是有限数字。")
+                return
+            if abs(angle_deg) > 360.0 or angle_deg == 0.0:
+                messagebox.showwarning(title, "角度需在 ±360° 内且不为 0（输出轴角度）。")
+                return
+            if speed_deg_s <= 0.0:
+                messagebox.showwarning(title, "速度需为正（输出轴 °/s）。")
+                return
+        if self._start_control_worker(
+            self._x42s_manual_worker, action, binding.driver_id,
+            binding.gear_ratio, role_value, angle_deg, speed_deg_s,
+        ) is None:
+            self.log("⛔ 控制器忙，稍后再操作 X42S")
+
+    def _x42s_manual_worker(self, action, driver_id, gear, role_value,
+                            angle_deg, speed_deg_s):
+        """控制工作线程：构造命令发往 ESP32，校验应答类型后报日志。"""
+        steps = speed_pps = None
+        if action in ("plus", "minus"):
+            # 输出轴角度/速度 → 电机轴脉冲/pps（与固件 X42S_PULSE_PER_REV 同源）。
+            steps = round(angle_deg * gear * X42S_PULSE_PER_REV / 360.0)
+            if action == "minus":
+                steps = -steps
+            speed_pps = max(1, round(speed_deg_s * gear * X42S_PULSE_PER_REV / 360.0))
+            if steps == 0:
+                self._post_ui(lambda: self.log(
+                    f"⚠️ {role_value} 角度换算后不足 1 脉冲（减速比 ×{gear:g}），未发令"))
+                return
+            if speed_pps > 100000:
+                self._post_ui(lambda: self.log(
+                    f"⚠️ {role_value} 速度换算后 {speed_pps}pps 超限（>100000），未发令"))
+                return
+            command = build_x42s_move_command(driver_id, steps, speed_pps)
+        elif action == "enable":
+            command = build_x42s_enable_command(driver_id, True)
+        elif action == "disable":
+            command = build_x42s_enable_command(driver_id, False)
+        elif action == "stop":
+            command = build_x42s_stop_command(driver_id)
+        elif action == "zero":
+            command = build_x42s_zero_command(driver_id)
+        else:  # pragma: no cover - 按钮不会产生其他值
+            return
+        resp = self._send_and_read(command, soft_timeout=True)
+        reply = parse_line(resp) if resp else None
+        ok = False
+        if isinstance(reply, X42sMoveAck):
+            ok = (reply.driver_id == driver_id and reply.steps == steps
+                  and reply.speed == speed_pps)
+        elif isinstance(reply, OkReply):
+            ok = (len(reply.values) >= 2
+                  and reply.values[0] == "X42S"
+                  and reply.values[1] == str(driver_id))
+        reason = "" if reply is None else reply.raw
+        self._post_ui(lambda: self.log(
+            ("✅" if ok else "⛔")
+            + f" X42S {role_value}·ID{driver_id} {command}"
+            + ("" if ok else f" → {reason}")))
+        if not ok:
+            self._post_ui(lambda: messagebox.showwarning(
+                "X42S 手动调试", f"命令未被接受：\n{command}\n→ {reason}"))
 
     def _jump_to_binding_axis(self, role=None):
         if role is None:

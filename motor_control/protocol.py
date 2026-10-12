@@ -193,6 +193,42 @@ def build_x42s_sync_command() -> str:
     return command_line("X42S", "SYNC")
 
 
+def build_x42s_enable_command(driver_id: int, enable: bool) -> str:
+    """Build ``X42S,<id>,EN,<0|1>``：使能/失能单台（应答 OK,X42S,<id>,EN,<v>）。"""
+
+    return command_line(
+        "X42S", _x42s_driver_id(driver_id), "EN", 1 if enable else 0
+    )
+
+
+def build_x42s_move_command(driver_id: int, steps: int, speed: int) -> str:
+    """Build ``X42S,<id>,MOVE,<steps>,<speed>``：电机轴相对运动（M 台架调试）。
+
+    steps = 电机轴脉冲（3200/圈，正负=方向），speed = 脉冲/秒。输出轴
+    角度由调用方按绑定 gear_ratio 换算：脉冲 = 角度 × 减速比 × 3200/360。
+    固件侧（01f3128 起）运动期间自动挂起该台全量轮询，仅低频探测。
+    """
+
+    _x42s_driver_id(driver_id)
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps == 0:
+        raise ProtocolEncodingError("steps must be a non-zero integer pulse count")
+    if not isinstance(speed, int) or isinstance(speed, bool) or speed < 1:
+        raise ProtocolEncodingError("speed must be a positive integer (pps)")
+    return command_line("X42S", driver_id, "MOVE", steps, speed)
+
+
+def build_x42s_stop_command(driver_id: int) -> str:
+    """Build ``X42S,<id>,STOP``：立即停止（急停链共用，应答 OK,X42S,<id>,STOP）。"""
+
+    return command_line("X42S", _x42s_driver_id(driver_id), "STOP")
+
+
+def build_x42s_zero_command(driver_id: int) -> str:
+    """Build ``X42S,<id>,ZERO``：把当前位置记为零点（存储式，应答 OK,...,ZERO）。"""
+
+    return command_line("X42S", _x42s_driver_id(driver_id), "ZERO")
+
+
 def build_encoder_status_command(axis: int) -> str:
     return command_line("ENC", _axis_token(axis), "S")
 
@@ -399,6 +435,18 @@ class X42sScanReply(Reply):
 
 
 @dataclass(frozen=True, slots=True)
+class X42sMoveAck(Reply):
+    """``ACK,X42S,<id>,MOVE,<steps>,<speed>``：固件已接受相对运动命令。
+
+    接受 ≠ 到位：到位判定看后续遥测行的 reached 位。
+    """
+
+    driver_id: int
+    steps: int
+    speed: int
+
+
+@dataclass(frozen=True, slots=True)
 class X42sOfflineEvent(AsyncEvent):
     """固件检测到某台驱动器掉线（遥测超 500ms 无应答，§10）。"""
 
@@ -417,6 +465,13 @@ def _parse_bool(text: str) -> Optional[bool]:
     if text == "1":
         return True
     return None
+
+
+def _parse_signed_int(text: str) -> Optional[int]:
+    if text.startswith("-") and len(text) > 1:
+        value = _parse_nonnegative(text[1:])
+        return None if value is None else -value
+    return _parse_nonnegative(text)
 
 
 def _unknown(raw: str, reason: str) -> UnknownMessage:
@@ -562,6 +617,20 @@ def parse_line(data: Union[str, bytes]) -> ProtocolMessage:
         if axis is not None:
             return AckReply(raw, axis)
         return _unknown(raw, "malformed acknowledgement")
+
+    # ACK,X42S,<id>,MOVE,<steps>,<speed>：固件接受 X42S 相对运动。
+    if (
+        len(fields) == 6
+        and fields[0] == "ACK"
+        and fields[1] == "X42S"
+        and fields[3] == "MOVE"
+    ):
+        driver_id = _parse_nonnegative(fields[2])
+        steps = _parse_signed_int(fields[4])
+        speed = _parse_nonnegative(fields[5])
+        if driver_id and steps and speed:
+            return X42sMoveAck(raw, driver_id, steps, speed)
+        return _unknown(raw, "malformed x42s move ack")
 
     if fields[0] == "OK" and len(fields) >= 2:
         return OkReply(raw, tuple(fields[1:]))

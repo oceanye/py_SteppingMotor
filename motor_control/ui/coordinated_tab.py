@@ -115,6 +115,13 @@ def apply_backend_editor_visibility(app) -> None:
         else:
             id_widgets[role.value].grid_remove()
             axis_widgets[role.value].grid()
+    # 手动调试区同样按后端显隐（headless 桩无该控件时不做事）。
+    manual = getattr(app, "coordinated_widgets", {}).get("x42s_manual")
+    if manual is not None:
+        if x42s:
+            manual.grid()
+        else:
+            manual.grid_remove()
 
 
 def sync_binding_editor(app, bindings) -> None:
@@ -314,6 +321,67 @@ def build_coordinated_tab(app, parent) -> None:
     dirty_label = ttk.Label(button_row, text="已应用", foreground="#16803a")
     dirty_label.pack(side="right", padx=6)
     app.coordinated_widgets["dirty_label"] = dirty_label
+
+    # X42S 手动调试区（2026-10-12 单台运动测试）：角度/速度按输出轴
+    # （填 90 = 输出轴转 90°），发令前按绑定减速比换算电机轴脉冲。
+    # 仅 x42s_uart 后端可见（apply_backend_editor_visibility 切换）。
+    manual = ttk.LabelFrame(
+        binding_frame, text="X42S 手动调试（角度=输出轴角度，速度=输出轴 °/s）"
+    )
+    manual.grid(row=7, column=0, columnspan=6, sticky="ew", padx=4, pady=5)
+    app.coordinated_widgets["x42s_manual"] = manual
+
+    app.x42s_manual_role_var = tk.StringVar(value=LogicalRole.MUP1.value)
+    manual_inputs = ttk.Frame(manual)
+    manual_inputs.pack(fill="x", padx=4, pady=3)
+    ttk.Label(manual_inputs, text="角色:").pack(side="left")
+    ttk.Combobox(
+        manual_inputs,
+        textvariable=app.x42s_manual_role_var,
+        state="readonly",
+        width=6,
+        values=[role.value for role in LOGICAL_ROLE_ORDER],
+    ).pack(side="left", padx=2)
+    ttk.Label(manual_inputs, text="角度(°):").pack(side="left", padx=(10, 0))
+    app.x42s_manual_angle_var = tk.StringVar(value="90.0")
+    ttk.Spinbox(
+        manual_inputs,
+        from_=-360,
+        to=360,
+        increment=15,
+        textvariable=app.x42s_manual_angle_var,
+        width=7,
+    ).pack(side="left", padx=2)
+    ttk.Label(manual_inputs, text="速度(°/s):").pack(side="left", padx=(10, 0))
+    app.x42s_manual_speed_var = tk.StringVar(value="8.4")
+    ttk.Spinbox(
+        manual_inputs,
+        from_=0.1,
+        to=60.0,
+        increment=0.1,
+        textvariable=app.x42s_manual_speed_var,
+        width=7,
+    ).pack(side="left", padx=2)
+
+    manual_buttons = ttk.Frame(manual)
+    manual_buttons.pack(fill="x", padx=4, pady=3)
+    manual_button_map = {}
+    for text, action in (
+        ("使能", "enable"),
+        ("失能", "disable"),
+        ("正转 +角度", "plus"),
+        ("反转 −角度", "minus"),
+        ("停止", "stop"),
+        ("设当前为零点", "zero"),
+    ):
+        button = ttk.Button(
+            manual_buttons,
+            text=text,
+            command=lambda a=action: app._x42s_manual_action(a),
+        )
+        button.pack(side="left", padx=3)
+        manual_button_map[action] = button
+    app.coordinated_widgets["x42s_manual_buttons"] = manual_button_map
 
     cards = ttk.LabelFrame(parent, text="四电机状态（软件脉冲估算）")
     cards.grid(row=2, column=0, sticky="nsew", **PAD)
