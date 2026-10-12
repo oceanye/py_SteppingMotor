@@ -30,8 +30,9 @@ void x42s_uart_tick();
 bool x42s_ping(uint8_t id);
 bool x42s_enable(uint8_t id, bool enable);
 bool x42s_stop(uint8_t id);
-void x42s_stop_all();   // 逐台单播停止；广播仅留给 x42s_estop/同步触发
-void x42s_estop();      // 停止 + 失能全部；此后必须显式重新使能（§14.1）
+// 急停：逐台单播停止+失能但只发不等应答（离线台等超时会拖爆 PC 0.8s
+// ESTOP 握手，2026-10-12 台架）；此后必须显式重新使能（§14.1）。
+void x42s_estop();
 bool x42s_zero_position(uint8_t id);
 bool x42s_move_relative(uint8_t id, int32_t steps, uint32_t speed_steps_s);
 bool x42s_sync_trigger();
@@ -55,7 +56,6 @@ const char* x42s_last_error();
 
 inline void x42s_uart_init() {}
 inline void x42s_uart_tick() {}
-inline void x42s_stop_all() {}
 inline void x42s_estop() {}
 
 #endif  // DRIVE_MODE_GEAR && X42S_UART_ENABLED

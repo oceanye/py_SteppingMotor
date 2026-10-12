@@ -127,6 +127,28 @@ bool transact(uint8_t id, uint8_t function, const uint8_t* payload,
   return false;
 }
 
+// 急停链专用（2026-10-12）：只发帧不等应答，但帧后必须留静默间隔。
+// 急停的安全语义是最快把停令砸上总线（在线台收到即执行）；离线台不会
+// 应答，逐台等 2×X42S_RESPONSE_TIMEOUT_MS 超时纯属烧时间——3 台离线时
+// estop 总耗时 ~360ms+，叠上命令排队（tick 正对离线台做 7×60ms 全量
+// 轮询）就把 PC 侧 0.8s 的 ESTOP 握手窗拖爆（台架实测 5 次"串口 I/O
+// 异常"断开）。台架另证（同日）：背靠背连发 8 帧驱动器整批丢帧（运动中
+// ESTOP 未拦停），而确认式单帧 7.8ms 即被接受——驱动器需要帧间总线
+// 静默消化，间隔取 X42S_CMD_GAP_MS。迟到的应答帧由下个事务开头的清
+// 残留丢弃，不会错配消费。
+static void send_frame_no_wait(uint8_t id, uint8_t function,
+                               const uint8_t* payload, size_t payload_len) {
+  uint8_t frame[x42s::kMaxFrameBytes];
+  const size_t len = x42s::encode_unicast_command(
+      id, function, payload, payload_len, frame, sizeof(frame));
+  if (len == 0) {
+    set_error("encode failed");
+    return;
+  }
+  write_frame(frame, len);
+  delay(X42S_CMD_GAP_MS);
+}
+
 // 遥测轮询（手册 5.5.x）：3C 状态对 + 36 实测位置 + 33 目标位置 + 37 跟随
 // 误差 + 35 转速 + 39 温度 + 26 总线电流，共 7 次事务。3C/36 失败即视为
 // 本次轮询失败（在线判定依赖它们）；其余字段失败只降级为无该字段
@@ -356,22 +378,23 @@ bool x42s_stop(uint8_t id) {
   return true;
 }
 
-void x42s_stop_all() {
-  // §10：不得用广播执行普通单轴动作；全局停止也逐台单播，确认每台应答。
-  for (uint8_t i = 0; i < X42S_DRIVER_COUNT; ++i) {
-    (void)x42s_stop(kDriverIds[i]);
-  }
-}
-
 void x42s_estop() {
-  x42s_stop_all();
-  // 失能全部：旧动作的迟到回复不得把状态重新置为运动（§14.1-4），
-  // 这里直接清 reached 并失能；恢复必须显式 x42s_enable。
+  // 逐台单播 FE98 停止 + F3AB 失能，但 best-effort 只发不等（见
+  // send_frame_no_wait 注释：等离线台超时会拖爆 PC 的 0.8s ESTOP 握手）。
+  // §10 仍满足——不用广播，逐台单播。
+  // 5.3.15：FE 98 <同步 00=立即>；5.3.2：F3 AB <失能 00> <00=立即>。
+  const uint8_t stop_payload[2] = {x42s::kAuxStop, 0x00};
+  const uint8_t disable_payload[3] = {x42s::kAuxEnable, 0x00, 0x00};
   for (uint8_t i = 0; i < X42S_DRIVER_COUNT; ++i) {
     const uint8_t id = kDriverIds[i];
-    (void)x42s_enable(id, false);
+    send_frame_no_wait(id, x42s::kFcStop, stop_payload, sizeof(stop_payload));
+    send_frame_no_wait(id, x42s::kFcEnable, disable_payload,
+                       sizeof(disable_payload));
+    // 失能不确认就不谎报 enabled（§12 精神）：真实状态由后续常规轮询的
+    // 3C 刷新。reached 直接清（§14.1-4）：迟到的 9F 上报不会重新点亮
+    // 运动；恢复必须显式 x42s_enable。
     s_telemetry[id].reached = false;
-    s_moving[id] = false;  // 急停即弃挂起：不应答也恢复常规轮询暴露故障
+    s_moving[id] = false;  // 急停即弃挂起：恢复常规轮询暴露真实状态
   }
 }
 

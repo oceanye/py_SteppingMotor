@@ -50,6 +50,27 @@ void test_command_frame_with_payload_manual_example(void) {
     TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, frame, sizeof(expected));
 }
 
+void test_estop_best_effort_frame_bytes(void) {
+    // 急停链 best-effort 帧（2026-10-12 修复配套）：逐台单播 FE98 停止 +
+    // F3AB 失能、只发不等应答。字节按手册 5.3.15 / 5.3.2 锁定，常量漂移
+    // （换固件/改辅助码）在此炸出，而不是到台架上才发现停不下来。
+    const uint8_t stop_payload[] = {x42s::kAuxStop, 0x00};
+    const uint8_t disable_payload[] = {x42s::kAuxEnable, 0x00, 0x00};
+    uint8_t frame[x42s::kMaxFrameBytes] = {0};
+    TEST_ASSERT_EQUAL_size_t(
+        5, x42s::encode_unicast_command(0x01, x42s::kFcStop, stop_payload,
+                                        sizeof(stop_payload), frame,
+                                        sizeof(frame)));
+    const uint8_t stop_frame[] = {0x01, 0xFE, 0x98, 0x00, 0x6B};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(stop_frame, frame, sizeof(stop_frame));
+    TEST_ASSERT_EQUAL_size_t(
+        6, x42s::encode_unicast_command(0x01, x42s::kFcEnable, disable_payload,
+                                        sizeof(disable_payload), frame,
+                                        sizeof(frame)));
+    const uint8_t disable_frame[] = {0x01, 0xF3, 0xAB, 0x00, 0x00, 0x6B};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(disable_frame, frame, sizeof(disable_frame));
+}
+
 void test_broadcast_restricted_to_explicit_encode(void) {
     uint8_t frame[x42s::kMaxFrameBytes] = {0};
     // 广播帧允许显式编码（同步触发），单播入口必须拒绝 ID 0。
@@ -290,6 +311,7 @@ int main(int /*argc*/, char** /*argv*/) {
     UNITY_BEGIN();
     RUN_TEST(test_command_frame_layout_manual_example);
     RUN_TEST(test_command_frame_with_payload_manual_example);
+    RUN_TEST(test_estop_best_effort_frame_bytes);
     RUN_TEST(test_broadcast_restricted_to_explicit_encode);
     RUN_TEST(test_encode_capacity_and_length_guards);
     RUN_TEST(test_expected_reply_lengths_match_manual);
