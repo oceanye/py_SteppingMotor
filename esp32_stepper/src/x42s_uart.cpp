@@ -26,6 +26,15 @@ uint32_t s_last_poll = 0;
 uint8_t s_poll_index = 0;          // 轮询游标：kDriverIds[] 下标
 char s_last_error[48] = "unavailable";
 
+// 运动挂起（2026-10-12 长运动 UART 卡死修复）：MOVE 期间该台驱动器
+// 执行插补，高频查询风暴（全量轮询 ~70 事务/s）可致其 UART 服务卡死
+// （10.8s 运动实测：连广播读 ID 都不应答，断电才恢复；2s 短运动无恙）。
+// 挂起 = 跳过全量轮询，仅按 X42S_MOVE_PROBE_MS 节拍发 3C+36 两帧探测；
+// 见到位（Prf_TF）或保护故障即恢复全量轮询，探测窗超限强制退出防死锁。
+bool s_moving[256] = {};
+uint32_t s_next_probe[256] = {};     // 下次探测时刻（含起步盲区偏移）
+uint32_t s_probe_deadline[256] = {};  // 挂起强制退出时刻（预估时长×2+2s）
+
 // 首装建议台号（需求 §4）；X42S,SCAN / 轮询只覆盖这四台。
 constexpr uint8_t kDriverIds[X42S_DRIVER_COUNT] = {1, 2, 3, 4};
 
@@ -201,7 +210,32 @@ bool fetch_telemetry(uint8_t id) {
   return true;
 }
 
-// 广播读取 ID（手册 5.6.30）：发 00 15 6B，应答 [Addr][15][Addr][6B]——
+// 挂起期轻探测（运动挂起修复）：仅 3C 状态对 + 36 实测位置两帧，刷
+// enabled/reached/fault/在线时刻与 GUI 位置。返回 true = 仍在运动
+// （未到位且无保护故障），false = 可恢复全量轮询。超时/坏帧保守视为
+// 仍在运动——探测窗超限（tick 里判定）兜底退出，不会死锁。
+bool probe_move(uint8_t id) {
+  x42s::Telemetry& t = s_telemetry[id];
+  x42s::ReplyFrame reply;
+  if (!transact(id, x42s::kFcReadStatusPair, nullptr, 0, &reply) ||
+      reply.payload_len < 2) {
+    return true;
+  }
+  x42s::telemetry_mark_seen(t, millis());
+  const uint8_t org_bits = reply.payload[0];
+  const uint8_t status_bits = reply.payload[1];
+  t.enabled = (status_bits & x42s::kStatusEnabled) != 0;
+  t.reached = (status_bits & x42s::kStatusReached) != 0;
+  t.fault = x42s::fault_from_status_words(org_bits, status_bits);
+  const bool done = t.reached || t.fault != x42s::Fault::kNone;
+  int32_t measured = 0;
+  if (!done && transact(id, x42s::kFcReadPosition, nullptr, 0, &reply) &&
+      x42s::parse_signed_u32(reply.payload, reply.payload_len, &measured)) {
+    t.measured_position = (float)measured / 10.0f;  // 0.1° → °
+    t.measured_valid = true;
+  }
+  return !done;
+}
 // 地址位与数据位各报一遍真实 ID。不依赖任何预置 ID，台架排查零应答时
 // 用它一步定位"驱动器在不在答、答的是几号"。应答地址是电机的真实 ID
 // （非发送的广播 0），与 transact 的严格匹配不符，故独立收帧循环；
@@ -256,8 +290,11 @@ void x42s_uart_init() {
 void x42s_uart_tick() {
   const uint32_t now = millis();
   // 掉线降沿：带事件行，PC 可直接定位是哪一台（§10）。
+  // 挂起台跳过：MOVE 刚被接受显然在线，且探测节拍(300ms)本就低于
+  // 掉线窗(500ms)——盲区瞬间超窗属预期，不得误报 OFFLINE。
   for (uint8_t i = 0; i < X42S_DRIVER_COUNT; ++i) {
     const uint8_t id = kDriverIds[i];
+    if (s_moving[id]) continue;
     x42s::Telemetry& t = s_telemetry[id];
     if (x42s::telemetry_should_mark_offline(t, now)) {
       t.online = false;
@@ -268,6 +305,21 @@ void x42s_uart_tick() {
   s_last_poll = now;
   const uint8_t id = kDriverIds[s_poll_index];
   s_poll_index = (s_poll_index + 1) % X42S_DRIVER_COUNT;
+  if (s_moving[id]) {
+    // 运动挂起：不做 7 帧全量轮询。探测窗超限强制退出（预估失准/
+    // 驱动器异常时恢复常规轮询，靠超时计数暴露问题）；否则按节拍
+    // 两帧轻探测，到位/保护故障即恢复。
+    if ((int32_t)(now - s_probe_deadline[id]) >= 0) {
+      s_moving[id] = false;
+      (void)fetch_telemetry(id);
+      return;
+    }
+    if ((int32_t)(now - s_next_probe[id]) >= 0) {
+      s_next_probe[id] = now + X42S_MOVE_PROBE_MS;
+      if (!probe_move(id)) s_moving[id] = false;
+    }
+    return;
+  }
   (void)fetch_telemetry(id);  // 失败只累计超时计数，不打断轮转
 }
 
@@ -287,6 +339,7 @@ bool x42s_enable(uint8_t id, bool enable) {
                               0x00};
   if (!transact(id, x42s::kFcEnable, payload, sizeof(payload), nullptr))
     return false;
+  if (!enable) s_moving[id] = false;  // 失能即停：清挂起态恢复全量轮询
   s_telemetry[id].enabled = enable;
   x42s::telemetry_mark_seen(s_telemetry[id], millis());
   return true;
@@ -298,6 +351,7 @@ bool x42s_stop(uint8_t id) {
   const uint8_t payload[2] = {x42s::kAuxStop, 0x00};
   if (!transact(id, x42s::kFcStop, payload, sizeof(payload), nullptr))
     return false;
+  s_moving[id] = false;  // 立即停止：无运动在途，恢复全量轮询
   x42s::telemetry_mark_seen(s_telemetry[id], millis());
   return true;
 }
@@ -317,6 +371,7 @@ void x42s_estop() {
     const uint8_t id = kDriverIds[i];
     (void)x42s_enable(id, false);
     s_telemetry[id].reached = false;
+    s_moving[id] = false;  // 急停即弃挂起：不应答也恢复常规轮询暴露故障
   }
 }
 
@@ -373,6 +428,16 @@ bool x42s_move_relative(uint8_t id, int32_t steps, uint32_t speed_steps_s) {
       (float)steps * 360.0f / (float)X42S_PULSE_PER_REV;
   t.command_valid = true;
   x42s::telemetry_mark_seen(t, millis());
+  // 运动挂起：起步盲区跨过"旧 reached=1 未清"前沿，之后低频探测；
+  // 探测窗超限（预估×2+2s）兜底退出，见 tick 的挂起分支。
+  const uint32_t now = millis();
+  s_moving[id] = true;
+  s_next_probe[id] = now + X42S_MOVE_START_BLIND_MS;
+  s_probe_deadline[id] =
+      now + 2 * x42s::estimate_move_ms(
+                  (uint32_t)(steps > 0 ? steps : -steps), speed_steps_s,
+                  X42S_PULSE_PER_REV, X42S_TRAP_ACC_RPM_PS) +
+      2000;
   return true;
 }
 

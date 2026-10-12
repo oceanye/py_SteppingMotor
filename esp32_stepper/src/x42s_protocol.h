@@ -264,6 +264,26 @@ inline bool parse_u16(const uint8_t* payload, size_t len, uint16_t* out) {
   return true;
 }
 
+// ---- 运动时长预估（运动挂起探测窗用）----
+// 梯形相对运动预估：匀速段 steps/speed + 加减速段 2×(速度RPM/加速度)。
+// 只用于 x42s_uart 的挂起探测截止时刻（防预估失准死锁），不参与到位
+// 判定——到位的权威来源是 3C 状态字的 Prf_TF 位。上限 1h 防溢出。
+constexpr uint32_t kMaxMoveEstimateMs = 3600000;
+
+inline uint32_t estimate_move_ms(uint32_t abs_steps, uint32_t speed_steps_s,
+                                 uint32_t pulse_per_rev, uint32_t acc_rpm_ps) {
+  if (speed_steps_s == 0 || pulse_per_rev == 0 || acc_rpm_ps == 0) {
+    return kMaxMoveEstimateMs;
+  }
+  const uint64_t cruise =
+      ((uint64_t)abs_steps * 1000 + speed_steps_s - 1) / speed_steps_s;
+  const uint64_t rpm =
+      ((uint64_t)speed_steps_s * 60 + pulse_per_rev - 1) / pulse_per_rev;
+  const uint64_t accel_ms = (rpm * 2000 + acc_rpm_ps - 1) / acc_rpm_ps;
+  const uint64_t total = cruise + accel_ms;
+  return total >= kMaxMoveEstimateMs ? kMaxMoveEstimateMs : (uint32_t)total;
+}
+
 // 通讯统计（§8.3 通讯错误计数）。由总线层在超时/错配/校验失败各事件点
 // 调用对应 note_* 归类累加；M2 扫描用它定位掉线台。
 struct CommStats {

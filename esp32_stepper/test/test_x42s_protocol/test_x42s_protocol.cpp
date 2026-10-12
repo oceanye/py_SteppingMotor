@@ -267,6 +267,25 @@ void test_comm_stats_classify_failures_and_timeouts(void) {
     TEST_ASSERT_EQUAL_UINT32(0, stats.replies_matched);
 }
 
+void test_estimate_move_ms_matches_bench_reality(void) {
+    // 运动挂起探测窗预估（2026-10-12 修复配套）。台架实测：输出轴 90°
+    // = 17200 脉冲 @1600pps 实跑 10.8s；预估 10750 匀速 + 120 加减速。
+    TEST_ASSERT_EQUAL_UINT32(
+        10870, x42s::estimate_move_ms(17200, 1600, 3200, 500));
+    // 首次运动验证：360° 整圈 3200 脉冲 @1600pps ≈ 2s。
+    TEST_ASSERT_EQUAL_UINT32(
+        2120, x42s::estimate_move_ms(3200, 1600, 3200, 500));
+    // M1 验收步距：320 脉冲 @1600pps = 200ms 匀速 + 120 加减速。
+    TEST_ASSERT_EQUAL_UINT32(
+        320, x42s::estimate_move_ms(320, 1600, 3200, 500));
+    // 非法参数与溢出保护 → 1h 上限（防探测窗 uint32 溢出）。
+    TEST_ASSERT_EQUAL_UINT32(
+        x42s::kMaxMoveEstimateMs, x42s::estimate_move_ms(100, 0, 3200, 500));
+    TEST_ASSERT_EQUAL_UINT32(
+        x42s::kMaxMoveEstimateMs,
+        x42s::estimate_move_ms(0xFFFFFFFFu, 1, 3200, 500));
+}
+
 int main(int /*argc*/, char** /*argv*/) {
     UNITY_BEGIN();
     RUN_TEST(test_command_frame_layout_manual_example);
@@ -281,5 +300,6 @@ int main(int /*argc*/, char** /*argv*/) {
     RUN_TEST(test_read_parsers_follow_manual_layout);
     RUN_TEST(test_pack_commands_concatenates_or_fails_whole);
     RUN_TEST(test_comm_stats_classify_failures_and_timeouts);
+    RUN_TEST(test_estimate_move_ms_matches_bench_reality);
     return UNITY_END();
 }
