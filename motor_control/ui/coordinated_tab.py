@@ -688,30 +688,42 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
 
         binding = snapshot.get("binding")
         live = snapshot.get("x42s")
-        if binding and live is not None:
-            detail = f"{snapshot.get('physical_label')} · 驱动器实测 · unit=deg"
-            fault = live.get("fault")
-            if fault:
-                detail += f"\n故障: {fault}"
-            widgets["detail"].configure(text=detail)
-            error = live.get("position_error")
-            speed = live.get("speed")
-            temperature = live.get("temperature_c")
-            progress_parts = []
-            if error is not None:
-                progress_parts.append(f"跟随误差 {float(error):.1f}")
-            if speed is not None:
-                progress_parts.append(f"速度 {float(speed):.1f}")
-            if temperature is not None:
-                progress_parts.append(f"{float(temperature):.0f}°C")
-            age = live.get("last_update_age_ms")
-            if age is not None:
-                progress_parts.append(f"{int(age)}ms 前")
-            progress = " · ".join(progress_parts) if progress_parts else "无遥测"
-            if live.get("stale"):
-                progress += " · 数据陈旧"
-            widgets["progress"].configure(text=progress)
-            _draw_x42s(widgets["canvas"], live)
+        if binding and binding.get("kind") == "x42s":
+            # X42S 后端独占该卡片：binding 无 axis 键，绝不能落进步进轴
+            # 分支（2026-10-12 实机：启动即加载 x42s 绑定、后端待接入时
+            # 在 binding["axis"] 上 KeyError，GUI 启动即崩）。
+            if live is not None:
+                detail = f"{snapshot.get('physical_label')} · 驱动器实测 · unit=deg"
+                fault = live.get("fault")
+                if fault:
+                    detail += f"\n故障: {fault}"
+                widgets["detail"].configure(text=detail)
+                error = live.get("position_error")
+                speed = live.get("speed")
+                temperature = live.get("temperature_c")
+                progress_parts = []
+                if error is not None:
+                    progress_parts.append(f"跟随误差 {float(error):.1f}")
+                if speed is not None:
+                    progress_parts.append(f"速度 {float(speed):.1f}")
+                if temperature is not None:
+                    progress_parts.append(f"{float(temperature):.0f}°C")
+                age = live.get("last_update_age_ms")
+                if age is not None:
+                    progress_parts.append(f"{int(age)}ms 前")
+                progress = " · ".join(progress_parts) if progress_parts else "无遥测"
+                if live.get("stale"):
+                    progress += " · 数据陈旧"
+                widgets["progress"].configure(text=progress)
+                _draw_x42s(widgets["canvas"], live)
+            else:
+                # 后端待接入（启动未轮询/未连接）：如实显示等待态。
+                widgets["detail"].configure(
+                    text=f"{snapshot.get('physical_label')} · 已绑定，后端待接入"
+                )
+                widgets["progress"].configure(
+                    text="连接串口并轮询后显示驱动器实测"
+                )
             continue
         if binding:
             axis = binding["axis"]

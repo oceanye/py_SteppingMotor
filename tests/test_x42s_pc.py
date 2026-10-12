@@ -382,6 +382,44 @@ class SnapshotMergeTests(unittest.TestCase):
         self.assertTrue(any("offline" in text for text in issues))
 
 
+class X42sPendingRefreshTests(unittest.TestCase):
+    """2026-10-12 实机回归：保存 x42s 绑定后重启 GUI，启动期后端待接入
+    （states 为空、快照无 "x42s" 键）时 refresh_coordinated_tab 落进了
+    步进轴分支取 binding["axis"]，KeyError 启动即崩。"""
+
+    class _Widget:
+        def __init__(self):
+            self.configured = {}
+
+        def configure(self, **kwargs):
+            self.configured.update(kwargs)
+
+    def test_pending_x42s_binding_renders_waiting_without_crash(self):
+        from motor_control.ui.coordinated_tab import refresh_coordinated_tab
+
+        fixture = _snapshot_app()
+        control, motors = _x42s_snapshot(
+            fixture, BindingSet.suggested_x42s(), states={})
+        roles, status = {}, {}
+        for role in ("Mup1", "Mr1", "Mup2", "Mr2"):
+            roles[role] = {name: self._Widget() for name in
+                           ("state", "position", "detail", "progress", "canvas")}
+            status[role] = self._Widget()
+        app = SimpleNamespace(
+            coordinated_widgets={
+                "roles": roles,
+                "binding_status": status,
+                "ready_label": self._Widget(),
+                "blocker_label": self._Widget(),
+            },
+            _binding_editor_dirty=False,
+        )
+        refresh_coordinated_tab(app, control, list(motors.values()))
+        for role in ("Mup1", "Mr1", "Mup2", "Mr2"):
+            self.assertIn("后端待接入", roles[role]["detail"].configured["text"])
+            self.assertIn("连接串口", roles[role]["progress"].configured["text"])
+
+
 class _Var:
     def __init__(self, value):
         self._value = value
