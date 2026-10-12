@@ -485,6 +485,12 @@ bool x42s_sync_trigger() {
 
 bool x42s_read_status(uint8_t id) {
   if (!id_valid(id)) return false;
+  // 运动挂起：7 帧全量读会复发轮询风暴（2026-10-10 台架实证），降级为
+  // 两帧轻探测（DIAG 人工命令也不例外）；探测失败退出挂起恢复常规轮询。
+  if (s_moving[id]) {
+    if (!probe_move(id)) s_moving[id] = false;
+    return true;
+  }
   return fetch_telemetry(id);
 }
 

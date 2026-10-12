@@ -9,7 +9,10 @@
 """
 import os
 import sys
+import time
 import unittest
+from dataclasses import replace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 裸名互导
 from types import SimpleNamespace
@@ -19,6 +22,7 @@ from motor_control import (
     BACKEND_X42S_UART,
     LOGICAL_ROLE_ORDER,
     BindingSet,
+    LogicalRole,
 )
 from motor_control.actuator_model import (
     KNOWN_X42S_FAULTS,
@@ -27,7 +31,9 @@ from motor_control.actuator_model import (
 )
 from motor_control.coordinated_control import build_coordinated_snapshot
 from motor_control.desktop_app import StepperGUI
-from motor_control.gait_executor import GaitExecutorError
+import motor_control.desktop_app as desktop_app_module
+from motor_control.gait_executor import GaitExecutor, GaitExecutorError
+from motor_control.gait_planner import GaitParams
 from motor_control.protocol import (
     OkReply,
     ProtocolEncodingError,
@@ -431,6 +437,207 @@ class _Var:
         self._value = value
 
 
+class _SyncThread:
+    """测试替身：把 daemon 线程的发送变成同步执行，断言可即时检查。"""
+
+    def __init__(self, target=None, args=(), daemon=None):
+        self._target, self._args = target, args
+
+    def start(self):
+        self._target(*self._args)
+
+
+def _x42s_gait_app(lead_mms=None, measured=(0.0, 0.0, 0.0, 0.0)):
+    """X42S 步态链联动台架：四台在线使能、实测可控、串口应答可控。
+
+    与 test_gait_linkage.mechanism() 同构（站位 A/B、横梁 180°、零位 0），
+    但绑定/遥测/命令全部走 X42S 路径；measured 是电机轴角度（÷21.5 才是
+    输出轴）。升降默认 lead 8mm（ppu=8600/mm）：lead 1mm 时 2mm/s 的提升
+    段速度即达 137,600pps，会撞 X42S_SPEED_PPS_MAX 硬上限。
+    """
+    app = _headless_app()
+    app._move_reservation = {a: None for a in range(6)}
+    default_leads = {"Mup1": 8.0, "Mup2": 8.0}
+    default_leads.update(lead_mms or {})
+    app.control_bindings = BindingSet.from_driver_id_mapping(
+        {"Mup1": 1, "Mr1": 2, "Mup2": 3, "Mr2": 4}, lead_mms=default_leads)
+    app._x42s_states = {}
+    app._gait_owned = {}
+    app._gait_run = None
+    app._gait_supports, app._gait_beta_deg = ("A", "B"), 180.0
+    app._gait_needs_recovery = False
+    app._closing = False
+    app._is_serial_connected = lambda: True
+    app._control_worker_cancelled = lambda: False
+    app._post_ui = lambda action: action()
+    app._refresh_gait_ui = lambda *args: None
+    app.stopped, app.commands = [], []
+    app.gait_params = GaitParams(
+        lift_mm=35, rotation_limit_deg=720.0, phase_gain=2.0,
+        mr1_zero_deg=0, mr2_zero_deg=0, calibration_confirmed=True,
+        calibration_fingerprint=app._gait_hardware_fingerprint())
+    app.gait_params = replace(
+        app.gait_params,
+        mr1_zero_signature=app._gait_zero_signature("Mr1", app.gait_params),
+        mr2_zero_signature=app._gait_zero_signature("Mr2", app.gait_params))
+    for role, driver_id, meas in zip(
+            ("Mup1", "Mr1", "Mup2", "Mr2"), (1, 2, 3, 4), measured):
+        app._x42s_states[role] = X42sActuatorState(
+            role=LogicalRole(role), driver_id=driver_id).with_telemetry(
+            now=time.monotonic(), enabled=True, reached=True,
+            measured_position=meas, speed=0.0)
+
+    def controller(command, **kwargs):
+        app.commands.append(command)
+        if kwargs.get("guard") is not None and not kwargs["guard"]():
+            return ""
+        t = command.split(",")
+        if t[:2] == ["X42S", "S"]:
+            return (f"X42S,{t[2]},S,1,1,{app._reply_reached},"
+                    f"{app._reply_fault},0.0,0.0,0.0,0.0,0.0,25.0,5,0,7")
+        if t[0] == "X42S" and t[2] == "MOVE":
+            return f"ACK,X42S,{t[1]},MOVE,{t[3]},{t[4]}"
+        if t[0] == "X42S" and t[2] == "STOP":
+            return f"OK,X42S,{t[1]},STOP"
+        if t[0] == "X42S" and t[2] == "ZERO":
+            return f"OK,X42S,{t[1]},ZERO"
+        return "ERR:unexpected " + command
+
+    app._reply_reached, app._reply_fault = "1", "none"
+    app._send_and_read = controller
+    return app
+
+
+class X42sGaitChainTests(unittest.TestCase):
+    """X42S 步态执行链（2026-10-12 §19 条件放行 + 宿主协议分支）。"""
+
+    def test_begin_run_x42s_builds_executor_and_reserves_handles(self):
+        app = _x42s_gait_app()
+        run, report = app._gait_begin_run("left", arc_deg=-60.0)
+        self.assertIsInstance(run, GaitExecutor)
+        self.assertEqual(set(app._gait_owned), {101, 102, 103, 104})
+        self.assertEqual(run.twin_lift_start, {"Mup1": 0.0, "Mup2": 0.0})
+        # X42S 路径不做 SYNC,S/ENA 预检（四台在线由遥测状态保证）。
+        self.assertFalse(any(c.startswith("SYNC,S") for c in app.commands))
+
+    def test_begin_run_x42s_requires_complete_quartet(self):
+        app = _x42s_gait_app()
+        app.control_bindings = BindingSet.from_driver_id_mapping(
+            {"Mup1": 1, "Mr1": 2, "Mup2": None, "Mr2": 4})
+        with self.assertRaises(GaitExecutorError) as ctx:
+            app._gait_begin_run("left", arc_deg=-60.0)
+        self.assertIn("四个角色", str(ctx.exception))
+        self.assertEqual(app._gait_owned, {})
+
+    def test_begin_run_x42s_requires_ready_quartet(self):
+        app = _x42s_gait_app()
+        app._x42s_states["Mr2"] = X42sActuatorState.offline(
+            LogicalRole("Mr2"), 4)
+        with self.assertRaises(GaitExecutorError) as ctx:
+            app._gait_begin_run("left", arc_deg=-60.0)
+        self.assertIn("Mr2", str(ctx.exception))
+        self.assertEqual(app._gait_owned, {})
+
+    def test_send_relative_x42s_conversion(self):
+        app = _x42s_gait_app(lead_mms={"Mup1": 8.0})
+        token = object()
+        app._gait_owned = {101: token}
+        app._move_reservation[101] = token
+        # Mup1：2mm @10mm/s、lead 8 → 输出轴 90°/450°ps → 17200 步/86000pps。
+        self.assertEqual(
+            StepperGUI._gait_send_relative(app, 101, 2.0, 10.0), "sent")
+        self.assertIn("X42S,1,MOVE,17200,86000", app.commands)
+        # Mr1：10° @8°/s → 1911 步/1529pps。
+        app._gait_owned[102] = token
+        app._move_reservation[102] = token
+        self.assertEqual(
+            StepperGUI._gait_send_relative(app, 102, 10.0, 8.0), "sent")
+        self.assertIn("X42S,2,MOVE,1911,1529", app.commands)
+        # 位移不足一脉冲 → noop；未预约句柄 → failed。
+        self.assertEqual(
+            StepperGUI._gait_send_relative(app, 101, 1e-6, 1.0), "noop")
+        app._gait_owned = {}
+        self.assertEqual(
+            StepperGUI._gait_send_relative(app, 101, 2.0, 10.0), "failed")
+
+    def test_send_relative_x42s_rejects_speed_over_cap(self):
+        app = _x42s_gait_app(lead_mms={"Mup1": 1.0})
+        token = object()
+        app._gait_owned = {101: token}
+        app._move_reservation[101] = token
+        # lead 1mm：10mm/s = 3600°/s 输出轴 → 688000pps 超过 100000 上限。
+        self.assertEqual(
+            StepperGUI._gait_send_relative(app, 101, 2.0, 10.0), "failed")
+
+    def test_send_synchronized_x42s_sequential_and_origin(self):
+        app = _x42s_gait_app()
+        token = object()
+        app._gait_owned = {102: token, 104: token}
+        app._move_reservation[102] = token
+        app._move_reservation[104] = token
+        app._gait_run = SimpleNamespace(rotation_start=None)
+        moves = [(102, 30.0, 10.0), (104, -30.0, 10.0)]
+        self.assertEqual(
+            StepperGUI._gait_send_synchronized(app, moves, 3.0), "sent")
+        sent = [c for c in app.commands if ",MOVE," in c]
+        self.assertEqual(len(sent), 2)
+        # 首个同步组把当前实测机构坐标锚定为旋转显示原点（单位=机构坐标）。
+        self.assertEqual(app._gait_run.rotation_start, {102: 0.0, 104: 0.0})
+        # 分段组：累计终点相对当前实测求本段位移（闭环反馈不累计取整误差）。
+        app.commands.clear()
+        self.assertEqual(
+            StepperGUI._gait_send_synchronized(
+                app, moves, 3.0, cumulative_targets=[60.0, -60.0]), "sent")
+        self.assertIn("X42S,2,MOVE,%d,%d" % (
+            round(60 * 21.5 * 3200 / 360), round(10 * 21.5 * 3200 / 360)),
+            app.commands)
+        self.assertIn("X42S,4,MOVE,-%d,%d" % (
+            round(60 * 21.5 * 3200 / 360), round(10 * 21.5 * 3200 / 360)),
+            app.commands)
+
+    def test_wait_terminal_x42s_done_fault_timeout(self):
+        app = _x42s_gait_app()
+        app._gait_run = None
+        with patch.object(desktop_app_module, "X42S_WAIT_BLIND_S", 0.02), \
+             patch.object(desktop_app_module, "X42S_WAIT_POLL_S", 0.02):
+            self.assertEqual(
+                StepperGUI._gait_wait_terminal(app, 102, 1.0), "DONE")
+            app._reply_fault = "stall"
+            self.assertEqual(
+                StepperGUI._gait_wait_terminal(app, 102, 1.0), "ABORTED")
+            app._reply_fault = "none"
+            app._reply_reached = "0"
+            self.assertEqual(
+                StepperGUI._gait_wait_terminal(app, 102, 0.1), "TIMEOUT")
+
+    def test_stop_axes_x42s_sends_confirmed_stops(self):
+        app = _x42s_gait_app()
+        with patch.object(desktop_app_module, "threading",
+                          SimpleNamespace(Thread=_SyncThread)):
+            StepperGUI._gait_stop_axes(app, [101, 104])
+        self.assertIn("X42S,1,STOP", app.commands)
+        self.assertIn("X42S,4,STOP", app.commands)
+
+    def test_record_zero_x42s_writes_driver_zero_and_params(self):
+        app = _x42s_gait_app()
+        app.state_store = SimpleNamespace(save_gait_params=lambda doc: None)
+        position = StepperGUI._gait_record_role_zero(app, "Mr1")
+        self.assertEqual(position, 0.0)
+        self.assertIn("X42S,2,ZERO", app.commands)
+        self.assertEqual(app.gait_params.mr1_zero_deg, 0.0)
+        self.assertEqual(app.gait_params.mr1_zero_signature,
+                         app._gait_zero_signature("Mr1", app.gait_params))
+
+    def test_record_zero_x42s_rejects_untrusted_telemetry(self):
+        app = _x42s_gait_app()
+        app._x42s_states["Mr1"] = X42sActuatorState.offline(
+            LogicalRole("Mr1"), 2)
+        with self.assertRaises(GaitExecutorError) as ctx:
+            StepperGUI._gait_record_role_zero(app, "Mr1")
+        self.assertIn("遥测不可信", str(ctx.exception))
+        self.assertNotIn("X42S,2,ZERO", app.commands)
+
+
 class DesktopIntegrationTests(unittest.TestCase):
     def _app(self):
         app = _headless_app()
@@ -440,12 +647,13 @@ class DesktopIntegrationTests(unittest.TestCase):
         app.coordinated_widgets = {}
         return app
 
-    def test_gait_role_axis_rejects_x42s_binding(self):
+    def test_gait_role_axis_returns_x42s_handle(self):
+        # §19 条件放行（2026-10-12）：x42s 绑定返回不透明句柄 100+driver_id，
+        # 点动/记零/方向标定可用；步态执行的额外门槛在 _gait_begin_run_x42s。
         app = self._app()
         app.control_bindings = BindingSet.suggested_x42s()
-        with self.assertRaises(GaitExecutorError) as ctx:
-            StepperGUI._gait_role_axis(app, "Mr1")
-        self.assertIn("X42S", str(ctx.exception))
+        self.assertEqual(StepperGUI._gait_role_axis(app, "Mr1"), 102)
+        self.assertEqual(StepperGUI._gait_role_axis(app, "Mup2"), 103)
 
     def test_apply_x42s_reply_merges_and_keeps_unknown_none(self):
         app = self._app()
@@ -486,10 +694,18 @@ class DesktopIntegrationTests(unittest.TestCase):
             StepperGUI._binding_draft(app)
         self.assertEqual(ctx.exception.code, "duplicate_driver_id")
 
-    def test_gait_begin_rejects_x42s_backend(self):
+    def test_gait_begin_x42s_requires_ready_quartet(self):
+        # §19 条件放行后步态不再按后端一刀切拒绝：对齐 X42S 指纹/标定后，
+        # 应命中"M5 四台在线+使能+遥测新鲜"门槛（无任何 _x42s_states 时
+        # 第一台即拦），且不留预约。
         from test_gait_linkage import mechanism
         app = mechanism()
         app.control_bindings = BindingSet.suggested_x42s()
+        app._x42s_states = {}
+        app.gait_params = replace(
+            app.gait_params,
+            calibration_fingerprint=app._gait_hardware_fingerprint(),
+            calibration_confirmed=True)
         with self.assertRaises(GaitExecutorError) as ctx:
             app._gait_begin_run("left", arc_deg=-60.0)
         self.assertIn("X42S", str(ctx.exception))

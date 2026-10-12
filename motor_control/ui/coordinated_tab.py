@@ -9,7 +9,10 @@ from tkinter import ttk
 from motor_control import (
     BACKEND_STEPDIR,
     BACKEND_X42S_UART,
+    DEFAULT_LEAD_MM,
     DEFAULT_X42S_GEAR_RATIO,
+    LEAD_MM_MAX,
+    LEAD_MM_MIN,
     LOGICAL_ROLE_ORDER,
     LogicalRole,
     MODE_LINEAR,
@@ -124,6 +127,14 @@ def apply_backend_editor_visibility(app) -> None:
             manual.grid_remove()
 
 
+def _default_lead_text(role, lead_mm=None) -> str:
+    """导程显示文本：直线角色显示数值（缺省 1.0），旋转角色恒 "-"。"""
+
+    if ROLE_SPECS[role].required_mode != MODE_LINEAR:
+        return "-"
+    return str(DEFAULT_LEAD_MM if lead_mm is None else lead_mm)
+
+
 def sync_binding_editor(app, bindings) -> None:
     """Replace the editor with an applied snapshot after an explicit action."""
 
@@ -137,19 +148,25 @@ def sync_binding_editor(app, bindings) -> None:
             option = UNBOUND_OPTION
             driver_id = ""
             gear = str(DEFAULT_X42S_GEAR_RATIO)
+            lead = _default_lead_text(role)
         elif binding.kind == "x42s":
             option = UNBOUND_OPTION
             driver_id = str(binding.driver_id)
             gear = str(binding.gear_ratio)
+            lead = _default_lead_text(role, binding.lead_mm)
         else:
             option = app._binding_option_by_axis[binding.axis]
             driver_id = ""
             gear = str(DEFAULT_X42S_GEAR_RATIO)
+            lead = _default_lead_text(role)
         app.control_binding_vars[role.value].set(option)
         app.x42s_binding_vars[role.value].set(driver_id)
         gear_var = getattr(app, "x42s_gear_vars", {}).get(role.value)
         if gear_var is not None:
             gear_var.set(gear)
+        lead_var = getattr(app, "x42s_lead_vars", {}).get(role.value)
+        if lead_var is not None:
+            lead_var.set(lead)
     apply_backend_editor_visibility(app)
     app._binding_editor_dirty = False
     app._binding_editor_revision = bindings.revision
@@ -226,6 +243,7 @@ def build_coordinated_tab(app, parent) -> None:
     app.control_binding_vars = {}
     app.x42s_binding_vars = {}
     app.x42s_gear_vars = {}
+    app.x42s_lead_vars = {}
     app.coordinated_widgets["binding_editor"] = {"axis": {}, "driver_id": {}}
     for row, role in enumerate(LOGICAL_ROLE_ORDER, start=2):
         spec = ROLE_SPECS[role]
@@ -281,6 +299,23 @@ def build_coordinated_tab(app, parent) -> None:
         )
         gear_spin.pack(side="left", padx=2)
         gear_spin.bind("<KeyRelease>", app._on_binding_editor_change)
+        # 导程（2026-10-12 步态链）：直线角色 Mup 的输出轴 mm/圈——步态的
+        # mm 位移经 360/lead_mm 换算为输出轴角度；旋转角色不参与，恒 "-"。
+        if spec.required_mode == MODE_LINEAR:
+            ttk.Label(id_frame, text="导程(mm):").pack(side="left", padx=(8, 0))
+            lead_var = tk.StringVar(value=str(DEFAULT_LEAD_MM))
+            app.x42s_lead_vars[role.value] = lead_var
+            lead_spin = ttk.Spinbox(
+                id_frame,
+                from_=LEAD_MM_MIN,
+                to=LEAD_MM_MAX,
+                increment=0.5,
+                textvariable=lead_var,
+                width=7,
+                command=app._on_binding_editor_change,
+            )
+            lead_spin.pack(side="left", padx=2)
+            lead_spin.bind("<KeyRelease>", app._on_binding_editor_change)
         ttk.Label(id_frame, text="（1..255，0=广播禁绑）", foreground="#555").pack(
             side="left", padx=2
         )

@@ -43,10 +43,12 @@ class X42sBindingSchemaTests(unittest.TestCase):
         self.assertEqual(document["schema_version"], BINDING_SCHEMA_VERSION)
         self.assertEqual(document["backend"], "x42s_uart")
         # gear_ratio（2026-10-10 实机 1:21.5）随绑定持久化；缺省即默认值。
+        # lead_mm（2026-10-12 步态链）同套持久化：直线角色 Mup 用它把 mm
+        # 位移换算为输出轴角度，旋转角色字段保留但忽略。
         self.assertEqual(bindings.for_role(LogicalRole.MR1).gear_ratio, 21.5)
         self.assertEqual(
             document["bindings"]["Mr1"],
-            {"kind": "x42s", "driver_id": 2, "gear_ratio": 21.5},
+            {"kind": "x42s", "driver_id": 2, "gear_ratio": 21.5, "lead_mm": 1.0},
         )
         self.assertEqual(
             json.loads(json.dumps(document)), document  # JSON 可序列化
@@ -103,6 +105,50 @@ class X42sBindingSchemaTests(unittest.TestCase):
         with self.assertRaises(BindingValidationError) as ctx:
             ActuatorBinding(axis=0, gear_ratio=21.5)
         self.assertEqual(ctx.exception.code, "binding_fields")
+
+    def test_lead_mm_default_round_trip_and_validation(self):
+        # 直线导程（2026-10-12 步态链）：缺省 1.0、显式值往返不丢、
+        # 范围 0.01..100（与 stepdir 直线轴同一套 coerce_lead_mm 校验）。
+        self.assertEqual(
+            ActuatorBinding(kind="x42s", driver_id=1).lead_mm, 1.0
+        )
+        bindings = BindingSet.from_driver_id_mapping(
+            {"Mup1": 1, "Mr1": 2, "Mup2": 3, "Mr2": 4},
+            lead_mms={"Mup1": 8.0, "Mup2": 2.0},
+        )
+        self.assertEqual(bindings.for_role(LogicalRole.MUP1).lead_mm, 8.0)
+        self.assertEqual(bindings.for_role(LogicalRole.MUP2).lead_mm, 2.0)
+        self.assertEqual(bindings.for_role(LogicalRole.MR1).lead_mm, 1.0)
+        self.assertEqual(
+            parse_binding_document(bindings.as_document()), bindings
+        )
+        # 数字字符串与 stepdir 直线轴同样经 float() 归一（不在此拒绝）。
+        for bad in (0.0, -1.0, 0.001, 100.1, float("inf"), float("nan"), "x"):
+            with self.assertRaises(BindingValidationError) as ctx:
+                ActuatorBinding(kind="x42s", driver_id=1, lead_mm=bad)
+            self.assertEqual(ctx.exception.code, "invalid_lead_mm")
+        # stepper 绑定不得携带导程（x42s 专属字段）。
+        with self.assertRaises(BindingValidationError) as ctx:
+            ActuatorBinding(axis=0, lead_mm=8.0)
+        self.assertEqual(ctx.exception.code, "binding_fields")
+
+    def test_lead_mm_legacy_document_defaults(self):
+        # 旧 v2 文档无 lead_mm 字段：解析后取默认 1.0（字段级向后兼容）。
+        document = {
+            "schema_version": 2,
+            "revision": 3,
+            "backend": "x42s_uart",
+            "bindings": {
+                "Mup1": {"kind": "x42s", "driver_id": 1, "gear_ratio": 21.5},
+                "Mr1": {"kind": "x42s", "driver_id": 2},
+                "Mup2": {"kind": "x42s", "driver_id": 3},
+                "Mr2": {"kind": "x42s", "driver_id": 4},
+            },
+        }
+        parsed = parse_binding_document(document)
+        for role in (LogicalRole.MUP1, LogicalRole.MR1,
+                     LogicalRole.MUP2, LogicalRole.MR2):
+            self.assertEqual(parsed.for_role(role).lead_mm, 1.0)
 
     def test_driver_id_boundaries(self):
         self.assertEqual(ActuatorBinding(kind="x42s", driver_id=1).driver_id, 1)

@@ -15,7 +15,7 @@ import time
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from .axis_math import MODE_LINEAR, MODE_ROTARY
+from .axis_math import DEFAULT_LEAD_MM, MODE_LINEAR, MODE_ROTARY, coerce_lead_mm
 from .axis_model import AxisProfile, AxisRuntime
 from .topology import NUM_STEPPER_AXES, stepper_axis_topology, validate_stepper_axis
 
@@ -136,12 +136,15 @@ class ActuatorBinding:
     kind="x42s"：ZDT X42S 闭环驱动器挂 UART 总线（driver_id 1..255 必填，
     不得携带 axis；0 仅作广播地址，禁止绑定）。gear_ratio 为减速电机
     电机轴→输出轴减速比（缺省 21.5，2026-10-10 实机确认），仅 x42s 有效。
+    lead_mm 为直线角色（Mup）的输出轴导程（mm/圈，缺省 1.0）：步态的
+    mm 位移经 360/lead_mm 换算为输出轴角度；旋转角色忽略该字段。
     """
 
     axis: int | None = None
     kind: str = "stepper"
     driver_id: int | None = None
     gear_ratio: float | None = None
+    lead_mm: float | None = None
 
     def __post_init__(self) -> None:
         if self.kind == "stepper":
@@ -152,6 +155,10 @@ class ActuatorBinding:
             if self.gear_ratio is not None:
                 raise BindingValidationError(
                     "binding_fields", "stepper 绑定不得携带 gear_ratio"
+                )
+            if self.lead_mm is not None:
+                raise BindingValidationError(
+                    "binding_fields", "stepper 绑定不得携带 lead_mm"
                 )
             if isinstance(self.axis, bool) or not isinstance(self.axis, int):
                 raise BindingValidationError("invalid_axis", "axis 必须是整数")
@@ -191,6 +198,15 @@ class ActuatorBinding:
                     f"{X42S_GEAR_RATIO_MAX} 的数（减速比，1=直驱）",
                 )
             object.__setattr__(self, "gear_ratio", float(gear))
+            # lead_mm 缺省 DEFAULT_LEAD_MM（与 stepdir 直线轴同一套校验/
+            # 默认值）；旋转角色不参与换算，字段保留原值即可。
+            try:
+                normalized_lead = coerce_lead_mm(
+                    DEFAULT_LEAD_MM if self.lead_mm is None else self.lead_mm
+                )
+            except ValueError as exc:
+                raise BindingValidationError("invalid_lead_mm", str(exc)) from exc
+            object.__setattr__(self, "lead_mm", normalized_lead)
         else:
             raise BindingValidationError(
                 "unsupported_kind", "绑定 kind 只支持 stepper 或 x42s"
@@ -202,6 +218,7 @@ class ActuatorBinding:
                 "kind": "x42s",
                 "driver_id": self.driver_id,
                 "gear_ratio": self.gear_ratio,
+                "lead_mm": self.lead_mm,
             }
         return {"kind": "stepper", "axis": self.axis}
 
@@ -295,6 +312,7 @@ class BindingSet:
         *,
         revision: int = 0,
         gear_ratios: Mapping[LogicalRole | str, float] | None = None,
+        lead_mms: Mapping[LogicalRole | str, float] | None = None,
     ) -> "BindingSet":
         normalized = _normalized_role_mapping(values)
         ratios = (
@@ -305,6 +323,14 @@ class BindingSet:
                 for role, ratio in gear_ratios.items()
             }
         )
+        leads = (
+            {}
+            if lead_mms is None
+            else {
+                LogicalRole(role) if isinstance(role, str) else role: lead
+                for role, lead in lead_mms.items()
+            }
+        )
         assignments: list[ActuatorBinding | None] = []
         for role in LOGICAL_ROLE_ORDER:
             driver_id = normalized[role.value]
@@ -312,11 +338,13 @@ class BindingSet:
                 assignments.append(None)
                 continue
             ratio = ratios.get(role)
+            lead = leads.get(role)
             assignments.append(
                 ActuatorBinding(
                     kind="x42s",
                     driver_id=driver_id,
                     **({"gear_ratio": ratio} if ratio is not None else {}),
+                    **({"lead_mm": lead} if lead is not None else {}),
                 )
             )
         return cls(tuple(assignments), revision=revision, backend=BACKEND_X42S_UART)
@@ -483,6 +511,7 @@ def _parse_x42s_binding_map(raw: Any, revision: int) -> BindingSet:
     raw_bindings = _require_role_map(raw)
     parsed: dict[str, int | None] = {}
     gear_ratios: dict[str, float] = {}
+    lead_mms: dict[str, float] = {}
     for role in LOGICAL_ROLE_ORDER:
         item = raw_bindings[role.value]
         if item is None:
@@ -491,16 +520,16 @@ def _parse_x42s_binding_map(raw: Any, revision: int) -> BindingSet:
         if not isinstance(item, Mapping) or "kind" not in item:
             raise BindingValidationError(
                 "binding_fields",
-                f"{role.value} 绑定必须只包含 kind、driver_id 和 gear_ratio",
+                f"{role.value} 绑定必须只包含 kind、driver_id、gear_ratio 和 lead_mm",
             )
         if item.get("kind") != "x42s":
             raise BindingValidationError(
                 "unsupported_kind", f"{role.value} 在 x42s_uart 后端仅支持 kind=x42s"
             )
-        if not set(item) <= {"kind", "driver_id", "gear_ratio"}:
+        if not set(item) <= {"kind", "driver_id", "gear_ratio", "lead_mm"}:
             raise BindingValidationError(
                 "binding_fields",
-                f"{role.value} 绑定必须只包含 kind、driver_id 和 gear_ratio",
+                f"{role.value} 绑定必须只包含 kind、driver_id、gear_ratio 和 lead_mm",
             )
         driver_id = item.get("driver_id")
         if isinstance(driver_id, bool) or not isinstance(driver_id, int):
@@ -512,8 +541,13 @@ def _parse_x42s_binding_map(raw: Any, revision: int) -> BindingSet:
         gear = item.get("gear_ratio")
         if gear is not None:
             gear_ratios[role.value] = gear
+        # lead_mm 可选（2026-10-12 加入）：直线角色缺省 DEFAULT_LEAD_MM，
+        # 旋转角色忽略；数值校验由 ActuatorBinding.__post_init__ 兜底。
+        lead = item.get("lead_mm")
+        if lead is not None:
+            lead_mms[role.value] = lead
     return BindingSet.from_driver_id_mapping(
-        parsed, revision=revision, gear_ratios=gear_ratios
+        parsed, revision=revision, gear_ratios=gear_ratios, lead_mms=lead_mms
     )
 
 
@@ -820,6 +854,7 @@ def build_coordinated_snapshot(
                         # 手册 V1.0.5：X 固件遥测/命令均为角度制（0.1°）。
                         "unit": "deg",
                         "gear_ratio": gear,
+                        "lead_mm": binding.lead_mm,
                         "progress_percent": None,
                         "executed_steps": None,
                         "requested_steps": None,
@@ -830,6 +865,16 @@ def build_coordinated_snapshot(
                 logical_motors.append(base)
                 continue
             live = state.as_snapshot_dict(now=stamp)
+            # 角色语义单位（2026-10-12 步态链）：Mr=输出轴角度°，Mup=输出轴
+            # 角度经 lead_mm 换算的机构 mm——与 stepdir 后端的角色单位一致，
+            # 孪生 z_mm/终位比对无需分后端换算。原始电机轴遥测在 x42s 子字典。
+            if spec.required_mode == MODE_LINEAR:
+
+                def _to_role_units(value, _gear=gear):
+                    out = _to_output_shaft(value, _gear)
+                    return None if out is None else out * binding.lead_mm / 360.0
+            else:
+                _to_role_units = _to_output_shaft
             if not connected:
                 card_state = "DISCONNECTED"
             elif safety_state != "normal":
@@ -857,17 +902,18 @@ def build_coordinated_snapshot(
                     # 实机 1:21.5 确认）；电流/温度无量纲不换算。
                     "measured": live["measured_position"] is not None,
                     "state": card_state,
-                    "position": _to_output_shaft(live["measured_position"], gear),
-                    "committed_position": _to_output_shaft(
+                    "position": _to_role_units(live["measured_position"], gear),
+                    "committed_position": _to_role_units(
                         live["command_position"], gear
                     ),
                     "projected_position": None,
-                    "target_position": _to_output_shaft(
+                    "target_position": _to_role_units(
                         live["command_position"], gear
                     ),
                     "position_trusted": bool(live["telemetry_trusted"]),
-                    "unit": "deg",
+                    "unit": ("mm" if spec.required_mode == MODE_LINEAR else "deg"),
                     "gear_ratio": gear,
+                    "lead_mm": binding.lead_mm,
                     "progress_percent": None,
                     "executed_steps": None,
                     "requested_steps": None,
