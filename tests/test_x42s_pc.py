@@ -242,6 +242,22 @@ class X42sProtocolTests(unittest.TestCase):
         self.assertIsInstance(ok, OkReply)
         self.assertEqual(ok.values, ("X42S", "1", "EN", "1"))
 
+    def test_reply_matcher_binds_move_ack_to_driver(self):
+        # 2026-10-12 实机回归：matcher 不认 ACK,X42S,..,MOVE 时，成功应答
+        # 被当迟到行丢弃，GUI 弹"未被接受"但电机照转——必须按台号认领。
+        move = reply_matcher_for(build_x42s_move_command(1, 17200, 1605))
+        self.assertTrue(move(parse_line("ACK,X42S,1,MOVE,17200,1605")))
+        self.assertFalse(move(parse_line("ACK,X42S,2,MOVE,17200,1605")))
+        self.assertTrue(move(parse_line("ERR:driver timeout")))
+        self.assertFalse(move(parse_line("OK,X42S,1,EN,1")))
+        # EN/STOP/ZERO 的 OK 应答同样按台号匹配（回归）。
+        self.assertTrue(reply_matcher_for("X42S,3,STOP")(
+            parse_line("OK,X42S,3,STOP")))
+        self.assertFalse(reply_matcher_for("X42S,3,STOP")(
+            parse_line("OK,X42S,4,STOP")))
+        self.assertTrue(reply_matcher_for("X42S,2,ZERO")(
+            parse_line("OK,X42S,2,ZERO")))
+
 
 class SnapshotMergeTests(unittest.TestCase):
     def setUp(self):

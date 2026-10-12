@@ -804,6 +804,14 @@ def reply_matcher_for(command: str) -> ReplyMatcher:
                     isinstance(reply, X42sDiagReply)
                     and reply.driver_id == driver_id
                 )
+            # X42S,<id>,MOVE,<steps>,<speed> 固件回 ACK,X42S,<id>,MOVE,..
+            # （2026-10-12 实机：不认这条会把成功应答当迟到行丢弃、误报失败）。
+            if len(tokens) == 5 and tokens[2] == "MOVE":
+                move_id = _parse_nonnegative(tokens[1])
+                return (
+                    isinstance(reply, X42sMoveAck)
+                    and reply.driver_id == move_id
+                )
             # X42S,<id>,EN|STOP|ZERO 固件回 OK,X42S,<id>,<sub>[,..]。
             return (
                 isinstance(reply, OkReply)
