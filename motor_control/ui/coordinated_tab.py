@@ -10,7 +10,6 @@ from motor_control import (
     BACKEND_STEPDIR,
     BACKEND_X42S_UART,
     DEFAULT_LEAD_MM,
-    DEFAULT_X42S_GEAR_RATIO,
     LEAD_MM_MAX,
     LEAD_MM_MIN,
     LOGICAL_ROLE_ORDER,
@@ -20,6 +19,7 @@ from motor_control import (
     SUGGESTED_X42S_ID_BY_ROLE,
     X42S_GEAR_RATIO_MAX,
     X42S_GEAR_RATIO_MIN,
+    default_gear_for_role,
     stepper_axis_topology,
 )
 from motor_control.ui.common import PAD
@@ -135,6 +135,46 @@ def _default_lead_text(role, lead_mm=None) -> str:
     return str(DEFAULT_LEAD_MM if lead_mm is None else lead_mm)
 
 
+def _default_gear_text(role) -> str:
+    """减速比显示文本：直线角色直驱丝杆（1.0），旋转角色减速电机（21.5）。"""
+
+    return str(default_gear_for_role(role))
+
+
+def apply_manual_debug_units(app) -> None:
+    """手动调试区按所选角色切单位（2026-10-13 双形态电机台架）。
+
+    旋转角色（Mr，减速电机）：输出轴角度°/°/s；直线角色（Mup，直驱
+    丝杆）：行程 mm/mm/s，发令前经 lead_mm 换算为输出轴角度（desktop_app
+    侧预换算，worker 语义不变）。同时切 Spinbox 范围与默认值。
+    """
+
+    role = LogicalRole(app.x42s_manual_role_var.get())
+    widgets = app.coordinated_widgets.get("x42s_manual_unit", {})
+    value_label, speed_label = widgets.get("value"), widgets.get("speed")
+    value_spin, speed_spin = widgets.get("value_spin"), widgets.get("speed_spin")
+    if value_label is None or speed_label is None:
+        return
+    if ROLE_SPECS[role].required_mode == MODE_LINEAR:
+        value_label.configure(text="行程(mm):")
+        speed_label.configure(text="速度(mm/s):")
+        if value_spin is not None:
+            value_spin.configure(from_=-500.0, to=500.0, increment=1.0)
+        if speed_spin is not None:
+            speed_spin.configure(from_=0.1, to=50.0)
+        app.x42s_manual_angle_var.set("5.0")
+        app.x42s_manual_speed_var.set("2.0")
+    else:
+        value_label.configure(text="角度(°):")
+        speed_label.configure(text="速度(°/s):")
+        if value_spin is not None:
+            value_spin.configure(from_=-360, to=360, increment=15)
+        if speed_spin is not None:
+            speed_spin.configure(from_=0.1, to=60.0)
+        app.x42s_manual_angle_var.set("90.0")
+        app.x42s_manual_speed_var.set("8.4")
+
+
 def sync_binding_editor(app, bindings) -> None:
     """Replace the editor with an applied snapshot after an explicit action."""
 
@@ -147,7 +187,7 @@ def sync_binding_editor(app, bindings) -> None:
         if binding is None:
             option = UNBOUND_OPTION
             driver_id = ""
-            gear = str(DEFAULT_X42S_GEAR_RATIO)
+            gear = _default_gear_text(role)
             lead = _default_lead_text(role)
         elif binding.kind == "x42s":
             option = UNBOUND_OPTION
@@ -157,7 +197,7 @@ def sync_binding_editor(app, bindings) -> None:
         else:
             option = app._binding_option_by_axis[binding.axis]
             driver_id = ""
-            gear = str(DEFAULT_X42S_GEAR_RATIO)
+            gear = _default_gear_text(role)
             lead = _default_lead_text(role)
         app.control_binding_vars[role.value].set(option)
         app.x42s_binding_vars[role.value].set(driver_id)
@@ -284,9 +324,10 @@ def build_coordinated_tab(app, parent) -> None:
         )
         id_spin.pack(side="left", padx=2)
         id_spin.bind("<KeyRelease>", app._on_binding_editor_change)
-        # 减速比（2026-10-10 实机 1:21.5）：遥测显示/孪生角度按此换算到输出轴。
+        # 减速比（2026-10-13 双形态）：旋转角色=减速电机（21.5），直线
+        # 角色=直驱丝杆（1.0）；仅 UI 草稿默认，保存时显式写入绑定。
         ttk.Label(id_frame, text="减速比:").pack(side="left", padx=(8, 0))
-        gear_var = tk.StringVar(value=str(DEFAULT_X42S_GEAR_RATIO))
+        gear_var = tk.StringVar(value=_default_gear_text(role))
         app.x42s_gear_vars[role.value] = gear_var
         gear_spin = ttk.Spinbox(
             id_frame,
@@ -357,46 +398,63 @@ def build_coordinated_tab(app, parent) -> None:
     dirty_label.pack(side="right", padx=6)
     app.coordinated_widgets["dirty_label"] = dirty_label
 
-    # X42S 手动调试区（2026-10-12 单台运动测试）：角度/速度按输出轴
-    # （填 90 = 输出轴转 90°），发令前按绑定减速比换算电机轴脉冲。
+    # X42S 手动调试区（2026-10-12 单台运动测试；2026-10-13 双形态）：
+    # 旋转角色按输出轴角度（填 90 = 输出轴转 90°），直线角色按机构行程
+    # mm（经绑定导程换算）；发令前按减速比换算电机轴脉冲。
     # 仅 x42s_uart 后端可见（apply_backend_editor_visibility 切换）。
     manual = ttk.LabelFrame(
-        binding_frame, text="X42S 手动调试（角度=输出轴角度，速度=输出轴 °/s）"
+        binding_frame,
+        text="X42S 手动调试（旋转=输出轴角度°/°/s，直线=机构行程mm/mm/s）",
     )
     manual.grid(row=7, column=0, columnspan=6, sticky="ew", padx=4, pady=5)
     app.coordinated_widgets["x42s_manual"] = manual
 
     app.x42s_manual_role_var = tk.StringVar(value=LogicalRole.MUP1.value)
+    app.x42s_manual_angle_var = tk.StringVar(value="5.0")
+    app.x42s_manual_speed_var = tk.StringVar(value="2.0")
     manual_inputs = ttk.Frame(manual)
     manual_inputs.pack(fill="x", padx=4, pady=3)
     ttk.Label(manual_inputs, text="角色:").pack(side="left")
-    ttk.Combobox(
+    role_combo = ttk.Combobox(
         manual_inputs,
         textvariable=app.x42s_manual_role_var,
         state="readonly",
         width=6,
         values=[role.value for role in LOGICAL_ROLE_ORDER],
-    ).pack(side="left", padx=2)
-    ttk.Label(manual_inputs, text="角度(°):").pack(side="left", padx=(10, 0))
-    app.x42s_manual_angle_var = tk.StringVar(value="90.0")
-    ttk.Spinbox(
+    )
+    role_combo.pack(side="left", padx=2)
+    # 切角色即切单位（标签/范围/默认值），desktop_app 提供回调。
+    role_combo.bind(
+        "<<ComboboxSelected>>", lambda _e: app._on_x42s_manual_role_change()
+    )
+    value_label = ttk.Label(manual_inputs, text="行程(mm):")
+    value_label.pack(side="left", padx=(10, 0))
+    value_spin = ttk.Spinbox(
         manual_inputs,
-        from_=-360,
-        to=360,
-        increment=15,
+        from_=-500,
+        to=500,
+        increment=1,
         textvariable=app.x42s_manual_angle_var,
         width=7,
-    ).pack(side="left", padx=2)
-    ttk.Label(manual_inputs, text="速度(°/s):").pack(side="left", padx=(10, 0))
-    app.x42s_manual_speed_var = tk.StringVar(value="8.4")
-    ttk.Spinbox(
+    )
+    value_spin.pack(side="left", padx=2)
+    speed_label = ttk.Label(manual_inputs, text="速度(mm/s):")
+    speed_label.pack(side="left", padx=(10, 0))
+    speed_spin = ttk.Spinbox(
         manual_inputs,
         from_=0.1,
-        to=60.0,
+        to=50.0,
         increment=0.1,
         textvariable=app.x42s_manual_speed_var,
         width=7,
-    ).pack(side="left", padx=2)
+    )
+    speed_spin.pack(side="left", padx=2)
+    app.coordinated_widgets["x42s_manual_unit"] = {
+        "value": value_label,
+        "speed": speed_label,
+        "value_spin": value_spin,
+        "speed_spin": speed_spin,
+    }
 
     manual_buttons = ttk.Frame(manual)
     manual_buttons.pack(fill="x", padx=4, pady=3)

@@ -638,6 +638,136 @@ class X42sGaitChainTests(unittest.TestCase):
         self.assertNotIn("X42S,2,ZERO", app.commands)
 
 
+class X42sManualUnitsTests(unittest.TestCase):
+    """双形态电机台架（2026-10-13）：直线=直驱丝杆 mm，旋转=减速电机°。"""
+
+    def test_default_gear_for_role(self):
+        # UI 草稿默认：Mup 直驱丝杆 1.0，Mr 减速电机 21.5（文档层缺省
+        # 仍恒 21.5，不受影响）。
+        from motor_control import default_gear_for_role
+        self.assertEqual(default_gear_for_role("Mup1"), 1.0)
+        self.assertEqual(default_gear_for_role("Mup2"), 1.0)
+        self.assertEqual(default_gear_for_role("Mr1"), 21.5)
+        self.assertEqual(default_gear_for_role("Mr2"), 21.5)
+
+    def _manual_app(self, lead_mm=8.0, gear=1.0):
+        app = _headless_app()
+        app.control_bindings = BindingSet.from_driver_id_mapping(
+            {"Mup1": 3, "Mr1": 1, "Mup2": None, "Mr2": None},
+            gear_ratios={"Mup1": gear}, lead_mms={"Mup1": lead_mm})
+        app._is_serial_connected = lambda: True
+        app.x42s_manual_role_var = _Var("Mup1")
+        app.x42s_manual_angle_var = _Var("5.0")
+        app.x42s_manual_speed_var = _Var("2.0")
+        app.captured = []
+        app._start_control_worker = (
+            lambda worker, action, *args: app.captured.append((action, args))
+            or object())
+        app.log = lambda message: None
+        return app
+
+    def test_manual_action_converts_linear_mm_to_output_deg(self):
+        # 直线角色（ID3 直驱丝杆 lead 8）：5mm → 输出轴 225°，2mm/s →
+        # 225°/s；worker 收到的恒为输出轴角度，语义不变。
+        app = self._manual_app()
+        StepperGUI._x42s_manual_action(app, "plus")
+        action, args = app.captured[-1]
+        self.assertEqual(action, "plus")
+        self.assertEqual(args[0], 3)      # driver_id
+        self.assertEqual(args[1], 1.0)   # gear=1（直驱）
+        self.assertEqual(args[2], "Mup1")
+        self.assertAlmostEqual(args[3], 5.0 * 360.0 / 8.0)   # 225°
+        self.assertAlmostEqual(args[4], 2.0 * 360.0 / 8.0)   # 225°/s
+        # 反向：方向取负由 worker 按 action 处理，action 层透传正值。
+        StepperGUI._x42s_manual_action(app, "minus")
+        self.assertAlmostEqual(app.captured[-1][1][3], 225.0)
+        self.assertAlmostEqual(app.captured[-1][1][4], 90.0)
+
+    def test_manual_action_rotary_passes_deg_through(self):
+        # 旋转角色（ID1 减速 21.5）：°/°/s 原样透传，不经过 lead。
+        app = self._manual_app()
+        app.x42s_manual_role_var.set("Mr1")
+        app.x42s_manual_angle_var.set("90.0")
+        app.x42s_manual_speed_var.set("8.4")
+        StepperGUI._x42s_manual_action(app, "plus")
+        action, args = app.captured[-1]
+        self.assertEqual(args[0], 1)
+        self.assertEqual(args[1], 21.5)
+        self.assertEqual(args[3], 90.0)
+        self.assertEqual(args[4], 8.4)
+
+    def test_manual_action_non_motion_skips_parsing(self):
+        # 使能/停止不解析输入框，任意残值不阻断。
+        app = self._manual_app()
+        app.x42s_manual_angle_var.set("残值")
+        StepperGUI._x42s_manual_action(app, "enable")
+        StepperGUI._x42s_manual_action(app, "stop")
+        self.assertEqual(len(app.captured), 2)
+        self.assertIsNone(app.captured[0][1][3])
+
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    HAS_TK = hasattr(tk, "Tk")
+except ImportError:
+    HAS_TK = False
+
+
+@unittest.skipUnless(HAS_TK, "real Tk unavailable")
+class X42sManualUnitSwitchTests(unittest.TestCase):
+    """手动调试区单位随角色形态切换（2026-10-13 双形态台架）。"""
+
+    def _build(self):
+        from motor_control import AxisProfile
+        from motor_control.gait_planner import GaitParams
+        from motor_control.ui.coordinated_tab import (
+            build_coordinated_tab, apply_manual_debug_units)
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        app = SimpleNamespace(
+            root=root,
+            axis_profiles=[AxisProfile() for _ in range(6)],
+            control_bindings=BindingSet.suggested(),
+            gait_params=GaitParams(),
+            _on_binding_editor_change=lambda *a: None,
+            _jump_to_binding_axis=lambda *a: None,
+            _fill_suggested_bindings=lambda *a: None,
+            _save_binding_editor=lambda *a: None,
+            _verify_x42s_ids=lambda *a: None,
+            _clear_binding_editor=lambda *a: None,
+            _x42s_manual_action=lambda action: None,
+            _role_debug_move=lambda *a: None,
+            _gait_record_direction_sign=lambda *a: None,
+        )
+        page = ttk.Frame(root)
+        page.pack(fill="both", expand=True)
+        build_coordinated_tab(app, page)
+        return app, apply_manual_debug_units
+
+    def test_units_switch_with_role_form(self):
+        app, switch = self._build()
+        widgets = app.coordinated_widgets["x42s_manual_unit"]
+        # 默认 Mup1（直线）：行程 mm、默认 5.0mm/2.0mm/s。
+        app.x42s_manual_role_var.set("Mup1")
+        switch(app)
+        self.assertIn("行程(mm)", widgets["value"].cget("text"))
+        self.assertIn("mm/s", widgets["speed"].cget("text"))
+        self.assertEqual(app.x42s_manual_angle_var.get(), "5.0")
+        self.assertEqual(app.x42s_manual_speed_var.get(), "2.0")
+        # 切 Mr1（旋转）：输出轴角度、默认 90°/8.4°/s。
+        app.x42s_manual_role_var.set("Mr1")
+        switch(app)
+        self.assertIn("角度(°)", widgets["value"].cget("text"))
+        self.assertIn("°/s", widgets["speed"].cget("text"))
+        self.assertEqual(app.x42s_manual_angle_var.get(), "90.0")
+        self.assertEqual(app.x42s_manual_speed_var.get(), "8.4")
+        # 绑定页减速比默认按角色：Mup 行 1.0、Mr 行 21.5。
+        self.assertEqual(app.x42s_gear_vars["Mup1"].get(), "1.0")
+        self.assertEqual(app.x42s_gear_vars["Mr1"].get(), "21.5")
+
+
 class DesktopIntegrationTests(unittest.TestCase):
     def _app(self):
         app = _headless_app()

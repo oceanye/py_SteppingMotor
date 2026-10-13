@@ -432,6 +432,20 @@ class BindingSet:
         }
 
 
+def default_gear_for_role(role: LogicalRole | str) -> float:
+    """UI 草稿的减速比默认值（2026-10-13 台架两形态电机）。
+
+    旋转角色（Mr）绑减速电机（实测 1:21.5）；直线角色（Mup）绑直驱
+    丝杆电机（无减速箱，gear=1，靠 lead_mm 换算行程）。只影响绑定页
+    显示初值/重置值——文档层缺省恒 DEFAULT_X42S_GEAR_RATIO 不变，
+    保存时用户看到的值会显式写入绑定。
+    """
+
+    normalized = role if isinstance(role, LogicalRole) else LogicalRole(role)
+    return 1.0 if ROLE_SPECS[normalized].required_mode == MODE_LINEAR \
+        else DEFAULT_X42S_GEAR_RATIO
+
+
 def _normalized_role_mapping(
     values: Mapping[LogicalRole | str, object]
 ) -> dict[str, object]:
@@ -1084,6 +1098,7 @@ __all__ = [
     "X42S_DRIVER_ID_MIN",
     "binding_compatibility_issues",
     "build_coordinated_snapshot",
+    "default_gear_for_role",
     "parse_binding_document",
     "projected_step_position",
     "propose_x42s_migration",

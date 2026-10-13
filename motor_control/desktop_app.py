@@ -46,6 +46,7 @@ from motor_control import (
     build_coordinated_snapshot,
     clamp_step_delay_us,
     convert_axis_value,
+    default_gear_for_role,
     direction_label_parts,
     outward_position_sign,
     propose_x42s_migration,
@@ -671,7 +672,7 @@ class StepperGUI:
                     str(SUGGESTED_X42S_ID_BY_ROLE[role.value])
                 )
                 if role.value in gear_vars:
-                    gear_vars[role.value].set(str(DEFAULT_X42S_GEAR_RATIO))
+                    gear_vars[role.value].set(str(default_gear_for_role(role)))
                 if role.value in lead_vars:
                     lead_vars[role.value].set(str(DEFAULT_LEAD_MM))
         else:
@@ -698,7 +699,7 @@ class StepperGUI:
             self.control_binding_vars[role.value].set("未绑定")
             self.x42s_binding_vars[role.value].set("")
             if role.value in gear_vars:
-                gear_vars[role.value].set(str(DEFAULT_X42S_GEAR_RATIO))
+                gear_vars[role.value].set(str(default_gear_for_role(role)))
             if role.value in lead_vars:
                 lead_vars[role.value].set(str(DEFAULT_LEAD_MM))
         self._on_binding_editor_change()
@@ -827,8 +828,19 @@ class StepperGUI:
     # 绑定的减速比换算成电机轴脉冲。手动运动不走步态路径，不适用 §19
     # 步态闸；硬件急停激活时由固件端拒绝（EN/MOVE 闸，双保险）。
 
+    def _on_x42s_manual_role_change(self):
+        """手动调试区角色切换：单位标签/范围/默认值随角色形态切换。"""
+
+        from motor_control.ui.coordinated_tab import apply_manual_debug_units
+        apply_manual_debug_units(self)
+
     def _x42s_manual_action(self, action):
-        """UI 线程入口：action ∈ enable/disable/plus/minus/stop/zero。"""
+        """UI 线程入口：action ∈ enable/disable/plus/minus/stop/zero。
+
+        输入单位按角色形态（2026-10-13 双形态电机）：旋转=输出轴°/°/s；
+        直线=机构 mm/mm/s——这里经绑定 lead_mm 预换算为输出轴角度后
+        交给 worker，worker 语义（输出轴角度→脉冲）保持不变。
+        """
         title = "X42S 手动调试"
         if self.control_bindings.backend != BACKEND_X42S_UART:
             messagebox.showinfo(title, "当前后端不是 x42s_uart：请先在绑定页切换后端。")
@@ -842,24 +854,39 @@ class StepperGUI:
         if binding is None or binding.kind != "x42s":
             messagebox.showwarning(title, f"{role_value} 未绑定 X42S 驱动器。")
             return
+        is_linear = ROLE_SPECS[role].required_mode == MODE_LINEAR
+        unit = "mm" if is_linear else "°"
 
         angle_deg = speed_deg_s = None
         if action in ("plus", "minus"):
             try:
-                angle_deg = float(self.x42s_manual_angle_var.get())
-                speed_deg_s = float(self.x42s_manual_speed_var.get())
+                value = float(self.x42s_manual_angle_var.get())
+                speed = float(self.x42s_manual_speed_var.get())
             except ValueError:
-                messagebox.showwarning(title, "角度/速度必须是数字。")
+                messagebox.showwarning(title, "位移/速度必须是数字。")
                 return
-            if not (math.isfinite(angle_deg) and math.isfinite(speed_deg_s)):
-                messagebox.showwarning(title, "角度/速度必须是有限数字。")
+            if not (math.isfinite(value) and math.isfinite(speed)):
+                messagebox.showwarning(title, "位移/速度必须是有限数字。")
                 return
-            if abs(angle_deg) > 360.0 or angle_deg == 0.0:
-                messagebox.showwarning(title, "角度需在 ±360° 内且不为 0（输出轴角度）。")
+            limit = 500.0 if is_linear else 360.0
+            if abs(value) > limit or value == 0.0:
+                messagebox.showwarning(
+                    title, f"位移需在 ±{limit:g}{unit} 内且不为 0"
+                    + ("（机构行程）" if is_linear else "（输出轴角度）") + "。")
                 return
-            if speed_deg_s <= 0.0:
-                messagebox.showwarning(title, "速度需为正（输出轴 °/s）。")
+            if speed <= 0.0:
+                messagebox.showwarning(
+                    title, "速度需为正（机构 mm/s）。" if is_linear
+                    else "速度需为正（输出轴 °/s）。")
                 return
+            if is_linear:
+                # 机构 mm → 输出轴角度（丝杆导程 mm/圈）。
+                deg_per_mm = 360.0 / binding.lead_mm
+                angle_deg = value * deg_per_mm
+                speed_deg_s = speed * deg_per_mm
+            else:
+                angle_deg = value
+                speed_deg_s = speed
         if self._start_control_worker(
             self._x42s_manual_worker, action, binding.driver_id,
             binding.gear_ratio, role_value, angle_deg, speed_deg_s,
