@@ -141,6 +141,16 @@ def _default_gear_text(role) -> str:
     return str(default_gear_for_role(role))
 
 
+def _configure_manual_button_text(app, plus_text, minus_text) -> None:
+    """运动按钮文案随单位形态切换（直线不再是"+角度"）。"""
+
+    buttons = app.coordinated_widgets.get("x42s_manual_buttons") or {}
+    if buttons.get("plus") is not None:
+        buttons["plus"].configure(text=plus_text)
+    if buttons.get("minus") is not None:
+        buttons["minus"].configure(text=minus_text)
+
+
 def apply_manual_debug_units(app) -> None:
     """手动调试区按所选角色切单位（2026-10-13 双形态电机台架）。
 
@@ -164,6 +174,7 @@ def apply_manual_debug_units(app) -> None:
             speed_spin.configure(from_=0.1, to=50.0)
         app.x42s_manual_angle_var.set("5.0")
         app.x42s_manual_speed_var.set("2.0")
+        _configure_manual_button_text(app, "正向 +mm", "反向 −mm")
     else:
         value_label.configure(text="角度(°):")
         speed_label.configure(text="速度(°/s):")
@@ -173,6 +184,7 @@ def apply_manual_debug_units(app) -> None:
             speed_spin.configure(from_=0.1, to=60.0)
         app.x42s_manual_angle_var.set("90.0")
         app.x42s_manual_speed_var.set("8.4")
+        _configure_manual_button_text(app, "正转 +角度", "反转 −角度")
 
 
 def sync_binding_editor(app, bindings) -> None:
@@ -475,6 +487,8 @@ def build_coordinated_tab(app, parent) -> None:
         button.pack(side="left", padx=3)
         manual_button_map[action] = button
     app.coordinated_widgets["x42s_manual_buttons"] = manual_button_map
+    # 默认角色（Mup1 直线）的标签/范围/按钮文案初始化。
+    apply_manual_debug_units(app)
 
     cards = ttk.LabelFrame(parent, text="四电机状态（软件脉冲估算）")
     cards.grid(row=2, column=0, sticky="nsew", **PAD)
