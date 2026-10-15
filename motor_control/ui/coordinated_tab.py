@@ -472,8 +472,8 @@ def build_coordinated_tab(app, parent) -> None:
     manual_buttons.pack(fill="x", padx=4, pady=3)
     manual_button_map = {}
     for text, action in (
-        ("使能", "enable"),
-        ("失能", "disable"),
+        ("使能(全部)", "enable"),
+        ("失能(全部)", "disable"),
         ("正转 +角度", "plus"),
         ("反转 −角度", "minus"),
         ("停止", "stop"),

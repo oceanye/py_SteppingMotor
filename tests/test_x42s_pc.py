@@ -673,15 +673,13 @@ class X42sManualUnitsTests(unittest.TestCase):
         StepperGUI._x42s_manual_action(app, "plus")
         action, args = app.captured[-1]
         self.assertEqual(action, "plus")
-        self.assertEqual(args[0], 3)      # driver_id
-        self.assertEqual(args[1], 1.0)   # gear=1（直驱）
-        self.assertEqual(args[2], "Mup1")
-        self.assertAlmostEqual(args[3], 5.0 * 360.0 / 8.0)   # 225°
-        self.assertAlmostEqual(args[4], 2.0 * 360.0 / 8.0)   # 225°/s
+        self.assertEqual(args[0], [("Mup1", 3, 1.0)])   # 单台（当前角色）
+        self.assertAlmostEqual(args[1], 5.0 * 360.0 / 8.0)   # 225°
+        self.assertAlmostEqual(args[2], 2.0 * 360.0 / 8.0)   # 225°/s
         # 反向：方向取负由 worker 按 action 处理，action 层透传正值。
         StepperGUI._x42s_manual_action(app, "minus")
-        self.assertAlmostEqual(app.captured[-1][1][3], 225.0)
-        self.assertAlmostEqual(app.captured[-1][1][4], 90.0)
+        self.assertAlmostEqual(app.captured[-1][1][1], 225.0)
+        self.assertAlmostEqual(app.captured[-1][1][2], 90.0)
 
     def test_manual_action_rotary_passes_deg_through(self):
         # 旋转角色（ID1 减速 21.5）：°/°/s 原样透传，不经过 lead。
@@ -691,10 +689,9 @@ class X42sManualUnitsTests(unittest.TestCase):
         app.x42s_manual_speed_var.set("8.4")
         StepperGUI._x42s_manual_action(app, "plus")
         action, args = app.captured[-1]
-        self.assertEqual(args[0], 1)
-        self.assertEqual(args[1], 21.5)
-        self.assertEqual(args[3], 90.0)
-        self.assertEqual(args[4], 8.4)
+        self.assertEqual(args[0], [("Mr1", 1, 21.5)])
+        self.assertEqual(args[1], 90.0)
+        self.assertEqual(args[2], 8.4)
 
     def test_manual_action_non_motion_skips_parsing(self):
         # 使能/停止不解析输入框，任意残值不阻断。
@@ -703,7 +700,85 @@ class X42sManualUnitsTests(unittest.TestCase):
         StepperGUI._x42s_manual_action(app, "enable")
         StepperGUI._x42s_manual_action(app, "stop")
         self.assertEqual(len(app.captured), 2)
-        self.assertIsNone(app.captured[0][1][3])
+        self.assertIsNone(app.captured[0][1][1])
+
+    def test_manual_action_enable_targets_all_bound_drivers(self):
+        # 一键全部使能（2026-10-15）：enable 的 targets 覆盖全部 x42s 绑定
+        # （当前角色未选中也不拦），stop/zero/plus/minus 仍单台。
+        app = self._manual_app()
+        app.x42s_manual_role_var.set("Mr1")
+        StepperGUI._x42s_manual_action(app, "enable")
+        targets = app.captured[-1][1][0]
+        self.assertEqual(
+            [t[0] for t in targets], ["Mup1", "Mr1"])   # LOGICAL_ROLE_ORDER 序
+        self.assertEqual([t[1] for t in targets], [3, 1])
+        StepperGUI._x42s_manual_action(app, "disable")
+        self.assertEqual(app.captured[-1][1][0], targets)
+        StepperGUI._x42s_manual_action(app, "stop")
+        self.assertEqual(app.captured[-1][1][0], [("Mr1", 1, 21.5)])
+        # 当前角色未绑定时 enable 仍对其余台生效（不再被单台检查拦住）。
+        app.control_bindings = BindingSet.from_driver_id_mapping(
+            {"Mup1": 3, "Mr1": None, "Mup2": None, "Mr2": None},
+            gear_ratios={"Mup1": 1.0})
+        app.x42s_manual_role_var.set("Mr1")
+        StepperGUI._x42s_manual_action(app, "enable")
+        self.assertEqual(app.captured[-1][1][0], [("Mup1", 3, 1.0)])
+        # 运动类动作仍要求当前角色已绑定（弹窗在 headless 下 patch 掉）。
+        with patch.object(desktop_app_module, "messagebox",
+                          SimpleNamespace(showwarning=lambda *a: None)):
+            StepperGUI._x42s_manual_action(app, "plus")
+        self.assertEqual(len(app.captured), 4)   # 未追加
+
+    def _worker_app(self):
+        app = self._manual_app()
+        app._post_ui = lambda action: action()
+        app.commands = []
+        def controller(command, **kwargs):
+            app.commands.append(command)
+            t = command.split(",")
+            if t[0] == "X42S" and t[2] == "EN":
+                return f"OK,X42S,{t[1]},EN,{t[3]}"
+            if t[0] == "X42S" and t[2] == "STOP":
+                return f"OK,X42S,{t[1]},STOP"
+            return "ERR:unexpected " + command
+        app._send_and_read = controller
+        return app
+
+    def test_manual_worker_enable_sends_each_driver_in_order(self):
+        # 全部使能逐台下发、按台号认领应答，每台各记一条日志。
+        app = self._worker_app()
+        logs = []
+        app.log = logs.append
+        StepperGUI._x42s_manual_worker(
+            app, "enable", [("Mup1", 3, 1.0), ("Mr1", 1, 21.5)], None, None)
+        self.assertEqual(app.commands, ["X42S,3,EN,1", "X42S,1,EN,1"])
+        self.assertEqual(sum("✅" in line for line in logs), 2)
+
+    def test_manual_worker_enable_warns_once_with_all_failures(self):
+        # 部分台被拒：只弹一个汇总窗（列全部失败台），不是每台一窗。
+        app = self._worker_app()
+        app.log = lambda message: None
+        def rejecting(command, **kwargs):
+            app.commands.append(command)
+            t = command.split(",")
+            if t[1] == "1":
+                return "ERR:driver rejected (E2/EE)"
+            return f"OK,X42S,{t[1]},EN,{t[3]}"
+        app._send_and_read = rejecting
+        warnings = []
+        with patch.object(desktop_app_module, "messagebox",
+                          SimpleNamespace(showwarning=lambda *a: warnings.append(a))):
+            StepperGUI._x42s_manual_worker(
+                app, "enable", [("Mup1", 3, 1.0), ("Mr1", 1, 21.5)], None, None)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("Mr1", warnings[0][1])
+        self.assertIn("E2/EE", warnings[0][1])
+
+    def test_manual_worker_stop_targets_selected_role_only(self):
+        app = self._worker_app()
+        app.log = lambda message: None
+        StepperGUI._x42s_manual_worker(app, "stop", [("Mup1", 3, 1.0)], None, None)
+        self.assertEqual(app.commands, ["X42S,3,STOP"])
 
 
 try:

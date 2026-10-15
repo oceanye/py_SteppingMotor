@@ -851,9 +851,25 @@ class StepperGUI:
         role_value = self.x42s_manual_role_var.get()
         role = LogicalRole(role_value)
         binding = self.control_bindings.for_role(role)
-        if binding is None or binding.kind != "x42s":
-            messagebox.showwarning(title, f"{role_value} 未绑定 X42S 驱动器。")
-            return
+        # 全部 X42S 绑定目标（2026-10-15 台架教训：驱动器使能是单台易失
+        # 的，断开串口/驱动器断电即清空——使能/失能改为一键全部，换台测
+        # 试不再因漏点某台使能而 E2 弹窗）。
+        all_targets = []
+        for each_role in LOGICAL_ROLE_ORDER:
+            each = self.control_bindings.for_role(each_role)
+            if each is not None and each.kind == "x42s":
+                all_targets.append(
+                    (each_role.value, each.driver_id, each.gear_ratio))
+        if action in ("enable", "disable"):
+            if not all_targets:
+                messagebox.showwarning(title, "没有任何角色绑定 X42S 驱动器。")
+                return
+            targets = all_targets
+        else:
+            if binding is None or binding.kind != "x42s":
+                messagebox.showwarning(title, f"{role_value} 未绑定 X42S 驱动器。")
+                return
+            targets = [(role_value, binding.driver_id, binding.gear_ratio)]
         is_linear = ROLE_SPECS[role].required_mode == MODE_LINEAR
         unit = "mm" if is_linear else "°"
 
@@ -888,16 +904,20 @@ class StepperGUI:
                 angle_deg = value
                 speed_deg_s = speed
         if self._start_control_worker(
-            self._x42s_manual_worker, action, binding.driver_id,
-            binding.gear_ratio, role_value, angle_deg, speed_deg_s,
+            self._x42s_manual_worker, action, targets, angle_deg, speed_deg_s,
         ) is None:
             self.log("⛔ 控制器忙，稍后再操作 X42S")
 
-    def _x42s_manual_worker(self, action, driver_id, gear, role_value,
-                            angle_deg, speed_deg_s):
-        """控制工作线程：构造命令发往 ESP32，校验应答类型后报日志。"""
-        steps = speed_pps = None
+    def _x42s_manual_worker(self, action, targets, angle_deg, speed_deg_s):
+        """控制工作线程：构造命令发往 ESP32，校验应答类型后报日志。
+
+        targets: [(role_value, driver_id, gear_ratio), ...]
+        enable/disable 逐台发全部绑定（一键全部使能/失能，台间留静默
+        间隔——驱动器背靠背连发命令帧会整批丢帧）；其余动作只作用于
+        targets[0]（当前选中角色）。
+        """
         if action in ("plus", "minus"):
+            role_value, driver_id, gear = targets[0]
             # 输出轴角度/速度 → 电机轴脉冲/pps（与固件 X42S_PULSE_PER_REV 同源）。
             steps = round(angle_deg * gear * X42S_PULSE_PER_REV / 360.0)
             if action == "minus":
@@ -912,34 +932,62 @@ class StepperGUI:
                     f"⚠️ {role_value} 速度换算后 {speed_pps}pps 超限（>100000），未发令"))
                 return
             command = build_x42s_move_command(driver_id, steps, speed_pps)
-        elif action == "enable":
-            command = build_x42s_enable_command(driver_id, True)
-        elif action == "disable":
-            command = build_x42s_enable_command(driver_id, False)
-        elif action == "stop":
+            ok, reason = self._send_manual_x42s(
+                command, role_value, driver_id, steps, speed_pps)
+            if not ok:
+                self._post_ui(lambda: messagebox.showwarning(
+                    "X42S 手动调试", f"命令未被接受：\n{command}\n→ {reason}"))
+            return
+        if action in ("enable", "disable"):
+            word = "使能" if action == "enable" else "失能"
+            failures = []
+            for role_value, driver_id, _gear in targets:
+                command = build_x42s_enable_command(
+                    driver_id, action == "enable")
+                ok, reason = self._send_manual_x42s(
+                    command, role_value, driver_id)
+                if not ok:
+                    failures.append(f"{role_value}·ID{driver_id} → {reason}")
+                time.sleep(0.05)   # 台间静默间隔
+            if failures:
+                detail = "\n".join(failures)
+                self._post_ui(lambda: messagebox.showwarning(
+                    "X42S 手动调试",
+                    f"{word}失败的驱动器：\n{detail}"))
+            return
+        # stop/zero：单台（当前选中角色）。
+        role_value, driver_id, _gear = targets[0]
+        if action == "stop":
             command = build_x42s_stop_command(driver_id)
         elif action == "zero":
             command = build_x42s_zero_command(driver_id)
         else:  # pragma: no cover - 按钮不会产生其他值
             return
+        ok, reason = self._send_manual_x42s(command, role_value, driver_id)
+        if not ok:
+            self._post_ui(lambda: messagebox.showwarning(
+                "X42S 手动调试", f"命令未被接受：\n{command}\n→ {reason}"))
+
+    def _send_manual_x42s(self, command, role_value, driver_id,
+                          steps=None, speed_pps=None):
+        """发一条手动调试命令并校验应答（MOVE 按台号+步数认领 ACK，其余
+        按台号认领 OK 行），报日志；返回 (ok, reason)，弹窗由调用方决定。"""
         resp = self._send_and_read(command, soft_timeout=True)
         reply = parse_line(resp) if resp else None
-        ok = False
-        if isinstance(reply, X42sMoveAck):
-            ok = (reply.driver_id == driver_id and reply.steps == steps
-                  and reply.speed == speed_pps)
-        elif isinstance(reply, OkReply):
-            ok = (len(reply.values) >= 2
+        if steps is None:
+            ok = (isinstance(reply, OkReply) and len(reply.values) >= 2
                   and reply.values[0] == "X42S"
                   and reply.values[1] == str(driver_id))
+        else:
+            ok = (isinstance(reply, X42sMoveAck)
+                  and reply.driver_id == driver_id
+                  and reply.steps == steps and reply.speed == speed_pps)
         reason = "" if reply is None else reply.raw
         self._post_ui(lambda: self.log(
             ("✅" if ok else "⛔")
             + f" X42S {role_value}·ID{driver_id} {command}"
             + ("" if ok else f" → {reason}")))
-        if not ok:
-            self._post_ui(lambda: messagebox.showwarning(
-                "X42S 手动调试", f"命令未被接受：\n{command}\n→ {reason}"))
+        return ok, reason
 
     def _jump_to_binding_axis(self, role=None):
         if role is None:
