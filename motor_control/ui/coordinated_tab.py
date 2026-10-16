@@ -648,8 +648,10 @@ def _refresh_direction_calibration(app, by_role) -> None:
             text=_direction_sign_text(role.value, sign),
             foreground="#16803a" if sign > 0 else "#b42318")
         snapshot = by_role.get(role.value, {})
+        # stepdir 空闲=IDLE；X42S 在线正常=X42S_ONLINE（2026-10-15 修正：
+        # 只认 IDLE 时 X42S 绑定四行点动永远灰，串口连着也无法标定）。
         movable = (bool(snapshot.get("binding_valid"))
-                   and snapshot.get("state") == "IDLE")
+                   and snapshot.get("state") in ("IDLE", "X42S_ONLINE"))
         for key in ("jog_plus", "jog_minus"):
             widgets[key].configure(state="normal" if movable else "disabled")
 

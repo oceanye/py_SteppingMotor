@@ -150,6 +150,7 @@ class RefreshDirectionCalibrationTests(unittest.TestCase):
             "Mr1": {"binding_valid": True, "state": "IDLE"},
             "Mr2": {"binding_valid": True, "state": "MOVING"},
             "Mup1": {"binding_valid": False, "state": "IDLE"},
+            "Mup2": {"binding_valid": True, "state": "X42S_ONLINE"},
         }
         direction = {
             role: {name: _FakeWidget() for name in
@@ -170,6 +171,9 @@ class RefreshDirectionCalibrationTests(unittest.TestCase):
                          "disabled")
         self.assertEqual(direction["Mup1"]["jog_plus"].configured["state"],
                          "disabled")
+        # X42S 在线正常同样可点动（2026-10-15：只认 IDLE 时永远灰）
+        self.assertEqual(direction["Mup2"]["jog_plus"].configured["state"],
+                         "normal")
 
 
 try:
