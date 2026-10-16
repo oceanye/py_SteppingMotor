@@ -1881,8 +1881,14 @@ class StepperGUI:
                 for group_index, group in enumerate(stage.move_groups):
                     for move_index, move in enumerate(group):
                         if stage.sync_endpoints:
+                            # endpoint=相对 stage 起点的累计偏移（planner 注释）：
+                            # 绝对终点=stage 起点+endpoint，段位移=绝对终点−上一
+                            # 段终点（与 stepdir 分支同构）。2026-10-15 修正：此前
+                            # endpoint−stage_origin 把累计偏移当段位移逐段叠加，
+                            # left 方向膨胀成 1830° 必被线缆窗口误拦。
                             endpoint = stage.sync_endpoints[group_index][move_index]
-                            signed_delta = endpoint - stage_origin[move.role]
+                            signed_delta = ((stage_origin[move.role] + endpoint)
+                                            - targets[move.role])
                         else:
                             signed_delta = move.delta
                         count = int(round(abs(signed_delta) * ppu[move.role]))
@@ -1910,6 +1916,7 @@ class StepperGUI:
         self._gait_run.route = route
         self._gait_run.arc_deg = arc_deg
         self._gait_run.rotation_start = None
+        self._gait_run.x42s_sync_origin = None
         self._gait_run.twin_lift_start = twin_lift_start
         self._gait_run.twin_final_positions = None
         self._gait_run.twin_manual_invalid = False
@@ -2194,7 +2201,18 @@ class StepperGUI:
                 current = self._x42s_role_output_units(role)
                 if current is None or not math.isfinite(endpoint):
                     return "failed"
-                delta = endpoint - current
+                # endpoint=相对 stage 起点的累计偏移；绝对终点=stage 起点实测
+                # +endpoint。stage 起点在本 run 首个分段同步组锚定（一个 run
+                # 只有 S4 一个分段 stage）。直接 endpoint−current 仅在 stage
+                # 起点=记零点时侥幸正确，连续多步（起点非零）会整体错位
+                # （2026-10-15 修正，与 begin_run 校验同语义）。
+                origin_map = getattr(run, "x42s_sync_origin", None) or {}
+                if axis not in origin_map:
+                    origin_map = dict(origin_map)
+                    origin_map[axis] = current
+                    if run is not None:
+                        run.x42s_sync_origin = origin_map
+                delta = origin_map[axis] + endpoint - current
             if not math.isfinite(speed) or speed <= 0:
                 return "failed"
             steps, speed_pps = self._x42s_move_conversion(role, delta, speed)

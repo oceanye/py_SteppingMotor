@@ -33,7 +33,7 @@ from motor_control.coordinated_control import build_coordinated_snapshot
 from motor_control.desktop_app import StepperGUI
 import motor_control.desktop_app as desktop_app_module
 from motor_control.gait_executor import GaitExecutor, GaitExecutorError
-from motor_control.gait_planner import GaitParams
+from motor_control.gait_planner import GaitGeometry, GaitParams
 from motor_control.protocol import (
     OkReply,
     ProtocolEncodingError,
@@ -538,6 +538,29 @@ class X42sGaitChainTests(unittest.TestCase):
         self.assertIn("Mr2", str(ctx.exception))
         self.assertEqual(app._gait_owned, {})
 
+    def test_begin_run_x42s_two_mode_cable_window_not_inflated(self):
+        # 实测参数推演（d220/arm40/two_mode/phase_gain−2，2026-10-15）：
+        # S4 分段累计终点曾被当"段位移"逐段叠加（left 方向 Mr 自转膨胀到
+        # 1830° = 三角形数 1+2+…+60），rotation_limit=180 必被线缆窗口
+        # 误拦；修正为累计语义后 left/right 双向放行。
+        for side, arc_deg in (("left", -60.0), ("right", 60.0)):
+            app = _x42s_gait_app()
+            app.gait_params = replace(
+                app.gait_params,
+                geometry=GaitGeometry(
+                    arm_radius_mm=0.2, node_radius_mm=0.2,
+                    safety_margin_mm=0.1, beam_height_mm=30.0),
+                phase_gain=-2.0, trajectory_mode="two_mode_v1",
+                rotation_limit_deg=180.0)
+            app.gait_params = replace(
+                app.gait_params,
+                mr1_zero_signature=app._gait_zero_signature(
+                    "Mr1", app.gait_params),
+                mr2_zero_signature=app._gait_zero_signature(
+                    "Mr2", app.gait_params))
+            run, _ = app._gait_begin_run(side, arc_deg=arc_deg)
+            self.assertGreater(len(run.stages), 0, side)
+
     def test_send_relative_x42s_conversion(self):
         app = _x42s_gait_app(lead_mms={"Mup1": 8.0})
         token = object()
@@ -593,6 +616,56 @@ class X42sGaitChainTests(unittest.TestCase):
             app.commands)
         self.assertIn("X42S,4,MOVE,-%d,%d" % (
             round(60 * 21.5 * 3200 / 360), round(10 * 21.5 * 3200 / 360)),
+            app.commands)
+        # 首个分段组锚定 stage 起点实测（origin 语义见下一用例）。
+        self.assertEqual(app._gait_run.x42s_sync_origin, {102: 0.0, 104: 0.0})
+
+    def test_send_synchronized_x42s_segments_anchor_stage_origin(self):
+        # stage 起点非零（连续第二步起步）：endpoint=相对 stage 起点的累计
+        # 偏移，段位移=origin+endpoint−current；直接 endpoint−current 会把
+        # 整段轨迹错位（2026-10-15 修正回归）。
+        app = _x42s_gait_app()
+        token = object()
+        app._gait_owned = {102: token, 104: token}
+        app._move_reservation[102] = token
+        app._move_reservation[104] = token
+        app._gait_run = SimpleNamespace(rotation_start=None,
+                                        x42s_sync_origin=None)
+        moves = [(102, 0.0, 10.0), (104, 0.0, 10.0)]
+
+        def set_meas(mr1_out, mr2_out):
+            now = time.monotonic()
+            app._x42s_states["Mr1"] = X42sActuatorState(
+                role=LogicalRole("Mr1"), driver_id=2).with_telemetry(
+                now=now, enabled=True, reached=True,
+                measured_position=mr1_out * 21.5, speed=0.0)
+            app._x42s_states["Mr2"] = X42sActuatorState(
+                role=LogicalRole("Mr2"), driver_id=4).with_telemetry(
+                now=now, enabled=True, reached=True,
+                measured_position=mr2_out * 21.5, speed=0.0)
+
+        set_meas(30.0, -30.0)
+        self.assertEqual(
+            StepperGUI._gait_send_synchronized(
+                app, moves, 3.0, cumulative_targets=[60.0, -60.0]), "sent")
+        self.assertEqual(app._gait_run.x42s_sync_origin,
+                         {102: 30.0, 104: -30.0})
+        # 第一段位移 = origin+endpoint−current = 60/−60。
+        self.assertIn("X42S,2,MOVE,%d,%d" % (
+            round(60 * 21.5 * 3200 / 360), round(10 * 21.5 * 3200 / 360)),
+            app.commands)
+        # 第二段：实测走到 90/−90，累计终点 75/−75 → 位移 15/−15
+        # （错位公式会得出 −10 错误方向）。
+        app.commands.clear()
+        set_meas(90.0, -90.0)
+        self.assertEqual(
+            StepperGUI._gait_send_synchronized(
+                app, moves, 3.0, cumulative_targets=[75.0, -75.0]), "sent")
+        self.assertIn("X42S,2,MOVE,%d,%d" % (
+            round(15 * 21.5 * 3200 / 360), round(10 * 21.5 * 3200 / 360)),
+            app.commands)
+        self.assertIn("X42S,4,MOVE,-%d,%d" % (
+            round(15 * 21.5 * 3200 / 360), round(10 * 21.5 * 3200 / 360)),
             app.commands)
 
     def test_wait_terminal_x42s_done_fault_timeout(self):
