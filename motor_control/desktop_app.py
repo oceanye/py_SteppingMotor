@@ -1244,9 +1244,13 @@ class StepperGUI:
                  f"{'+' if axis_positive else '−'}{amount:g}{unit}"
                  f"（输出轴 {out_deg:+.1f}°，约 {est_s:.1f}s；"
                  f"程序驱动方向={drive_text}；请观察机构真实方向）")
+        # targets: [(role, driver_id, gear)] 单台列表（57a720c worker 签名；
+        # 2026-10-16 修正：此处仍按旧签名传 6 参，worker 线程启动即
+        # TypeError，点动无任何反应也无提示——gui_2026-10-16.log 实证）。
         if self._start_control_worker(
-            self._x42s_manual_worker, "plus", driver_id, binding.gear_ratio,
-            role_name, out_deg, X42S_DEBUG_JOG_DEG_S,
+            self._x42s_manual_worker, "plus",
+            [(role_name, driver_id, binding.gear_ratio)],
+            out_deg, X42S_DEBUG_JOG_DEG_S,
         ) is None:
             self.log("⛔ 控制器忙，稍后再操作 X42S 点动")
 

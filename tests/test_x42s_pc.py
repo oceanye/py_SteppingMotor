@@ -933,6 +933,28 @@ class DesktopIntegrationTests(unittest.TestCase):
         self.assertEqual(StepperGUI._gait_role_axis(app, "Mr1"), 102)
         self.assertEqual(StepperGUI._gait_role_axis(app, "Mup2"), 103)
 
+    def test_role_debug_move_x42s_dispatches_new_worker_signature(self):
+        # 2026-10-16：_role_debug_move_x42s 曾残留 57a720c 之前的旧 6 参
+        # 调用，worker 线程启动即 TypeError（方向标定点动无反应也无提示，
+        # gui_2026-10-16.log 实证）。锁定新签名：
+        # ("plus", [(role, driver_id, gear)], out_deg, speed)。
+        app = self._app()
+        app.control_bindings = BindingSet.suggested_x42s()
+        app._x42s_states["Mr1"] = X42sActuatorState(
+            role=LogicalRole("Mr1"), driver_id=2).with_telemetry(
+            now=time.monotonic(), enabled=True, reached=True,
+            measured_position=0.0, speed=0.0)
+        calls = []
+        with patch.object(
+                StepperGUI, "_start_control_worker",
+                side_effect=lambda target, *a, **k: (
+                    calls.append((target.__name__, a)) or object())):
+            StepperGUI._role_debug_move_x42s(app, "Mr1", 102, True, 10.0, "°")
+        self.assertEqual(calls, [(
+            "_x42s_manual_worker",
+            ("plus", [("Mr1", 2, 21.5)], 10.0,
+             desktop_app_module.X42S_DEBUG_JOG_DEG_S))])
+
     def test_apply_x42s_reply_merges_and_keeps_unknown_none(self):
         app = self._app()
         app.control_bindings = BindingSet.suggested_x42s()
