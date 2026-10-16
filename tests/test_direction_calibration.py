@@ -85,7 +85,11 @@ class RecordDirectionSignTests(unittest.TestCase):
         app = calibrated_app()
         var = _SignVar()
         app.gait_sign_vars = {"mr2_sign": var}
-        app._gait_record_direction_sign("Mr2", False)   # 实际俯视顺时针 ⇒ −1
+        # 2026-10-16 起变更前弹确认窗；实测已定符号，误点不再直接落盘。
+        with patch("motor_control.desktop_app.messagebox.askyesno",
+                   return_value=True) as confirm:
+            app._gait_record_direction_sign("Mr2", False)   # 实际俯视顺时针 ⇒ −1
+        confirm.assert_called_once()
         self.assertEqual(app.gait_params.mr2_sign, -1)
         self.assertFalse(app.gait_params.calibration_confirmed)
         self.assertEqual(app.saved_docs[-1]["mr2_sign"], -1)
@@ -97,9 +101,22 @@ class RecordDirectionSignTests(unittest.TestCase):
 
     def test_lift_sign_flip_has_no_zero_invalidation(self):
         app = calibrated_app()
-        app._gait_record_direction_sign("Mup2", False)  # 实际下降 ⇒ −1
+        with patch("motor_control.desktop_app.messagebox.askyesno",
+                   return_value=True):
+            app._gait_record_direction_sign("Mup2", False)  # 实际下降 ⇒ −1
         self.assertEqual(app.gait_params.mup2_lift_sign, -1)
         self.assertFalse(any("记零" in line for line in app._logs))
+
+    def test_declining_confirm_dialog_keeps_sign(self):
+        # 弹窗点"否"：取消修改，不落盘、不打翻已确认的标定。
+        app = calibrated_app()
+        with patch("motor_control.desktop_app.messagebox.askyesno",
+                   return_value=False):
+            app._gait_record_direction_sign("Mr2", False)
+        self.assertEqual(app.gait_params.mr2_sign, 1)
+        self.assertTrue(app.gait_params.calibration_confirmed)
+        self.assertEqual(app.saved_docs, [])
+        self.assertTrue(any("取消" in line for line in app._logs))
 
     def test_unchanged_sign_keeps_confirmed_params(self):
         app = calibrated_app()
@@ -112,7 +129,9 @@ class RecordDirectionSignTests(unittest.TestCase):
     def test_gait_ownership_blocks_recording(self):
         app = calibrated_app()
         app._gait_owned = {3: object()}
-        with patch("motor_control.desktop_app.messagebox.showerror") as err:
+        with patch("motor_control.desktop_app.messagebox.askyesno",
+                   return_value=True), \
+             patch("motor_control.desktop_app.messagebox.showerror") as err:
             app._gait_record_direction_sign("Mr2", False)
         err.assert_called_once()
         self.assertEqual(app.gait_params.mr2_sign, 1)

@@ -1271,6 +1271,16 @@ class StepperGUI:
             self.log(f"✓ {role_name} 方向标定：真实方向与轴坐标+ 一致，"
                      f"符号保持 {new_sign:+d}，无变更")
             return
+        # 2026-10-16 防误改：四台符号实机敲定后，记录按钮仍可随手点，
+        # 误改即步态方向全反（且 Mr 侧零位作废）——变更前强制确认。
+        if not messagebox.askyesno(
+                "确认修改方向符号",
+                f"{role_name} 方向符号 {old_sign:+d} → {new_sign:+d}\n\n"
+                "方向已实机标定，误改会导致步态方向整体反转；"
+                "旋转电机（Mr）符号变更后该侧零位随之作废。\n\n"
+                "确认要修改吗？"):
+            self.log(f"↩ {role_name} 方向符号修改已取消（保持 {old_sign:+d}）")
+            return
         try:
             self._save_gait_params(replace(
                 self.gait_params, **{field: new_sign},
