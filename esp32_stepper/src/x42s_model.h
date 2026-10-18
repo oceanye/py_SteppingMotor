@@ -96,16 +96,23 @@ struct Telemetry {
   uint32_t timeout_count;  // 该台应答超时累计（掉线定位用，§10）
 };
 
-inline void telemetry_reset(Telemetry& t) {
-  t.online = false;
-  t.enabled = false;
-  t.reached = false;
+// A new query must not re-stamp values left over from an earlier response.
+// The light motion probe restores measured_valid only; all optional fields
+// remain unknown until the next successful full query.
+inline void telemetry_invalidate_values(Telemetry& t) {
   t.command_valid = false;
   t.measured_valid = false;
   t.error_valid = false;
   t.speed_valid = false;
   t.current_valid = false;
   t.temperature_valid = false;
+}
+
+inline void telemetry_reset(Telemetry& t) {
+  t.online = false;
+  t.enabled = false;
+  t.reached = false;
+  telemetry_invalidate_values(t);
   t.command_position = 0.0f;
   t.measured_position = 0.0f;
   t.position_error = 0.0f;

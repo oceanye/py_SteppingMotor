@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import queue
 import threading
+import time
+import uuid
 from typing import Callable, Optional, Protocol, Union, runtime_checkable
 
 from .protocol import (
@@ -27,6 +29,7 @@ from .protocol import (
     parse_line,
     reply_matcher_for,
 )
+from .diagnostics import operation_id
 
 
 @runtime_checkable
@@ -85,6 +88,8 @@ class _PendingRequest:
     completed: threading.Event
     reply: Optional[Reply] = None
     error: Optional[BaseException] = None
+    request_id: Optional[str] = None
+    operation_id: Optional[str] = None
 
 
 class SerialSession:
@@ -98,6 +103,7 @@ class SerialSession:
         unsolicited_handler: Optional[UnsolicitedHandler] = None,
         error_handler: Optional[ErrorHandler] = None,
         trace_handler: Optional[TraceHandler] = None,
+        diagnostics=None,
         reader_name: str = "motor-serial-reader",
     ) -> None:
         self._serial = serial_port
@@ -109,6 +115,7 @@ class SerialSession:
             self._unsolicited_handlers.append(unsolicited_handler)
         self._error_handler = error_handler
         self._trace_handler = trace_handler
+        self._diagnostics = diagnostics
         self._reader_name = reader_name
 
         self._events: queue.Queue[AsyncEvent] = queue.Queue()
@@ -164,6 +171,7 @@ class SerialSession:
                 target=self._reader_loop, name=self._reader_name, daemon=True
             )
             self._reader.start()
+        self._diagnose("serial.opened", reader=self._reader_name)
 
     def close(self, join_timeout: float = 1.0) -> None:
         with self._state_lock:
@@ -183,6 +191,7 @@ class SerialSession:
             self._notify_error(SerialIoError(f"serial close failed: {exc}"))
         if reader is not None and reader is not threading.current_thread():
             reader.join(max(0.0, join_timeout))
+        self._diagnose("serial.closed")
 
     def __enter__(self) -> "SerialSession":
         self.start()
@@ -254,22 +263,34 @@ class SerialSession:
             raise ValueError("timeout must be non-negative")
         payload = encode_line(command)
         effective_matcher = matcher if matcher is not None else reply_matcher_for(command)
-        pending = _PendingRequest(effective_matcher, threading.Event())
+        pending = _PendingRequest(effective_matcher, threading.Event(),
+                                  request_id=uuid.uuid4().hex[:16], operation_id=operation_id())
+        started = time.monotonic()
+        self._diagnose("request.queued", pending, command=command, timeout_s=timeout,
+                       soft_timeout=soft_timeout)
 
         with self._request_lock:
-            self._ensure_running()
-            if guard is not None and not guard():
-                raise RequestCancelled(f"request cancelled before send: {command!r}")
+            try:
+                self._ensure_running()
+                if guard is not None and not guard():
+                    raise RequestCancelled(f"request cancelled before send: {command!r}")
+            except Exception as exc:
+                self._diagnose("request.cancelled" if isinstance(exc, RequestCancelled)
+                               else "request.error", pending, command=command,
+                               error=str(exc), phase="before_send")
+                raise
             with self._state_lock:
                 if self._pending is not None:
                     raise SerialSessionError("internal error: concurrent pending request")
                 self._pending = pending
             try:
                 self._write(payload, command)
-            except BaseException:
+            except BaseException as exc:
                 with self._state_lock:
                     if self._pending is pending:
                         self._pending = None
+                self._diagnose("request.error", pending, command=command,
+                               error=str(exc), phase="write")
                 raise
 
             completed = pending.completed.wait(timeout)
@@ -280,10 +301,14 @@ class SerialSession:
                 error = pending.error
 
             if error is not None:
+                self._diagnose("request.error", pending, error=str(error),
+                               elapsed_ms=(time.monotonic()-started)*1000)
                 if isinstance(error, SerialSessionError):
                     raise error
                 raise SerialIoError(str(error)) from error
             if reply is None:
+                self._diagnose("request.timeout", pending, command=command,
+                               soft_timeout=soft_timeout, elapsed_ms=(time.monotonic()-started)*1000)
                 if soft_timeout:
                     return None
                 timeout_error = RequestTimeout(command, timeout)
@@ -293,6 +318,9 @@ class SerialSession:
                     )
                 )
                 raise timeout_error
+            self._diagnose("request.completed", pending, reply=reply.raw,
+                           reply_type=type(reply).__name__,
+                           elapsed_ms=(time.monotonic()-started)*1000)
             return reply
 
     def request_line(
@@ -325,7 +353,11 @@ class SerialSession:
 
     def _write(self, payload: bytes, line: str) -> None:
         try:
+            with self._state_lock:
+                pending = self._pending
+            self._diagnose("serial.tx_attempt", pending, line=line)
             self._serial.write(payload)
+            self._diagnose("serial.tx_written", pending, line=line)
             self._trace("TX", line)
         except Exception as exc:
             error = SerialIoError(f"serial write failed: {exc}")
@@ -345,6 +377,9 @@ class SerialSession:
             message = parse_line(data)
             if not message.raw:
                 continue
+            # RX gets correlated only AFTER matching. An asynchronous or late
+            # reply must not inherit the identity of a merely pending request.
+            self._diagnose("serial.rx", line=message.raw, message_type=type(message).__name__)
             self._trace("RX", message.raw)
             if isinstance(message, AsyncEvent):
                 self._publish_event(message)
@@ -369,6 +404,7 @@ class SerialSession:
                 # A timeout or close may have retired this request while its
                 # custom matcher was executing.
                 if self._pending is pending:
+                    self._diagnose("reply.matched", pending, reply=reply.raw)
                     pending.reply = reply
                     self._pending = None
                     pending.completed.set()
@@ -376,6 +412,7 @@ class SerialSession:
         self._publish_unsolicited(reply)
 
     def _publish_event(self, event: AsyncEvent) -> None:
+        self._diagnose("serial.event", event_type=type(event).__name__, raw=event.raw)
         self._events.put(event)
         with self._state_lock:
             handlers = tuple(self._event_handlers)
@@ -386,6 +423,7 @@ class SerialSession:
                 self._notify_error(exc)
 
     def _publish_unsolicited(self, message: ProtocolMessage) -> None:
+        self._diagnose("serial.unsolicited", raw=message.raw, message_type=type(message).__name__)
         self._unsolicited.put(message)
         with self._state_lock:
             handlers = tuple(self._unsolicited_handlers)
@@ -409,6 +447,7 @@ class SerialSession:
         self._notify_error(error)
 
     def _notify_error(self, error: BaseException) -> None:
+        self._diagnose("serial.error", error_type=type(error).__name__, error=str(error))
         if self._error_handler is None:
             return
         try:
@@ -424,3 +463,14 @@ class SerialSession:
             self._trace_handler(direction, line)
         except Exception as exc:
             self._notify_error(exc)
+
+    def _diagnose(self, event, pending=None, **fields):
+        if self._diagnostics is not None:
+            try:
+                self._diagnostics.event(
+                    "motor", event,
+                    level="ERROR" if event.endswith((".error", ".timeout")) else "INFO",
+                    request_id=pending.request_id if pending else None,
+                    operation_id=pending.operation_id if pending else operation_id(), **fields)
+            except Exception:
+                pass  # Logging failure must never break serial control.

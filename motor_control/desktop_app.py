@@ -91,7 +91,7 @@ from motor_control.protocol import (
     build_x42s_zero_command,
     parse_line,
 )
-from motor_control.actuator_model import X42sActuatorState
+from motor_control.actuator_model import X42sActuatorState, TELEMETRY_FRESH_MAX_AGE_MS
 from motor_control.serial_session import (
     RequestCancelled,
     RequestTimeout,
@@ -136,6 +136,9 @@ from motor_control.ui import (
     sync_binding_editor as sync_binding_editor_view,
 )
 from motor_control.web_adapter import DesktopWebController
+from motor_control.diagnostics import (
+    install_exception_hooks, logged_action, operation_id, operation_scope, start_diagnostics,
+)
 
 # ============== 轴配置 ==============
 # 步进拓扑与单位模型位于 motor_control；这里仅保留闭环电机兼容常量。
@@ -230,7 +233,12 @@ class _GaitHostAdapter:
                                                 cumulative_targets=endpoints)
 
     def wait_terminal(self, axis, timeout_s):
-        return self._app._gait_wait_terminal(axis, timeout_s)
+        result = self._app._gait_wait_terminal(axis, timeout_s)
+        recorder = getattr(self._app, "diagnostics", None)
+        if recorder is not None:
+            recorder.event("motor", "motion.terminal", axis_handle=axis,
+                           result=result, timeout_s=timeout_s)
+        return result
 
     def stop_axes(self, axes):
         self._app._gait_stop_axes(axes)
@@ -243,10 +251,16 @@ class _GaitHostAdapter:
 
 
 class StepperGUI:
-    def __init__(self, root, web_server_factory=None):
+    def __init__(self, root, web_server_factory=None, diagnostics=None):
         self.root = root
         self.state_store = StateStore(PROJECT_DIR)
         self._startup_warnings = []
+        try:
+            self.diagnostics = diagnostics or start_diagnostics(PROJECT_DIR)
+            install_exception_hooks(self.diagnostics, root)
+        except OSError as exc:
+            self.diagnostics = None
+            self._startup_warnings.append(f"⚠️ 后台诊断日志无法启动：{exc}")
         self.root.title("30轴步进（ESP32 + Pico）+ FOC/GEAR + 轨道 D 控制器")
         self.root.resizable(True, True)
 
@@ -435,6 +449,11 @@ class StepperGUI:
         self._load_gear_tune()
         if web_server_factory is not None:
             self._start_web_server(web_server_factory)
+        if self.diagnostics is not None:
+            self.diagnostics.event("gui", "configuration.loaded",
+                                   bindings=self.control_bindings.as_document(),
+                                   gait=self.gait_params.as_document(), axis_profiles=self.axis_profiles)
+            self.log(f"后台诊断已启动，会话 {self.diagnostics.session_id}（串口/电机日志自动记录）")
 
     # ═════════════ 顶层 UI ═════════════
     def _build_ui(self):
@@ -719,6 +738,7 @@ class StepperGUI:
             parts.append(f"{role.value}→{text}")
         return ", ".join(parts)
 
+    @logged_action
     def _save_binding_editor(self):
         try:
             candidate = self._binding_draft()
@@ -834,6 +854,7 @@ class StepperGUI:
         from motor_control.ui.coordinated_tab import apply_manual_debug_units
         apply_manual_debug_units(self)
 
+    @logged_action
     def _x42s_manual_action(self, action):
         """UI 线程入口：action ∈ enable/disable/plus/minus/stop/zero。
 
@@ -982,7 +1003,7 @@ class StepperGUI:
             ok = (isinstance(reply, X42sMoveAck)
                   and reply.driver_id == driver_id
                   and reply.steps == steps and reply.speed == speed_pps)
-        reason = "" if reply is None else reply.raw
+        reason = "无应答（超时或请求已取消）；请检查连接及驱动器状态" if reply is None else reply.raw
         self._post_ui(lambda: self.log(
             ("✅" if ok else "⛔")
             + f" X42S {role_value}·ID{driver_id} {command}"
@@ -1015,6 +1036,17 @@ class StepperGUI:
         with self.state_lock:
             control, snapshots = self._snapshot_coordinated_control_locked()
         refresh_coordinated_tab_view(self, control, snapshots)
+        label = getattr(self, "diagnostic_status_label", None)
+        recorder = getattr(self, "diagnostics", None)
+        if label is not None:
+            health = recorder.health() if recorder is not None else None
+            if health is None:
+                label.configure(text="⚠ 后台日志不可用", foreground="#b42318")
+            elif health["dropped"] or health["write_errors"]:
+                label.configure(text=f"⚠ 日志丢弃 {health['dropped']} / 写入失败 {health['write_errors']}",
+                                foreground="#b42318")
+            else:
+                label.configure(text="● 后台日志自动记录中", foreground="#16803a")
         if self._binding_editor_dirty:
             self._show_binding_draft_validation()
         self._refresh_gait_ui()
@@ -1057,6 +1089,8 @@ class StepperGUI:
         if getattr(self, "_gait_owned", {}):
             raise GaitExecutorError("步态执行中禁止改参数/标定，请先中止或完成")
         self.state_store.save_gait_params(params.as_document())
+        if getattr(self, "diagnostics", None) is not None:
+            self.diagnostics.event("gui", "configuration.gait_saved", gait=params.as_document())
         self.gait_params = params
         return params
 
@@ -1128,6 +1162,7 @@ class StepperGUI:
     def _role_negative_direction_text(self, role_name):
         return "俯视顺时针" if role_name.startswith("Mr") else "下降"
 
+    @logged_action
     def _role_debug_move(self, role_name, axis_positive):
         """电机绑定页单角色点动：按机构坐标 +/- 小步驱动（Mr 10°/Mup 1mm）。
 
@@ -1194,7 +1229,7 @@ class StepperGUI:
             return None
         with self.state_lock:
             state = self._x42s_states.get(role.value)
-        if (state is None or state.driver_id != binding.driver_id
+        if (state is None or state.driver_id != binding.driver_id or not state.online
                 or state.measured_position is None):
             return None
         out_deg = state.measured_position / binding.gear_ratio
@@ -1335,6 +1370,7 @@ class StepperGUI:
                 f"{role_name} 绑定的轴{AXIS_LABEL[axis]} 参数无效")
         return axis
 
+    @logged_action
     def _gait_record_role_zero(self, role_name):
         """UI 线程：把绑定 Mr 轴当前软件位置记为 ψ=30° 基准零位。"""
 
@@ -1378,16 +1414,16 @@ class StepperGUI:
             raise GaitExecutorError("步态拥有四轴时不能修改零位；请先中止/完成")
         if not self._is_serial_connected():
             raise GaitExecutorError("记零需要串口已连接")
-        with self.state_lock:
-            state = self._x42s_states.get(role_name)
+        state = self._x42s_preflight_state(LogicalRole(role_name), driver_id)
         if (state is None or state.driver_id != driver_id
                 or not state.online or state.fault is not None
                 or not state.telemetry_trusted):
             raise GaitExecutorError(
                 f"{role_name} / X42S ID{driver_id} 遥测不可信或不在线；"
                 "先在绑定页手动调试区确认状态正常")
-        if state.speed is not None and abs(state.speed) > 0.5:
-            raise GaitExecutorError(f"{role_name} 仍在运动，不能记零")
+        if ((state.speed is not None and abs(state.speed) > 0.5)
+                or (state.speed is None and not state.reached)):
+            raise GaitExecutorError(f"{role_name} 仍在运动或尚未确认静止，不能记零")
         resp = self._send_and_read(build_x42s_zero_command(driver_id),
                                    timeout=1.5, soft_timeout=True)
         reply = parse_line(resp) if resp else None
@@ -1468,6 +1504,7 @@ class StepperGUI:
                 return (start, name, pivot, bearing)
         return None
 
+    @logged_action
     def _gait_begin_run(self, side, params=None, arc_deg=None):
         """UI 线程：前置检查 + 干跑 + 按当前相位建立执行器。
 
@@ -1766,8 +1803,7 @@ class StepperGUI:
             binding = bindings.for_role(role)
             role_handles[role.value] = (
                 X42S_AXIS_HANDLE_BASE + binding.driver_id)
-            with self.state_lock:
-                state = self._x42s_states.get(role.value)
+            state = self._x42s_preflight_state(role, binding.driver_id)
             if (state is None or state.driver_id != binding.driver_id
                     or not state.online or not state.enabled
                     or state.fault is not None or not state.telemetry_trusted):
@@ -2073,6 +2109,12 @@ class StepperGUI:
         run = self._gait_run
         if run is None:
             return
+        recorder = getattr(self, "diagnostics", None)
+        stage = run.current_stage()
+        stage_id = stage.stage_id if stage else None
+        if recorder is not None:
+            recorder.event("motor", "gait.stage.begin", stage_id=stage_id,
+                           side=run.side, route=run.route, params=run.params.as_document())
 
         def progress(stage_id, done_groups, total_groups):
             self._post_ui(
@@ -2086,16 +2128,22 @@ class StepperGUI:
             run.execute_current_stage(progress)
         except Exception as exc:
             self.log(f"⛔ 步态阶段未执行：{exc}")
+            if recorder is not None:
+                recorder.exception("motor", "gait.stage.error", exc, stage_id=stage_id)
             run.request_stop()
             run._fail("failed", f"执行异常：{exc}")
             self._gait_stop_axes(self._gait_bound_handles())
         finally:
+            if recorder is not None:
+                recorder.event("motor", "gait.stage.end", stage_id=stage_id,
+                               state=run.state, stopped=run._stop_requested)
             if run.state in ("aborted", "failed"):
                 self._gait_needs_recovery = True
                 self.gait_params = replace(self.gait_params, calibration_confirmed=False)
                 self._gait_release_ownership()
             self._post_ui(lambda: self._refresh_gait_ui())
 
+    @logged_action
     def _gait_abort_run(self):
         """UI 线程：中止按钮——请求退出 + 立即停掉四个绑定轴。"""
 
@@ -2402,13 +2450,16 @@ class StepperGUI:
     def _gait_wait_terminal_x42s(self, axis, timeout_s):
         """X42S 终态等待：每 X42S_WAIT_POLL_S 主动查单台状态。
 
-        DONE 判据 = 应答 reached=1 且距进入等待已过起步盲区（覆盖"上一段
-        到位标志未清"前沿与 PC 2Hz 轮询周期）；保护故障 → ABORTED；超时
+        DONE 判据 = 在线使能、无故障、实测位置新鲜、reached=1 且已过起步盲区
+        （覆盖"上一段到位标志未清"前沿）；保护故障/离线/失能 → ABORTED；超时
         → TIMEOUT。查询落在固件 s_moving 降级路径上（运动中仅两帧探测，
         不复发 2026-10-12 的轮询风暴卡死）。查询失败不立即判死，等
         deadline 兜底。
         """
         driver_id = axis - X42S_AXIS_HANDLE_BASE
+        role = self.control_bindings.role_for_driver_id(driver_id)
+        if role is None:
+            return "ABORTED"
         t0 = time.monotonic()
         deadline = t0 + timeout_s
         next_poll = t0 + X42S_WAIT_BLIND_S
@@ -2429,10 +2480,18 @@ class StepperGUI:
             reply = parse_line(resp) if resp else None
             if (isinstance(reply, X42sStatusReply)
                     and reply.driver_id == driver_id):
+                # 到位查询也是位置数据源。下一同步段用累计终点−此实测位置，
+                # 不能等 2Hz 后台轮询才更新，否则会多走上一段的位移。
+                self._apply_x42s_reply(role, driver_id, reply)
+                if not reply.online or not reply.enabled:
+                    self.log(f"⛔ X42S ID{driver_id} 已离线或失能，不能确认到位")
+                    return "ABORTED"
                 if reply.fault is not None:
                     self.log(f"⛔ X42S ID{driver_id} 保护故障 {reply.fault}")
                     return "ABORTED"
                 if (reply.reached
+                        and reply.measured_position is not None
+                        and reply.age_ms <= TELEMETRY_FRESH_MAX_AGE_MS
                         and time.monotonic() - t0 >= X42S_WAIT_BLIND_S):
                     return "DONE"
             time.sleep(0.02)
@@ -2627,6 +2686,7 @@ class StepperGUI:
         draw_gait_preview(self)
         self._refresh_gait_ui()
 
+    @logged_action
     def _gait_stage_confirmed(self):
         run = self._gait_run
         if run is None:
@@ -2829,6 +2889,8 @@ class StepperGUI:
     def _handle_ui_dispatch_error(self, exc):
         """异步 UI 更新失败必须可诊断，不能静默表现为按钮无响应。"""
         message = f"⚠️ UI 更新失败: {exc}"
+        if getattr(self, "diagnostics", None) is not None:
+            self.diagnostics.exception("gui", "exception.ui_dispatch", exc)
         try:
             self.log(message)
         except Exception:
@@ -2844,10 +2906,26 @@ class StepperGUI:
                 return None
             generation = self._control_generation
 
+        diagnostic_operation = operation_id()
+        recorder = getattr(self, "diagnostics", None)
+        worker_name = getattr(target, "__name__", type(target).__name__)
+
         def runner():
             self._control_context.generation = generation
             try:
-                target(*args, **kwargs)
+                with operation_scope(diagnostic_operation):
+                    if recorder is not None:
+                        recorder.event("motor", "worker.begin", worker=worker_name, args=args)
+                    try:
+                        target(*args, **kwargs)
+                    except Exception as exc:
+                        if recorder is not None:
+                            recorder.exception("motor", "worker.error", exc, worker=worker_name)
+                        self.log(f"⛔ 控制线程 {worker_name} 异常：{exc}；详见后台日志")
+                        raise
+                    finally:
+                        if recorder is not None:
+                            recorder.event("motor", "worker.end", worker=worker_name)
             finally:
                 try:
                     del self._control_context.generation
@@ -3255,6 +3333,7 @@ class StepperGUI:
         if ports:
             self.port_cb.set(ports[0])
 
+    @logged_action
     def toggle_connect(self):
         with self.state_lock:
             teardown_in_progress = self._disconnect_teardown_in_progress
@@ -3292,9 +3371,12 @@ class StepperGUI:
                 generation = self._serial_generation
             time.sleep(1.0)
             while opened_serial.in_waiting:
-                opened_serial.readline()
+                boot_line = opened_serial.readline()
+                if getattr(self, "diagnostics", None) is not None:
+                    self.diagnostics.event("motor", "serial.boot", line=boot_line.decode("utf-8", errors="replace"))
             new_session = SerialSession(
                 opened_serial,
+                diagnostics=getattr(self, "diagnostics", None),
                 event_handler=lambda event: self._handle_serial_event(
                     event, generation, new_session
                 ),
@@ -5126,8 +5208,33 @@ class StepperGUI:
                 time.sleep(self.X42S_POLL_INTERVAL_S / len(polled))
             time.sleep(0.05)
 
+    def _x42s_preflight_state(self, role, driver_id):
+        """Re-read an aged online sample before start/zero checks.
+
+        The background loop is deliberately slow (2Hz, to avoid driver UART
+        overload). Four staggered samples cannot all fit a 200ms freshness
+        window. Re-read only the expired sample, then keep the existing safety
+        checks; a timeout must never make the previous position fresh again.
+        Firmware S returns its cache, not a forced UART sample: this can still
+        fail the freshness gate until firmware polling has produced a new sample.
+        """
+        with self.state_lock:
+            state = self._x42s_states.get(role.value)
+        if (state is not None and state.driver_id == driver_id and state.online
+                and not state.telemetry_trusted):
+            resp = self._send_and_read(
+                build_x42s_status_command(driver_id), soft_timeout=True)
+            reply = parse_line(resp) if resp else None
+            if isinstance(reply, X42sStatusReply) and reply.driver_id == driver_id:
+                self._apply_x42s_reply(role, driver_id, reply)
+            else:
+                return None  # Do not accept a cache update from another poll.
+            with self.state_lock:
+                state = self._x42s_states.get(role.value)
+        return state
+
     def _apply_x42s_reply(self, role, driver_id, reply):
-        """把一次成功遥测并入状态缓存；未知字段保持 None（§12）。"""
+        """合并一帧遥测；保留 online/age/valid 的真实含义（§12）。"""
 
         if reply.driver_id != driver_id:
             return  # 错台号回复不得并入该角色（调用方已查，这里兜底）
@@ -5135,20 +5242,40 @@ class StepperGUI:
             "enabled": reply.enabled,
             "reached": reply.reached,
             "fault": reply.fault,
+            "online": reply.online,
+            "last_update_monotonic": time.monotonic() - reply.age_ms / 1000.0,
         }
         for name in ("command_position", "measured_position",
                      "position_error", "speed", "current_a", "temperature_c"):
-            value = getattr(reply, name)
-            if value is not None:
-                fields[name] = value
+            # 本轮无效必须清空；不能给上一轮位置/速度刷新时间戳。
+            fields[name] = getattr(reply, name)
         with self.state_lock:
+            binding = self.control_bindings.for_role(role)
+            if (binding is None or binding.kind != "x42s"
+                    or binding.driver_id != driver_id):
+                return  # 查询在途时已换绑定，旧回复不得覆盖新角色。
             current = self._x42s_states.get(role.value)
             base = (
                 current
                 if current is not None and current.driver_id == driver_id
                 else X42sActuatorState(role=role, driver_id=driver_id)
             )
-            self._x42s_states[role.value] = base.with_telemetry(**fields)
+            self._x42s_states[role.value] = replace(base, **fields)
+        recorder = getattr(self, "diagnostics", None)
+        if recorder is not None:
+            output_deg = (None if reply.measured_position is None
+                          else reply.measured_position / binding.gear_ratio)
+            position = (output_deg if ROLE_SPECS[role].required_mode == MODE_ROTARY
+                        or output_deg is None else output_deg * binding.lead_mm / 360.0)
+            recorder.event("telemetry", "x42s.telemetry", role=role.value, driver_id=driver_id,
+                           motor_deg=reply.measured_position, command_motor_deg=reply.command_position,
+                           output_position=position,
+                           unit="deg" if ROLE_SPECS[role].required_mode == MODE_ROTARY else "mm",
+                           gear_ratio=binding.gear_ratio, lead_mm=binding.lead_mm,
+                           error_motor_deg=reply.position_error, speed_motor_rpm=reply.speed,
+                           current_a=reply.current_a, temperature_c=reply.temperature_c,
+                           online=reply.online, enabled=reply.enabled, reached=reply.reached,
+                           fault=reply.fault, age_ms=reply.age_ms, raw=reply.raw)
 
     def _update_foc_display(self, axis, state, cur, tgt, fault):
         self.v_focstate[axis].set(FOC_STATE_NAMES.get(state, "?"))
@@ -5607,6 +5734,8 @@ class StepperGUI:
                 )
         self._save_calib()
         self.root.destroy()
+        if getattr(self, "diagnostics", None) is not None:
+            self.diagnostics.close()
 
     def _ensure_web_control_available(self, *, allow_estop_retry=False):
         with self.state_lock:
@@ -5627,6 +5756,7 @@ class StepperGUI:
             raise RuntimeError("串口未连接")
         return generation
 
+    @logged_action
     def _stop_all_outputs(self, allow_closing=False):
         """发送固件原子软件急停；返回是否收到精确确认。"""
         with self.state_lock:
@@ -5818,12 +5948,17 @@ class StepperGUI:
     def log(self, msg):
         ts = time.strftime("%H:%M:%S")
         full = f"{ts}  {msg}"
-        # 写日期分割的日志文件（追加）
-        try:
-            with open(self._log_file_path(), "a", encoding="utf-8") as f:
-                f.write(full + "\n")
-        except Exception:
-            pass
+        recorder = getattr(self, "diagnostics", None)
+        if recorder is not None:
+            level = {"err": "ERROR", "warn": "WARNING"}.get(self._classify_log(msg), "INFO")
+            recorder.event("gui", "gui.message", level=level, message=msg)
+        else:
+            # Compatibility/failure fallback when structured diagnostics cannot start.
+            try:
+                with open(self._log_file_path(), "a", encoding="utf-8") as f:
+                    f.write(full + "\n")
+            except Exception:
+                pass
         # UI 上色显示
         tag = self._classify_log(msg)
         def _append():
@@ -5833,6 +5968,8 @@ class StepperGUI:
             else:
                 self.log_text.insert("end", full + "\n")
             self.log_text.see("end")
+            if int(self.log_text.index("end-1c").split(".")[0]) > 3000:
+                self.log_text.delete("1.0", "501.0")
             self.log_text.config(state="disabled")
         self._post_ui(_append)
 
@@ -5846,6 +5983,23 @@ class StepperGUI:
             os.startfile(LOG_DIR)  # Windows
         except Exception:
             messagebox.showinfo("日志目录", LOG_DIR)
+
+    def _export_diagnostics(self):
+        """Export in a non-control worker; never send hardware commands or upload."""
+        if getattr(self, "_diagnostic_export_running", False):
+            return
+        self._diagnostic_export_running = True
+        def worker():
+            try:
+                from motor_control.diagnostic_export import export_bundle
+                path = export_bundle(PROJECT_DIR, recorder=getattr(self, "diagnostics", None))
+                self.log(f"✓ 脱敏诊断包已导出：{path}（未自动上传）")
+                self._post_ui(lambda: messagebox.showinfo("诊断包已导出", str(path)))
+            except Exception as exc:
+                self.log(f"⛔ 导出诊断包失败：{exc}")
+            finally:
+                self._diagnostic_export_running = False
+        threading.Thread(target=worker, name="diagnostic-export", daemon=True).start()
 
     def _open_user_guide(self):
         """在默认浏览器打开本地使用说明 docs/user_guide.html。"""

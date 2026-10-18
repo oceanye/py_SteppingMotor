@@ -156,6 +156,7 @@ static void send_frame_no_wait(uint8_t id, uint8_t function,
 // 转速 0.1RPM、温度 ℃、电流 mA。
 bool fetch_telemetry(uint8_t id) {
   x42s::Telemetry& t = s_telemetry[id];
+  x42s::telemetry_invalidate_values(t);
   uint8_t org_bits = 0, status_bits = 0;
   {
     x42s::ReplyFrame reply;
@@ -238,6 +239,7 @@ bool fetch_telemetry(uint8_t id) {
 // 仍在运动——探测窗超限（tick 里判定）兜底退出，不会死锁。
 bool probe_move(uint8_t id) {
   x42s::Telemetry& t = s_telemetry[id];
+  x42s::telemetry_invalidate_values(t);
   x42s::ReplyFrame reply;
   if (!transact(id, x42s::kFcReadStatusPair, nullptr, 0, &reply) ||
       reply.payload_len < 2) {
@@ -251,7 +253,11 @@ bool probe_move(uint8_t id) {
   t.fault = x42s::fault_from_status_words(org_bits, status_bits);
   const bool done = t.reached || t.fault != x42s::Fault::kNone;
   int32_t measured = 0;
-  if (!done && transact(id, x42s::kFcReadPosition, nullptr, 0, &reply) &&
+  // Even the first reached=1 response needs a new measured position. Skipping
+  // 36 here returned the previous moving sample as a freshly reached endpoint,
+  // which inflated the PC's next (cumulative target - measured) segment.
+  // This remains a two-frame probe; failure leaves measured_valid=false.
+  if (transact(id, x42s::kFcReadPosition, nullptr, 0, &reply) &&
       x42s::parse_signed_u32(reply.payload, reply.payload_len, &measured)) {
     t.measured_position = (float)measured / 10.0f;  // 0.1° → °
     t.measured_valid = true;

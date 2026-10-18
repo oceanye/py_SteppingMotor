@@ -11,7 +11,8 @@ if not exist ".venv\Scripts\pythonw.exe" (
 rem Launch without a console window. This removes the CMD box entirely,
 rem which sidesteps two known issues: (1) wheel-scroll in the console box
 rem did nothing, (2) resizing the console box after a move killed the app.
-rem Runtime logs go to the GUI log pane and logs\gui_<date>.log; crash
+rem Runtime logs go to the GUI pane and logs\diagnostics\<session>\*.jsonl; crash
 rem tracebacks are captured to logs\gui_stderr.log by pc_gui.py itself.
+rem Use the GUI diagnostic export button for a redacted ZIP (no auto-upload).
 rem Use start_gui_console.bat when you need live tracebacks for debugging.
 start "" ".venv\Scripts\pythonw.exe" "pc_gui.py"

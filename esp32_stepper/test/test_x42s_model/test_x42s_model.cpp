@@ -51,6 +51,38 @@ void test_freshness_window_matches_pc_contract(void) {
     TEST_ASSERT_FALSE(x42s::telemetry_is_fresh(t, 1100));
 }
 
+void test_probe_does_not_refresh_old_optional_values(void) {
+    x42s::Telemetry t;
+    x42s::telemetry_reset(t);
+    x42s::telemetry_mark_seen(t, 1000);
+    t.enabled = true;
+    t.reached = true;
+    t.command_valid = t.measured_valid = t.error_valid = true;
+    t.speed_valid = t.current_valid = t.temperature_valid = true;
+    t.measured_position = 123.0f;
+    t.timeout_count = 2;
+    x42s::telemetry_invalidate_values(t);
+    TEST_ASSERT_FALSE(x42s::telemetry_is_fresh(t, 1000));
+    TEST_ASSERT_FALSE(t.command_valid);
+    TEST_ASSERT_FALSE(t.measured_valid);
+    TEST_ASSERT_FALSE(t.error_valid);
+    TEST_ASSERT_FALSE(t.speed_valid);
+    TEST_ASSERT_FALSE(t.current_valid);
+    TEST_ASSERT_FALSE(t.temperature_valid);
+    // Status and diagnostics survive; validity, not zero, expresses unknown.
+    TEST_ASSERT_TRUE(t.online);
+    TEST_ASSERT_TRUE(t.enabled);
+    TEST_ASSERT_TRUE(t.reached);
+    TEST_ASSERT_EQUAL_FLOAT(123.0f, t.measured_position);
+    TEST_ASSERT_EQUAL_UINT32(2, t.timeout_count);
+    // A successful 36 restores only this new position's validity.
+    t.measured_position = 215.0f;
+    t.measured_valid = true;
+    x42s::telemetry_mark_seen(t, 1100);
+    TEST_ASSERT_TRUE(x42s::telemetry_is_fresh(t, 1100));
+    TEST_ASSERT_FALSE(t.speed_valid);
+}
+
 void test_offline_detection_boundaries(void) {
     x42s::Telemetry t;
     x42s::telemetry_reset(t);
@@ -126,6 +158,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     UNITY_BEGIN();
     RUN_TEST(test_reset_clears_everything);
     RUN_TEST(test_freshness_window_matches_pc_contract);
+    RUN_TEST(test_probe_does_not_refresh_old_optional_values);
     RUN_TEST(test_offline_detection_boundaries);
     RUN_TEST(test_status_word_bit_constants_match_manual);
     RUN_TEST(test_fault_priority_and_tags);

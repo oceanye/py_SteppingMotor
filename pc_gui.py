@@ -45,6 +45,16 @@ from motor_control.bootstrap import configure_standard_streams
 _PROJECT_PATH = Path(__file__).resolve().parent
 configure_standard_streams(_PROJECT_PATH)
 
+# Install before importing Tk/controller so pythonw startup failures are retained.
+_diagnostics = None
+if __name__ == "__main__":
+    from motor_control.diagnostics import start_diagnostics, install_exception_hooks
+    try:
+        _diagnostics = start_diagnostics(_PROJECT_PATH)
+        install_exception_hooks(_diagnostics)
+    except OSError as exc:
+        print(f"Diagnostic startup failed: {exc}", file=sys.stderr)
+
 from motor_control import (  # noqa: E402 - bootstrap must run first under pythonw
     AXIS_LABEL,
     DEFAULT_GEAR_RATIO,
@@ -98,9 +108,17 @@ def main() -> None:
 
     from web_control import WebControlServer
 
-    root = tk.Tk()
-    StepperGUI(root, lambda controller: WebControlServer(controller))
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        StepperGUI(root, lambda controller: WebControlServer(controller), diagnostics=_diagnostics)
+        root.mainloop()
+    except Exception as exc:
+        if _diagnostics is not None:
+            _diagnostics.exception("gui", "startup_or_mainloop.error", exc)
+        raise
+    finally:
+        if _diagnostics is not None:
+            _diagnostics.close()
 
 
 if __name__ == "__main__":

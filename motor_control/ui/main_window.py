@@ -142,7 +142,7 @@ def build_ui(app, log_dir, num_motor_axes):
     app._build_gait_tab(gait_tab)
 
     log_frame = ttk.LabelFrame(app.root,
-                               text=f"日志（同时写到 {os.path.basename(log_dir)}/gui_<日期>.log）")
+                               text=f"日志（后台自动记录 GUI / 电机 / 遥测：{os.path.basename(log_dir)}/diagnostics）")
     log_frame.grid(row=2, column=0, sticky="ew", **pad)
     app.log_text = tk.Text(log_frame, height=6, width=96, state="disabled", font=("Consolas", 9))
     app.log_text.pack(side="left", fill="both", padx=4, pady=3)
@@ -161,8 +161,11 @@ def build_ui(app, log_dir, num_motor_axes):
     log_btn_frame.grid(row=3, column=0, sticky="e", padx=6, pady=2)
     ttk.Button(log_btn_frame, text="清空", command=app.clear_log).pack(side="left", padx=2)
     ttk.Button(log_btn_frame, text="打开日志目录", command=app._open_log_dir).pack(side="left", padx=2)
+    ttk.Button(log_btn_frame, text="导出脱敏诊断包", command=app._export_diagnostics).pack(side="left", padx=2)
+    app.diagnostic_status_label = ttk.Label(log_btn_frame, text="后台诊断启动中…")
+    app.diagnostic_status_label.pack(side="left", padx=4)
     app.raw_log_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(log_btn_frame, text="串口原始流(新文件)", variable=app.raw_log_var,
+    ttk.Checkbutton(log_btn_frame, text="另存原始流(可选)", variable=app.raw_log_var,
                     command=app._toggle_raw_log).pack(side="left", padx=8)
 
     app._raw_log_fh = None
