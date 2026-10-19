@@ -1,0 +1,35 @@
+{
+  "schema": "motor-diagnostics-v1",
+  "session_id": "20261019T053556-a9abfd915b",
+  "closed": true,
+  "started_utc": "2026-10-19T05:35:56.392687+00:00",
+  "limits": {
+    "max_bytes_per_file": 2000000,
+    "backups": 2,
+    "queue_size": 8192,
+    "keep_closed_sessions": 20
+  },
+  "metadata": {
+    "python": "3.13.7",
+    "platform": "Windows-10-10.0.19045-SP0",
+    "executable": "pythonw.exe",
+    "commit": "77dfbe2bc5516ed5453bf7db79cd3c45b30093e6",
+    "branch": "feature/x42s-uart-actuator-binding",
+    "worktree": "M logs/diagnostics/20261019T010932-1b27173fdb/gui.jsonl\n M logs/diagnostics/20261019T010932-1b27173fdb/motor.jsonl\n M logs/diagnostics/20261019T010932-1b27173fdb/motor.jsonl.1\n M logs/diagnostics/20261019T010932-1b27173fdb/motor.jsonl.2\n M logs/diagnostics/20261019T010932-1b27173fdb/session.json\n M logs/diagnostics/20261019T010932-1b27173fdb/telemetry.jsonl\n M logs/diagnostics/20261019T010932-1b27173fdb/telemetry.jsonl.1\n M logs/diagnostics/20261019T010932-1b27173fdb/telemetry.jsonl.2",
+    "source_sha256": {
+      "desktop_app.py": "2f5b92600ce09afac081e3f08943c7858862ab57a9bfe1731898f72fdbac3683",
+      "serial_session.py": "4e7ceb744898cc7de3029e5f1e70ea7204cf143b7e94711e2debc81cb7694c07",
+      "diagnostics.py": "cd40fcf2fcddbc3a180e8374a0860bb3f94984176b52d6a8c86888d9a214a057",
+      "gait_executor.py": "996d1b96bce8f39971d2718b49c39aab6b7c72894642f19317e4078fe65e120e"
+    }
+  },
+  "health": {
+    "session_id": "20261019T053556-a9abfd915b",
+    "queued": 0,
+    "dropped": 0,
+    "write_errors": 0,
+    "last_error": null,
+    "closed": true
+  },
+  "ended_utc": "2026-10-19T05:50:07.941248+00:00"
+}
