@@ -691,15 +691,18 @@ class X42sGaitChainTests(unittest.TestCase):
         self.assertIn("X42S,1,STOP", app.commands)
         self.assertIn("X42S,4,STOP", app.commands)
 
-    def test_record_zero_x42s_writes_driver_zero_and_params(self):
-        app = _x42s_gait_app()
+    def test_record_zero_x42s_writes_pc_side_baseline(self):
+        # 2026-10-19 定案：驱动器 93 88 01 回 02 但遥测不重置——记零改存
+        # PC 侧基准（当前实测输出轴角），不再发驱动器 ZERO。
+        app = _x42s_gait_app(measured=(0.0, 645.0, 0.0, 0.0))  # Mr1 电机轴645°
         app.state_store = SimpleNamespace(save_gait_params=lambda doc: None)
         position = StepperGUI._gait_record_role_zero(app, "Mr1")
-        self.assertEqual(position, 0.0)
-        self.assertIn("X42S,2,ZERO", app.commands)
-        self.assertEqual(app.gait_params.mr1_zero_deg, 0.0)
+        self.assertAlmostEqual(position, 645.0 / 21.5)  # 输出轴 30°
+        self.assertNotIn("X42S,2,ZERO", app.commands)
+        self.assertAlmostEqual(app.gait_params.mr1_zero_deg, 645.0 / 21.5)
         self.assertEqual(app.gait_params.mr1_zero_signature,
                          app._gait_zero_signature("Mr1", app.gait_params))
+        self.assertFalse(app.gait_params.calibration_confirmed)
 
     def test_record_zero_x42s_rejects_untrusted_telemetry(self):
         app = _x42s_gait_app()
@@ -708,7 +711,6 @@ class X42sGaitChainTests(unittest.TestCase):
         with self.assertRaises(GaitExecutorError) as ctx:
             StepperGUI._gait_record_role_zero(app, "Mr1")
         self.assertIn("遥测不可信", str(ctx.exception))
-        self.assertNotIn("X42S,2,ZERO", app.commands)
 
 
 class X42sManualUnitsTests(unittest.TestCase):

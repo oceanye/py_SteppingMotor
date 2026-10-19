@@ -1403,11 +1403,13 @@ class StepperGUI:
         return position
 
     def _gait_record_role_zero_x42s(self, role_name, handle):
-        """X42S 记零：发存储式 ZERO 命令，驱动器侧当前输出轴位置即 ψ 基准。
+        """X42S 记零：把当前实测输出轴位置记为 ψ 基准（PC 侧零点）。
 
-        驱动器 ZERO（存储式）把当前实测位置归零，故 PC 侧 zero_deg 恒
-        0.0；ψ = LOW_NODE_PHASE_DEG + sign×(meas/gear − 0)。UI 线程同步
-        发送（一次串口往返，点击式操作可接受）；失败抛错不改参数。
+        2026-10-19 实测定案：驱动器 93 88 01（存储式设零）虽回 02 接受，
+        但遥测位置不重置（gui_2026-10-19 诊断记录：四台 meas 纹丝不动，
+        Mr1 −107.8°/Mr2 −495.3°电机轴）——驱动器侧归零不可靠。零点基准
+        改存 PC 侧：zero_deg=记零时刻实测输出轴角，ψ=基准+sign×(meas
+        −zero)；断电保持由 .gait_params.json 承担，与驱动器内部零点无关。
         """
         driver_id = handle - X42S_AXIS_HANDLE_BASE
         if getattr(self, "_gait_owned", {}):
@@ -1424,25 +1426,19 @@ class StepperGUI:
         if ((state.speed is not None and abs(state.speed) > 0.5)
                 or (state.speed is None and not state.reached)):
             raise GaitExecutorError(f"{role_name} 仍在运动或尚未确认静止，不能记零")
-        resp = self._send_and_read(build_x42s_zero_command(driver_id),
-                                   timeout=1.5, soft_timeout=True)
-        reply = parse_line(resp) if resp else None
-        if not (isinstance(reply, OkReply)
-                and len(reply.values) >= 3
-                and reply.values[0] == "X42S"
-                and reply.values[1] == str(driver_id)
-                and reply.values[2] == "ZERO"):
+        position = self._x42s_role_output_units(LogicalRole(role_name))
+        if position is None or not math.isfinite(position):
             raise GaitExecutorError(
-                f"X42S ID{driver_id} 记零未获固件确认：{resp or '无应答'}")
-        updates = {"mr1_zero_deg" if role_name == "Mr1" else "mr2_zero_deg": 0.0,
+                f"{role_name} 实测位置缺失（§12 不回退 0），不能记零")
+        updates = {"mr1_zero_deg" if role_name == "Mr1" else "mr2_zero_deg": position,
                    ("mr1_zero_signature" if role_name == "Mr1"
                     else "mr2_zero_signature"):
                        self._gait_zero_signature(role_name, self.gait_params)}
         self._save_gait_params(replace(self.gait_params,
                                         calibration_confirmed=False, **updates))
-        self.log(f"✓ {role_name} 零位已记录：X42S ID{driver_id} 当前位置"
-                 f"已写入驱动器（zero_deg=0；对应 ψ 基准 {LOW_NODE_PHASE_DEG:g}°）")
-        return 0.0
+        self.log(f"✓ {role_name} 零位已记录：输出轴 {position:+.3f}° 为 ψ 基准"
+                 f"（X42S ID{driver_id} 实测，PC 侧基准，断电保持）")
+        return position
 
     def _gait_swing_theta_deg(self, side, params):
         """摆动侧 Mr 累计角 θ = 机构坐标 − 零位（≈线缆缠绕量，度）。

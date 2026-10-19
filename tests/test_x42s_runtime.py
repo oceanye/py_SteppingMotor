@@ -116,13 +116,15 @@ class X42sRuntimeTests(unittest.TestCase):
         self.assertEqual(app._gait_owned, {})
 
     def test_zero_refreshes_stale_sample_before_existing_safety_checks(self):
+        # 2026-10-19：记零改 PC 侧基准（measured 默认 0 ⇒ 基准 0），
+        # 仍先刷新过期遥测再走静止/可信检查；不再发驱动器 ZERO。
         app = _x42s_gait_app()
         app.state_store = SimpleNamespace(save_gait_params=lambda _doc: None)
         state = app._x42s_states["Mr1"]
         app._x42s_states["Mr1"] = replace(
             state, last_update_monotonic=time.monotonic() - 1)
         self.assertEqual(app._gait_record_role_zero("Mr1"), 0)
-        self.assertEqual(app.commands, ["X42S,S,2", "X42S,2,ZERO"])
+        self.assertEqual(app.commands, ["X42S,S,2"])
 
     def test_manual_timeout_has_actionable_message(self):
         app = _x42s_gait_app()
