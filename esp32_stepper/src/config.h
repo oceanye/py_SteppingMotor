@@ -3,7 +3,8 @@
 
 // 编译模式由 platformio.ini 的 build_flags 提供：
 //   -DDRIVE_MODE_FOC   → 旧板：双路步进 + 双路 FOC
-//   -DDRIVE_MODE_GEAR  → 默认新板：六路步进 + 双路闭环减速电机 + 轨道 D
+//   -DDRIVE_MODE_GEAR + X42S_UART_ENABLED → 当前四轴 X42S + GEAR + 轨道 D
+//   -DDRIVE_MODE_GEAR（不启用 X42S） → 历史六路 STEP/DIR 板
 #if !defined(DRIVE_MODE_FOC) && !defined(DRIVE_MODE_GEAR)
   #error "Build flag missing: define DRIVE_MODE_FOC or DRIVE_MODE_GEAR in platformio.ini"
 #endif
@@ -61,14 +62,14 @@
 #endif  // DRIVE_MODE_FOC
 
 // ============================================================
-// GEAR 模式（六路 DM422/DM442 + 两路闭环 DRV8871 + 一路轨道 D）
+// GEAR 模式：当前 X42S / 历史六路 STEP/DIR 均复用 GEAR 和轨道 D 配置。
 // ============================================================
 #if defined(DRIVE_MODE_GEAR)
 
-#define NUM_AXES 6          // 步进轴数（6 × DM422）
+#define NUM_AXES 6          // 历史 STEP/DIR 轴数；X42S 构建不初始化这些轴
 #define NUM_GEAR_AXES 2     // GEAR 减速电机轴数（DRV8871，不变）
 
-// ── 步进（PUL/DIR 每轴一对）──
+// ── 历史 STEP/DIR 引脚（仅 LEGACY_STEPDIR_ENABLED 构建驱动）──
 #define PIN_STEP_PUL_0     5
 #define PIN_STEP_DIR_0     6
 #define PIN_STEP_PUL_1     7
@@ -196,7 +197,7 @@
 // ── 可选 X42S TTL-UART 四轴闭环执行层（feature/x42s-uart-actuator-binding）──
 // 与 RS485 remote / 编码器诊断 I2C 共用 GPIO42/47，编译期互斥。
 // 功能码/数据布局/状态字已按手册 V1.0.5 核对（2026-09-29，见
-// x42s_protocol.h 头注）。M5 台架验证通过前步态仍拒绝该后端（§19）。
+// x42s_protocol.h 头注）。步态由 PC 检查在线、使能、遥测及现场基准。
 #ifndef X42S_UART_ENABLED
   #define X42S_UART_ENABLED  0
 #endif
@@ -265,3 +266,15 @@
 #define GEAR_TASK_TICK_MS       1       // 1 kHz 闭环
 
 #endif  // DRIVE_MODE_GEAR
+
+// X42S 当前硬件与历史 STEP/DIR 严格隔离；禁用时不得初始化旧 GPIO/任务。
+#ifndef LEGACY_STEPDIR_ENABLED
+  #if defined(X42S_UART_ENABLED) && X42S_UART_ENABLED
+    #define LEGACY_STEPDIR_ENABLED 0
+  #else
+    #define LEGACY_STEPDIR_ENABLED 1
+  #endif
+#endif
+#if defined(X42S_UART_ENABLED) && X42S_UART_ENABLED && LEGACY_STEPDIR_ENABLED
+  #error "X42S build must not enable legacy STEP/DIR outputs"
+#endif

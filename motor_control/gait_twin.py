@@ -1,4 +1,4 @@
-"""Read-only gait pose from commanded pulse coordinates, never control feedback.
+"""Read-only gait pose from axis feedback, never control feedback.
 
 XY is normalized by the beam length (d=1), so the live schematic needs no
 additional geometry inputs. Z is displacement from the current step's starting
@@ -17,6 +17,27 @@ from motor_control.gait_avoidance import lattice_coordinates
 PAD_CENTERS = {"A": (-1.0, 0.0), "B": (0.0, 0.0),
                "C": (-0.5, math.sqrt(3) / 2)}
 ROLES = ("Mup1", "Mr1", "Mup2", "Mr2")
+
+
+def axis_motion_active(axis):
+    """X42S retains its last target at rest; a target alone is not motion.
+
+    Missing/stale status is not permission to edit a live physical reference.
+    Legacy pulse axes retain their original pending-target semantics.
+    """
+    if str(axis.get("position_source", "")).startswith("x42s"):
+        # No live actuator: allow offline simulation. Physical reference edits
+        # still have their own online/enabled/fresh-feedback preflight.
+        if (axis.get("binding_valid") is False or axis.get("state") in (
+                "UNBOUND", "INVALID", "DISCONNECTED", "X42S_OFFLINE", "X42S_BACKEND_PENDING")):
+            return False
+        live = axis.get("x42s") or {}
+        speed = live.get("speed")
+        return (not axis.get("position_trusted") or bool(axis.get("stale"))
+                or live.get("reached") is not True or not _finite(speed)
+                or abs(speed) > 0.01)
+    return (axis.get("target_position") is not None
+            or axis.get("state") in ("STARTING", "MOVING", "CONTINUOUS"))
 
 
 class TwinHistory:
@@ -119,11 +140,10 @@ def build_twin_snapshot(
     calibration_valid: bool = False,
     needs_recovery: bool = False,
 ) -> dict:
-    """Consume the same pulse ledger as desktop/Web; never extrapolate by time.
+    """Use measured X42S axes or legacy pulse accounting, never command targets.
 
-    A target is the command's destination, not the estimated current position.
-    Progress reports count emitted pulses; they do not detect missed steps.
-    Future encoder integration can provide a separate measured pose/source.
+    Axis feedback is measured; world pose is kinematic inference with assumed
+    support/contact and calibrated geometry, not externally measured XYZ.
     """
     motors = {str(a["role"]): dict(a) for a in axes}
     # X42S 后端：位置为驱动器实测（快照层已 ÷gear_ratio 换算输出轴），
@@ -132,7 +152,10 @@ def build_twin_snapshot(
         str(a.get("position_source", "")).startswith("x42s") for a in axes
     )
     result = {"source": "x42s_measured" if all_x42s else "commanded_pulses",
-              "measured": all_x42s,
+              "measured": (all_x42s and len(motors) == len(ROLES)
+                           and all(a.get("position_trusted") and _finite(a.get("position"))
+                                   for a in motors.values())),
+              "pose_measured": False,
               "xy_unit": "beam_length", "axes": motors,
               "pose": None, "target_pose": None, "state": "unavailable",
               "message": "等待四个电机绑定", "reference_key": None}
@@ -164,7 +187,9 @@ def build_twin_snapshot(
                      "显示电机轴坐标；开始步态后按已确认支点推算公转"),
         )
         return result
-    pending = [motors[r] for r in ROLES if motors[r].get("target_position") is not None]
+    pending = [motors[r] for r in ROLES
+               if motors[r].get("target_position") is not None
+               and (not all_x42s or axis_motion_active(motors[r]))]
     if any(a.get("stale") for a in pending):
         result.update(state="stale", message="脉冲进度超过1秒未更新；保留最近有效估算")
         return result
@@ -186,7 +211,7 @@ def build_twin_snapshot(
     if all_x42s:
         # 实测位置无需"脉冲进度"确认，直接进入实测态。
         result.update(state="estimated",
-                      message="X42S 实测位置 · 已按减速比换算为输出轴角度")
+                      message="X42S 轴位反馈（mm/°）· 整机姿态按支点与机械模型推算")
     else:
         result.update(state="waiting" if waiting else "estimated",
                       message=("指令目标已显示，等待首帧脉冲进度" if waiting else

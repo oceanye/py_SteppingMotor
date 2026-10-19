@@ -1,5 +1,10 @@
 # PC 控制端架构
 
+当前硬件（2026-10-19）：ESP32-S3 → TTL-UART → 四台 X42S。
+`X42sActuatorState` 的反馈经减速比/导程换算到角色单位，`AxisProfile/Runtime`
+和30轴Pico拓扑仅用于历史 STEP/DIR 维护。GUI默认不开放该控制路径；
+默认固件不初始化其 GPIO/任务，并拒绝旧运动/诊断命令。GEAR及轨道D为独立子系统，不因DM退役移除。
+
 `pc_gui.py` 是兼容启动入口。PC 是 USB 串口的唯一主站；Tk 界面和局域网 HTTP
 服务共同调用桌面控制层，不允许各自直接读取串口。
 
@@ -7,7 +12,7 @@
 Tk views ─────────┐
                   ├── desktop controller ── SerialSession ── ESP32-S3
 LAN Web API ──────┘          │                       │
-                      AxisProfile/Runtime      RS485 Pico nodes
+                      X42sActuatorState         X42S UART × 4
                               │
                     logical-role bindings
                     Mup1/Mr1/Mup2/Mr2
@@ -36,7 +41,7 @@ LAN Web API ──────┘          │                       │
 
 ## 不变量
 
-1. 位置和软件限位内部以脉冲坐标保存。`linear`/`rotary` 只改变显示和命令单位；
+1. 历史 STEP/DIR 位置和软件限位内部以脉冲坐标保存。`linear`/`rotary` 只改变显示和命令单位；
    切换模式不得改变等效脉冲位置。
 2. 运动中或 MOVE 已预约但尚未发送时不得切换模式/物理参数；参数非法、位置不可信或
    目标越过软件限位时不得下发 MOVE。绝对定位必须在预约后按最新 steps 计算差值。
@@ -54,11 +59,12 @@ LAN Web API ──────┘          │                       │
 8. 串口请求超时后无法证明下一条同形回复属于哪个请求，因此必须废弃会话并重连。
 9. ESP32 发往 PC 的每个运行期文本帧必须在共享 TX mutex 内整行输出；不得从不同任务
    分段 `Serial.print`。步进延时上限为 10,000,000 us，远端 RP2040 下限为 100 us。
-10. `Mup1/Mup2` 只能绑定 `linear` 步进轴，`Mr1/Mr2` 只能绑定 `rotary` 步进轴；同一物理
-    轴不得重复绑定。绑定保存只改映射，不自动改轴参数、不下发串口命令，绑定轴运动中
-    不允许保存或切换到不兼容模式。
-11. 逻辑电机位置来自 `host_pulse_accounting`。运动中只可按真实 `STEP,P` 帧投影，
-    `DONE/ABORT` 才结算规范位置；该值不是传感器实测值。当前自动协调运动必须保持关闭。
+10. 当前四角色均绑定唯一 X42S ID：`Mup1/Mup2` 单位mm，`Mr1/Mr2` 单位°。
+    历史后端才要求绑定linear/rotary步进轴。绑定保存不发送运动命令；运动占用时禁止换绑。
+11. X42S 使用 `x42s_driver` 位置反馈，指令目标单列，不能冒充当前位置；
+    reached/速度/遥测可信度判断运动，不以“目标字段非空”判断忙碌。
+    历史后端才使用 `host_pulse_accounting`。整机姿态和间隙仍依赖机械与支点模型，非外部测量。
+    三足分阶段步态有独立预检，不以只读绑定页的自动化状态替代执行门槛。
 
 ## 线程所有权
 

@@ -1,10 +1,9 @@
-"""Situational twin map: planned-trajectory overlay + live pulse-estimated pose.
+"""Read-only twin: candidate/simulation overlays and feedback-based live pose.
 
-2026-09-30 合并"轨迹与间隙"预览到孪生画面：同一 5×5 地图上分两种数据源
-模式——评估模拟（计划层，蓝抬头，不动电机）与实机脉冲（实机层，红抬头，
-无编码器估算）。执行开始自动切实机并隐藏计划层；重新干跑/重置流程回
-评估。最近足高亮与爪端-高杆距离曲线在两种模式下都提供（口径=爪端点到
-杆表面，mm）。后续编码器接入时在此层再加"编码器实测"数据源即可。
+Current X42S axis positions are driver measurements; world pose and rod
+clearance remain kinematic inference. Legacy STEP/DIR is explicitly labelled
+as pulse accounting. Neither target commands nor planned clearance curves
+are presented as measured positions or externally measured gaps.
 """
 import math
 import time
@@ -14,7 +13,7 @@ from tkinter import ttk, messagebox
 
 from motor_control.gait_avoidance import lattice_coordinates
 from motor_control.gait_planner import effective_geometry
-from motor_control.gait_twin import ROLES, TwinHistory, pad_center
+from motor_control.gait_twin import ROLES, TwinHistory, pad_center, axis_motion_active
 from motor_control.gait_map import map_pads, map_label, start_pair_reference
 from motor_control.gait_twin_timing import plan_sample_times
 from motor_control.ui.common import bind_canvas_view, canvas_view_zoom, reset_canvas_view
@@ -246,7 +245,7 @@ def build_twin_panel(app, parent):
     # 2026-09-30 按用户要求：抬头变色区分数据源——评估模拟（计划）蓝、
     # 实机脉冲（真机）红；执行开始自动切红并隐藏计划层，重新干跑/重置
     # 回蓝。模式也可手动切换（工具栏两态选择）。
-    title = ttk.Label(panel, text="🔴 实机脉冲 · 无编码器估算",
+    title = ttk.Label(panel, text="🔴 实机反馈 · 等待有效轴位",
                       foreground="#b91c1c", font=("Microsoft YaHei", 10, "bold"))
     title.grid(row=0, column=0, sticky="w", padx=8, pady=(4, 0))
     # 计划控件槽位容器保留（历史上放换位方式/模拟按钮，2026-10-08 起
@@ -271,7 +270,7 @@ def build_twin_panel(app, parent):
         rows[role] = tuple(ttk.Label(table, text="—", font=("Consolas", 9)) for _ in range(3))
         for col, label in enumerate(rows[role]):
             label.grid(row=row, column=col, sticky="w", padx=(0, 5), pady=2)
-    legend = ttk.Label(panel, text="虚线落点=预估位置(左蓝/右橙) 紫=累计模拟 红=实机脉冲(无编码器)\n"
+    legend = ttk.Label(panel, text="虚线落点=预估位置(左蓝/右橙) 紫=累计模拟 红=实机反馈推算\n"
                        "足色:蓝=左足 橙=右足 灰=断连冻结 绿点=低节点(落脚) 红点=高节点(红杆)\n"
                        "轨迹仅显示上一步淡色、当前步深色；虚线=预估位置。\n"
                        "黄圈+数字=6爪中与红杆最近者(爪端到杆表面距离,mm)\n"
@@ -283,7 +282,7 @@ def build_twin_panel(app, parent):
                        "XY 为中心距=1的估算；Z 为本步位移，非接触检测。\n"
                        "轨迹为足中心+三爪端；隐藏更早路径、重复静止线及落脚编号。\n"
                        "执行中显示虚线预计落点；真机灰线=跨步计划参考（非实测）。\n"
-                       "编码器未接入：不以指令估算生成实测曲线；地图ΔZ仍按脉冲估算。\n"
+                       "X42S 轴位来自驱动器反馈；地图及间隙由模型推算，不是外部测距。\n"
                        "点选四动作即看候选；模拟下一步才演示完整阶段并累计站位/路径。\n"
                        "模拟有独立账本；轴表始终显示实机，不随模拟变化。\n"
                        "重置模拟才回起点。四个【开始…移】按钮是真机入口。",
@@ -406,7 +405,7 @@ def refresh_twin_panel(app):
     from .gait_curve import sync_live_reference
     sync_live_reference(app, view)
     busy = bool(getattr(app, "_gait_owned", {})) or any(
-        a.get("target_position") is not None or a.get("state") in ("STARTING", "MOVING", "CONTINUOUS")
+        axis_motion_active(a)
         for a in snapshot.get("axes", {}).values())
     view["start_busy"] = busy
     if busy:
@@ -429,10 +428,11 @@ def refresh_twin_panel(app):
         axis = snapshot["axes"].get(role, {})
         unit = axis.get("unit", "")
         labels[0].configure(text=f"{role} / {axis.get('axis', '—')}")
-        labels[1].configure(text=_coordinate(axis.get("position"), unit, estimated=True))
+        labels[1].configure(text=_coordinate(axis.get("position"), unit,
+                                            estimated=not axis.get("measured", False)))
         labels[2].configure(text=_coordinate(axis.get("target_position"), unit))
         good = (axis.get("position_trusted") and axis.get("binding_valid")
-                and axis.get("state") in ("IDLE", "STARTING", "MOVING", "CONTINUOUS")
+                and axis.get("state") in ("IDLE", "STARTING", "MOVING", "CONTINUOUS", "X42S_ONLINE")
                 and not (axis.get("stale") and axis.get("target_position") is not None))
         for label in labels:
             label.configure(foreground="#334155" if good else "#9a6700")
@@ -703,7 +703,7 @@ def _render_map(app, view):
                            tags=f"lift_{side}")
         canvas.create_text(x, height-17, text=f"{label} ΔZ≈{z:+.2f}mm", fill="#475569")
     corner = (f"模拟 · {sim.frame.stage}" if sim is not None else
-              ("实机脉冲" if live else "实机脉冲（已冻结）"))
+              ("实机反馈推算" if live else "实机姿态（已冻结）"))
     canvas.create_text(width-8, 10, text=corner,
                        anchor="ne", fill="#7c3aed" if sim is not None else "#b91c1c" if live else "#9a6700", tags="corner_mode")
     _draw_curve(app, view)
@@ -718,13 +718,15 @@ def _update_title(app, view, mode, snapshot, live):
                                 foreground="#1d4ed8")
         return
     state = snapshot.get("state")
+    source = ("X42S 轴位实测 · 姿态推算" if snapshot.get("source") == "x42s_measured"
+              else "历史脉冲估算 · 非实测")
     frozen = state in ("untrusted", "stale") or live is None
     if frozen:
         detail = "已冻结（断连/失信）" if state in ("untrusted", "stale") else "等待姿态基准"
-        view["title"].configure(text=f"🔴 实机脉冲 · {detail}（非实测）",
+        view["title"].configure(text=f"🔴 {source} · {detail}",
                                 foreground="#9a6700")
     else:
-        view["title"].configure(text="🔴 实机脉冲 · 无编码器估算",
+        view["title"].configure(text=f"🔴 {source}",
                                 foreground="#b91c1c")
 
 

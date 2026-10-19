@@ -349,7 +349,8 @@ class GaitLayoutTests(unittest.TestCase):
                                         arm_length_mm=60, safety_margin_mm=3,
                                         arm_radius_mm=0.123456789),
                        mr1_zero_deg=12.3, mr2_zero_deg=-4.5,
-                       mr1_zero_signature="left", mr2_zero_signature="right")
+                       mr1_zero_signature="left", mr2_zero_signature="right",
+                       calibration_confirmed=True, calibration_fingerprint="test")
         self.app.gait_params = base
         load_gait_fields(self.app)
         self.app.gait_field_vars["swing_speed_deg_s"].set("4")
@@ -361,6 +362,76 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertEqual(saved.mr2_zero_deg, -4.5)
         self.assertEqual(saved.mr1_zero_signature, "left")
         self.assertEqual(saved.mr2_zero_signature, "right")
+        self.assertTrue(saved.calibration_confirmed)
+
+    def test_run_and_preview_edits_keep_confirmation_but_direction_does_not(self):
+        from motor_control.ui.gait_tab import RUN_FIELDS, PREVIEW_FIELDS
+        for field, _ in RUN_FIELDS + PREVIEW_FIELDS:
+            self.app.gait_calibrated_var.set(True)
+            self.app._gait_last_report = object()
+            var = self.app.gait_field_vars[field]
+            var.set(str(float(var.get()) + 1))
+            self.assertTrue(self.app.gait_calibrated_var.get(), field)
+            self.assertIsNone(self.app._gait_last_report)
+        self.app.gait_sign_vars['mr1_sign'].set('-1')
+        self.assertFalse(self.app.gait_calibrated_var.get())
+
+    def test_ordinary_save_cannot_resign_a_changed_hardware_fingerprint(self):
+        from motor_control.ui.gait_tab import collect_gait_params, load_gait_fields, refresh_gait_panel
+        base = replace(self.app.gait_params, calibration_confirmed=True,
+                       calibration_fingerprint='old-hardware', mr1_zero_deg=0., mr2_zero_deg=0.,
+                       mr1_zero_signature='old-mr1', mr2_zero_signature='old-mr2')
+        self.app.gait_params = base
+        self.app._gait_hardware_fingerprint = lambda: 'new-hardware'
+        load_gait_fields(self.app)
+        result = collect_gait_params(self.app, base)
+        self.assertEqual(result.calibration_fingerprint, 'old-hardware')
+        refresh_gait_panel(self.app)
+        self.assertIn('绑定/传动已变化', self.app.gait_widgets['readiness'].cget('text'))
+        self.app.gait_calibrated_var.set(False)
+        self.assertIsNone(collect_gait_params(self.app, base).calibration_fingerprint)
+
+    def test_checkbox_cannot_claim_ready_when_reference_is_missing(self):
+        from motor_control.ui.gait_tab import refresh_gait_panel
+        self.app.gait_params = replace(self.app.gait_params, calibration_confirmed=True,
+                                       calibration_fingerprint='test')
+        self.app.gait_calibrated_var.set(True)
+        refresh_gait_panel(self.app)
+        text = self.app.gait_widgets['readiness'].cget('text')
+        self.assertIn('缺少Mr1/Mr2基准', text)
+        self.assertNotIn('基准已保存', text)
+        page = self.app.gait_widgets['param_pages']['calibration'].content
+        self.assertFalse(any(isinstance(w, ttk.Checkbutton) for w in page.winfo_children()))
+        self.assertFalse(any(isinstance(w, ttk.Button) and w.cget('text') == '记零'
+                             for w in page.winfo_children()))
+        self.assertIn('确认摆放', self.app.gait_widgets['prepare_baseline'].cget('text'))
+
+    def test_prepare_button_roundtrip_updates_real_tk_confirmation_and_zero_labels(self):
+        from unittest.mock import patch
+        from test_gait_baseline_workflow import baseline_app
+        from motor_control.ui.gait_tab import collect_gait_params, load_gait_fields, refresh_gait_panel
+        controller = baseline_app()
+        self.app.gait_params = controller.gait_params
+        self.app._gait_hardware_fingerprint = controller._gait_hardware_fingerprint
+        self.app._gait_zero_signature = controller._gait_zero_signature
+        load_gait_fields(self.app)
+        controller._gait_params_from_ui = lambda: collect_gait_params(self.app, controller.gait_params)
+        def reload_fields(_controller):
+            self.app.gait_params = controller.gait_params
+            load_gait_fields(self.app)
+        controller._refresh_gait_ui = lambda: refresh_gait_panel(self.app)
+        button = self.app.gait_widgets['prepare_baseline']
+        button.configure(command=controller._gait_reestablish_baseline)
+        with patch('motor_control.desktop_app.messagebox.askokcancel', return_value=True), \
+                patch('motor_control.desktop_app.stop_preview_animation'), \
+                patch('motor_control.desktop_app.load_gait_fields', side_effect=reload_fields):
+            button.invoke()
+        self.assertTrue(self.app.gait_calibrated_var.get())
+        self.assertIn('基准已保存', self.app.gait_widgets['readiness'].cget('text'))
+        self.assertNotEqual(self.app.gait_zero_vars['Mr1'].get(), '未标定')
+        controller.state_store.save_gait_params.assert_called_once()
+        self.assertFalse(any(',MOVE,' in c or ',ZERO' in c for c in controller.commands))
+        self.assertFalse(self.errors)
 
     def test_changing_trajectory_mode_invalidates_calibration_and_cached_preview(self):
         from motor_control.gait_avoidance import TWO_MODE
@@ -657,7 +728,7 @@ class GaitLayoutTests(unittest.TestCase):
             self.assertFalse(canvas.find_withtag(tag), tag)
         self.assertTrue(canvas.find_withtag("twin_placeholder"))
         self.assertFalse(curve.find_withtag("curve_left_0"))   # 无采样数据
-        self.assertIn("实机脉冲", view["title"].cget("text"))
+        self.assertIn("历史脉冲估算", view["title"].cget("text"))
 
     def test_auto_button_state_follows_run_and_auto_flag(self):
         # 2026-09-29 一键执行按钮：未开始流程时禁用；自动进行中始终可点

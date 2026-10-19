@@ -255,6 +255,8 @@ class _GaitHostAdapter:
 class StepperGUI:
     def __init__(self, root, web_server_factory=None, diagnostics=None):
         self.root = root
+        # Explicit archive maintenance opt-in; never inferred from old JSON.
+        self.legacy_stepdir_enabled = os.environ.get("STEPPER_LEGACY_STEPDIR") == "1"
         self.state_store = StateStore(PROJECT_DIR)
         self._startup_warnings = []
         try:
@@ -263,7 +265,8 @@ class StepperGUI:
         except OSError as exc:
             self.diagnostics = None
             self._startup_warnings.append(f"⚠️ 后台诊断日志无法启动：{exc}")
-        self.root.title("30轴步进（ESP32 + Pico）+ FOC/GEAR + 轨道 D 控制器")
+        self.root.title("X42S 四轴步态与数字孪生" if not self.legacy_stepdir_enabled
+                        else "历史 STEP/DIR 维护 · 电机控制器")
         self.root.resizable(True, True)
 
         # ── 共享：串口 ──
@@ -414,7 +417,8 @@ class StepperGUI:
         self.axis_ppr_var  = [tk.DoubleVar(value=DEFAULT_PULSE_PER_REV) for _ in range(NUM_STEPPER_AXES)]
         self.axis_gr_var   = [tk.DoubleVar(value=DEFAULT_GEAR_RATIO) for _ in range(NUM_STEPPER_AXES)]
         self.axis_lead_var = [tk.DoubleVar(value=DEFAULT_LEAD_MM) for _ in range(NUM_STEPPER_AXES)]
-        self._load_axis_config()
+        if self.legacy_stepdir_enabled:
+            self._load_axis_config()
         self._load_control_bindings()
 
         # ── 三足轮换步态：参数（标定向导写入 .gait_params.json）+ 当前执行实例 ──
@@ -446,7 +450,8 @@ class StepperGUI:
             self.axis_lead_var[axis].trace_add("write", _param_cb)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(25, self._drain_ui_actions)
-        self._load_calib()
+        if self.legacy_stepdir_enabled:
+            self._load_calib()
         self._refresh_coordinated_ui()
         self._load_foc_tune()
         self._load_gear_tune()
@@ -495,6 +500,11 @@ class StepperGUI:
             self._startup_warnings.append(
                 f"⚠️ 逻辑电机绑定配置无效（{exc.code}）: {exc}；已安全回退为未绑定"
             )
+        if (self.control_bindings.backend == BACKEND_STEPDIR
+                and not getattr(self, "legacy_stepdir_enabled", True)):
+            self._startup_warnings.append(
+                "⚠️ 检测到历史 STEP/DIR 绑定，原文件已保留但运动已禁用；"
+                "请切换 X42S、核对 ID/减速比/导程后保存，不自动迁移实物映射")
 
     def _safety_state_locked(self):
         if self._hardware_estop_active:
@@ -508,7 +518,7 @@ class StepperGUI:
     def _snapshot_coordinated_control_locked(self, *, now=None):
         """Build the desktop/Web shared snapshot while ``state_lock`` is held."""
 
-        return build_coordinated_snapshot(
+        control, motors = build_coordinated_snapshot(
             bindings=self.control_bindings,
             profiles=self.axis_profiles,
             runtimes=self.axis_runtime,
@@ -526,12 +536,17 @@ class StepperGUI:
             x42s_states=getattr(self, "_x42s_states", {}),
             now=now,
         )
+        control["legacy_stepdir_enabled"] = getattr(self, "legacy_stepdir_enabled", True)
+        return control, motors
 
     def _apply_control_bindings(self, candidate):
         """Atomically validate, persist and publish a complete binding set."""
 
         if not isinstance(candidate, BindingSet):
             candidate = BindingSet.from_axis_mapping(candidate)
+        if (candidate.backend == BACKEND_STEPDIR
+                and not getattr(self, "legacy_stepdir_enabled", True)):
+            raise RuntimeError("DM422/DM442 已退役；当前只允许保存 X42S 绑定")
         with self.state_lock:
             if getattr(self, "_gait_owned", {}):
                 raise RuntimeError("步态执行中禁止换绑（含后端切换）；请先中止或完成步态")
@@ -709,12 +724,12 @@ class StepperGUI:
     def _clear_binding_editor(self):
         if not messagebox.askyesno(
             "解除逻辑绑定",
-            "将解除 Mup1/Mr1/Mup2/Mr2 的全部执行器绑定并回到步进轴后端。\n"
+            "将解除 Mup1/Mr1/Mup2/Mr2 的全部执行器绑定并回到 X42S 后端。\n"
             "此操作不会移动电机，也不会清除轴校准。是否继续？",
             icon="warning",
         ):
             return
-        self.binding_backend_var.set(BACKEND_STEPDIR)
+        self.binding_backend_var.set(BACKEND_X42S_UART)
         gear_vars = getattr(self, "x42s_gear_vars", None) or {}
         lead_vars = getattr(self, "x42s_lead_vars", None) or {}
         for role in LOGICAL_ROLE_ORDER:
@@ -762,8 +777,8 @@ class StepperGUI:
                     "当前文件是 v1 步进轴绑定；保存为 X42S UART 后端将生成"
                     " schema v2 文档并覆盖旧 v1 文件（revision 保留递增）。\n"
                     f"建议映射：{suggested_text}\n\n"
-                    "X42S 台号必须与驱动器实际拨码一致；迁移后步态被拒"
-                    "（未过 M5 台架验证，§19），且须重新做零位标定。是否继续？",
+                    "X42S 台号必须与驱动器实际拨码一致；迁移后请在步态页"
+                    "【确认摆放并记录双侧基准】，执行前仍需四台在线使能及完整预检。是否继续？",
                     icon="warning",
                 ):
                     self.log("ℹ️ 已取消 v1→x42s_uart 迁移，绑定未保存")
@@ -866,6 +881,15 @@ class StepperGUI:
         交给 worker，worker 语义（输出轴角度→脉冲）保持不变。
         """
         title = "X42S 手动调试"
+        if action == "zero":
+            messagebox.showinfo(title, "步态不需要驱动器归零；请在步态页【确认摆放并记录双侧基准】。")
+            return
+        if getattr(self, "_gait_owned", {}):
+            if action == "stop":
+                self._gait_abort_clicked()
+            else:
+                messagebox.showwarning(title, "步态已占用四轴，请先完成或取消计划，再做手动调试")
+            return
         if self.control_bindings.backend != BACKEND_X42S_UART:
             messagebox.showinfo(title, "当前后端不是 x42s_uart：请先在绑定页切换后端。")
             return
@@ -996,7 +1020,14 @@ class StepperGUI:
                           steps=None, speed_pps=None):
         """发一条手动调试命令并校验应答（MOVE 按台号+步数认领 ACK，其余
         按台号认领 OK 行），报日志；返回 (ok, reason)，弹窗由调用方决定。"""
-        resp = self._send_and_read(command, soft_timeout=True)
+        if command.endswith(",ZERO"):
+            return False, "常规调试不发送驱动器ZERO；请使用步态页双侧基准"
+        def allowed():
+            return (not getattr(self, "_gait_owned", {})
+                    and not getattr(self, "_gait_baseline_recording", False))
+        if not allowed():
+            return False, "步态执行/基准记录占用四轴，手动命令未发送"
+        resp = self._send_and_read(command, soft_timeout=True, guard=allowed)
         reply = parse_line(resp) if resp else None
         if steps is None:
             ok = (isinstance(reply, OkReply) and len(reply.values) >= 2
@@ -1014,6 +1045,16 @@ class StepperGUI:
         return ok, reason
 
     def _jump_to_binding_axis(self, role=None):
+        if self.binding_backend_var.get() == BACKEND_X42S_UART:
+            from motor_control.ui.coordinated_tab import apply_manual_debug_units
+            selected = LogicalRole(role) if role is not None else LogicalRole.MUP1
+            self.x42s_manual_role_var.set(selected.value)
+            apply_manual_debug_units(self)
+            self.coordinated_widgets["x42s_manual"].focus_set()
+            return
+        if not getattr(self, "legacy_stepdir_enabled", True):
+            messagebox.showinfo("历史绑定已停用", "请切换到 X42S 并核对台号，不能进入旧脉冲轴校准页")
+            return
         if role is None:
             roles = LOGICAL_ROLE_ORDER
         else:
@@ -1141,7 +1182,7 @@ class StepperGUI:
         sign = params.mr1_sign if role == "Mr1" else params.mr2_sign
         binding = self.control_bindings.for_role(role)
         if binding is not None and binding.kind == "x42s":
-            # X42S 零位基准是驱动器存储零点：签名覆盖句柄/减速比/导程/方向。
+            # X42S 零位是 PC 保存的实测基准：签名覆盖句柄/减速比/导程/方向。
             return repr((X42S_AXIS_HANDLE_BASE + binding.driver_id,
                          binding.gear_ratio, binding.lead_mm, sign))
         axis = self._gait_role_axis(role)
@@ -1151,7 +1192,9 @@ class StepperGUI:
         """Caller holds state_lock; changing the world frame never moves axes."""
         if (getattr(self, "_gait_owned", {}) or getattr(self, "_rot_release_active", False)
                 or any(getattr(self, key, False) for key in (
-                    "_closing", "_disconnecting", "_estop_in_progress", "_estop_unconfirmed"))
+                    "_closing", "_disconnecting", "_estop_in_progress", "_estop_unconfirmed",
+                    "_hardware_estop_active"))
+                or getattr(self, "_active_control_workers", 0)
                 or any(self._axis_motion_active_locked(a) for a in range(len(self.axis_runtime)))):
             raise GaitExecutorError("请先完成/中止运动，确认所有电机静止并恢复旋转轴锁定，再调整起步位置")
 
@@ -1186,19 +1229,106 @@ class StepperGUI:
         self.log(f"✓ 起步位置已设置：左足 {left}，右足 {right}，β₀={beta:g}°；"
                  "未移动电机，须重新记两侧零位并确认标定")
 
+    @logged_action
+    def _gait_capture_baseline(self, params):
+        """Commit both measured references and human confirmation together.
+
+        No MOVE, ZERO, EN or pulse-ledger writes. The caller must have confirmed
+        the physical placement. A failed read/save leaves the old baseline and
+        recovery latch untouched. Freshness is checked at each sequential read,
+        not by pretending four staggered UART samples are simultaneous.
+        """
+        params = replace(params, beam_reference_deg=params.initial_beam_deg).validated()
+        with self.state_lock:
+            self._gait_check_start_edit()
+            if not self._is_serial_connected():
+                raise GaitExecutorError("建立基准需要连接控制器；连接失败无需重复标定方向")
+            original = self.gait_params
+            bindings = self.control_bindings
+            fingerprint = self._gait_hardware_fingerprint()
+            generation = getattr(self, "_control_generation", None)
+            self._gait_baseline_recording = True
+        try:
+            positions = {}
+            for role in LOGICAL_ROLE_ORDER:
+                handle = self._gait_role_axis(role.value)
+                if handle >= X42S_AXIS_HANDLE_BASE:
+                    driver_id = handle - X42S_AXIS_HANDLE_BASE
+                    state = self._x42s_preflight_state(role, driver_id)
+                    if (state is None or state.driver_id != driver_id or not state.online
+                            or not state.enabled or state.fault is not None
+                            or not state.telemetry_trusted):
+                        raise GaitExecutorError(
+                            f"{role.value} 状态未就绪：检查在线、使能、故障并等待新鲜遥测；"
+                            "原基准未改动，不需要重新标定方向或驱动器归零")
+                    if (not state.reached or (state.speed is not None
+                            and (not math.isfinite(state.speed) or abs(state.speed) > 0.5))):
+                        raise GaitExecutorError(f"{role.value} 未确认到位静止，不能建立基准")
+                    binding = bindings.for_role(role)
+                    if binding is None or binding.kind != "x42s" or binding.driver_id != driver_id:
+                        raise GaitExecutorError("读取期间绑定已改变，未保存基准")
+                    position = state.measured_position / binding.gear_ratio
+                else:
+                    with self.state_lock:
+                        if self._axis_motion_active_locked(handle):
+                            raise GaitExecutorError(f"{role.value} 正在运动，不能建立基准")
+                        runtime = self.axis_runtime[handle]
+                        if not runtime.position_trusted:
+                            raise GaitExecutorError(f"{role.value} 脉冲位置不可信，请先校准该轴位置")
+                        position = self.axis_profiles[handle].units_from_steps(runtime.position_steps)
+                if position is None or not math.isfinite(position):
+                    raise GaitExecutorError(f"{role.value} 实测/可信位置缺失，不能以0替代")
+                positions[role.value] = position
+            with self.state_lock:
+                self._gait_check_start_edit()
+                if (not self._is_serial_connected()
+                        or generation != getattr(self, "_control_generation", None)
+                        or self.gait_params != original
+                        or fingerprint != self._gait_hardware_fingerprint()):
+                    raise GaitExecutorError("读取期间连接、绑定或参数已变化；未保存基准，请重试")
+                prepared = replace(
+                    params, mr1_zero_deg=positions["Mr1"], mr2_zero_deg=positions["Mr2"],
+                    mr1_zero_signature=self._gait_zero_signature("Mr1", params),
+                    mr2_zero_signature=self._gait_zero_signature("Mr2", params),
+                    calibration_confirmed=True, calibration_fingerprint=fingerprint)
+                self._save_gait_params(prepared)
+                self._gait_supports = tuple(prepared.initial_supports)
+                self._gait_beta_deg = prepared.initial_beam_deg
+                self._gait_needs_recovery = False
+                self._gait_auto_run = False
+                self._gait_run = None
+                self._gait_world_epoch = getattr(self, "_gait_world_epoch", 0) + 1
+                self._gait_last_report = None
+            self.log(f"✓ 双侧起步基准已记录并确认：Mr1={positions['Mr1']:+.3f}°，"
+                     f"Mr2={positions['Mr2']:+.3f}°；未移动电机、未发送驱动器ZERO。"
+                     "正常连续换步无需重新记零；断电后须核对物理摆放和坐标连续性。")
+            return prepared
+        finally:
+            with self.state_lock:
+                self._gait_baseline_recording = False
+
     def _gait_reestablish_baseline(self):
         if getattr(self, "_gait_owned", {}):
             messagebox.showwarning("步态占用", "请先中止并确认四轴停止")
             return
-        supports = self.gait_params.initial_supports
+        params = self._gait_params_from_ui()
+        if params is None:
+            return
+        supports = params.initial_supports
         stance_text = (f"左足在{supports[0]}、右足在{supports[1]}，三爪均踩低节点；"
-                       f"红杆在横梁{'右' if self.gait_params.initial_placement == 'red_right' else '左'}侧"
+                       f"红杆在横梁{'右' if params.initial_placement == 'red_right' else '左'}侧"
                        "（与步态页【初始摆放】选择一致）")
-        if not messagebox.askokcancel("重建物理基准", f"必须人工确认：{stance_text}；四轴静止、位置已校准。\n此按钮不移动电机。确认后须重新记两侧旋转零位并确认标定。"):
+        if not messagebox.askokcancel(
+                "确认摆放并记录双侧基准",
+                f"请确认实物已处于所选起步位置：{stance_text}。\n"
+                "四轴已静止且支撑可靠；已核实方向、减速比、升降导程与真实投影尺寸。\n\n"
+                "确认后一次记录左右旋转基准并保存，无需分别记零、再次勾选或保存。"
+                "不移动电机、不发送驱动器ZERO、不改方向。\n"
+                "正常连续换步不要点此按钮；它会将地图基准重建到所选起步位置。"):
             return
         try:
-            self._gait_set_start_reference(self.gait_params)
-        except (GaitExecutorError, StateStoreError) as exc:
+            self._gait_capture_baseline(params)
+        except (GaitExecutorError, StateStoreError, ValueError) as exc:
             messagebox.showwarning("起步基准未更改", str(exc))
             return
         stop_preview_animation(self)
@@ -1259,7 +1389,7 @@ class StepperGUI:
     # 机构坐标 ↔ 电机轴脉冲的换算与手动调试区同源：
     #   Mr（旋转）：机构坐标=输出轴角度，脉冲 = deg×gear×3200/360；
     #   Mup（直线）：机构坐标=mm，输出轴角度 = mm×360/lead_mm 再换算脉冲。
-    # 方向语义与 DM422 同构：输出轴角度增大 = 机构坐标 +，方向标定
+    # 机构方向语义：输出轴角度增大 = 机构坐标 +，方向标定
     # （mr*_sign / mup*_lift_sign）对两种后端通用。
 
     def _x42s_move_conversion(self, role, delta, speed):
@@ -1319,6 +1449,9 @@ class StepperGUI:
         与手动调试区共用 worker 与应答校验；点动速度取输出轴 8.4°/s
         （台架验证过的手动默认值），Mr/Mup 同速。未使能时提示先使能。
         """
+        if getattr(self, "_gait_owned", {}):
+            self.log("⛔ 步态已占用四轴；请先完成或取消计划，再点动")
+            return
         driver_id = handle - X42S_AXIS_HANDLE_BASE
         binding = self.control_bindings.for_role(LogicalRole(role_name))
         signed_amount = amount if axis_positive else -amount
@@ -1414,6 +1547,8 @@ class StepperGUI:
             raise GaitExecutorError(f"{role_name} 未绑定物理执行器")
         if binding.kind == "x42s":
             return X42S_AXIS_HANDLE_BASE + binding.driver_id
+        if not getattr(self, "legacy_stepdir_enabled", True):
+            raise GaitExecutorError("历史 STEP/DIR 绑定已停用，请核对 X42S 角色与 ID")
         axis = binding.axis
         spec = ROLE_SPECS[role]
         with self.state_lock:
@@ -1469,7 +1604,7 @@ class StepperGUI:
         但遥测位置不重置（gui_2026-10-19 诊断记录：四台 meas 纹丝不动，
         Mr1 −107.8°/Mr2 −495.3°电机轴）——驱动器侧归零不可靠。零点基准
         改存 PC 侧：zero_deg=记零时刻实测输出轴角，ψ=基准+sign×(meas
-        −zero)；断电保持由 .gait_params.json 承担，与驱动器内部零点无关。
+        −zero)。PC文件可保存基准，但不保证驱动器断电后多圈坐标仍连续。
         """
         driver_id = handle - X42S_AXIS_HANDLE_BASE
         if getattr(self, "_gait_owned", {}):
@@ -1497,7 +1632,7 @@ class StepperGUI:
         self._save_gait_params(replace(self.gait_params,
                                         calibration_confirmed=False, **updates))
         self.log(f"✓ {role_name} 零位已记录：输出轴 {position:+.3f}° 为 ψ 基准"
-                 f"（X42S ID{driver_id} 实测，PC 侧基准，断电保持）")
+                 f"（X42S ID{driver_id} 实测，PC侧保存；断电后须核对坐标连续性）")
         return position
 
     def _gait_swing_theta_deg(self, side, params):
@@ -1619,6 +1754,8 @@ class StepperGUI:
             active_backend = self.control_bindings.backend
         if active_backend == BACKEND_X42S_UART:
             return self._gait_begin_run_x42s(side, params, arc_deg)
+        if not getattr(self, "legacy_stepdir_enabled", True):
+            raise GaitExecutorError("历史 STEP/DIR 步态已停用；请核对并保存 X42S 绑定")
         if active_backend != BACKEND_STEPDIR:
             raise GaitExecutorError(
                 f"未知绑定后端 {active_backend}；步态仅支持 stepdir / x42s_uart"
@@ -1630,9 +1767,9 @@ class StepperGUI:
         if getattr(self, "_gait_owned", {}):
             raise GaitExecutorError("上一次步态尚未完成/中止，不能覆盖执行器")
         if not params.calibration_confirmed:
-            raise GaitExecutorError("尚未确认电机方向、PPR、零位及现场支撑条件；请在步态页的【标定】中确认")
+            raise GaitExecutorError("尚未确认现场基准；请完成首次方向/传动标定，摆好实物后点击【确认摆放并记录双侧基准】一次")
         if getattr(self, "_gait_needs_recovery", False):
-            raise GaitExecutorError("上一次动作未完整完成；必须人工重建 A/B 物理基准、重新标定")
+            raise GaitExecutorError("上一次动作未完整完成；恢复可靠支撑与所选起步摆放后，点击【确认摆放并记录双侧基准】；硬件未变无需重做方向标定")
         if params.calibration_fingerprint != self._gait_hardware_fingerprint():
             raise GaitExecutorError("绑定或PPR/减速比已变化，旧零位标定失效，请重新标定")
         if self._rot_release_active:
@@ -1661,8 +1798,7 @@ class StepperGUI:
                                 ("Mr2", params.mr2_zero_deg)):
             if zero is None:
                 raise GaitExecutorError(
-                    f"{role_name} 尚未做零位标定；请先把三足摆到基准位"
-                    f"（ψ=30°）并【记零】")
+                    f"{role_name} 缺少零位基准；双侧记零已合并为【确认摆放并记录双侧基准】，请先摆好实物")
             saved_signature = params.mr1_zero_signature if role_name == "Mr1" else params.mr2_zero_signature
             if saved_signature != self._gait_zero_signature(role_name, params):
                 raise GaitExecutorError(f"{role_name} 零位与绑定/方向/PPR不匹配，必须重新记零")
@@ -1869,10 +2005,12 @@ class StepperGUI:
             bindings = self.control_bindings
         if getattr(self, "_gait_owned", {}):
             raise GaitExecutorError("上一次步态尚未完成/中止，不能覆盖执行器")
+        if getattr(self, "_active_control_workers", 0):
+            raise GaitExecutorError("手动控制命令尚未结束；等待完成及四轴静止后重试，无需重新标定")
         if not params.calibration_confirmed:
-            raise GaitExecutorError("尚未确认电机方向、PPR、零位及现场支撑条件；请在步态页的【标定】中确认")
+            raise GaitExecutorError("尚未确认现场基准；请完成首次方向/传动标定，摆好实物后点击【确认摆放并记录双侧基准】一次")
         if getattr(self, "_gait_needs_recovery", False):
-            raise GaitExecutorError("上一次动作未完整完成；必须人工重建 A/B 物理基准、重新标定")
+            raise GaitExecutorError("上一次动作未完整完成；恢复可靠支撑与所选起步摆放后，点击【确认摆放并记录双侧基准】；硬件未变无需重做方向标定")
         # 1. 四台绑定齐（M5 多机门槛，先于指纹检查给出明确指引）
         if not bindings.is_complete:
             raise GaitExecutorError(
@@ -1892,13 +2030,15 @@ class StepperGUI:
                 raise GaitExecutorError(
                     f"{role.value} / X42S ID{binding.driver_id} 不在线/未使能"
                     "/遥测不新鲜或有保护故障；步态前先在绑定页逐台确认")
+            if (not state.reached or (state.speed is not None
+                    and (not math.isfinite(state.speed) or abs(state.speed) > 0.5))):
+                raise GaitExecutorError(f"{role.value} 尚未到位静止；先等待运动结束，无需重复记零")
         # 2. 两侧旋转零位 + X42S 版签名
         for role_name, zero in (("Mr1", params.mr1_zero_deg),
                                 ("Mr2", params.mr2_zero_deg)):
             if zero is None:
                 raise GaitExecutorError(
-                    f"{role_name} 尚未做零位标定；请先把三足摆到基准位"
-                    f"（ψ=30°）并【记零】")
+                    f"{role_name} 缺少零位基准；双侧记零已合并为【确认摆放并记录双侧基准】，请先摆好实物")
             saved_signature = (params.mr1_zero_signature if role_name == "Mr1"
                                else params.mr2_zero_signature)
             if saved_signature != self._gait_zero_signature(role_name, params):
@@ -2001,6 +2141,8 @@ class StepperGUI:
                 f"脉冲量化包络 {pulse_envelope:.2f}mm；建议提高减速比或修正几何")
         # 预检整个行程：分辨率/速度/线缆窗口（X42S 无软件行程限位）。
         with self.state_lock:
+            if getattr(self, "_active_control_workers", 0):
+                raise GaitExecutorError("预检期间出现手动控制命令，待完成后重新开始")
             if self._gait_hardware_fingerprint() != params.calibration_fingerprint:
                 raise GaitExecutorError("预检期间配置已变化")
             targets = dict(positions)
@@ -2130,7 +2272,7 @@ class StepperGUI:
 
     def _gait_twin_snapshot(self):
         """Read-only visual model; its output never enters motion/safety decisions."""
-        from motor_control.gait_twin import build_twin_snapshot
+        from motor_control.gait_twin import build_twin_snapshot, axis_motion_active
 
         with self.state_lock:
             _control, axes = self._snapshot_coordinated_control_locked()
@@ -2153,7 +2295,7 @@ class StepperGUI:
                         "mr1_zero_deg", "mr2_zero_deg", "mr1_sign", "mr2_sign",
                         "mup1_lift_sign", "mup2_lift_sign", "beam_reference_deg"))):
                 if run.twin_final_positions is not None and any(
-                        a.get("target_position") is not None
+                        axis_motion_active(a)
                         or a.get("position") != run.twin_final_positions.get(a["role"])
                         for a in axes):
                     # After independent manual/Web moves the grounded pivot is
@@ -2252,6 +2394,14 @@ class StepperGUI:
             # 2026-09-24 走完一步后随手点【中止】不触发"须重建基准"：
             # 流程已完成，站位/横梁角已更新、四轴已释放，没有东西可停。
             self.log("步态流程已完成，无需中止；可直接开始下一次换位（或点【重置】清理显示）")
+            return
+        if (not any(getattr(self, key, False) for key in (
+                "_closing", "_disconnecting", "_estop_in_progress",
+                "_hardware_estop_active", "_estop_unconfirmed"))
+                and run.cancel_before_motion()):
+            self._gait_release_ownership()
+            self.log("✓ 运动前取消计划：尚未排队/执行运动阶段，保留方向、零位和当前站位；"
+                     "可直接重新选择动作，无需重建基准")
             return
         run.request_stop()
         self._gait_needs_recovery = True
@@ -3166,10 +3316,11 @@ class StepperGUI:
         with self.state_lock:
             if (self._estop_in_progress or self._hardware_estop_active
                     or self._estop_unconfirmed or self._closing
-                    or self._disconnecting):
-                self.log("控制器正在停止或急停，已拒绝新的 GUI 控制命令")
+                    or self._disconnecting or getattr(self, "_gait_baseline_recording", False)):
+                self.log("控制器正在停止、急停或记录基准，已拒绝新的 GUI 控制命令")
                 return None
             generation = self._control_generation
+            self._active_control_workers = getattr(self, "_active_control_workers", 0) + 1
 
         diagnostic_operation = operation_id()
         recorder = getattr(self, "diagnostics", None)
@@ -3192,13 +3343,20 @@ class StepperGUI:
                         if recorder is not None:
                             recorder.event("motor", "worker.end", worker=worker_name)
             finally:
+                with self.state_lock:
+                    self._active_control_workers -= 1
                 try:
                     del self._control_context.generation
                 except AttributeError:
                     pass
 
         thread = threading.Thread(target=runner, daemon=True)
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            with self.state_lock:
+                self._active_control_workers -= 1
+            raise
         return thread
 
     def _control_worker_cancelled(self):
@@ -3978,6 +4136,13 @@ class StepperGUI:
         propagate_request_error=False,
         soft_timeout=False,
     ):
+        if (not getattr(self, "legacy_stepdir_enabled", True)
+                and cmd.split(",", 1)[0] in {"MOVE", "SYNC", "ENA", "STDIAG", "ENC", "NODE"}):
+            reason = "ERR:legacy stepdir disabled; use X42S controls"
+            self.log("⛔ 旧脉冲控制已停用，请使用 X42S 绑定/步态页")
+            if propagate_request_error:
+                raise RequestCancelled(reason)
+            return reason
         context_generation = getattr(self._control_context, "generation", None)
         with self.state_lock:
             session = self.serial_session
@@ -4031,6 +4196,9 @@ class StepperGUI:
     def _send_pulses(
         self, axis, steps, direction, delay_ms, guard=None, profile=None
     ):
+        if not getattr(self, "legacy_stepdir_enabled", True):
+            self.log("⛔ 历史 STEP/DIR 已停用；不会发送脉冲或改变旧位置账本")
+            return False
         if not 0 <= axis < NUM_STEPPER_AXES:
             return False
         if self._rot_release_active and axis in self._rot_release_axes:
@@ -5883,6 +6051,8 @@ class StepperGUI:
                 self.notebook.tab(self.tab_index_gear[a], state="normal")
             self.notebook.select(self.tab_index_gear[0])
             self._apply_gear_tune_to_firmware()
+        if not getattr(self, "legacy_stepdir_enabled", True):
+            self.notebook.select(self.tab_index_coordinated)
         self.log(f"固件模式 = {mode}")
 
     # ═════════════ 网页服务公开接口（允许从非 Tk 线程调用）═════════════

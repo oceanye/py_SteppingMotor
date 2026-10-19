@@ -120,6 +120,8 @@ def build_ui(app, log_dir, num_motor_axes):
     paired_tab = ttk.Frame(app.stepper_axis_books[0])
     app.stepper_axis_books[0].add(paired_tab, text="轴 左右直联动")
     app._build_paired_tab(paired_tab)
+    if not getattr(app, "legacy_stepdir_enabled", True):
+        app.notebook.tab(stepper_index, state="hidden")
     for axis in range(num_motor_axes):
         tab = ttk.Frame(app.notebook)
         app.tab_index_foc[axis] = app.notebook.index("end")

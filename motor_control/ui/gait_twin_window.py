@@ -15,7 +15,7 @@ def open_twin_window(app):
         main["large_window"]["window"].lift()
         return
     window = tk.Toplevel(app.root)
-    window.title("数字孪生大图 · 只读观察（无编码器估算）")
+    window.title("数字孪生大图 · 轴位反馈与姿态推算（只读）")
     window.geometry(f"{min(1500, window.winfo_screenwidth()-80)}x{min(820, window.winfo_screenheight()-80)}")
     window.minsize(640, 500)
     window.columnconfigure(0, weight=1)

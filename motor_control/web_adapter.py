@@ -231,6 +231,7 @@ class DesktopWebController:
             "motor_axes": motors,
             "track_detail": track,
             "coordinated_control": coordinated_control,
+            "legacy_stepdir_enabled": getattr(app, "legacy_stepdir_enabled", True),
             "logical_motors": logical_motors,
             "topology": {
                 "total_axes": NUM_STEPPER_AXES,
@@ -252,6 +253,8 @@ class DesktopWebController:
         """Asynchronously move a stepper without touching Tk on this thread."""
 
         app = self._app
+        if not getattr(app, "legacy_stepdir_enabled", True):
+            raise RuntimeError("历史 STEP/DIR 控制已停用；请使用桌面 X42S 控制")
         if not isinstance(confirm_high_rate, bool):
             raise ValueError("confirm_high_rate 必须是布尔值")
         generation = app._ensure_web_control_available()
@@ -393,6 +396,8 @@ class DesktopWebController:
         """Apply axis configuration on the UI thread before returning."""
 
         app = self._app
+        if not getattr(app, "legacy_stepdir_enabled", True):
+            raise RuntimeError("历史 STEP/DIR 标定已停用；请配置 X42S 绑定参数")
         try:
             axis = int(axis)
         except (TypeError, ValueError):

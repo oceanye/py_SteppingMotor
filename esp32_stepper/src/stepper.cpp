@@ -7,6 +7,7 @@
 #include <esp_timer.h>
 #include "sync_math.h"
 
+#if LEGACY_STEPDIR_ENABLED
 // 每轴引脚（编译期常量数组）
 #if defined(DRIVE_MODE_FOC)
 static const int PIN_PUL[NUM_AXES] = {PIN_STEP_PUL_0, PIN_STEP_PUL_1};
@@ -373,3 +374,15 @@ void stepper_run_diagnostics(int axis) {
   }
   serial_tx_line("===== DIAG 结束 =====");
 }
+#else
+// Keep STOP/ESTOP callers link-compatible without touching legacy pins.
+void stepper_init() {}
+bool stepper_sync_async(int, int, int, int, int) { return false; }
+void stepper_move(int, int, int, int) {}
+bool stepper_move_async(int, int, int, int) { return false; }
+bool stepper_is_busy(int) { return false; }
+bool stepper_abort(int) { return false; }
+void stepper_run_diagnostics(int) {}
+bool stepper_set_ena(int, bool) { return false; }
+bool stepper_ena_locked(int) { return false; }
+#endif

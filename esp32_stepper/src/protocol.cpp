@@ -537,6 +537,13 @@ void protocol_handle_line(const String& command) {
   const int n = split_tokens(command, tok, MAX_TOKENS);
   if (n < 0) { reply_err("too many fields"); return; }
 
+#if !LEGACY_STEPDIR_ENABLED
+  if (tok[0] == "MOVE" || tok[0] == "SYNC" || tok[0] == "ENA" ||
+      tok[0] == "STDIAG" || tok[0] == "ENC" || tok[0] == "NODE") {
+    reply_err("legacy stepdir disabled; use X42S commands"); return;
+  }
+#endif
+
   if (tok[0] == "MODE") {
     if (n != 1) { reply_err("bad format"); return; }
 #if defined(DRIVE_MODE_FOC)

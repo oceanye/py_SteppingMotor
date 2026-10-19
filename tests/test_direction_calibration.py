@@ -245,11 +245,12 @@ class DirectionCalibrationLayoutTests(unittest.TestCase):
         self.assertEqual(records, [(r, p) for r in
                                    ("Mup1", "Mr1", "Mup2", "Mr2")
                                    for p in (True, False)])
-        # X42S 手动调试按钮组：六个 action 各自接线，接错即测出。
-        for action in ("enable", "disable", "plus", "minus", "stop", "zero"):
+        # 常规调试不再暴露驱动器ZERO；其余五个 action 保留。
+        self.assertNotIn("zero", app.coordinated_widgets["x42s_manual_buttons"])
+        for action in ("enable", "disable", "plus", "minus", "stop"):
             app.coordinated_widgets["x42s_manual_buttons"][action].invoke()
         self.assertEqual(
-            manual, ["enable", "disable", "plus", "minus", "stop", "zero"])
+            manual, ["enable", "disable", "plus", "minus", "stop"])
 
     def test_x42s_manual_panel_visibility_follows_backend(self):
         # 手动调试区随后端切换显隐：stepdir 隐藏、x42s_uart 显示。

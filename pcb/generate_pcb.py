@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 """Generate the modular six-axis ESP32-S3 motor carrier (KiCad 8).
 
+ARCHIVED DM422 hardware, NOT the current X42S board or wiring specification.
+Do not generate fabrication files for the current machine from this design.
+
 This file is the design's single source of truth.  The PCB is strictly a
 carrier for complete ready-made modules: use pin headers/sockets by default,
 or a module-specific castellated-pad footprint only when that module actually

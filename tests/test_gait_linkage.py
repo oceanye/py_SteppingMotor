@@ -539,7 +539,7 @@ class AutoRunTests(unittest.TestCase):
         app._gait_auto_run = True
         app._gait_abort_run()
         self.assertFalse(app._gait_auto_run)
-        self.assertTrue(app._gait_needs_recovery)
+        self.assertFalse(app._gait_needs_recovery)  # No motion stage queued yet.
 
 
 

@@ -26,9 +26,9 @@
     <div class="warning show">此控制页未设置登录或令牌，仅限可信局域网使用。</div>
     <button id="estop" class="estop">紧急停止全部电机</button>
 
-    <section><h2>四逻辑电机绑定与状态</h2><p class="hint">只读监控。绑定请在桌面 GUI 的“电机绑定与状态”页修改。本页位置是主机脉冲软件估算，并非编码器实测；当前不提供自动 A↔C / S0–S7 控制。</p><div id="coordinatedReadiness" class="readiness">正在读取绑定状态…</div><div id="logicalMotors" class="grid"></div></section>
+    <section><h2>四逻辑电机绑定与状态</h2><p class="hint">只读监控。X42S 轴位来自驱动器反馈，按减速比/导程换算为 °/mm；整机姿态仍属模型推算。绑定与步态请在桌面 GUI 操作。历史 STEP/DIR 位置为脉冲估算。</p><div id="coordinatedReadiness" class="readiness">正在读取绑定状态…</div><div id="logicalMotors" class="grid"></div></section>
 
-    <section><h2>30 路步进电机</h2><div class="axis-toolbar"><label>控制器分组<select id="stepperGroup"></select></label><span id="topologyNote" class="topology-note">正在读取拓扑…</span></div><p class="hint">网页支持轴配置、定距运动与停止；设置原点、软限位、绝对位置和连续运动请在桌面 GUI 完成。远端轴 6–29 还要求 ESP32 使用 remote 固件且对应 Pico 节点在线。</p><div id="steppers" class="grid"></div></section>
+    <section id="legacySteppers" hidden><h2>历史 STEP/DIR 维护（30 轴，非当前硬件）</h2><div class="axis-toolbar"><label>控制器分组<select id="stepperGroup"></select></label><span id="topologyNote" class="topology-note">正在读取拓扑…</span></div><p class="hint">仅在显式启用历史维护模式时开放。当前四轴 X42S 不使用这些脉冲参数或原点。</p><div id="steppers" class="grid"></div></section>
     <section><h2>闭环电机</h2><div id="motors" class="grid"></div></section>
     <section><h2>轨道 D（DRV8871）</h2>
       <div class="card">
@@ -86,7 +86,7 @@
         if(typeof x.speed==='number')parts.push(`速度 ${formatNumber(x.speed,1)}`);
         if(x.fault)parts.push(`故障 ${x.fault}`);
         progress=parts.length?parts.join(' · '):(x.online?'无遥测字段':'无遥测');
-        modeLine=item.position_source==='x42s_driver'?'驱动器实测 (unit=deg)':'X42S 后端待接入';
+        modeLine=item.position_source==='x42s_driver'?`驱动器反馈换算 · 单位 ${unit}`:'X42S 后端待接入';
       }else{
         progress=item.progress_percent==null?(item.in_progress?'运动中，暂无中间进度帧':'空闲'):`进度 ${formatNumber(item.progress_percent,1)}% · ${item.executed_steps}/${item.requested_steps} 脉冲`;
         if(typeof item.target_position==='number'&&Number.isFinite(item.target_position))progress+=` · 目标 ${formatNumber(item.target_position)} ${unit}`;
@@ -112,7 +112,7 @@
     function updateCoordinated(control,motors){
       const ready=document.getElementById('coordinatedReadiness'),valid=!!control?.configuration_valid;
       const blockers=(control?.blockers||[]).map(code=>BLOCKER_TEXT[code]||code);
-      ready.textContent=`绑定配置：${valid?'有效':'未完成或无效'} · 自动协调：未就绪 · 编辑范围：桌面 GUI\n${blockers.join('；')}`;
+      ready.textContent=`绑定配置：${valid?'有效':'未完成或无效'} · 无人值守：未启用（步态以桌面预检为准）\n${blockers.join('；')}`;
       for(const item of motors||[])updateLogicalMotor(item);
     }
     buildLogicalMotors();
@@ -259,6 +259,7 @@
       if(refreshInFlight)return;refreshInFlight=true;
       try{
         const s=await api('/api/status');
+        document.getElementById('legacySteppers').hidden=s.legacy_stepdir_enabled!==true;
         document.getElementById('dot').classList.toggle('ok',!!s.connected);
         document.getElementById('conn').textContent=s.connected?'串口已连接':'服务在线 · 串口未连接';
         const incoming=s.topology?.axes||[];

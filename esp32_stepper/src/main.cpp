@@ -53,16 +53,17 @@ void setup() {
   serial_tx_line("Protocol: MOVE/STOP/ESTOP | FOC,<axis>,... | DIAG,<axis> | STDIAG,<axis> | MODE");
 #elif defined(DRIVE_MODE_GEAR)
   hardware_estop_init();
-  serial_tx_line("ESP32 Controller Ready (GEAR mode, stepper + DC gear motor)");
-  serial_tx_line("  fw: accel-ramp + 6-axis stepper + PCNT-clear");
-  serial_tx_printf("NUM_AXES (stepper) = %d", NUM_AXES);
+  serial_tx_line("ESP32 Controller Ready (GEAR mode)");
+  serial_tx_printf("Legacy STEP/DIR: %s", LEGACY_STEPDIR_ENABLED ? "ENABLED" : "DISABLED");
   serial_tx_printf("NUM_GEAR_AXES = %d", NUM_GEAR_AXES);
+#if LEGACY_STEPDIR_ENABLED
   const int pul_pins[] = {PIN_STEP_PUL_0,PIN_STEP_PUL_1,PIN_STEP_PUL_2,PIN_STEP_PUL_3,PIN_STEP_PUL_4,PIN_STEP_PUL_5};
   const int dir_pins[] = {PIN_STEP_DIR_0,PIN_STEP_DIR_1,PIN_STEP_DIR_2,PIN_STEP_DIR_3,PIN_STEP_DIR_4,PIN_STEP_DIR_5};
   for (int a = 0; a < NUM_AXES; a++) {
     serial_tx_printf("  stepper %d: PUL=%d DIR=%d", a, pul_pins[a],
                      dir_pins[a]);
   }
+#endif
   const int gin1[] = {PIN_GEAR_IN1_0, PIN_GEAR_IN1_1};
   const int gin2[] = {PIN_GEAR_IN2_0, PIN_GEAR_IN2_1};
   const int gea[]  = {PIN_GEAR_ENCA_0, PIN_GEAR_ENCA_1};
@@ -98,7 +99,7 @@ void setup() {
                    PIN_STEPPER_ENCODER_I2C_SDA,
                    PIN_STEPPER_ENCODER_I2C_SCL);
 #else
-  serial_tx_line("  optional step encoders: DISABLED/reserved (set diagnostics flag after hardware install)");
+  serial_tx_line("  legacy step encoder diagnostics: DISABLED");
 #endif
 #if REMOTE_STEPPER_ENABLED
   serial_tx_printf("  RS485 Pico nodes: ENABLED, global axes 6..%d RX/TX/DE=%d/%d/%d",
@@ -108,12 +109,16 @@ void setup() {
   serial_tx_line("  RS485 Pico nodes: DISABLED (select a *_remote environment)");
 #endif
 #if X42S_UART_ENABLED
-  serial_tx_printf("  X42S UART: ENABLED, ID1..%d RX/TX=%d/%d baud=%d (function codes pending manual check)",
+  serial_tx_printf("  X42S UART: ENABLED, ID1..%d RX/TX=%d/%d baud=%d",
                    X42S_DRIVER_COUNT, PIN_X42S_RX, PIN_X42S_TX, X42S_BAUD);
 #else
   serial_tx_line("  X42S UART: DISABLED (select esp32s3_gear_x42s environment)");
 #endif
-  serial_tx_line("Protocol: MOVE/STOP/ESTOP | FOC | TRACK | ENC,<axis>,S | DIAG | STDIAG | X42S | MODE");
+#if LEGACY_STEPDIR_ENABLED
+  serial_tx_line("Protocol: MOVE/STOP/ESTOP | FOC | TRACK | ENC,<axis>,S | DIAG | STDIAG | MODE");
+#else
+  serial_tx_line("Protocol: X42S | ESTOP | FOC | TRACK | DIAG | MODE (legacy STEP/DIR disabled)");
+#endif
 #endif
 }
 

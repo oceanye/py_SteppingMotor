@@ -240,13 +240,13 @@ def build_coordinated_tab(app, parent) -> None:
         warning,
         text=(
             "本页只配置逻辑角色绑定并监控，不执行自动 A↔C / S0–S7 换位。\n"
-            "位置来自主机脉冲累计，不是编码器实测；未收到 STEP,P 时不伪造运动中位置。"
+            "X42S 使用驱动器反馈：升降为 mm、旋转为输出轴 °；整机姿态仍按机械模型推算。"
         ),
         foreground="#b42318",
         justify="left",
     ).pack(anchor="w", padx=8, pady=5)
 
-    binding_frame = ttk.LabelFrame(parent, text="逻辑电机绑定（步进轴 / X42S UART）")
+    binding_frame = ttk.LabelFrame(parent, text="逻辑电机绑定（当前硬件：X42S UART）")
     binding_frame.grid(row=1, column=0, sticky="ew", **PAD)
 
     # 后端单选：v1 stepdir（原样）或 v2 x42s_uart（schema v2 文档）。
@@ -255,10 +255,11 @@ def build_coordinated_tab(app, parent) -> None:
     ttk.Label(backend_row, text="执行层后端:", font=("Microsoft YaHei", 9, "bold")).pack(
         side="left"
     )
-    app.binding_backend_var = tk.StringVar(value=BACKEND_STEPDIR)
+    app.binding_backend_var = tk.StringVar(value=BACKEND_X42S_UART)
     ttk.Radiobutton(
         backend_row,
-        text="步进轴 stepdir（v1，现状）",
+        text="STEP/DIR（历史维护，非当前硬件）",
+        state="normal" if getattr(app, "legacy_stepdir_enabled", True) else "disabled",
         variable=app.binding_backend_var,
         value=BACKEND_STEPDIR,
         command=app._on_binding_editor_change,
@@ -273,7 +274,7 @@ def build_coordinated_tab(app, parent) -> None:
     ttk.Label(
         backend_row,
         foreground="#b42318",
-        text="X42S 后端未过 M5 台架验证；切换后步态被拒（§19），且 v1→v2 迁移须确认",
+        text="X42S 步态需四台在线使能及有效现场基准；迁移后在步态页一次记录双侧基准",
     ).pack(side="left", padx=8)
 
     headings = ("角色", "固定动作", "要求模式", "物理执行器", "校验", "定位")
@@ -477,7 +478,6 @@ def build_coordinated_tab(app, parent) -> None:
         ("正转 +角度", "plus"),
         ("反转 −角度", "minus"),
         ("停止", "stop"),
-        ("设当前为零点", "zero"),
     ):
         button = ttk.Button(
             manual_buttons,
@@ -487,10 +487,12 @@ def build_coordinated_tab(app, parent) -> None:
         button.pack(side="left", padx=3)
         manual_button_map[action] = button
     app.coordinated_widgets["x42s_manual_buttons"] = manual_button_map
+    ttk.Label(manual, text="步态无需驱动器归零：摆好实物后在步态页一次记录双侧基准。",
+              foreground="#64748b").pack(anchor="w", padx=6, pady=3)
     # 默认角色（Mup1 直线）的标签/范围/按钮文案初始化。
     apply_manual_debug_units(app)
 
-    cards = ttk.LabelFrame(parent, text="四电机状态（软件脉冲估算）")
+    cards = ttk.LabelFrame(parent, text="四电机状态（位置来源按后端标注）")
     cards.grid(row=2, column=0, sticky="nsew", **PAD)
     for column in range(2):
         cards.columnconfigure(column, weight=1, uniform="role")
@@ -652,6 +654,9 @@ def _refresh_direction_calibration(app, by_role) -> None:
         # 只认 IDLE 时 X42S 绑定四行点动永远灰，串口连着也无法标定）。
         movable = (bool(snapshot.get("binding_valid"))
                    and snapshot.get("state") in ("IDLE", "X42S_ONLINE"))
+        if (snapshot.get("backend") == BACKEND_STEPDIR
+                and not getattr(app, "legacy_stepdir_enabled", True)):
+            movable = False
         for key in ("jog_plus", "jog_minus"):
             widgets[key].configure(state="normal" if movable else "disabled")
 
@@ -802,7 +807,8 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
             # 分支（2026-10-12 实机：启动即加载 x42s 绑定、后端待接入时
             # 在 binding["axis"] 上 KeyError，GUI 启动即崩）。
             if live is not None:
-                detail = f"{snapshot.get('physical_label')} · 驱动器实测 · unit=deg"
+                detail = (f"{snapshot.get('physical_label')} · 驱动器反馈换算"
+                          f" · 单位 {snapshot.get('unit', '—')}")
                 fault = live.get("fault")
                 if fault:
                     detail += f"\n故障: {fault}"
@@ -872,11 +878,11 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
 
     blockers = [BLOCKER_TEXT.get(code, code) for code in control.get("blockers", [])]
     app.coordinated_widgets["ready_label"].configure(
-        text="就绪" if control.get("automation_ready") else "未就绪",
+        text="无人值守：就绪" if control.get("automation_ready") else "无人值守：未启用（不代表步态被禁用）",
         foreground="#16803a" if control.get("automation_ready") else "#b42318",
     )
     app.coordinated_widgets["blocker_label"].configure(
-        text="；".join(blockers)
+        text="步态请以步态页预检为准。无人值守尚需核验：" + "；".join(blockers)
     )
 
 

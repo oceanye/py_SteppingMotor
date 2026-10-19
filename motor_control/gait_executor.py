@@ -66,6 +66,7 @@ class GaitExecutor:
         self._stage_index = 0
         self._lock = threading.Lock()
         self._stop_requested = False
+        self._cancelled_before_motion = False
 
     # ── UI/状态读取 ─────────────────────────────────────────
 
@@ -107,6 +108,24 @@ class GaitExecutor:
         """UI 中止按钮：请求停止并让正在等待的循环尽快退出。"""
 
         self._stop_requested = True
+
+    def cancel_before_motion(self) -> bool:
+        """Cancel a plan only before any motion stage has run or been queued.
+
+        The same lock guards worker admission. A queued/running stage, a failed
+        run, or a completed motion stage must take the normal stop/recovery path.
+        """
+        with self._lock:
+            if self._cancelled_before_motion:
+                return True
+            if (self.state != "ready" or self._stop_requested
+                    or any(s.is_motion_stage for s in self.stages[:self._stage_index])):
+                return False
+            self._stop_requested = True
+            self._cancelled_before_motion = True
+            self.state = "aborted"
+            self.last_error = "运动前取消计划；未改变物理基准"
+            return True
 
     def begin_stage_execution(self) -> None:
         """UI 在启动工作线程前抢占状态，防止重复点击执行按钮。"""

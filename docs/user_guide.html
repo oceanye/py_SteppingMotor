@@ -58,6 +58,18 @@
   &nbsp;|&nbsp; 适用版本：main <code>2d1bc3c</code>（2026-09-20）&nbsp;|&nbsp; 离线文档，可直接分享</div>
 </header>
 
+<section id="current-x42s" class="box warn">
+<h2>当前硬件：四轴 X42S（2026-10-19）</h2>
+<p>DM422/DM442 已退役。下方30轴、Pico、脉冲PPR及分开记零章节仅供历史维护，不是当前操作流程。</p>
+<ol><li>启动 <code>run_gui.bat</code>，连接 ESP32；固件使用 <code>esp32s3_gear_x42s</code>。</li>
+<li>在绑定页核对四台X42S的ID、旋转减速比及升降导程，校验总线并使能。</li>
+<li>首次/异常恢复：确认可靠支撑及所选起步摆放，点击“确认摆放并记录双侧基准”一次。</li>
+<li>选择四动作之一并执行步态；正常连续换步不需要再标定或驱动器ZERO。</li></ol>
+<p>轴位是驱动器反馈；地图、整机姿态和间隙是机械模型推算。灰色曲线为计划参考，不是实测间隙。</p>
+<p>完整流程与远端验收见 <a href="HANDOFF_2026-10-19_BASELINE_WORKFLOW.md">X42S交接指引</a>。
+旧接线图/PCB不适用，实际模块供电和接口电平须依现场型号、驱动器手册确认。</p>
+</section>
+
 <nav class="toc">
   <b>目录</b>
   <ol>

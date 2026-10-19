@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from dataclasses import replace
 
 from motor_control.gait_planner import (
@@ -41,7 +41,7 @@ RUN_FIELDS = (
     ("settle_speed_mm_s", "落足速度 (mm/s)"),
 )
 CALIBRATION_FIELDS = (
-    ("beam_reference_deg", "记零时横梁世界角 β₀ (°)"),
+    ("beam_reference_deg", "起步横梁角 β₀（地图派生，°）"),
 )
 PREVIEW_FIELDS = (
     ("swing_segments", "预览爪臂展示数量"),
@@ -55,6 +55,21 @@ SIGN_FIELDS = (
     ("mup2_lift_sign", "Mup2 抬升方向", "轴坐标增大 = 抬起"),
 )
 INTEGER_FIELDS = {"swing_segments", "feasibility_samples"}
+
+BASELINE_GUIDE = (
+    "首次装机或更换传动：\n"
+    "1. 在绑定页核对四台 ID、减速比、升降导程；低速点动确认方向一次并保存。\n"
+    "2. 连接并使能四台，选择与实物一致的起步两格/红杆侧。人工摆好双足，三爪对准低节点。\n"
+    "3. 点击【确认摆放并记录双侧基准】，确认一次即可记录左右基准并保存。\n"
+    "4. 选择四动作之一并开始；启动仍检查状态、相位、间隙、速度和限位。\n\n"
+    "正常连续换步：直接选择下一动作，不重新记零、不重建地图、不重复方向标定。\n"
+    "修改速度、行程、预览采样：保留基准，执行前仍重新校验计划。\n"
+    "运动前取消计划：保留基准；运动已排队/开始后中止：先恢复可靠支撑和所选起步摆放，"
+    "再执行第3步，硬件参数不变无需重做方向测试。\n\n"
+    "断电、坐标跳变或手动搬动后：先核对实物与驱动器坐标；无法确认连续性时重新摆放并执行第3步。"
+    "PC保存了基准，不等于编码器断电后仍保留同一多圈坐标。\n"
+    "无需使用驱动器ZERO；它不是机械回原点，也不是步态准备的前置。"
+)
 
 # 2026-09-24 初始摆放（红杆在横梁左/右侧的镜像摆法）下拉：标签面向
 # 操作员，内部值进 params.initial_placement；β₀ 由摆放派生并联动覆写。
@@ -211,10 +226,13 @@ def _build_params_column(app, parent) -> None:
         caption = ttk.Label(inner, text=label, wraplength=185, justify="left")
         caption.grid(row=row, column=0, sticky="w", padx=6, pady=3)
         var = tk.StringVar()
-        var.trace_add("write", lambda *_: _invalidate_calibration(app))
+        var.trace_add("write", lambda *_, field=key: _invalidate_calibration(
+            app, reference_changed=field not in dict(RUN_FIELDS + PREVIEW_FIELDS)))
         app.gait_field_vars[key] = var
         entry = ttk.Entry(inner, textvariable=var, width=9)
         entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+        if key == "beam_reference_deg":
+            entry.configure(state="readonly")
         if key == "d_mm":
             app.gait_widgets["spacing_entry"] = entry
             app.gait_widgets["spacing_caption"] = caption
@@ -235,8 +253,8 @@ def _build_params_column(app, parent) -> None:
          "腿/杆投影宽度和δ仍需实测，不能调小数值强行放行。抬高不替代平面避让。")
 
     inner = pages["calibration"].content
-    note(inner, 0, "先在“电机绑定与状态”页设置 PPR、减速比和升降导程，\n"
-         "并用页内【逐电机调试与方向标定】点动验证、记录每个电机的真实方向。")
+    note(inner, 0, "首次装机才需核对绑定、减速比、升降导程并点动确认方向（STEP/DIR还需PPR）。\n"
+         "日常只需摆好实物，点下方【确认摆放并记录双侧基准】一次；正常连续换步不重做。")
     ttk.Label(inner, text="初始摆放（俯视·从左足看向右足）",
               wraplength=185, justify="left").grid(
                   row=1, column=0, sticky="w", padx=6, pady=3)
@@ -252,7 +270,7 @@ def _build_params_column(app, parent) -> None:
     note(inner, 2, "机构实际怎么摆就选什么：俯视、站在左足处看向右足，\n"
          "紧挨横梁的那根红杆在哪只手边就选哪侧。红杆在哪侧决定同一按钮\n"
          "的模态序列（两摆法互为镜像）。切换即基准变更：零位作废，须重新\n"
-         "摆机构到该初始状态、重新记零并确认标定。\n"
+         "摆机构到该初始状态，再点下方【确认摆放并记录双侧基准】。\n"
          "任意两格在右侧数字孪生中选择；此下拉仅用于恢复 A/B 预设。")
     add_number_field(inner, 3, *CALIBRATION_FIELDS[0])
     row = 4
@@ -270,7 +288,7 @@ def _build_params_column(app, parent) -> None:
             row=row+1, column=0, columnspan=3, sticky="w", padx=6)
         row += 2
 
-    note(inner, row, "旋转零位：把三足摆到 ψ=30° 基准后分别记零。")
+    note(inner, row, "已保存的旋转基准（不要求驱动器读数为0）：")
     row += 1
     for role_name in ("Mr1", "Mr2"):
         ttk.Label(inner, text=f"{role_name} 零位").grid(
@@ -279,18 +297,9 @@ def _build_params_column(app, parent) -> None:
             inner, textvariable=app.gait_zero_vars[role_name],
             font=("Consolas", 10, "bold"),
         ).grid(row=row, column=1, sticky="w", padx=4)
-        ttk.Button(
-            inner, text="记零",
-            command=lambda name=role_name: app._gait_record_zero_clicked(name),
-        ).grid(row=row, column=2, sticky="w", padx=4, pady=1)
         row += 1
-
-    ttk.Checkbutton(inner, variable=app.gait_calibrated_var,
-                    text="已确认电机标定与现场支撑").grid(
-                        row=row, column=0, columnspan=3, sticky="w", padx=6, pady=6)
-    row += 1
-    ttk.Button(inner, text="人工重建所选起步基准（不动电机）",
-               command=app._gait_reestablish_baseline).grid(
+    ttk.Button(inner, text="查看首次准备与日常运行指引",
+               command=lambda: messagebox.showinfo("步态基准操作指引", BASELINE_GUIDE)).grid(
                    row=row, column=0, columnspan=3, sticky="w", padx=6, pady=4)
 
     inner = pages["geometry"].content
@@ -314,9 +323,13 @@ def _build_params_column(app, parent) -> None:
     ttk.Button(
         buttons, text="放弃修改并重读", command=app._gait_reload_params_clicked
     ).pack(side="left", padx=3)
+    app.gait_widgets["prepare_baseline"] = ttk.Button(
+        parent, text="确认摆放并记录双侧基准（首次/恢复）",
+        command=app._gait_reestablish_baseline)
+    app.gait_widgets["prepare_baseline"].grid(row=2, column=0, sticky="ew", padx=6, pady=4)
     app.gait_widgets["readiness"] = ttk.Label(parent, text="", justify="left", wraplength=280)
     app.gait_widgets["readiness"].grid(
-        row=2, column=0, sticky="ew", padx=6, pady=(0, 4))
+        row=3, column=0, sticky="ew", padx=6, pady=(0, 4))
 
 
 def _build_run_column(app, parent) -> None:
@@ -488,12 +501,13 @@ def _refresh_geometry_fields(app):
         text="中心距 d=√3a（自动，mm）")
 
 
-def _invalidate_calibration(app):
+def _invalidate_calibration(app, *, reference_changed=True):
     _refresh_trajectory_status(app)
     _refresh_geometry_fields(app)
     if not getattr(app, "_gait_loading_fields", False):
         app.gait_widgets.get("twin", {}).pop("candidate", None)
-        app.gait_calibrated_var.set(False)
+        if reference_changed:
+            app.gait_calibrated_var.set(False)
         # Changing the law/geometry must not replay a cached, different path.
         app._gait_last_report = None
         if getattr(app, "gait_widgets", {}).get("preview_anim"):
@@ -578,8 +592,10 @@ def collect_gait_params(app, base: GaitParams) -> GaitParams:
         param_updates[key] = int(raw)
     confirmed = bool(app.gait_calibrated_var.get())
     param_updates["calibration_confirmed"] = confirmed
+    # Ordinary save/start may retain a confirmation, never re-sign changed
+    # hardware. Only the explicitly confirmed baseline transaction signs it.
     param_updates["calibration_fingerprint"] = (
-        app._gait_hardware_fingerprint() if confirmed else None)
+        base.calibration_fingerprint if confirmed else None)
     return replace(
         base,
         geometry=replace(base.geometry, **geometry_updates),
@@ -861,10 +877,32 @@ def refresh_gait_panel(app, progress_text=None) -> None:
 
     run = getattr(app, "_gait_run", None)
     verified = app.gait_params.calibration_confirmed and app.gait_calibrated_var.get()
+    missing = [role for role, zero, signature in (
+        ("Mr1", app.gait_params.mr1_zero_deg, app.gait_params.mr1_zero_signature),
+        ("Mr2", app.gait_params.mr2_zero_deg, app.gait_params.mr2_zero_signature))
+        if zero is None or not signature]
+    reference_problem = None
+    if missing:
+        reference_problem = "缺少" + "/".join(missing) + "基准"
+    elif verified:
+        try:
+            if app.gait_params.calibration_fingerprint != app._gait_hardware_fingerprint():
+                reference_problem = "绑定/传动已变化"
+            check_signature = getattr(app, "_gait_zero_signature", None)
+            if check_signature and any(saved != check_signature(role, app.gait_params)
+                    for role, saved in (("Mr1", app.gait_params.mr1_zero_signature),
+                                        ("Mr2", app.gait_params.mr2_zero_signature))):
+                reference_problem = "旋转方向/基准签名已变化"
+        except (RuntimeError, ValueError):
+            reference_problem = "绑定未完整"
+    verified = verified and reference_problem is None
     needs_recovery = getattr(app, "_gait_needs_recovery", False)
+    app.gait_widgets["prepare_baseline"].configure(
+        state="disabled" if getattr(app, "_gait_owned", {}) else "normal")
     app.gait_widgets["readiness"].configure(
-        text="须人工重建物理基准" if needs_recovery else (
-            "标定已确认；启动前仍须完整预检" if verified else "未确认标定：仅看候选/模拟"),
+        text="中止后须恢复支撑/所选起步摆放，再记录双侧基准" if needs_recovery else (
+            "基准已保存；连续换步无需重记，启动仍完整预检" if verified else
+            (reference_problem or "尚未确认现场基准") + "：摆好实物后点上方按钮一次"),
         foreground="#b42318" if needs_recovery or not verified else "#16803a")
     snapshot = run.describe() if run is not None else None
     if snapshot is None:

@@ -398,7 +398,7 @@ class CompatibilityAndSnapshotTests(unittest.TestCase):
 
     def test_snapshot_with_stepper_backend_unchanged(self):
         control, motors = build_coordinated_snapshot(
-            bindings=BindingSet.empty(),
+            bindings=BindingSet.empty(backend=BACKEND_STEPDIR),
             profiles=[object()] * 6,
             runtimes=[object()] * 6,
             axis_param_valid=[True] * 6,

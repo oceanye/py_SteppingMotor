@@ -78,7 +78,7 @@ def curve_payload(app, view):
             status = "模拟跨步滑窗 · 非实测"
     else:
         reference = view.get("live_curve_reference")
-        grey, status = True, "灰色=计划参考滑窗 · 编码器未接入"
+        grey, status = True, "灰色=计划参考滑窗 · 不代表间隙实测"
         if reference:
             timeline = view["live_curve_timeline"]
             offset, segment = reference["offset_s"], reference["segment"]

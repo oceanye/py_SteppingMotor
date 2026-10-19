@@ -280,8 +280,9 @@ class BindingSet:
             )
 
     @classmethod
-    def empty(cls) -> "BindingSet":
-        return cls()
+    def empty(cls, *, backend: str = BACKEND_X42S_UART) -> "BindingSet":
+        """Current hardware defaults to X42S, but never guesses physical IDs."""
+        return cls(backend=backend)
 
     @classmethod
     def suggested(cls) -> "BindingSet":
@@ -811,7 +812,8 @@ def build_coordinated_snapshot(
             "required_mode": spec.required_mode,
             "binding_revision": bindings.revision,
             "backend": bindings.backend,
-            "position_source": POSITION_SOURCE,
+            "position_source": ("x42s_driver_pending" if bindings.backend == BACKEND_X42S_UART
+                                else POSITION_SOURCE),
             "measured": False,
         }
         if binding is None:
@@ -933,7 +935,10 @@ def build_coordinated_snapshot(
                     "requested_steps": None,
                     "last_update_age_ms": live["last_update_age_ms"],
                     "stale": bool(live["stale"]),
-                    "in_progress": False,
+                    "in_progress": (live["reached"] is not True
+                                    or live["speed"] is None
+                                    or not math.isfinite(live["speed"])
+                                    or abs(live["speed"]) > 0.01),
                     "continuous": False,
                     "x42s": live,
                 }
@@ -1062,6 +1067,8 @@ def build_coordinated_snapshot(
 
     configuration_valid = bindings.is_complete and not issues
     blockers = list(AUTOMATION_BLOCKERS)
+    if bindings.backend == BACKEND_X42S_UART:
+        blockers.remove("pico_node_health_incomplete")
     if not configuration_valid:
         blockers.insert(0, "logical_motor_bindings_incomplete_or_invalid")
     control = {
@@ -1070,8 +1077,12 @@ def build_coordinated_snapshot(
         "configuration_valid": configuration_valid,
         "automation_ready": False,
         "edit_scope": "desktop_only",
-        "position_source": POSITION_SOURCE,
-        "measured": False,
+        "position_source": ("x42s_driver" if bindings.backend == BACKEND_X42S_UART
+                            else POSITION_SOURCE),
+        "measured": (bindings.backend == BACKEND_X42S_UART
+                     and configuration_valid
+                     and all(m.get("measured") and m.get("position_trusted")
+                             for m in logical_motors)),
         "blockers": blockers,
     }
     return control, logical_motors
