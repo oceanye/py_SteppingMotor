@@ -14,6 +14,8 @@ from motor_control.gait_planner import (
     parse_gait_params, effective_geometry, point_segment_distance, gait_pads,
 )
 from motor_control.gait_executor import GaitExecutorError
+from motor_control.gait_map import map_pads
+from motor_control.gait_simulation import GaitSimulation
 from motor_control.protocol import parse_line
 from test_gait_twin import linked_app
 
@@ -48,6 +50,123 @@ def complete(app, side, arc):
 
 
 class TwoModeGeometryTests(unittest.TestCase):
+    def test_projected_edge_190_is_the_only_scale_for_all_four_actions(self):
+        # User-confirmed planar edge. Intentionally leave the old d=220;
+        # validation, planning and stage construction must all derive sqrt(3)*a.
+        p = GaitParams(trajectory_mode=TWO_MODE,
+                       geometry=GaitGeometry(arm_length_mm=190))
+        self.assertIs(p.validated(), p)
+        self.assertEqual(p.geometry.d_mm, 220)
+        self.assertAlmostEqual(effective_geometry(p).d_mm, math.sqrt(3)*190)
+        sim = GaitSimulation(p)
+        for side, arc, family, end in MODES:
+            with self.subTest(side=side, arc=arc):
+                report = sim.preview(side, arc)
+                self.assertTrue(report.feasible, report.message)
+                self.assertEqual(report.modality, family)
+                self.assertAlmostEqual(report.min_margin_mm,
+                                       27.5815232377 if family == LOW else 8.1677273075, places=6)
+                stage = next(s for s in plan_gait_stages(p, side=side, arc_deg=arc,
+                    route=report.route, swing_psi_start_deg=30) if s.stage_id == "S4")
+                self.assertEqual(stage.sync_endpoints[-1], end)
+
+    def test_projected_scale_document_roundtrip_preserves_legacy_spacing_and_zeros(self):
+        p = GaitParams(trajectory_mode=TWO_MODE,
+                       geometry=GaitGeometry(arm_length_mm=190),
+                       mr1_zero_deg=12.3, mr2_zero_deg=-4.5,
+                       mr1_zero_signature="left", mr2_zero_signature="right")
+        restored = parse_gait_params(p.as_document())
+        self.assertEqual(restored, p)
+        self.assertAlmostEqual(effective_geometry(restored).d_mm, math.sqrt(3)*190)
+        # Legacy has an independent spacing and still rejects overlapping pads.
+        with self.assertRaisesRegex(ValueError, "中心距"):
+            replace(p, trajectory_mode=LEGACY).validated()
+        legacy = replace(p, trajectory_mode=LEGACY,
+                         geometry=replace(p.geometry, d_mm=350.123456789))
+        self.assertEqual(parse_gait_params(legacy.as_document()), legacy)
+        self.assertEqual(effective_geometry(legacy).d_mm, 350.123456789)
+
+    def test_derived_spacing_does_not_waive_other_geometry_checks(self):
+        p = GaitParams(trajectory_mode=TWO_MODE,
+                       geometry=GaitGeometry(arm_length_mm=190))
+        for field, value in (("arm_length_mm", 0), ("arm_length_mm", math.nan),
+                             ("arm_length_mm", 1.7e308), ("hub_radius_mm", 190),
+                             ("arm_radius_mm", -1), ("node_radius_mm", 0),
+                             ("safety_margin_mm", 0), ("surrounding_pads", "true")):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                replace(p, geometry=replace(p.geometry, **{field: value})).validated()
+
+    def test_all_map_routes_classify_by_beam_swept_sector_not_button(self):
+        # Independent geometric oracle: a high rod's center is inside the
+        # signed sector swept by the beam segment. Do not reuse the classifier's
+        # midpoint/mod120 formula to construct the expected result.
+        p = params()
+        g = effective_geometry(p)
+        centers = map_pads()
+        checked = 0
+        modes_by_action = {}
+        for left, a in centers.items():
+            for right, b in centers.items():
+                if not math.isclose(math.dist(a, b), 1.0):
+                    continue
+                sim = GaitSimulation(p, (left, right))
+                for side in ("left", "right"):
+                    for arc in (60, -60):
+                        try:
+                            route = sim.route(side, arc)
+                        except ValueError:  # A map-edge action has no landing.
+                            continue
+                        pads = gait_pads(p, route[2])
+                        pivot = pads[route[2]].center
+                        crosses = False
+                        for pad in pads.values():
+                            for rod in pad.high_nodes(g.arm_length_mm):
+                                radius = math.dist(pivot, rod)
+                                if not 0 < radius < g.d_mm:
+                                    continue
+                                angle = math.degrees(math.atan2(
+                                    rod[1]-pivot[1], rod[0]-pivot[0]))
+                                swept = ((route[3]-angle) if arc > 0 else
+                                         (angle-route[3])) % 360
+                                crosses |= 1e-6 < swept < abs(arc)-1e-6
+                        actual = avoidance_path(route[3], arc).modality
+                        with self.subTest(supports=sim.supports, side=side, arc=arc):
+                            self.assertEqual(actual, HIGH if crosses else LOW)
+                        modes_by_action.setdefault((side, arc), set()).add(actual)
+                        checked += 1
+        self.assertGreater(checked, 300)
+        self.assertEqual(len(modes_by_action), 4)
+        self.assertTrue(all(modes == {LOW, HIGH} for modes in modes_by_action.values()))
+
+    def test_mirrored_initial_placements_swap_all_four_modalities(self):
+        for side, arc, family, _ in MODES:
+            for placement in ("red_right", "red_left"):
+                sim = GaitSimulation(replace(params(), initial_placement=placement,
+                                             beam_reference_deg=0 if placement == "red_left" else 180))
+                report = sim.preview(side, arc)
+                expected = family if placement == "red_right" else (HIGH if family == LOW else LOW)
+                with self.subTest(side=side, arc=arc, placement=placement):
+                    self.assertEqual(report.modality, expected)
+                    self.assertIn("自动 HIGH" if expected == HIGH else "自动 LOW", report.message)
+
+    def test_continuous_simulation_reclassifies_and_return_keeps_route_modality(self):
+        sim = GaitSimulation(params())
+        first = sim.begin("left", 60)
+        self.assertEqual(first.modality, LOW)
+        while sim.active:
+            sim.advance()
+        # Same button is now HIGH; reversing the just-completed path stays LOW.
+        self.assertEqual(sim.preview("left", 60).modality, HIGH)
+        self.assertEqual(sim.preview("left", -60).modality, LOW)
+        self.assertEqual(sim.preview("right", 60).modality, LOW)
+        self.assertEqual(sim.preview("right", -60).modality, HIGH)
+        second = sim.begin("right", -60)
+        self.assertEqual(second.modality, HIGH)
+        while sim.active:
+            sim.advance()
+        self.assertEqual(sim.preview("right", 60).modality, HIGH)
+        self.assertEqual(sim.preview("left", 60).modality, LOW)
+
     def test_four_initial_modes_and_current_stance_classification(self):
         for side, arc, family, end in MODES:
             bearing = 180 if side == "left" else 360
@@ -144,6 +263,19 @@ class TwoModeGeometryTests(unittest.TestCase):
 
 
 class TwoModeExecutionTests(unittest.TestCase):
+    def test_execution_reclassifies_after_completed_step_like_simulation(self):
+        app = app_fixture()
+        sim = GaitSimulation(app.gait_params)
+        for side, arc, expected in (("left", 60, LOW), ("right", -60, HIGH)):
+            simulated = sim.begin(side, arc)
+            run, executed = complete(app, side, arc)
+            self.assertEqual(run.state, "done")
+            self.assertEqual((simulated.modality, executed.modality), (expected, expected))
+            self.assertEqual(simulated.route[:3], executed.route[:3])
+            while sim.active:
+                sim.advance()
+            self.assertEqual(sim.supports, tuple(app._gait_supports))
+
     def test_non_neighbor_arc_refused_before_controller_access(self):
         app = app_fixture()
         with self.assertRaisesRegex(GaitExecutorError, "相邻支座"):

@@ -7,6 +7,7 @@ axis coordinate, not a contact/ground-height measurement.
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Mapping, Sequence
 
 from motor_control.gait_planner import GaitParams, LOW_NODE_PHASE_DEG
@@ -16,6 +17,91 @@ from motor_control.gait_avoidance import lattice_coordinates
 PAD_CENTERS = {"A": (-1.0, 0.0), "B": (0.0, 0.0),
                "C": (-0.5, math.sqrt(3) / 2)}
 ROLES = ("Mup1", "Mr1", "Mup2", "Mr2")
+
+
+class TwinHistory:
+    """Bounded display-only path; invalid telemetry always breaks the line.
+
+    A new step does not clear world history. Only a new physical reference or
+    an explicit clear does. No targets, wall-clock interpolation or motor IO.
+    """
+
+    def __init__(self, max_points=6000):
+        self.points = deque(maxlen=max_points)
+        self.landings = deque(maxlen=250)
+        self.world_key = None
+        self.clear()
+
+    def clear(self, snapshot=None):
+        self.points.clear()
+        self.landings.clear()
+        self.completed_steps = 0
+        self._segment = 0
+        self.current_step = 0
+        self.segment_steps = {}
+        self._last_reference = None
+        self._healthy = False
+        self._last_done = (snapshot.get("reference_key")
+                           if snapshot and snapshot.get("step_done") else None)
+        if snapshot:
+            self.world_key = snapshot.get("world_key")
+
+    def observe(self, snapshot):
+        world = snapshot.get("world_key")
+        if world != self.world_key:
+            self.clear()
+            self.world_key = world
+        pose = snapshot.get("pose")
+        if pose is None or snapshot.get("state") not in ("estimated", "waiting"):
+            self._healthy = False
+            return
+        left, right = (tuple(pose["feet"][s]["center"]) for s in ("left", "right"))
+        center = tuple((a+b)/2 for a, b in zip(left, right))
+        if not all(math.isfinite(v) for point in (left, right) for v in point):
+            self._healthy = False
+            return
+        # 世界 ψ（左右）随点记录：实机轨迹要画三爪端折线（与评估层同款），
+        # 只有中心点不够。旧测试替身不带 psi_deg → None，绘制时跳过爪线。
+        psis = tuple(pose["feet"][s].get("psi_deg") for s in ("left", "right"))
+        ref = snapshot.get("reference_key")
+        if not self.current_step or ref != self._last_reference:
+            self.current_step += 1
+        if not self._healthy or ref != self._last_reference:
+            self._segment += 1
+            self.segment_steps[self._segment] = self.current_step
+            # Match the bounded point history; a long session must not leak metadata.
+            retained = {p[0] for p in self.points} | {self._segment}
+            self.segment_steps = {k: v for k, v in self.segment_steps.items() if k in retained}
+        point = (self._segment, left, right, center, psis)
+        if not self.points or point != self.points[-1]:
+            self.points.append(point)
+        self._healthy, self._last_reference = True, ref
+        if snapshot.get("step_done") and ref != self._last_done:
+            self._last_done = ref
+            self.completed_steps += 1
+            self.landings.append((self.completed_steps, left, right))
+
+    def segments(self):
+        """Split on steps and telemetry gaps; never draw an invented connector."""
+        chunks = []
+        for point in self.points:
+            if not chunks or chunks[-1][-1][0] != point[0]:
+                chunks.append([])
+            chunks[-1].append(point)
+        return chunks
+
+    def recent_segments(self):
+        """Return (age, segment) for current/previous STEP, not telemetry chunk.
+
+        A disconnect splits a line but must not make the same physical step
+        look like a previous step. All older paths stay out of the display.
+        """
+        chunks = self.segments()
+        steps = [self.segment_steps.get(chunk[0][0], chunk[0][0]) for chunk in chunks]
+        current = self.current_step or (steps[-1] if steps else 0)
+        previous = next((s for s in reversed(steps) if s != current), None)
+        return [(0 if step == current else 1, chunk) for step, chunk in zip(steps, chunks)
+                if step == current or step == previous]
 
 
 def pad_center(name):

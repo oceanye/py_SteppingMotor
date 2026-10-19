@@ -1,43 +1,385 @@
-"""Live pulse-estimated motor/foot view, separate from the planned path plot."""
-import math
-import tkinter as tk
-from tkinter import ttk
+"""Situational twin map: planned-trajectory overlay + live pulse-estimated pose.
 
-from motor_control.gait_twin import PAD_CENTERS, ROLES
+2026-09-30 合并"轨迹与间隙"预览到孪生画面：同一 5×5 地图上分两种数据源
+模式——评估模拟（计划层，蓝抬头，不动电机）与实机脉冲（实机层，红抬头，
+无编码器估算）。执行开始自动切实机并隐藏计划层；重新干跑/重置流程回
+评估。最近足高亮与爪端-高杆距离曲线在两种模式下都提供（口径=爪端点到
+杆表面，mm）。后续编码器接入时在此层再加"编码器实测"数据源即可。
+"""
+import math
+import time
+import tkinter as tk
+from collections import deque
+from tkinter import ttk, messagebox
+
+from motor_control.gait_avoidance import lattice_coordinates
+from motor_control.gait_planner import effective_geometry
+from motor_control.gait_twin import ROLES, TwinHistory, pad_center
+from motor_control.gait_map import map_pads, map_label, start_pair_reference
+from motor_control.gait_twin_timing import plan_sample_times
+from motor_control.ui.common import bind_canvas_view, canvas_view_zoom, reset_canvas_view
+from motor_control.ui.gait_charts import build_twin_charts
+
+# 地图爪端轨迹和曲线共用配色：左足三爪蓝系、右足三爪橙系。
+CURVE_COLORS = (("#1d4ed8", "#3b82f6", "#93c5fd"),   # 左足 爪1/2/3
+                ("#9a3412", "#ea580c", "#fdba74"))   # 右足 爪1/2/3
+_SIX_STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, -1), (-1, 1))
+CURVE_SAMPLE_INTERVAL_S = 0.15     # 实机曲线采样节流
+CURVE_MAX_POINTS = 1800            # 实机曲线有界缓存（≈4.5 分钟@0.15s）
+
+
+def twin_pad_window():
+    """Fixed 5 rows x 5 columns, same world coordinates throughout a session."""
+    return map_pads()
+
+
+# 地图邻域（25 格外扩一圈）：只用于"最近足/曲线"的高杆距离计算——避障
+# 认证范围不因 5×5 裁剪（边缘支座旁边地图外的高杆同样可能最近）。
+def _neighborhood_pads():
+    pads = map_pads()
+    inside = {lattice_coordinates(n) for n in pads}
+    merged = dict(pads)
+    for i, j in list(inside):
+        for di, dj in _SIX_STEPS:
+            key = (i + di, j + dj)
+            if key in inside:
+                continue
+            name = f"邻座({key[0]},{key[1]})"
+            merged.setdefault(name, (key[0] + key[1] / 2,
+                                     math.sqrt(3) * key[1] / 2))
+    return merged
+
+
+_NEIGHBORHOOD = None
+
+
+def neighborhood_pads():
+    global _NEIGHBORHOOD
+    if _NEIGHBORHOOD is None:
+        _NEIGHBORHOOD = _neighborhood_pads()
+    return _NEIGHBORHOOD
+
+
+def lattice_d_mm(params):
+    """态势图换算用的晶格中心距——与 planner 同口径。
+
+    两模态认证在紧贴晶格上（d=√3×爪臂长，GUI 的 d_mm 字段忽略），旧模式
+    才用 d_mm。mm↔归一化（地图中心距=1）的一切换算必须走这里，否则两模态
+    下腿长/杆位/轨迹会被 d_mm 占位值（默认 220）整体缩放错位。
+    """
+
+    return effective_geometry(params).d_mm
+
+
+def high_rods_mm(params):
+    """邻域全部高杆的 mm 坐标 [(name, j, x, y), ...]（含地图外一圈）。"""
+
+    d = lattice_d_mm(params)
+    arm = params.geometry.arm_length_mm
+    rods = []
+    for name, (nx, ny) in neighborhood_pads().items():
+        cx, cy = nx * d, ny * d
+        for j in range(3):
+            a = math.radians(90.0 + 120.0 * j)
+            rods.append((name, j, cx + arm * math.cos(a), cy + arm * math.sin(a)))
+    return rods
+
+
+_ROD_CACHE = None
+
+
+def _rods_cached(params):
+    global _ROD_CACHE
+    key = (lattice_d_mm(params), params.geometry.arm_length_mm)
+    if _ROD_CACHE is None or _ROD_CACHE[0] != key:
+        _ROD_CACHE = (key, high_rods_mm(params))
+    return _ROD_CACHE[1]
+
+
+def foot_tips_mm(center_norm, psi_deg, params):
+    """一足三爪端 mm 坐标：中心（归一化）+ 爪臂长·dir(ψ+120k)。"""
+
+    d = lattice_d_mm(params)
+    arm = params.geometry.arm_length_mm
+    cx, cy = center_norm[0] * d, center_norm[1] * d
+    tips = []
+    for k in range(3):
+        a = math.radians(psi_deg + 120.0 * k)
+        tips.append((cx + arm * math.cos(a), cy + arm * math.sin(a)))
+    return tips
+
+
+def tip_surface_distances(pose, params):
+    """live pose 的 6 爪端对邻域高杆的最近表面距离 [左0..2, 右0..2] (mm)。"""
+
+    node_r = params.geometry.node_radius_mm
+    rods = _rods_cached(params)
+    values = []
+    for side in ("left", "right"):
+        foot = pose["feet"][side]
+        for tip in foot_tips_mm(foot["center"], foot["psi_deg"], params):
+            values.append(min(math.dist(tip, (r[2], r[3])) for r in rods) - node_r)
+    return values
+
+
+def plan_tip_series(report, params, psis=(30.0, 30.0)):
+    """计划层 6 爪距离序列：[(t_s, [左0..2, 右0..2]), ...]。
+
+    摆动足 3 爪按 samples 逐点计算；支撑足 3 爪踩在支点低节点上，
+    距离为常数（起点一次算清）。时间轴使用该 route/方向的各段五次
+    进度计划时间；不含通讯等待，也不代表实机已运动的时间。
+    """
+
+    node_r = params.geometry.node_radius_mm
+    rods = _rods_cached(params)
+    d, arm = lattice_d_mm(params), params.geometry.arm_length_mm
+    start, target, pivot, _bearing = report.route
+    pxy = pad_center(pivot)
+    px, py = pxy[0] * d, pxy[1] * d
+    swing_slot = 0 if report.side == "left" else 1
+    support_slot = 1 - swing_slot
+    support = []
+    for k in range(3):
+        a = math.radians(psis[support_slot] + 120.0 * k)
+        tip = (px + arm * math.cos(a), py + arm * math.sin(a))
+        support.append(min(math.dist(tip, (r[2], r[3])) for r in rods) - node_r)
+    # 6 条顺序固定 [左足0..2, 右足0..2]：支撑足占另一侧的三个槽位。
+    times = plan_sample_times(report, params)
+    series = []
+    for index, sample in enumerate(report.samples):
+        swing_vals = []
+        for k in range(3):
+            a = math.radians(sample.psi_deg + psis[swing_slot]-30.0 + 120.0 * k)
+            tip = (sample.center[0] + arm * math.cos(a),
+                   sample.center[1] + arm * math.sin(a))
+            swing_vals.append(min(math.dist(tip, (r[2], r[3])) for r in rods) - node_r)
+        vals = [0.0] * 6
+        vals[swing_slot * 3:swing_slot * 3 + 3] = swing_vals
+        vals[support_slot * 3:support_slot * 3 + 3] = support
+        series.append((times[index], vals))
+    return series
+
+
+def sync_twin_start_fields(app):
+    view = app.gait_widgets.get("twin")
+    if view:
+        for side, name in zip(("left", "right"), app.gait_params.initial_supports):
+            view[f"start_{side}"].set(map_label(name))
+
+
+def clear_twin_history(app):
+    """Display operation only: retain stance, calibration and pulse positions."""
+    view = app.gait_widgets["twin"]
+    if _mode(app, view) != "live":
+        sim = view.get("simulation")
+        if sim is not None:
+            sim.clear_path()
+        if _mode(app, view) == "plan":
+            from .gait_tab import stop_preview_animation
+            stop_preview_animation(app)
+            app._gait_last_report = None
+        _draw(app, view)
+        return
+    view["history"].clear(view["snapshot"])
+    _clear_live_curve(view)
+    timeline = view.get("live_curve_timeline")
+    if timeline is not None:
+        timeline.clear()
+    reference = view.get("live_curve_reference")
+    if reference is not None:
+        reference["retain_from_s"] = reference["current_s"]
+    if view.get("encoder_curve"):
+        view["encoder_curve"].samples.clear()
+    _draw(app, view)
+
+
+def apply_twin_start(app):
+    from motor_control.gait_executor import GaitExecutorError
+    from motor_control.state_store import StateStoreError
+    from motor_control.ui.gait_tab import collect_gait_params, load_gait_fields, stop_preview_animation
+    view = app.gait_widgets["twin"]
+    names = {map_label(n): n for n in map_pads()}
+    try:
+        left, right = (names[view[f"start_{s}"].get()] for s in ("left", "right"))
+        beta, _ = start_pair_reference((left, right))
+        with app.state_lock:
+            app._gait_check_start_edit()
+        params = collect_gait_params(app, app.gait_params)
+        if not messagebox.askokcancel(
+                "确认起步位置（不移动电机）",
+                f"左足：{map_label(left)}；右足：{map_label(right)}；横梁 β₀={beta:g}°。\n"
+                "请先人工摆到选定两格，三爪均踩低节点，所有轴静止。\n"
+                "应用后清除旧轨迹、旧旋转零位与标定确认；不会改变电机脉冲坐标。\n"
+                "随后须重新记两侧旋转零位并确认标定。"):
+            return
+        app._gait_apply_start_pair(left, right, params=params)  # Rechecks idle after the dialog.
+    except (ValueError, KeyError, GaitExecutorError, StateStoreError) as exc:
+        messagebox.showwarning("起步位置未更改", str(exc))
+        return
+    stop_preview_animation(app)
+    load_gait_fields(app)
+    view["select_side"].set("")
+    _clear_live_curve(view)
+    app._refresh_gait_ui()
+
+
+def _map_click(app, event, view=None):
+    view = view if view is not None else app.gait_widgets["twin"]
+    side = view["select_side"].get()
+    if side not in ("left", "right") or view.get("start_busy"):
+        return
+    project = view.get("project")
+    if project is None:
+        return
+    pads = map_pads()
+    name = min(pads, key=lambda n: math.dist(project(pads[n]), (event.x, event.y)))
+    if math.dist(project(pads[name]), (event.x, event.y)) > view["map_scale"] / math.sqrt(3):
+        return
+    view[f"start_{side}"].set(map_label(name))
+    draw_twin(app)
 
 
 def build_twin_panel(app, parent):
-    panel = ttk.LabelFrame(parent, text="实时数字孪生 · 脉冲估算（无编码器）")
+    panel = ttk.LabelFrame(parent, text="态势图 · 5×5 地图（虚线候选 / 累计模拟 / 实机）")
     panel.grid(row=0, column=0, sticky="ew", padx=6, pady=3)
     panel.columnconfigure(0, weight=1)
-    canvas = tk.Canvas(panel, width=240, height=290, background="white",
-                       highlightthickness=1, highlightbackground="#cbd5e1")
-    canvas.grid(row=0, column=0, sticky="ew", padx=6, pady=5)
+    # 2026-09-30 按用户要求：抬头变色区分数据源——评估模拟（计划）蓝、
+    # 实机脉冲（真机）红；执行开始自动切红并隐藏计划层，重新干跑/重置
+    # 回蓝。模式也可手动切换（工具栏两态选择）。
+    title = ttk.Label(panel, text="🔴 实机脉冲 · 无编码器估算",
+                      foreground="#b91c1c", font=("Microsoft YaHei", 10, "bold"))
+    title.grid(row=0, column=0, sticky="w", padx=8, pady=(4, 0))
+    # 计划控件槽位容器保留（历史上放换位方式/模拟按钮，2026-10-08 起
+    # 操作区移到右列顶层总开关下，此槽位暂空）。
+    plan_slot = ttk.Frame(panel)
+    plan_slot.grid(row=1, column=0, sticky="ew", padx=6)
+    plan_slot.columnconfigure(0, weight=1)
+    charts = build_twin_charts(panel)
+    charts["chart_panes"].grid(row=2, column=0, sticky="ew", padx=6, pady=5)
+    canvas = charts["canvas"]
     status = ttk.Label(panel, text="等待电机绑定", wraplength=260, justify="left")
-    status.grid(row=1, column=0, sticky="ew", padx=6, pady=3)
+    status.grid(row=6, column=0, sticky="ew", padx=6, pady=3)
+    coordinates = ttk.Label(panel, text="", wraplength=260, justify="left")
+    coordinates.grid(row=7, column=0, sticky="ew", padx=6, pady=3)
     table = ttk.Frame(panel)
-    table.grid(row=2, column=0, sticky="ew", padx=6, pady=3)
+    table.grid(row=8, column=0, sticky="ew", padx=6, pady=3)
     table.columnconfigure((0, 1, 2), weight=1)
-    for col, text in enumerate(("电机 / 轴", "估算坐标", "指令目标")):
+    for col, text in enumerate(("实机电机 / 轴", "实机估算坐标", "实机指令目标")):
         ttk.Label(table, text=text, foreground="#64748b").grid(row=0, column=col, sticky="w")
     rows = {}
     for row, role in enumerate(ROLES, 1):
         rows[role] = tuple(ttk.Label(table, text="—", font=("Consolas", 9)) for _ in range(3))
         for col, label in enumerate(rows[role]):
             label.grid(row=row, column=col, sticky="w", padx=(0, 5), pady=2)
-    legend = ttk.Label(panel, text="蓝=左足  橙=右足  虚线=指令目标  灰=历史估算\n"
-                       "XY 为中心距=1的示意；Z 为本步起点起算位移，非接触检测。",
+    legend = ttk.Label(panel, text="虚线落点=预估位置(左蓝/右橙) 紫=累计模拟 红=实机脉冲(无编码器)\n"
+                       "足色:蓝=左足 橙=右足 灰=断连冻结 绿点=低节点(落脚) 红点=高节点(红杆)\n"
+                       "轨迹仅显示上一步淡色、当前步深色；虚线=预估位置。\n"
+                       "黄圈+数字=6爪中与红杆最近者(爪端到杆表面距离,mm)\n"
+                       "曲线跨步累计90秒滑窗；纵轴固定−20～200mm，0=杆表面，负值红底。\n"
+                       "爪端为正不能证明整腿避碰；完整校验不变。超量程提示，不自动缩放。\n"
+                       "画面:左键点一下(蓝框)=选中,滚轮缩放;移出自动取消 中键拖动=平移 双击=复位\n"
+                       "固定5×5地图，B=(0,0)；默认上+Y、右+X，可整体逆时针旋转60°。\n"
+                       "旋转仅改变视角，世界坐标/行列/动作方向不变；全图保留旋转选项。\n"
+                       "XY 为中心距=1的估算；Z 为本步位移，非接触检测。\n"
+                       "轨迹为足中心+三爪端；隐藏更早路径、重复静止线及落脚编号。\n"
+                       "执行中显示虚线预计落点；真机灰线=跨步计划参考（非实测）。\n"
+                       "编码器未接入：不以指令估算生成实测曲线；地图ΔZ仍按脉冲估算。\n"
+                       "点选四动作即看候选；模拟下一步才演示完整阶段并累计站位/路径。\n"
+                       "模拟有独立账本；轴表始终显示实机，不随模拟变化。\n"
+                       "重置模拟才回起点。四个【开始…移】按钮是真机入口。",
                        wraplength=260, justify="left", foreground="#64748b")
-    legend.grid(row=3, column=0, sticky="ew", padx=6, pady=3)
-    view = {"canvas": canvas, "status": status, "rows": rows, "snapshot": {},
-            "last_pose": None, "reference_key": None}
+    legend.grid(row=9, column=0, sticky="ew", padx=6, pady=3)
+    view = {**charts, "status": status, "rows": rows, "snapshot": {},
+            "last_pose": None, "reference_key": None, "coordinates": coordinates,
+            "history": TwinHistory(), "show_path": tk.BooleanVar(value=True),
+            "rotate_map_var": tk.BooleanVar(value=False),
+            "select_side": tk.StringVar(value=""),
+            "start_left": tk.StringVar(), "start_right": tk.StringVar(),
+            "title": title, "plan_slot": plan_slot,
+            "mode_var": tk.StringVar(value="live"),
+            "mode_controls": [],
+            "curve_live": deque(maxlen=CURVE_MAX_POINTS),
+            "curve_plan": [], "curve_seg": 0, "curve_last_t": None}
     app.gait_widgets["twin"] = view
+    toolbar = ttk.Frame(panel)
+    toolbar.grid(row=3, column=0, sticky="ew", padx=6)
+    ttk.Checkbutton(toolbar, text="显示路径", variable=view["show_path"],
+                    command=lambda: _draw(app, view)).grid(row=0, column=0)
+    view["clear_button"] = ttk.Button(toolbar, text="清空路径", command=lambda: clear_twin_history(app))
+    view["clear_button"].grid(row=0, column=1, padx=3)
+    # 模式切换（评估模拟/实机脉冲）短文本放首行尾部——整行请求宽度必须
+    # 低于右列视口宽（第二行放满会把起步下拉框挤出滚动视口，布局测试覆盖）。
+    for col, (mode, text) in enumerate((("sim", "🟣 模拟"), ("live", "🔴 实机"))):
+        control = ttk.Radiobutton(toolbar, text=text, variable=view["mode_var"], value=mode,
+                                  command=lambda: _draw(app, view))
+        control.grid(row=2, column=col, padx=3)
+        view["mode_controls"].append(control)
+
+    def zoom(delta):
+        from types import SimpleNamespace
+        state = app.gait_widgets["twin_view"]
+        state["active"] = True
+        canvas_view_zoom(state, SimpleNamespace(widget=canvas, delta=delta,
+                         x=canvas.winfo_width()/2, y=canvas.winfo_height()/2),
+                         lambda: _draw(app, view))
+
+    for col, (label, callback) in enumerate((
+            ("放大 +", lambda: zoom(240)), ("缩小 −", lambda: zoom(-240)),
+            ("全图", lambda: (reset_canvas_view(app.gait_widgets["twin_view"]), _draw(app, view))))):
+        ttk.Button(toolbar, text=label, width=8, command=callback).grid(row=1, column=col, pady=3)
+    from motor_control.ui.gait_twin_window import open_twin_window
+    ttk.Button(toolbar, text="大图窗口", command=lambda: open_twin_window(app)).grid(
+        row=3, column=0, columnspan=2, sticky="ew", pady=3)
+    view["rotate_map_control"] = ttk.Checkbutton(
+        toolbar, text="地图逆时针旋转60°", variable=view["rotate_map_var"],
+        command=lambda: _draw(app, view))
+    view["rotate_map_control"].grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
+
+    # Same data stream beside the map, not below it. No second sampler.
+    view["curve_canvas"].bind("<Configure>", lambda _e: _draw_curve(app, view))
+    chart_hint = ttk.Label(panel, text="左：平面位置与路径；右：六爪端到高杆表面距离（非整腿净间隙）。拖动中间分隔条调宽；大图可最大化。",
+                           wraplength=280, foreground="#64748b")
+    chart_hint.grid(row=4, column=0, sticky="ew", padx=6)
+
+    start = ttk.LabelFrame(panel, text="起步两格（仅设置，不移动电机）")
+    start.grid(row=5, column=0, sticky="ew", padx=6, pady=3)
+    start.columnconfigure(1, weight=1)
+    options = tuple(map_label(n) for n in map_pads())
+    view["start_controls"] = []
+    for row, (side, label) in enumerate((("left", "左足"), ("right", "右足"))):
+        radio = ttk.Radiobutton(start, text=f"地图选{label}", variable=view["select_side"], value=side)
+        radio.grid(row=row, column=0, padx=3)
+        choice = ttk.Combobox(start, textvariable=view[f"start_{side}"], values=options,
+                              state="readonly", width=12)
+        choice.grid(row=row, column=1, sticky="ew", padx=3, pady=2)
+        choice.bind("<<ComboboxSelected>>", lambda _e: _draw(app, view))
+        view["start_controls"].extend(((radio, "normal"), (choice, "readonly")))
+    browse = ttk.Radiobutton(start, text="仅浏览", variable=view["select_side"], value="")
+    browse.grid(row=2, column=0)
+    view["apply_button"] = ttk.Button(start, text="应用起步位置", command=lambda: apply_twin_start(app))
+    view["apply_button"].grid(row=2, column=1, sticky="ew", padx=3, pady=3)
+    view["start_controls"].append((view["apply_button"], "normal"))
+    sync_twin_start_fields(app)
+    # 视图状态与计划层共用同一交互（左键选中+滚轮缩放+中键平移+双击复位）。
+    app.gait_widgets["twin_view"] = {"zoom": 1.0, "pan_x": 0.0, "pan_y": 0.0,
+                                     "active": False}
+    bind_canvas_view(canvas, app.gait_widgets["twin_view"],
+                     lambda: _draw(app, view))
+    canvas.bind("<Button-1>", lambda e: _map_click(app, e), add="+")
 
     def resized(event):
-        for label in (status, legend):
+        for label in (status, legend, coordinates, chart_hint):
             label.configure(wraplength=max(200, event.width - 8))
-        _draw(view)
-    canvas.bind("<Configure>", resized)
+        _draw(app, view)
+    panel.bind("<Configure>", resized)
+    canvas.bind("<Configure>", lambda _e: _draw(app, view))
+
+
+def draw_twin(app):
+    """公开重画入口（gait_tab 兼容 shim / 缩放平移回调共用）。"""
+    view = (getattr(app, "gait_widgets", None) or {}).get("twin")
+    if view is not None:
+        _draw(app, view)
 
 
 def refresh_twin_panel(app):
@@ -46,15 +388,42 @@ def refresh_twin_panel(app):
         return
     provider = getattr(app, "_gait_twin_snapshot", None)
     snapshot = provider() if provider else {"axes": {}, "pose": None, "message": "等待电机绑定"}
+    if snapshot.get("world_key") != view.get("pose_world_key"):
+        view["last_pose"] = None  # Never freeze an old origin onto a new world map.
+        view["pose_world_key"] = snapshot.get("world_key")
+    curve_key = (snapshot.get("world_key"), effective_geometry(app.gait_params))
+    if curve_key != view.get("curve_world_key"):
+        _clear_live_curve(view)
+        view["curve_world_key"] = curve_key
+    view["history"].observe(snapshot)
     if snapshot.get("reference_key") != view["reference_key"]:
         view["last_pose"] = None
         view["reference_key"] = snapshot.get("reference_key")
+        _clear_live_curve(view)  # Raw pulse diagnostics are step-local; reference timeline is separate.
     if snapshot.get("pose") is not None:
         view["last_pose"] = snapshot["pose"]
     view["snapshot"] = snapshot
+    from .gait_curve import sync_live_reference
+    sync_live_reference(app, view)
+    busy = bool(getattr(app, "_gait_owned", {})) or any(
+        a.get("target_position") is not None or a.get("state") in ("STARTING", "MOVING", "CONTINUOUS")
+        for a in snapshot.get("axes", {}).values())
+    view["start_busy"] = busy
+    if busy:
+        from .gait_simulation import cancel_simulation
+        cancel_simulation(app)
+        view["mode_var"].set("live")
+        view.pop("candidate", None)
+    sim = view.get("simulation")
+    for choice in app.gait_widgets.get("action_choices", ()):
+        choice.configure(state="disabled" if busy or (sim and sim.active) else "normal")
+    for control in view.get("mode_controls", ()):
+        control.configure(state="disabled" if busy else "normal")
+    for control, idle_state in view["start_controls"]:
+        control.configure(state="disabled" if busy else idle_state)
     healthy = snapshot.get("state") in ("estimated", "waiting")
     route = snapshot.get("pose", {}).get("route") if snapshot.get("pose") else None
-    view["status"].configure(text=snapshot["message"] + (f"\n{route}" if route else ""),
+    view["status"].configure(text="实机状态：" + snapshot["message"] + (f"\n{route}" if route else ""),
                              foreground="#1565c0" if healthy else "#b45309")
     for role, labels in view["rows"].items():
         axis = snapshot["axes"].get(role, {})
@@ -75,7 +444,38 @@ def refresh_twin_panel(app):
     else:
         text = snapshot["message"]
     app.gait_widgets["angles"].configure(text=text)
-    _draw(view)
+    if pose is not None and healthy:
+        _record_live_curve(app, view, pose)
+        view["curve_healthy"] = True
+    else:
+        if view.get("curve_healthy"):
+            view["curve_seg"] += 1
+        view["curve_healthy"] = False
+        view["curve_last_t"] = None
+    _draw(app, view)
+
+
+def _clear_live_curve(view):
+    view["curve_live"].clear()
+    view.update(curve_seg=0, curve_last_t=None, curve_t0=None, curve_healthy=False)
+
+
+def _record_live_curve(app, view, pose):
+    """实机曲线采样：节流追加 6 爪距离；换步/断连分段。"""
+
+    now = time.monotonic()
+    last = view.get("curve_last_t")
+    if last is not None and now - last < CURVE_SAMPLE_INTERVAL_S:
+        return
+    view["curve_last_t"] = now
+    base = view.get("curve_t0")
+    if base is None:
+        base = view["curve_t0"] = now
+    try:
+        values = tip_surface_distances(pose, app.gait_params)
+    except Exception:
+        return
+    view["curve_live"].append((now - base, values, view["curve_seg"]))
 
 
 def _coordinate(value, unit, estimated=False):
@@ -84,75 +484,216 @@ def _coordinate(value, unit, estimated=False):
     return f"{'≈' if estimated else ''}{value:+.2f}{unit}"
 
 
-def _draw(view):
+def twin_projection(width, height, xmin, xmax, ymin, ymax,
+                    zoom=1.0, pan_x=0.0, pan_y=0.0, *, rotation_deg=0.0):
+    """World → rotated/fitted map → canvas zoom/pan; never mutate world data.
+
+    Positive angles are counterclockwise in world XY (screen Y points down).
+    Fit the rotated bounding box to retain all 25 cells at zoom=1. Pointer
+    zoom remains the same final screen-space transform at either angle.
+    """
+
+    top, bottom = 76.0, 74.0  # Keep map below HUD and above the live ΔZ bars.
+    available_h = max(1.0, height-top-bottom)
+    angle = math.radians(rotation_deg)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    span_x, span_y = xmax-xmin, ymax-ymin
+    rotated_w = abs(cosine)*span_x + abs(sine)*span_y
+    rotated_h = abs(sine)*span_x + abs(cosine)*span_y
+    scale = min(max(1.0, width-26)/rotated_w, available_h/rotated_h)
+    map_cy = top+available_h/2
+
+    def project(point):
+        x, y = point[0]-(xmin+xmax)/2, point[1]-(ymin+ymax)/2
+        rx, ry = cosine*x-sine*y, sine*x+cosine*y
+        base_x = width/2 + rx*scale
+        base_y = map_cy - ry*scale
+        return (width / 2 + (base_x - width / 2) * zoom + pan_x,
+                height / 2 + (base_y - height / 2) * zoom + pan_y)
+    return project, scale
+
+
+def _mode(app, view):
+    if getattr(app, "_gait_owned", {}) or view.get("start_busy"):
+        return "live"
+    var = view.get("mode_var")
+    try:
+        return var.get()
+    except Exception:
+        return "live"
+
+
+def _draw(app, view):
+    """Both windows render one snapshot/history; no second sampler or worker."""
+    _draw_map(app, view)
+    from motor_control.ui.gait_twin_window import refresh_twin_window
+    refresh_twin_window(app, view)
+
+
+def _view_params(app, view, mode):
+    if mode == "sim" and view.get("simulation") is not None:
+        return view["simulation"].params
+    context = getattr(app, "_gait_plan_context", None)
+    if mode == "plan" and context and context[0] is getattr(app, "_gait_last_report", None):
+        return context[1]
+    return app.gait_params
+
+
+def _plan_psis(app, report):
+    context = getattr(app, "_gait_plan_context", None)
+    return context[2] if context and context[0] is report and len(context) > 2 else (30.0, 30.0)
+
+
+def _draw_map(app, view):
+    _render_map(app, view)
+    from .gait_candidate import draw_candidate
+    draw_candidate(app, view)
+    view["canvas"].addtag_all("twin_dynamic")
+    view["canvas"].dtag("twin_background", "twin_dynamic")
+
+
+def _render_map(app, view):
     canvas = view["canvas"]
-    canvas.delete("all")
+    canvas.delete("twin_dynamic")
     width, height = canvas.winfo_width(), canvas.winfo_height()
     if width < 20 or height < 20:
         return
+    mode = _mode(app, view)
+    params = _view_params(app, view, mode)
+    sim = view.get("simulation") if mode == "sim" else None
     snapshot = view["snapshot"]
     live = snapshot.get("pose")
     pose = live or view["last_pose"]
+    if mode == "sim":
+        live = pose = sim.frame.pose if sim is not None else None
+    all_pads = twin_pad_window()
+    report = getattr(app, "_gait_last_report", None)
+    plan_report = report if (mode == "plan" and report is not None and report.samples) else None
+    route_pads = (pose.get("route_pads", {}) if mode in ("live", "sim") and pose else {})
+    if plan_report is not None:
+        start, target, pivot, _bearing = plan_report.route
+        route_pads = {name: pad_center(name) for name in (start, target, pivot)}
+    xs, ys = zip(*all_pads.values())
+    xmin, xmax = min(xs)-.6, max(xs)+.6
+    ymin, ymax = min(ys)-.6, max(ys)+.6
+    twin_view = view.get("view_state") or (getattr(app, "gait_widgets", None) or {}).get("twin_view") or {}
+    zoom = float(twin_view.get("zoom", 1.0))
+    pan_x = float(twin_view.get("pan_x", 0.0))
+    pan_y = float(twin_view.get("pan_y", 0.0))
+    rotation_var = view.get("rotate_map_var")
+    rotation_deg = 60.0 if rotation_var is not None and rotation_var.get() else 0.0
+    project, scale = twin_projection(width, height, xmin, xmax, ymin, ymax,
+                                     zoom, pan_x, pan_y, rotation_deg=rotation_deg)
+
+    view["project"], view["map_scale"] = project, scale*zoom
+    _update_title(app, view, mode, snapshot, live)
+    selected = {view[f"start_{side}"].get(): side for side in ("left", "right")}
+    applied = dict(zip(("left", "right"), app.gait_params.initial_supports))
+
+    background_key = (width, height, zoom, pan_x, pan_y, rotation_deg, tuple(route_pads),
+                      tuple(selected.items()), tuple(applied.items()))
+    if view.get("background_key") != background_key:
+        canvas.delete("all")
+        for name, center in all_pads.items():
+            on_route = name in route_pads
+            selection = selected.get(map_label(name))
+            nodes = [(center[0]+math.cos(math.radians(30+i*60))/math.sqrt(3),
+                      center[1]+math.sin(math.radians(30+i*60))/math.sqrt(3)) for i in range(6)]
+            canvas.create_polygon(*(v for node in nodes for v in project(node)),
+                                  fill=("#eff6ff" if selection == "left" else
+                                        "#fff7ed" if selection == "right" else ""),
+                                  outline="#94a3b8" if on_route else "#d1d5db",
+                                  width=1.5 if on_route else 1,
+                                  dash=() if on_route else (3, 3), tags="map_hex")
+            x, y = project(center)
+            label = map_label(name)
+            if scale*zoom < 80:
+                label = label.replace("行", ",").replace("列", "")
+            canvas.create_text(x, y+10, text=label, fill="#475569",
+                               font=("Microsoft YaHei", 8), tags="map_label")
+            if selection:
+                caption = ("起步" if applied[selection] == name else "待应用") + ("左" if selection == "left" else "右")
+                canvas.create_text(x, y-9, text=caption,
+                                   fill="#2563eb" if selection == "left" else "#ea580c", tags="start_pad")
+            dot = 2.5 if on_route else 1.8
+            for i, node in enumerate(nodes):
+                nx, ny = project(node)
+                canvas.create_oval(nx-dot, ny-dot, nx+dot, ny+dot,
+                                   fill="#16a34a" if i % 2 == 0 else "#dc2626", outline="")
+        canvas.addtag_all("twin_background")
+        view["background_key"] = background_key
+
+    canvas.create_text(8, 43, anchor="nw", width=width-16, fill="#64748b",
+                       text="视角 ↺60°" if rotation_deg else "视角 0°",
+                       font=("Microsoft YaHei", 8), tags="map_orientation")
+    history = sim.history if sim is not None else view["history"]
+    path_prefix = "sim_history" if mode == "sim" else "history"
+    if (mode == "live" or sim is not None) and view["show_path"].get():
+        from .gait_paths import draw_recent_paths
+        draw_recent_paths(canvas, history, project,
+                          params.geometry.arm_length_mm/lattice_d_mm(params), path_prefix)
+
+    if plan_report is not None:
+        _draw_plan_layer(app, view, plan_report, project)
+        _draw_curve(app, view)
+        return
+    if mode == "plan":
+        canvas.create_text(width/2, 26, text="评估模式：请先预览 / 校验；不显示实机姿态",
+                           width=width-16, fill="#1d4ed8", tags="plan_placeholder")
+        view["coordinates"].configure(text="暂无有效计划；实机轴账本不代表模拟位置")
+        _draw_curve(app, view)
+        return
+    if mode == "sim" and sim is None:
+        canvas.create_text(width/2, 26, text="累计模拟：选择起步两格后点击【重置模拟】或【模拟下一步】",
+                           width=width-16, fill="#7c3aed", tags="sim_placeholder")
+        view["coordinates"].configure(text="模拟尚未开始；不显示实机位置")
+        _draw_curve(app, view)
+        return
     if pose is None:
-        canvas.create_text(width/2, 24, text="世界姿态待建立 · 电机轴坐标仍可跟踪",
-                           width=width-12, fill="#64748b", tags="twin_placeholder")
-        for role, fraction in (("Mr1", 0.25), ("Mr2", 0.75)):
-            axis = snapshot.get("axes", {}).get(role, {})
-            x, y, radius = width*fraction, height/2, min(48, width/6)
-            canvas.create_oval(x-radius, y-radius, x+radius, y+radius, outline="#94a3b8")
-            angle = axis.get("position")
-            if axis.get("binding_valid") and isinstance(angle, (int, float)) and math.isfinite(angle):
-                theta = math.radians(angle)
-                canvas.create_line(x, y, x+radius*math.cos(theta), y-radius*math.sin(theta),
-                                   fill="#64748b", width=2, tags=f"axis_{role}")
-            canvas.create_text(x, y+radius+18, text=role, fill="#475569")
+        canvas.create_text(width/2, 14, text="起步位置待确认 / 标定，非实测位置",
+                           width=width-12, fill="#b45309", tags="twin_placeholder")
+        view["coordinates"].configure(text=f"已记录完成步：{history.completed_steps}；世界位置尚不可用")
+        _draw_curve(app, view)
         return
 
-    # Fixed FOR THIS ROUTE; include neighbor landings without zooming per frame.
-    pads = pose.get("route_pads", PAD_CENTERS)
-    xs, ys = zip(*pads.values())
-    xmin, xmax = min(xs)-.7, max(xs)+.7
-    ymin, ymax = min(ys)-.7, max(ys)+.7
-    scale = min((width-26)/(xmax-xmin), (height-100)/(ymax-ymin))
-    def project(point):
-        x, y = point
-        return width/2+(x-(xmin+xmax)/2)*scale, 15+(ymax-y)*scale
-
-    for name, center in pads.items():
-        nodes = [(center[0]+math.cos(math.radians(30+i*60))/math.sqrt(3),
-                  center[1]+math.sin(math.radians(30+i*60))/math.sqrt(3)) for i in range(6)]
-        canvas.create_polygon(*(v for node in nodes for v in project(node)),
-                              fill="", outline="#d1d5db", dash=(3, 3))
-        x, y = project(center)
-        canvas.create_text(x, y+12, text=name, fill="#94a3b8")
-        for i, node in enumerate(nodes):
-            nx, ny = project(node)
-            canvas.create_oval(nx-2, ny-2, nx+2, ny+2,
-                               fill="#16a34a" if i%2 == 0 else "#dc2626", outline="")
-
-    target = snapshot.get("target_pose") if live else None
-    for drawing, ghost in ((target, True), (pose, False)):
-        if drawing is None:
-            continue
-        dash = (4, 3) if ghost else ()
-        centers = [project(drawing["feet"][side]["center"]) for side in ("left", "right")]
-        canvas.create_line(*centers[0], *centers[1], fill="#cbd5e1" if ghost else "#64748b",
-                           width=2, dash=dash, tags="target_beam" if ghost else "live_beam")
-        for side, color in (("left", "#2563eb"), ("right", "#ea580c")):
-            foot = drawing["feet"][side]
-            color = "#cbd5e1" if ghost else color if live else "#94a3b8"
-            x, y = project(foot["center"])
-            for i in range(3):
-                theta = math.radians(foot["psi_deg"] + i*120)
-                end = (foot["center"][0]+math.cos(theta)/math.sqrt(3),
-                       foot["center"][1]+math.sin(theta)/math.sqrt(3))
-                canvas.create_line(x, y, *project(end), fill=color, width=1 if ghost else 3,
-                                   dash=dash, tags=f"{'target' if ghost else 'live'}_{side}")
-            canvas.create_oval(x-5, y-5, x+5, y+5, outline=color,
-                               fill="" if ghost else color, tags=f"{side}_center")
-    heights = [abs(drawing["feet"][side]["z_mm"]) for drawing in (pose, target)
-               if drawing is not None for side in ("left", "right")]
-    max_z = max(1, *heights)
+    # 实机层：只画已回报/落定的脉冲姿态，绝不画指令的未来目标。
+    left_xy, right_xy = (pose["feet"][s]["center"] for s in ("left", "right"))
+    mid = tuple((a+b)/2 for a, b in zip(left_xy, right_xy))
+    source = "模拟（非实机）" if sim is not None else ("估算" if live else "历史冻结")
+    steps = sim.completed_steps if sim is not None else history.completed_steps
+    view["coordinates"].configure(text=(
+        f"{source} XY（中心距=1）· 已完成 {steps} 步\n"
+        f"左 ({left_xy[0]:+.3f}, {left_xy[1]:+.3f})；右 ({right_xy[0]:+.3f}, {right_xy[1]:+.3f})\n"
+        f"机构中心 ({mid[0]:+.3f}, {mid[1]:+.3f})"))
+    centers = [project(pose["feet"][side]["center"]) for side in ("left", "right")]
+    canvas.create_line(*centers[0], *centers[1], fill="#64748b",
+                       width=2, tags="sim_beam" if sim is not None else "live_beam")
+    nearest = None
+    for side, color in (("left", "#2563eb"), ("right", "#ea580c")):
+        foot = pose["feet"][side]
+        color = color if live else "#94a3b8"
+        x, y = project(foot["center"])
+        # 腿长归一化 = 爪臂长/晶格中心距（planner 口径；两模态=1/√3，
+        # 爪端正好落在节点环/六边形顶点上）。
+        arm = params.geometry.arm_length_mm / lattice_d_mm(params)
+        for i in range(3):
+            theta = math.radians(foot["psi_deg"] + i*120)
+            end = (foot["center"][0]+arm*math.cos(theta),
+                   foot["center"][1]+arm*math.sin(theta))
+            tip_xy = project(end)
+            canvas.create_line(x, y, *tip_xy, fill=color, width=3,
+                               tags=f"{'sim' if sim is not None else 'live'}_{side}")
+            surface = _tip_surface(app, end, params, side, i)
+            if surface is not None and (nearest is None or surface < nearest[0]):
+                nearest = (surface, tip_xy)
+        canvas.create_oval(x-5, y-5, x+5, y+5, outline=color,
+                           fill=color, tags=f"{side}_center")
+    if nearest is not None:
+        _highlight_nearest(canvas, nearest[0], nearest[1])
+        canvas.create_text(
+            8, 26, anchor="nw", width=width-16, fill="#b45309", font=("Microsoft YaHei", 9),
+            text=f"6爪最近(当前) {nearest[0]:.2f}mm（爪端到杆表面）", tags="hud_nearest")
+    max_z = max(1, *(abs(pose["feet"][side]["z_mm"]) for side in ("left", "right")))
     for side, fraction, label, color in (("left", 0.25, "左", "#2563eb"),
                                          ("right", 0.75, "右", "#ea580c")):
         x, y = width*fraction, height-45
@@ -160,10 +701,172 @@ def _draw(view):
         canvas.create_line(x-32, y, x+32, y, fill="#cbd5e1")
         canvas.create_line(x, y, x, y-z/max_z*28, width=5, fill=color if live else "#94a3b8",
                            tags=f"lift_{side}")
-        if target:
-            target_y = y-target["feet"][side]["z_mm"]/max_z*28
-            canvas.create_line(x-10, target_y, x+10, target_y, fill="#94a3b8", dash=(3, 2),
-                               tags=f"target_lift_{side}")
         canvas.create_text(x, height-17, text=f"{label} ΔZ≈{z:+.2f}mm", fill="#475569")
-    canvas.create_text(width-8, 10, text="实时估算" if live else "历史估算（已冻结）",
-                       anchor="ne", fill="#1565c0" if live else "#9a6700")
+    corner = (f"模拟 · {sim.frame.stage}" if sim is not None else
+              ("实机脉冲" if live else "实机脉冲（已冻结）"))
+    canvas.create_text(width-8, 10, text=corner,
+                       anchor="ne", fill="#7c3aed" if sim is not None else "#b91c1c" if live else "#9a6700", tags="corner_mode")
+    _draw_curve(app, view)
+
+
+def _update_title(app, view, mode, snapshot, live):
+    if mode == "sim":
+        view["title"].configure(text="🟣 累计模拟 · 独立虚拟站位（不动电机）", foreground="#7c3aed")
+        return
+    if mode == "plan":
+        view["title"].configure(text="🔵 单步预览 · 候选轨迹（不累计/不动电机）",
+                                foreground="#1d4ed8")
+        return
+    state = snapshot.get("state")
+    frozen = state in ("untrusted", "stale") or live is None
+    if frozen:
+        detail = "已冻结（断连/失信）" if state in ("untrusted", "stale") else "等待姿态基准"
+        view["title"].configure(text=f"🔴 实机脉冲 · {detail}（非实测）",
+                                foreground="#9a6700")
+    else:
+        view["title"].configure(text="🔴 实机脉冲 · 无编码器估算",
+                                foreground="#b91c1c")
+
+
+def _tip_surface(app, tip_norm, params, side, k):
+    """单个爪端（归一化坐标）对邻域高杆的最近表面距离 mm。"""
+
+    d = lattice_d_mm(params)
+    node_r = params.geometry.node_radius_mm
+    tip = (tip_norm[0] * d, tip_norm[1] * d)
+    best = min(math.dist(tip, (r[2], r[3])) for r in _rods_cached(params))
+    return best - node_r
+
+
+def _highlight_nearest(canvas, surface, tip_xy):
+    x, y = tip_xy
+    canvas.create_oval(x-7, y-7, x+7, y+7, outline="#f59e0b", width=2.5,
+                       fill="", tags="nearest_tip")
+    canvas.create_text(x, y-13, text=f"{surface:.1f}mm", fill="#b45309",
+                       font=("Microsoft YaHei", 8, "bold"), tags="nearest_tip")
+
+
+# ── 计划层（评估模拟）：轨迹 + 动画帧 ghost 足 + 最近足高亮 ──
+
+def _draw_plan_layer(app, view, report, project):
+    canvas = view["canvas"]
+    params = _view_params(app, view, "plan")
+    geometry = params.geometry
+    psis = _plan_psis(app, report)
+    swing_slot = 0 if report.side == "left" else 1
+    offset = psis[swing_slot]-30.0
+    support_psi = psis[1-swing_slot]
+    # report 是 mm 域、且基于 planner 的有效几何（两模态 d=√3×爪臂长）。
+    # 归一化必须同口径：换算后爪端=1/√3·dir(...)，正好站在六边形顶点
+    # （绿色低节点）上——用 GUI 的 d_mm 占位值会整体缩放错位。
+    d = lattice_d_mm(params)
+    k_norm = 1.0 / d if d else 0.0
+    anim = app.gait_widgets.get("preview_anim") or {}
+    frame = anim.get("frame") if (anim.get("playing") or anim.get("paused")) else None
+
+    def to_map(point_mm):
+        return project((point_mm[0] * k_norm, point_mm[1] * k_norm))
+
+    samples = report.samples
+    show_path = view["show_path"].get()
+    # 摆动中心轨迹（蓝虚线）+ 三条爪端轨迹（彩虚线）——历史路径一律虚线
+    arc = [v for s in samples for v in to_map(s.center)]
+    if show_path and len(arc) >= 4:
+        canvas.create_line(*arc, fill="#2563eb", width=2, dash=(6, 3), tags="plan_center")
+    for leg in range(3) if show_path else ():
+        points = []
+        for s in samples:
+            a = math.radians(s.psi_deg + offset + 120.0 * leg)
+            tip = (s.center[0] + geometry.arm_length_mm * math.cos(a),
+                   s.center[1] + geometry.arm_length_mm * math.sin(a))
+            points.extend(to_map(tip))
+        if len(points) >= 4:
+            canvas.create_line(*points, fill=CURVE_COLORS[swing_slot][leg], width=1.5,
+                               dash=(5, 3), tags=f"plan_track_{leg}")
+    index = len(samples) - 1 if frame is None else max(0, min(frame, len(samples) - 1))
+    if frame is not None and show_path:
+        walked = [v for s in samples[:index + 1] for v in to_map(s.center)]
+        if len(walked) >= 4:
+            canvas.create_line(*walked, fill="#2563eb", width=2.5, dash=(6, 3),
+                               tags="plan_walked")
+    sample = samples[index]
+    # 摆动足当前帧：腿画实线——机构本体实线、历史轨迹一律虚线
+    # （2026-09-30 按用户要求把两类线型对调）。
+    x, y = to_map(sample.center)
+    for leg in range(3):
+        a = math.radians(sample.psi_deg + offset + 120.0 * leg)
+        end = (sample.center[0] + geometry.arm_length_mm * math.cos(a),
+               sample.center[1] + geometry.arm_length_mm * math.sin(a))
+        canvas.create_line(x, y, *to_map(end), fill="#2563eb", width=2,
+                           tags="plan_ghost")
+    canvas.create_oval(x-5, y-5, x+5, y+5, outline="#2563eb", width=2,
+                       fill="", tags="plan_ghost")
+    # 支撑足（支点低节点基准）与横梁
+    start, target, pivot, _bearing = report.route
+    pivot_norm = pad_center(pivot)
+    pivot_mm = (pivot_norm[0] * d, pivot_norm[1] * d)
+    px, py = to_map(pivot_mm)
+    for leg in range(3):
+        a = math.radians(support_psi + 120.0 * leg)
+        end = (pivot_mm[0] + geometry.arm_length_mm * math.cos(a),
+               pivot_mm[1] + geometry.arm_length_mm * math.sin(a))
+        canvas.create_line(px, py, *to_map(end), fill="#94a3b8", width=2,
+                           tags="plan_support")
+    canvas.create_oval(px-5, py-5, px+5, py+5, outline="#475569", width=2,
+                       fill="", tags="plan_support")
+    canvas.create_line(x, y, px, py, fill="#94a3b8", width=2, tags="plan_beam")
+    # 落脚点标记
+    target_norm = pad_center(target)
+    tx, ty = to_map((target_norm[0] * d, target_norm[1] * d))
+    canvas.create_oval(tx-6, ty-6, tx+6, ty+6, outline="#16a34a", width=2,
+                       dash=(3, 2), tags="plan_target")
+    # 当前帧六个爪端一并评估；不要把只计算摆动侧的结果标成“6爪”。
+    nearest = None
+    for center, psi in ((sample.center, sample.psi_deg+offset), (pivot_mm, support_psi)):
+        for leg in range(3):
+            a = math.radians(psi + 120.0 * leg)
+            tip = (center[0]+geometry.arm_length_mm*math.cos(a),
+                   center[1]+geometry.arm_length_mm*math.sin(a))
+            surface = _tip_surface(app, (tip[0]*k_norm, tip[1]*k_norm), params, report.side, leg)
+            if nearest is None or surface < nearest[0]:
+                nearest = (surface, to_map(tip))
+    if nearest is not None:
+        _highlight_nearest(canvas, nearest[0], nearest[1])
+    worst = report.min_margin_sample
+    hud = (f"回放 φ={sample.phi_deg:.1f}° ψ={sample.psi_deg+offset:.1f}°"
+           f"（{index + 1}/{len(samples)}）" if frame is not None else
+           f"评估计划 {start}→{target} 绕{pivot}")
+    hud_lines = [hud]
+    if nearest is not None:
+        hud_lines.append(f"6爪端当前最近 {nearest[0]:.2f}mm（非整腿净间隙）")
+    if worst is not None:
+        hud_lines.append(f"整腿净间隙下界 {report.min_margin_mm:.2f}mm")
+    canvas.create_text(8, 8, anchor="nw", fill="#1d4ed8", width=canvas.winfo_width()-16,
+                       font=("Microsoft YaHei", 9), text="\n".join(hud_lines),
+                       tags=("hud_plan", "hud_nearest", "hud_margin"))
+    swing_xy = (sample.center[0]/d, sample.center[1]/d)
+    left, right = (swing_xy, pivot_norm) if report.side == "left" else (pivot_norm, swing_xy)
+    view["coordinates"].configure(text=(
+        f"评估位置（非实机）· 第 {index+1}/{len(samples)} 帧\n"
+        f"左 ({left[0]:+.3f}, {left[1]:+.3f})；右 ({right[0]:+.3f}, {right[1]:+.3f})"))
+
+
+# ── 爪端-高杆距离曲线（评估/实机共用绘制） ────────────────
+
+def _draw_curve(app, view):
+    from .gait_curve import draw_curve
+    draw_curve(app, view)
+
+
+def _curve_segments(data, t_min):
+    chunks, current = [], []
+    for point in data:
+        if point[0] < t_min - 1e-9:
+            continue
+        if current and current[-1][2] != point[2]:
+            chunks.append(current)
+            current = []
+        current.append(point)
+    if current:
+        chunks.append(current)
+    return [c for c in chunks if len(c) >= 2]

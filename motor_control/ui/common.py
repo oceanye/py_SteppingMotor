@@ -24,6 +24,87 @@ import tkinter as tk
 # 统一控件间距（原为 padx=10, pady=5，压缩后一屏可放下全部内容）
 PAD = dict(padx=6, pady=2)
 
+
+# ── 画布视图交互：左键选中 + 滚轮缩放 + 中键平移 + 双击复位 ──────
+# 2026-09-23 现场调出的交互模式（步态预览画面）：画面默认不抢滚轮，
+# 滚轮归滚动视口的页面滚动；在画面内点一下左键（蓝框）后滚轮只缩放
+# 画面，鼠标移出画面即自动取消选中，滚轮交还页面滚动（此前缩放与
+# 页面滚动被同一滚轮同时触发）。2026-09-29 抽成通用实现，数字孪生
+# 画面与预览画面共用同一套行为。
+def canvas_view_zoom(view, event, redraw):
+    """滚轮缩放；画面处于左键选中状态（active）时才生效。
+
+    未激活返回 None，事件继续传给右侧滚动视口的页面滚动绑定；激活时
+    缩放并返回 "break" 阻断页面滚动。指针位置为不动点：
+    T(v)=center+(v-center)·zoom+pan 仿射复合，求新 pan 使指针所指的点
+    缩放前后落在同一画布像素上。
+    """
+    if not view.get("active"):
+        return None
+    factor = 1.1 ** (event.delta / 120.0)   # Windows 滚轮一格 ±120
+    old = float(view["zoom"])
+    new = min(50.0, max(0.2, old * factor))
+    if new == old:
+        return "break"
+    cx = event.widget.winfo_width() / 2.0
+    cy = event.widget.winfo_height() / 2.0
+    view["pan_x"] = (event.x - cx) - new * (event.x - cx - view["pan_x"]) / old
+    view["pan_y"] = (event.y - cy) - new * (event.y - cy - view["pan_y"]) / old
+    view["zoom"] = new
+    redraw()
+    return "break"
+
+
+def canvas_view_pan_start(view, event) -> None:
+    view["pan_anchor"] = (event.x, event.y)
+
+
+def canvas_view_pan_move(view, event, redraw) -> None:
+    anchor = view.get("pan_anchor")
+    if anchor is None:
+        return
+    view["pan_x"] += event.x - anchor[0]
+    view["pan_y"] += event.y - anchor[1]
+    view["pan_anchor"] = (event.x, event.y)
+    redraw()
+
+
+def reset_canvas_view(view) -> None:
+    view.update(zoom=1.0, pan_x=0.0, pan_y=0.0)
+    view.pop("pan_anchor", None)
+
+
+def bind_canvas_view(canvas, view, redraw, *,
+                     active_border="#2563eb", idle_border="#cbd5e1") -> None:
+    """给画布绑定"左键选中 + 滚轮缩放 + 中键平移 + 双击复位"交互。
+
+    view 为挂在调用方（如 app.gait_widgets）上的状态字典
+    {"zoom", "pan_x", "pan_y", "active"}；redraw() 在视图变化后被调用。
+    选中态用 highlightbackground 描边提示（默认蓝/灰）。
+    """
+
+    def activate(_event):
+        view["active"] = True
+        try:
+            canvas.configure(highlightbackground=active_border)
+        except tk.TclError:
+            pass
+
+    def deactivate(_event):
+        view["active"] = False
+        try:
+            canvas.configure(highlightbackground=idle_border)
+        except tk.TclError:
+            pass
+
+    canvas.bind("<MouseWheel>", lambda e: canvas_view_zoom(view, e, redraw))
+    canvas.bind("<Button-1>", activate)
+    canvas.bind("<Leave>", deactivate)
+    canvas.bind("<Button-2>", lambda e: canvas_view_pan_start(view, e))
+    canvas.bind("<B2-Motion>", lambda e: canvas_view_pan_move(view, e, redraw))
+    canvas.bind("<Double-Button-1>",
+                lambda _e: (reset_canvas_view(view), redraw()))
+
 # 全角 → 半角映射：数字、小数点三种全角形态、全角减号；全角空格删除
 _FULLWIDTH_MAP = {ord(c): r for c, r in zip("０１２３４５６７８９", "0123456789")}
 _FULLWIDTH_MAP.update({

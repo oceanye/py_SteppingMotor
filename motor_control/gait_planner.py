@@ -21,6 +21,7 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 from .gait_avoidance import LEGACY, TWO_MODE, MODE_NAMES, avoidance_path, leg_clearance, lattice_coordinates
+from .gait_map import start_pair_reference
 
 # ── 角度约定 ──────────────────────────────────────────────
 # 对外 API 一律用"度"；内部三角函数换算弧度。
@@ -29,6 +30,7 @@ SWING_ARC_DEG = 60.0        # 一次公转角
 SWING_SPIN_DEG = 120.0      # 摆动侧自转角（= 2×公转角）
 LOW_NODE_PHASE_DEG = 30.0   # 低节点起始相位 ψ10（同时是三根爪臂之一的方向）
 HIGH_NODE_PHASE_DEG = 90.0  # 高节点相位（与低节点相间 60°）
+DEFAULT_PROJECTED_EDGE_MM = 190.0  # 本机构确认的俯视投影边长；新桌面会话默认
 
 SWING_JOINT_DELTA_DEG = 180.0  # 摆动侧电机关节角总变化 Δq = 120-(-60)
 SUPPORT_JOINT_DELTA_DEG = 60.0  # 支撑侧电机补偿角总变化 Δq = 0-(-60)
@@ -134,8 +136,8 @@ def point_segment_distance(
 class GaitGeometry:
     """俯视几何。所有长度 mm，占位默认值需现场实测后覆盖。"""
 
-    d_mm: float = 220.0             # AB = BC 六边形中心距（占位默认，需实测覆盖）
-    arm_length_mm: float = 40.0     # 爪臂长度 = 六边形节点环半径（落脚一致性）
+    d_mm: float = 220.0             # 旧策略中心距；两模态仅由投影边长派生，不使用此值
+    arm_length_mm: float = 40.0     # 正六边形投影边长 a = 中心到顶点 R = 腿投影长度
     hub_radius_mm: float = 12.0     # 三足中心壳体等效半径
     arm_radius_mm: float = 4.0      # 爪臂等效半径（胶囊粗细）
     node_radius_mm: float = 5.0     # 高节点等效半径
@@ -145,6 +147,11 @@ class GaitGeometry:
     beam_height_mm: float = 30.0    # 横梁中心线相对低节点高度，必须实测
     beam_radius_mm: float = 4.0    # 横梁/连接件保守胶囊包络
     surrounding_pads: bool = True  # 检查紧邻的六边形，不只 A/B/C
+
+    @property
+    def touching_center_distance_mm(self) -> float:
+        """Adjacent touching hexagons: projected center spacing d = sqrt(3)*a."""
+        return math.sqrt(3) * self.arm_length_mm
 
     def validated(self) -> "GaitGeometry":
         positive = (
@@ -157,7 +164,7 @@ class GaitGeometry:
                 raise ValueError(f"几何参数 {name} 必须是大于 0 的有限数值")
         if self.hub_radius_mm >= self.arm_length_mm:
             raise ValueError("壳体半径必须小于爪臂长度")
-        if self.d_mm + 1e-8 < math.sqrt(3) * self.arm_length_mm:
+        if self.d_mm + 1e-8 < self.touching_center_distance_mm:
             raise ValueError("六边形中心距小于紧贴正六边形要求，节点环模型重叠；请核实几何")
         for name in ("high_node_height_mm", "body_drop_mm"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
@@ -230,6 +237,7 @@ class GaitParams:
     # 边）——原有唯一摆法，故仍是默认。切换即更换坐标基准：账本重置、
     # 零位作废，必须按新摆放重新记零标定。
     initial_placement: str = "red_right"
+    initial_pad_pair: tuple[str, str] | None = None  # None: legacy A/B placement
     beam_reference_deg: float = 180.0  # 两个 Mr 同时记零时横梁世界角
     calibration_confirmed: bool = False  # 实测几何、方向、PPR、反力闭合已确认
     calibration_fingerprint: str | None = None
@@ -239,9 +247,15 @@ class GaitParams:
     SCHEMA = "gait-params-v1"
 
     def validated(self) -> "GaitParams":
-        self.geometry.validated()
         if self.trajectory_mode not in (LEGACY, TWO_MODE):
             raise ValueError("未知步态轨迹模式")
+        # Validate the SAME spacing used by two-mode planning. The saved d is
+        # legacy-only and must not reject a measured projected edge (e.g. 190
+        # with an old d=220). Preserve the document and all other checks,
+        # including surrounding_pads type; do not silently migrate legacy.
+        geometry = (replace(self.geometry, d_mm=self.geometry.touching_center_distance_mm)
+                    if self.trajectory_mode == TWO_MODE else self.geometry)
+        geometry.validated()
         if self.initial_placement not in INITIAL_PLACEMENTS:
             raise ValueError("initial_placement 必须是 red_left 或 red_right")
         if not 1 <= int(self.swing_segments) <= 200:
@@ -273,12 +287,16 @@ class GaitParams:
             raise ValueError("phase_gain 必须为 ±2/±4/±6/±8/±10；终点须对准三重对称低节点")
         if not math.isfinite(self.beam_reference_deg):
             raise ValueError("beam_reference_deg 必须是有限数值")
-        # 摆放与横梁基准必须成对：红杆左=β₀180°、红杆右=β₀0°。手工
-        # 改 JSON 或数字框造成的不一致直接拒绝，防止账本用混合基准推算。
-        if not math.isclose(self.beam_reference_deg,
-                            INITIAL_PLACEMENTS[self.initial_placement][1]):
-            raise ValueError("beam_reference_deg 必须与初始摆放一致"
-                             "（红杆左=180°、红杆右=0°）；请用【初始摆放】切换")
+        expected_beam = self.initial_beam_deg
+        if self.initial_pad_pair is not None:
+            if not isinstance(self.initial_pad_pair, tuple):
+                raise ValueError("initial_pad_pair 必须是两个支座组成的 tuple")
+            _, placement = start_pair_reference(self.initial_pad_pair)
+            if self.initial_placement != placement:
+                raise ValueError("初始摆放与选定左右足支座不一致，请重新应用起步位置")
+        if not math.isclose(self.beam_reference_deg, expected_beam):
+            raise ValueError("beam_reference_deg 必须与起步支座及摆放一致；"
+                             "请用【应用起步位置】或【初始摆放】设置")
         if not isinstance(self.calibration_confirmed, bool):
             raise ValueError("calibration_confirmed 必须是布尔值")
         if self.calibration_fingerprint is not None and not isinstance(self.calibration_fingerprint, str):
@@ -298,10 +316,13 @@ class GaitParams:
     # 初始摆放派生的账本原点（启动/重建基准时写入 _gait_supports/_gait_beta_deg）。
     @property
     def initial_supports(self) -> tuple[str, str]:
-        return INITIAL_PLACEMENTS[self.initial_placement][0]
+        return (self.initial_pad_pair if self.initial_pad_pair is not None
+                else INITIAL_PLACEMENTS[self.initial_placement][0])
 
     @property
     def initial_beam_deg(self) -> float:
+        if self.initial_pad_pair is not None:
+            return start_pair_reference(self.initial_pad_pair)[0]
         return INITIAL_PLACEMENTS[self.initial_placement][1]
 
     def as_document(self) -> dict[str, Any]:
@@ -337,12 +358,26 @@ class GaitParams:
             "phase_gain": self.phase_gain,
             "trajectory_mode": self.trajectory_mode,
             "initial_placement": self.initial_placement,
+            "initial_pad_pair": (list(self.initial_pad_pair)
+                                 if self.initial_pad_pair is not None else None),
             "beam_reference_deg": self.beam_reference_deg,
             "calibration_confirmed": self.calibration_confirmed,
             "calibration_fingerprint": self.calibration_fingerprint,
             "mr1_zero_signature": self.mr1_zero_signature,
             "mr2_zero_signature": self.mr2_zero_signature,
         }
+
+
+def default_gait_params() -> GaitParams:
+    """Shipped desktop defaults, not a copy of any machine's calibration.
+
+    Keep the legacy dataclass/API defaults for older partial documents. New
+    desktop sessions use the confirmed 190 mm projection and automatic modes,
+    with no zero signatures, bindings or calibration confirmation.
+    """
+    return GaitParams(trajectory_mode=TWO_MODE, geometry=GaitGeometry(
+        arm_length_mm=DEFAULT_PROJECTED_EDGE_MM,
+        d_mm=math.sqrt(3)*DEFAULT_PROJECTED_EDGE_MM)).validated()
 
 
 def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
@@ -382,10 +417,14 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
     geometry_raw = value.get("geometry", {})
     if not isinstance(geometry_raw, Mapping):
         raise ValueError("geometry 必须是对象")
+    # Only fill missing two-mode geometry; explicit site values (including 40)
+    # always win. Documents without a mode retain historical legacy semantics.
+    geometry_defaults = (default_gait_params().geometry
+                         if value.get("trajectory_mode") == TWO_MODE else GaitGeometry())
     geometry = GaitGeometry(
-        d_mm=float(geometry_raw.get("d_mm", GaitGeometry.d_mm)),
+        d_mm=float(geometry_raw.get("d_mm", geometry_defaults.d_mm)),
         arm_length_mm=float(
-            geometry_raw.get("arm_length_mm", GaitGeometry.arm_length_mm)),
+            geometry_raw.get("arm_length_mm", geometry_defaults.arm_length_mm)),
         hub_radius_mm=float(
             geometry_raw.get("hub_radius_mm", GaitGeometry.hub_radius_mm)),
         arm_radius_mm=float(
@@ -403,7 +442,13 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
     )
     beam_reference_deg = _number("beam_reference_deg", 180.0)
     initial_placement = value.get("initial_placement")
-    if initial_placement is None:
+    pair = value.get("initial_pad_pair")
+    if pair is not None:
+        _, derived_placement = start_pair_reference(pair)
+        pair = tuple(pair)
+        if initial_placement is None:
+            initial_placement = derived_placement
+    elif initial_placement is None:
         # 旧文档无摆放键：按已保存的β₀查配对摆放，避免缺键默认与旧β₀
         # 矛盾导致加载失败。
         matched = [name for name, (_sup, beam) in INITIAL_PLACEMENTS.items()
@@ -444,6 +489,7 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         phase_gain=_number("phase_gain", GaitParams.phase_gain),
         trajectory_mode=value.get("trajectory_mode", LEGACY),
         initial_placement=initial_placement,
+        initial_pad_pair=pair,
         beam_reference_deg=beam_reference_deg,
         calibration_confirmed=value.get("calibration_confirmed", False),
         calibration_fingerprint=value.get("calibration_fingerprint"),
@@ -661,11 +707,12 @@ def angular_targets(params: GaitParams, phi_deg: float) -> tuple[float, float, f
 def effective_geometry(params: GaitParams) -> GaitGeometry:
     """Two-mode paths are certified on the requested touching-hexagon lattice.
 
-    Old d is retained in the config, never overwritten or used to pretend a
-    different site is certified. Radius/thickness remain measured quantities.
+    Projected hexagon edge = leg reach = node ring radius is the only scale.
+    Old d is retained for legacy, but never read by two-mode validation or
+    planning. Projected leg/rod widths and the safety gap remain independent.
     """
     if params.trajectory_mode == TWO_MODE:
-        return replace(params.geometry, d_mm=math.sqrt(3)*params.geometry.arm_length_mm,
+        return replace(params.geometry, d_mm=params.geometry.touching_center_distance_mm,
                        surrounding_pads=True)
     return params.geometry
 
@@ -673,7 +720,7 @@ def effective_geometry(params: GaitParams) -> GaitGeometry:
 def gait_pads(params: GaitParams, pivot_name="B") -> dict[str, HexPad]:
     geometry = effective_geometry(params)
     pads = default_hex_pads(geometry)
-    if params.trajectory_mode == TWO_MODE:
+    if params.trajectory_mode == TWO_MODE or params.initial_pad_pair is not None:
         # Recenter the obstacle neighborhood after EVERY step; never lose an
         # outer rod just because the support left the original A/B/C patch.
         pi, pj = lattice_coordinates(pivot_name)

@@ -105,6 +105,7 @@ from motor_control.gait_planner import (
     LOW_NODE_PHASE_DEG,
     SWING_ARC_DEG,
     GaitParams,
+    default_gait_params,
     parse_gait_params,
     plan_gait_stages,
     plan_swing_trajectory,
@@ -416,8 +417,9 @@ class StepperGUI:
         self._load_control_bindings()
 
         # ── 三足轮换步态：参数（标定向导写入 .gait_params.json）+ 当前执行实例 ──
-        self.gait_params = GaitParams(trajectory_mode=TWO_MODE)
+        self.gait_params = default_gait_params()
         self._gait_run: GaitExecutor | None = None
+        self._gait_auto_run = False   # ⚡ 一键执行中（阶段间自动推进）
         self._gait_owned = {}
         self._gait_supports = ("A", "B")
         self._gait_beta_deg = 180.0
@@ -1057,14 +1059,16 @@ class StepperGUI:
 
     # ═════════════ 三足轮换步态：参数 / 标定 / 分阶段执行 ═════════════
     def _load_gait_params(self):
-        """启动时读 .gait_params.json；坏数据安全回退为占位默认。"""
+        """本机配置优先；缺失/损坏时使用仓库190mm默认，仍未标定。"""
 
         try:
             data = self.state_store.load_gait_params()
         except StateStoreError as exc:
             self._startup_warnings.append(f"⚠️ 步态参数读取失败: {exc}")
+            self.gait_params = default_gait_params()
             return
         if data is None:
+            self.gait_params = default_gait_params()
             return
         try:
             parsed = parse_gait_params(data)
@@ -1077,10 +1081,10 @@ class StepperGUI:
                     f"{parsed.initial_placement}（左右标注对调校正；几何与零位不变）")
             # Pulse coordinates do not establish physical support locations on restart.
             self.gait_params = replace(parsed, calibration_confirmed=False)
-        except ValueError as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             self._startup_warnings.append(
-                f"⚠️ 步态参数无效（{exc}）；已回退为默认占位参数")
-            self.gait_params = GaitParams()
+                f"⚠️ 步态参数无效（{exc}）；已回退为190mm默认投影参数，须重新确认标定")
+            self.gait_params = default_gait_params()
 
     def _save_gait_params(self, params):
         """校验、原子写盘并发布到内存（UI 线程调用）。"""
@@ -1122,26 +1126,61 @@ class StepperGUI:
         axis = self._gait_role_axis(role)
         return repr((axis, self.axis_profiles[axis], sign))
 
+    def _gait_check_start_edit(self):
+        """Caller holds state_lock; changing the world frame never moves axes."""
+        if (getattr(self, "_gait_owned", {}) or getattr(self, "_rot_release_active", False)
+                or any(getattr(self, key, False) for key in (
+                    "_closing", "_disconnecting", "_estop_in_progress", "_estop_unconfirmed"))
+                or any(self._axis_motion_active_locked(a) for a in range(len(self.axis_runtime)))):
+            raise GaitExecutorError("请先完成/中止运动，确认所有电机静止并恢复旋转轴锁定，再调整起步位置")
+
+    def _gait_set_start_reference(self, params):
+        """Persist a manually confirmed start, invalidate zeros, then publish.
+
+        Never rewrite the motor pulse ledger or certify untrusted axes. Saving
+        must succeed before changing any in-memory stance/history reference.
+        """
+        params = replace(params, mr1_zero_deg=None, mr2_zero_deg=None,
+                         mr1_zero_signature=None, mr2_zero_signature=None,
+                         calibration_confirmed=False, calibration_fingerprint=None,
+                         beam_reference_deg=params.initial_beam_deg).validated()
+        with self.state_lock:
+            self._gait_check_start_edit()
+            self._save_gait_params(params)
+            self._gait_supports = tuple(params.initial_supports)
+            self._gait_beta_deg = params.initial_beam_deg
+            self._gait_needs_recovery = False
+            self._gait_auto_run = False
+            self._gait_run = None
+            self._gait_world_epoch = getattr(self, "_gait_world_epoch", 0) + 1
+            self._gait_last_report = None
+
+    def _gait_apply_start_pair(self, left, right, *, params=None):
+        from motor_control.gait_map import start_pair_reference
+        pair = (left, right)
+        beta, placement = start_pair_reference(pair)
+        self._gait_set_start_reference(replace(
+            self.gait_params if params is None else params, initial_pad_pair=pair,
+            initial_placement=placement, beam_reference_deg=beta))
+        self.log(f"✓ 起步位置已设置：左足 {left}，右足 {right}，β₀={beta:g}°；"
+                 "未移动电机，须重新记两侧零位并确认标定")
+
     def _gait_reestablish_baseline(self):
         if getattr(self, "_gait_owned", {}):
             messagebox.showwarning("步态占用", "请先中止并确认四轴停止")
             return
         supports = self.gait_params.initial_supports
         stance_text = (f"左足在{supports[0]}、右足在{supports[1]}，三爪均踩低节点；"
-                       f"红杆在横梁{'右' if supports[0] == 'A' else '左'}侧"
+                       f"红杆在横梁{'右' if self.gait_params.initial_placement == 'red_right' else '左'}侧"
                        "（与步态页【初始摆放】选择一致）")
         if not messagebox.askokcancel("重建物理基准", f"必须人工确认：{stance_text}；四轴静止、位置已校准。\n此按钮不移动电机。确认后须重新记两侧旋转零位并确认标定。"):
             return
-        with self.state_lock:
-            if any(self._axis_motion_active_locked(a) for a in self.control_bindings.bound_axes):
-                return
-            self._gait_supports = tuple(supports)
-            self._gait_beta_deg = self.gait_params.initial_beam_deg
-            self._gait_needs_recovery = False
-        self._gait_run = None
-        self._save_gait_params(replace(self.gait_params, mr1_zero_deg=None, mr2_zero_deg=None,
-                                      calibration_confirmed=False,
-                                      beam_reference_deg=self.gait_params.initial_beam_deg))
+        try:
+            self._gait_set_start_reference(self.gait_params)
+        except (GaitExecutorError, StateStoreError) as exc:
+            messagebox.showwarning("起步基准未更改", str(exc))
+            return
+        stop_preview_animation(self)
         load_gait_fields(self)
         self._refresh_gait_ui()
 
@@ -1471,15 +1510,18 @@ class StepperGUI:
                             arc_deg=SWING_ARC_DEG):
         """按当前站位与横梁角匹配该侧几何落点（默认顺向 +60°）。
 
-        2026-09-21 按用户要求放开区域限制：目标座不再固定取 A/B/C 的
-        第三块，而是在全部支座（含邻座）中按方位/半径匹配；初始站位
+        目标座不再固定取 A/B/C 的第三块，而是在 5×5 地图内的支座
+        中按方位/半径匹配；障碍物仍保留地图外的邻座。初始站位
         (A,B) 的右侧换位因此落到邻座。干跑预览与实机执行共用本方法，
         预览图与实际动作才是同一几何。arc_deg 是换位方向（+60 顺向 /
         -60 逆向），预览与执行传同一值。匹配不到返回 None（调用方决定
-        拦截还是回退）。
+        拦截，不生成替代路线）。
         """
 
-        supports = getattr(self, "_gait_supports", ("A", "B"))
+        from motor_control.gait_map import in_map
+        supports = getattr(self, "_gait_supports", params.initial_supports)
+        if not all(in_map(name) for name in supports):
+            return None
         beta_now = getattr(self, "_gait_beta_deg", params.beam_reference_deg)
         start, pivot = supports if side == "left" else supports[::-1]
         bearing = beta_now + (180.0 if side == "right" else 0.0)
@@ -1488,7 +1530,7 @@ class StepperGUI:
             pads = gait_pads(params, pivot)
         landing_bearing = (bearing - arc_deg + 180.0) % 360.0 - 180.0
         for name, pad in pads.items():
-            if name in (start, pivot):
+            if name in (start, pivot) or not in_map(name):
                 continue
             pad_bearing = math.degrees(math.atan2(
                 pad.center[1] - pads[pivot].center[1],
@@ -1499,6 +1541,17 @@ class StepperGUI:
             if bearing_err <= 0.5 and radius_err <= 0.5:
                 return (start, name, pivot, bearing)
         return None
+
+    def _gait_set_view_mode(self, mode):
+        """态势图数据源模式：plan=评估模拟(计划层) / live=实机脉冲。
+
+        无 GUI（headless 测试）时静默跳过。开始执行→live；干跑成功/
+        重置流程→plan；操作员也可在态势图工具栏手动切换。
+        """
+
+        view = (getattr(self, "gait_widgets", None) or {}).get("twin")
+        if view is not None:
+            view["mode_var"].set(mode)
 
     @logged_action
     def _gait_begin_run(self, side, params=None, arc_deg=None):
@@ -1563,6 +1616,8 @@ class StepperGUI:
             raise GaitExecutorError("旋转轴释放状态未解除，不能执行步态")
         if not params.geometry.surrounding_pads:
             raise GaitExecutorError("实际步态不能关闭邻接六边形高点检查")
+        if self._gait_landing_route(side, params, arc_deg=arc_deg) is None:
+            raise GaitExecutorError("当前方向在 5×5 地图内没有可用落脚支座；请核对横梁角/起步位置，或选择另一换位方向")
         # 1. 四个逻辑角色全部绑定且模式正确
         role_axes = {}
         for role in LOGICAL_ROLE_ORDER:
@@ -1751,8 +1806,16 @@ class StepperGUI:
         self._gait_run.twin_lift_start = twin_lift_start
         self._gait_run.twin_final_positions = None
         self._gait_run.twin_manual_invalid = False
+        # Read-only display reference: this run's validated plan, never an old
+        # virtual simulation. Preserve claw indices after any S3 phase setup.
+        swing_s4_psi = psi_now + (phase_stage.move_groups[0][0].delta * sign
+                                  if phase_stage is not None else 0.0)
+        self._gait_run.twin_report = report
+        self._gait_run.twin_psis = ((swing_s4_psi, support_psi) if side == "left"
+                                    else (support_psi, swing_s4_psi))
         self.log(f"步态执行器就绪（{side}）：{len(stages)} 个阶段，"
                  f"当前 ψ={psi_now:.1f}°")
+        self._gait_set_view_mode("live")   # 执行开始：态势图切实机层，隐藏计划层
         if clearance_warnings:
             text = "\n".join(clearance_warnings)
             self.log(f"⚠️ 碰撞/避障校验未通过（仅提示，不拦截）：{text}")
@@ -2050,12 +2113,14 @@ class StepperGUI:
             _control, axes = self._snapshot_coordinated_control_locked()
             params = self.gait_params
             try:
-                reference_valid = (params.calibration_fingerprint == self._gait_hardware_fingerprint()
+                hardware_fingerprint = self._gait_hardware_fingerprint()
+                reference_valid = (params.calibration_fingerprint == hardware_fingerprint
                          and params.mr1_zero_deg is not None and params.mr2_zero_deg is not None
                          and params.mr1_zero_signature == self._gait_zero_signature("Mr1", params)
                          and params.mr2_zero_signature == self._gait_zero_signature("Mr2", params))
             except GaitExecutorError:
                 reference_valid = False
+                hardware_fingerprint = None
             valid = params.calibration_confirmed and reference_valid
             run = getattr(self, "_gait_run", None)
             context = None
@@ -2077,9 +2142,17 @@ class StepperGUI:
                 context = {"side": run.side, "route": run.route,
                            "rotation_start": rotation_start, "lift_start": run.twin_lift_start,
                            "reference_key": id(run), "manual_invalid": run.twin_manual_invalid}
-            return build_twin_snapshot(params, axes, context=context,
-                                       calibration_valid=valid,
-                                       needs_recovery=getattr(self, "_gait_needs_recovery", False))
+            snapshot = build_twin_snapshot(params, axes, context=context,
+                                          calibration_valid=valid,
+                                          needs_recovery=getattr(self, "_gait_needs_recovery", False))
+            snapshot["world_key"] = (getattr(self, "_gait_world_epoch", 0),
+                                     params.initial_supports, params.beam_reference_deg,
+                                     hardware_fingerprint,
+                                     params.mr1_zero_signature, params.mr2_zero_signature,
+                                     params.mr1_zero_deg, params.mr2_zero_deg,
+                                     params.mr1_sign, params.mr2_sign)
+            snapshot["step_done"] = run is not None and run.state == "done"
+            return snapshot
 
     def _gait_execute_stage(self):
         """UI 线程：启动控制工作线程执行当前运动阶段。"""
@@ -2137,12 +2210,18 @@ class StepperGUI:
                 self._gait_needs_recovery = True
                 self.gait_params = replace(self.gait_params, calibration_confirmed=False)
                 self._gait_release_ownership()
-            self._post_ui(lambda: self._refresh_gait_ui())
+            self._post_ui(self._gait_stage_worker_done)
+
+    def _gait_stage_worker_done(self):
+        """阶段工作线程结束（UI 线程）：刷新面板；自动模式下推进下一阶段。"""
+        self._refresh_gait_ui()
+        self._gait_auto_step()
 
     @logged_action
     def _gait_abort_run(self):
         """UI 线程：中止按钮——请求退出 + 立即停掉四个绑定轴。"""
 
+        self._gait_auto_run = False   # 中止即终止自动推进
         run = self._gait_run
         if run is None:
             return
@@ -2158,6 +2237,24 @@ class StepperGUI:
         self._gait_release_ownership()
         self.log("⛔ 步态已中止：四个逻辑轴都已发 STOP；"
                  "如有轴被 ABORT，位置不可信，需重新校准后才能继续")
+
+    def _twin_progress_refresh(self):
+        """脉冲进度帧驱动的态势图节流刷新（UI 线程）。
+
+        组级 progress 回调只在组边界刷面板——两腿同升/同降这类单组长
+        阶段会整段静止（ΔZ 停在起点，组完成瞬跳终点）。挂在每帧脉冲
+        进度上后 ΔZ/轨迹/曲线逐帧跟进；非步态运动不刷（点动与态势图
+        无关），0.1s 节流防高频帧刷爆 Tk。
+        """
+        if getattr(self, "_closing", False):
+            return
+        if not getattr(self, "_gait_owned", {}) and getattr(self, "_gait_run", None) is None:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_twin_progress_refresh_at", 0.0) < 0.1:
+            return
+        self._twin_progress_refresh_at = now
+        self._refresh_gait_ui()
 
     def _refresh_gait_ui(self, progress_text=None):
         """刷新步态面板（面板在协调页构建后存在）。"""
@@ -2579,6 +2676,9 @@ class StepperGUI:
         self._refresh_gait_ui()
 
     def _gait_run_dry_run(self, interactive=True):
+        from motor_control.ui.gait_simulation import preview_from_simulation
+        if preview_from_simulation(self, interactive):
+            return
         params = self._gait_params_from_ui()
         if params is None:
             return
@@ -2597,20 +2697,17 @@ class StepperGUI:
         alt_route = self._gait_landing_route(side, params, arc_deg=-arc_deg)
         self._gait_preview_alt_pad = (alt_route[1] if alt_route else None)
         if route is None:
-            if params.trajectory_mode == TWO_MODE:
-                stop_preview_animation(self)
-                self._gait_last_report = None
-                self.gait_report_var.set("当前站位该方向没有目标支座；未生成替代轨迹")
-                draw_gait_preview(self)
-                return
-            self.log(f"⚠️ 干跑：当前站位该侧{'顺' if arc_deg > 0 else '逆'}向"
-                     f"{abs(arc_deg):g}°落点没有六边形支座，"
-                     "预览退回固定 A→C/B→A 示意路由")
+            stop_preview_animation(self)
+            self._gait_last_report = None
+            self.gait_report_var.set("当前方向在 5×5 地图内没有落脚支座；未生成替代轨迹")
+            draw_gait_preview(self)
+            return
         report = plan_swing_trajectory(
             params, side=side, route=route, arc_deg=arc_deg)
         # 新轨迹新包围盒：滚轮缩放/中键平移视图复位，避免旧视图卡住新图
         reset_preview_view(self)
         self._gait_last_report = report
+        self._gait_plan_context = (report, params)
         self._gait_last_report_key = (side, arc_deg)
         self._gait_preview_stance = (getattr(self, "_gait_supports", ("A", "B")),
                                     getattr(self, "_gait_beta_deg", 180.0))
@@ -2623,6 +2720,7 @@ class StepperGUI:
             f"步态角度预览（{side}·{direction}，{start}→{target} 绕{pivot}"
             f"{alt_text}，轨迹模式 {params.trajectory_mode}）：{report.message}")
         stop_preview_animation(self)
+        self._gait_set_view_mode("plan")   # 干跑成功：态势图切评估层（计划轨迹）
         draw_gait_preview(self)
         if not report.feasible and interactive:
             messagebox.showwarning(
@@ -2647,6 +2745,10 @@ class StepperGUI:
             selection = None
         stance = (getattr(self, "_gait_supports", ("A", "B")),
                   getattr(self, "_gait_beta_deg", 180.0))
+        view = (getattr(self, "gait_widgets", None) or {}).get("twin", {})
+        sim = view.get("simulation")
+        if sim is not None and view["mode_var"].get() != "live":
+            stance = ("simulation", sim.supports, sim.beta)
         if (getattr(self, "_gait_last_report", None) is None
                 or selection is None
                 or getattr(self, "_gait_last_report_key", None) != selection
@@ -2655,6 +2757,9 @@ class StepperGUI:
         play_preview_animation(self)
 
     def _gait_start_run_clicked(self, side, arc_deg=None):
+        from motor_control.ui.gait_simulation import cancel_simulation
+        cancel_simulation(self)
+        self._gait_auto_run = False   # 新一次摆动从人工确认开始
         params = self._gait_params_from_ui()
         if params is None:
             return
@@ -2684,6 +2789,11 @@ class StepperGUI:
 
     @logged_action
     def _gait_stage_confirmed(self):
+        self._gait_advance_stage()
+
+    def _gait_advance_stage(self, *, auto=False):
+        """推进当前阶段：单步确认（弹窗）与一键执行（auto 跳过弹窗）共用。"""
+
         run = self._gait_run
         if run is None:
             return
@@ -2697,55 +2807,138 @@ class StepperGUI:
         if stage is None:
             self._refresh_gait_ui()
             return
-        verb = "执行" if stage.is_motion_stage else "确认完成"
-        if not messagebox.askokcancel(
-                f"{stage.stage_id} {stage.title}",
-                stage.confirm_text + f"\n\n确定{verb}本阶段？"):
-            return
+        if not auto:
+            verb = "执行" if stage.is_motion_stage else "确认完成"
+            if not messagebox.askokcancel(
+                    f"{stage.stage_id} {stage.title}",
+                    stage.confirm_text + f"\n\n确定{verb}本阶段？"):
+                return
         if stage.is_motion_stage:
             self._gait_execute_stage()
+            if auto and run.state != "running":
+                # 工作线程没起来（控制器正在停止/急停）：自动链中断。
+                self._gait_auto_run = False
         elif run.advance_confirm():
-            self.log(f"✓ {stage.stage_id} {stage.title} 人工确认通过")
-            if run.state == "done":
-                start, target, pivot, _bearing = run.route
-                self._gait_supports = (target, pivot) if run.side == "left" else (pivot, target)
-                support_role = "Mr2" if run.side == "left" else "Mr1"
-                a = self._gait_role_axis(support_role)
-                support_sign = run.params.mr2_sign if run.side == "left" else run.params.mr1_sign
-                if a >= X42S_AXIS_HANDLE_BASE:
-                    # X42S：支撑侧公转角取实测（rotation_start 存机构坐标）。
-                    pos = self._x42s_role_output_units(LogicalRole(support_role))
-                    origin = (run.rotation_start or {}).get(a)
-                    if pos is not None and origin is not None:
-                        self._gait_beta_deg -= support_sign * (pos - origin)
-                    else:
-                        self.log("⚠️ 支撑侧实测位置缺失；横梁角未随换位更新，"
-                                 "建议【重建物理基准】后再继续")
-                    finals = {}
-                    for role in LOGICAL_ROLE_ORDER:
-                        value = self._x42s_role_output_units(role)
-                        if value is not None:
-                            finals[role.value] = value
-                    run.twin_final_positions = finals or None
-                else:
-                    actual_phi = support_sign * self.axis_profiles[a].units_from_steps(
-                        self.axis_runtime[a].position_steps - run.rotation_start[a])
-                    self._gait_beta_deg -= actual_phi
-                    run.twin_final_positions = {
-                        role.value: self.axis_profiles[self._gait_role_axis(role.value)].units_from_steps(
-                            self.axis_runtime[self._gait_role_axis(role.value)].position_steps)
-                        for role in LOGICAL_ROLE_ORDER}
-                self._gait_release_ownership()
+            self.log(f"✓ {stage.stage_id} {stage.title} "
+                     f"{'自动' if auto else '人工'}确认通过")
+            self._gait_finish_if_done()
         self._refresh_gait_ui()
+
+    def _gait_finish_if_done(self):
+        """本步全部阶段完成后的账本收尾：站位/横梁角更新 + 释放四轴。"""
+
+        run = self._gait_run
+        if run is None or run.state != "done":
+            return
+        start, target, pivot, _bearing = run.route
+        self._gait_supports = (target, pivot) if run.side == "left" else (pivot, target)
+        support_role = "Mr2" if run.side == "left" else "Mr1"
+        a = self._gait_role_axis(support_role)
+        support_sign = run.params.mr2_sign if run.side == "left" else run.params.mr1_sign
+        if a >= X42S_AXIS_HANDLE_BASE:
+            # X42S：支撑侧公转角取驱动器实测（rotation_start 存机构坐标，
+            # 2026-10-19 合并 main 时从旧内联收尾逻辑移植；_gait_pc_zero
+            # 后 PC 侧零点与实测同系，账本随每步收尾滚动更新）。
+            pos = self._x42s_role_output_units(LogicalRole(support_role))
+            origin = (run.rotation_start or {}).get(a)
+            if pos is not None and origin is not None:
+                self._gait_beta_deg -= support_sign * (pos - origin)
+            else:
+                self.log("⚠️ 支撑侧实测位置缺失；横梁角未随换位更新，"
+                         "建议【重建物理基准】后再继续")
+            finals = {}
+            for role in LOGICAL_ROLE_ORDER:
+                value = self._x42s_role_output_units(role)
+                if value is not None:
+                    finals[role.value] = value
+            run.twin_final_positions = finals or None
+        else:
+            actual_phi = support_sign * self.axis_profiles[a].units_from_steps(
+                self.axis_runtime[a].position_steps - run.rotation_start[a])
+            self._gait_beta_deg -= actual_phi
+            run.twin_final_positions = {
+                role.value: self.axis_profiles[self._gait_role_axis(role.value)].units_from_steps(
+                    self.axis_runtime[self._gait_role_axis(role.value)].position_steps)
+                for role in LOGICAL_ROLE_ORDER}
+        self._gait_release_ownership()
+        if getattr(self, "_gait_auto_run", False):
+            self._gait_auto_run = False
+            self.log("✅ 一键执行完成：本步全部阶段已走完，可继续下一次换位")
+
+    def _gait_auto_clicked(self):
+        """⚡ 一键执行：本步剩余阶段自动连走，不再逐阶段弹窗（录视频用）。
+
+        自动进行中再点一次＝停止自动推进（当前阶段完成后回到人工确认）。
+        """
+
+        if getattr(self, "_gait_auto_run", False):
+            self._gait_auto_run = False
+            self.log("已停止自动推进：当前阶段结束后回到人工确认")
+            self._refresh_gait_ui()
+            return
+        run = self._gait_run
+        if run is None:
+            messagebox.showwarning("步态未开始", "请先选择方向并【开始】一次摆动")
+            return
+        if run.state == "running" or run._stop_requested:
+            return
+        stage = run.current_stage()
+        if stage is None:
+            return
+        if not messagebox.askyesno(
+                "一键执行",
+                f"将自动执行本步剩余全部阶段（当前 {stage.stage_id} 起），"
+                "不再逐阶段弹窗确认。\n"
+                "确认型检查（横梁过杆、落位、现场支撑）不再逐项人工核对，"
+                "开始前请先确认机构周围安全。\n\n"
+                "执行中随时可点【⛔ 中止】停车；再点本按钮可停在当前阶段后"
+                "回到人工确认。\n\n确定开始自动执行？"):
+            return
+        self._gait_auto_run = True
+        self._gait_auto_step()
+
+    def _gait_auto_step(self):
+        """自动推进：连过确认型阶段，运动阶段交给 worker 后等完成回调。
+
+        入口（一键按钮）与每个阶段工作线程结束后（UI 线程）都从这里
+        续链；done/aborted/failed 或用户停止自动时链自然终止。
+        """
+
+        while getattr(self, "_gait_auto_run", False):
+            run = self._gait_run
+            if run is None:
+                self._gait_auto_run = False
+                return
+            snapshot = run.describe()
+            if snapshot["state"] == "running":
+                return   # 下一运动阶段已排队，等它的完成回调续链
+            if snapshot["state"] != "ready" or snapshot["stage_id"] is None:
+                # done / aborted / failed：自动链结束（收尾/恢复各自已处理）。
+                self._gait_auto_run = False
+                self._refresh_gait_ui()
+                return
+            before = snapshot["stage_index"]
+            self._gait_advance_stage(auto=True)
+            after = run.describe()
+            if after["state"] == "running":
+                return   # 运动阶段已交工作线程，等完成回调
+            if after["stage_index"] == before:
+                # 未推进且未进入运动（异常防御）：终止自动链避免死循环。
+                self._gait_auto_run = False
+                return
 
     def _gait_abort_clicked(self):
         self._gait_abort_run()
         self._refresh_gait_ui()
 
     def _gait_reset_run(self):
+        self._gait_auto_run = False
         if getattr(self, "_gait_owned", {}):
             self._gait_abort_run()
         self._gait_run = None
+        self._gait_set_view_mode("live")   # 不恢复旧的独立预览；重新点选动作生成候选。
+        view = (getattr(self, "gait_widgets", None) or {}).get("twin", {})
+        view.pop("candidate", None)
         self.log("步态流程已重置（执行器丢弃，重新开始前会重新干跑）")
         self._refresh_gait_ui()
 
@@ -3002,6 +3195,7 @@ class StepperGUI:
             self.sw[axis]['progress']['value'] = pct
             self.sw[axis]['progress_label'].config(text=f"{pct}%  ({done}/{total} 步)")
         self._land_release_tick(axis)
+        self._twin_progress_refresh()
 
     def _reset_progress(self, axis):
         if axis < len(self.sw) and 'progress' in self.sw[axis]:
@@ -3922,6 +4116,7 @@ class StepperGUI:
         with self.state_lock:
             if axis in getattr(self, "_gait_owned", {}):
                 self._gait_needs_recovery = True
+                self._gait_auto_run = False
                 if self._gait_run is not None:
                     self._gait_run.request_stop()
             self._axis_motion_generation[axis] += 1
@@ -5681,6 +5876,9 @@ class StepperGUI:
 
     def _on_close(self):
         """尽力停车，然后回收串口和网页服务器。"""
+        from motor_control.ui.gait_simulation import cancel_simulation
+        cancel_simulation(self)
+        stop_preview_animation(self)
         with self.state_lock:
             if self._closing:
                 return
@@ -5758,6 +5956,7 @@ class StepperGUI:
         with self.state_lock:
             if getattr(self, "_gait_owned", {}):
                 self._gait_needs_recovery = True
+                self._gait_auto_run = False
                 if self._gait_run is not None:
                     self._gait_run.request_stop()
                 self._gait_release_ownership()

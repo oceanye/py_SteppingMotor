@@ -1,0 +1,7 @@
+{
+  "schema": "gait-params-v1",
+  "trajectory_mode": "two_mode_v1",
+  "geometry": {
+    "arm_length_mm": 190.0
+  }
+}
