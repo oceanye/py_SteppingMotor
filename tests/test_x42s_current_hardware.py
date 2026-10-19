@@ -83,10 +83,15 @@ class CurrentHardwareTests(unittest.TestCase):
         self.assertEqual(motors['Mr1']['unit'], 'deg')
 
     def test_unknown_moving_or_stale_feedback_never_counts_as_idle(self):
+        # 2026-10-19 实机定案：X42S 静止时驱动器常不置速度 valid 位
+        # （四台遥测 speed 恒 None）——速度未知不构成"在运动"；静止
+        # 证据=位置可信+新鲜+reached。速度报了数值时才判非零/非有限。
         for fields in ({'reached': False}, {'reached': None}, {'speed': 1.0},
-                       {'speed': None}, {'speed': math.nan}):
+                       {'speed': math.nan}):
             _, motors = self.snapshot(**fields)
             self.assertTrue(axis_motion_active(motors['Mr1']), fields)
+        _, motors = self.snapshot(speed=None)
+        self.assertFalse(axis_motion_active(motors['Mr1']))
         _, motors = self.snapshot()
         card = dict(motors['Mr1'], stale=True)
         self.assertTrue(axis_motion_active(card))

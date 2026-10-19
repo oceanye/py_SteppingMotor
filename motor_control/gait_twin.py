@@ -33,9 +33,14 @@ def axis_motion_active(axis):
             return False
         live = axis.get("x42s") or {}
         speed = live.get("speed")
+        # 2026-10-19 实机定案：X42S 静止时驱动器常不置速度 valid 位
+        # （speed=None 是常态，四台实测全部如此）——速度未知不构成
+        # "在运动"；静止证据=位置可信+遥测新鲜+reached。速度仅在
+        # 驱动器上报了数值时才判非零。
         return (not axis.get("position_trusted") or bool(axis.get("stale"))
-                or live.get("reached") is not True or not _finite(speed)
-                or abs(speed) > 0.01)
+                or live.get("reached") is not True
+                or (speed is not None
+                    and (not _finite(speed) or abs(speed) > 0.01)))
     return (axis.get("target_position") is not None
             or axis.get("state") in ("STARTING", "MOVING", "CONTINUOUS"))
 
