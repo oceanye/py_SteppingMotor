@@ -2196,6 +2196,9 @@ class StepperGUI:
         self._gait_run.twin_manual_invalid = False
         self.log(f"步态执行器就绪（{side}，X42S）：{len(stages)} 个阶段，"
                  f"当前 ψ={psi_now:.1f}°（实测）")
+        # 2026-10-19 修复：X42S 链路漏了 stepdir 版的实机层切换（1977 行），
+        # 态势图一直停在静态计划层——升降竖杆/旋转/时间轴随动全部不显示。
+        self._gait_set_view_mode("live")
         if clearance_warnings:
             text = "\n".join(clearance_warnings)
             self.log(f"⚠️ 碰撞/避障校验未通过（仅提示，不拦截）：{text}")

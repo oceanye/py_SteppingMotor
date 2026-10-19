@@ -520,6 +520,15 @@ class X42sGaitChainTests(unittest.TestCase):
         # X42S 路径不做 SYNC,S/ENA 预检（四台在线由遥测状态保证）。
         self.assertFalse(any(c.startswith("SYNC,S") for c in app.commands))
 
+    def test_begin_run_x42s_switches_twin_to_live(self):
+        # 2026-10-19：X42S 链路曾漏掉 stepdir 版的实机层切换，态势图
+        # 停在静态计划层——升降竖杆/旋转/时间轴随动全部不显示。
+        app = _x42s_gait_app()
+        mode = _Var("plan")
+        app.gait_widgets = {"twin": {"mode_var": mode}}
+        app._gait_begin_run("left", arc_deg=-60.0)
+        self.assertEqual(mode.get(), "live")
+
     def test_begin_run_x42s_requires_complete_quartet(self):
         app = _x42s_gait_app()
         app.control_bindings = BindingSet.from_driver_id_mapping(
