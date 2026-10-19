@@ -591,7 +591,7 @@ class AutoRunTests(unittest.TestCase):
         # 启动加载旧配对文档：迁移成功挂提示、零位保留；标定确认照启动
         # 规则复位（勾选确认即可，不必重新记零）。
         app = mechanism()
-        good = GaitParams(initial_placement="red_right",
+        good = GaitParams(trajectory_mode="two_mode_v1", initial_placement="red_right",
                           beam_reference_deg=180.0,
                           mr1_zero_deg=3.5, mr2_zero_deg=-2.5).validated()
         # headless 夹具跳过 __init__：挂 state_store 桩与启动警告列表

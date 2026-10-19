@@ -1060,8 +1060,9 @@ class StepperGUI:
 
     # ═════════════ 三足轮换步态：参数 / 标定 / 分阶段执行 ═════════════
     def _load_gait_params(self):
-        """本机配置优先；缺失/损坏时使用仓库190mm默认，仍未标定。"""
+        """Startup only: old strategies are backed up and migrated, never run."""
 
+        self._gait_profile_migration_error = None
         try:
             data = self.state_store.load_gait_params()
         except StateStoreError as exc:
@@ -1082,11 +1083,23 @@ class StepperGUI:
                     f"{parsed.initial_placement}（左右标注对调校正；几何与零位不变）")
             # Pulse coordinates do not establish physical support locations on restart.
             self.gait_params = replace(parsed, calibration_confirmed=False)
-            if (parsed.trajectory_mode != TWO_MODE
-                    or not math.isclose(parsed.geometry.arm_length_mm, 190.0, abs_tol=1e-6)):
-                self._startup_warnings.append(
-                    "⚠️ 本机仍使用非190mm两模态配置；本机构请在断开串口后点击"
-                    "步态页【应用190 mm两模态】。更新代码不会覆盖现场参数；切换后须重新记零标定。")
+            if parsed.trajectory_mode != TWO_MODE:
+                self.gait_params = apply_190_two_mode_profile(parsed)
+                try:
+                    if self._is_serial_connected():
+                        raise StateStoreError("请停止运动、断开串口并重启GUI后迁移旧配置")
+                    backup = self.state_store.backup_gait_params()
+                    self.state_store.save_gait_params(self.gait_params.as_document())
+                except StateStoreError as exc:
+                    self._gait_profile_migration_error = str(exc)
+                    self._startup_warnings.append(
+                        f"⚠️ 旧配置迁移未完成：{exc}；旧文件未覆盖，禁止保存/实机启动。"
+                        "当前仅使用190mm自动避让进行离线评估；修复文件问题后重启GUI。")
+                else:
+                    self._startup_warnings.append(
+                        "ℹ️ 旧策略已自动迁移为190mm两模态自动避让；无需选择模式。"
+                        + (f"原文件备份：{backup.name}；" if backup else "")
+                        + "旋转零位/标定已失效，现场方向/传动参数/包络保留，须核实实物。")
         except (ValueError, TypeError, OverflowError) as exc:
             self._startup_warnings.append(
                 f"⚠️ 步态参数无效（{exc}）；已回退为190mm默认投影参数，须重新确认标定")
@@ -1096,6 +1109,8 @@ class StepperGUI:
         """校验、原子写盘并发布到内存（UI 线程调用）。"""
 
         params = params.validated()
+        if getattr(self, "_gait_profile_migration_error", None):
+            raise StateStoreError("旧步态配置备份/迁移未完成；请修复文件问题并重启GUI，不能覆盖原文件")
         if getattr(self, "_gait_owned", {}):
             raise GaitExecutorError("步态执行中禁止改参数/标定，请先中止或完成")
         self.state_store.save_gait_params(params.as_document())
@@ -1568,6 +1583,8 @@ class StepperGUI:
         任何门槛不满足抛 GaitExecutorError。
         """
 
+        if getattr(self, "_gait_profile_migration_error", None):
+            raise GaitExecutorError("旧配置迁移未完成，禁止实机启动；请修复文件问题并重启GUI")
         params = (params if params is not None else self.gait_params).validated()
         auto_avoidance = params.trajectory_mode == TWO_MODE
         geometry = effective_geometry(params)
@@ -2696,6 +2713,9 @@ class StepperGUI:
     def _gait_params_from_ui(self):
         """收集输入框 → 校验后的 GaitParams；非法时弹窗并返回 None。"""
 
+        if getattr(self, "_gait_profile_migration_error", None):
+            messagebox.showwarning("配置迁移未完成", "请修复文件问题并重启GUI；旧文件备份完成前不能保存或驱动电机")
+            return None
         if getattr(self, "_gait_owned", {}):
             messagebox.showwarning("步态占用", "执行期间不能保存/更换参数，请先完成或中止")
             return None

@@ -352,10 +352,11 @@ class GaitLayoutTests(unittest.TestCase):
                        mr1_zero_signature="left", mr2_zero_signature="right")
         self.app.gait_params = base
         load_gait_fields(self.app)
-        self.app.gait_field_vars["phase_gain"].set("4")
+        self.app.gait_field_vars["swing_speed_deg_s"].set("4")
         saved = collect_gait_params(self.app, base)
         self.assertEqual(saved.geometry, base.geometry)
-        self.assertEqual(saved.phase_gain, 4)
+        self.assertEqual(saved.swing_speed_deg_s, 4)
+        self.assertEqual(saved.phase_gain, base.phase_gain)
         self.assertEqual(saved.mr1_zero_deg, 12.3)
         self.assertEqual(saved.mr2_zero_deg, -4.5)
         self.assertEqual(saved.mr1_zero_signature, "left")
@@ -371,20 +372,24 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertIsNone(self.app._gait_last_report)
         self.assertEqual(collect_gait_params(self.app, self.app.gait_params).trajectory_mode, TWO_MODE)
 
-    def test_modalities_are_read_only_and_legacy_strategy_is_advanced(self):
+    def test_modalities_are_read_only_and_no_legacy_or_mode_switch_is_exposed(self):
         from motor_control.gait_avoidance import TWO_MODE, LEGACY
+        from motor_control.ui.gait_tab import collect_gait_params
         widgets = self.app.gait_widgets
         run = widgets["param_pages"]["run"].content
         geometry = widgets["param_pages"]["geometry"].content
         self.assertIsInstance(widgets["trajectory_status"], ttk.Label)
         self.assertIs(widgets["trajectory_status"].master, run)
         self.assertFalse(any(isinstance(w, ttk.Combobox) for w in run.winfo_children()))
-        self.assertIs(widgets["trajectory_strategy"].master, geometry)
-        self.assertEqual(tuple(widgets["trajectory_strategy"]["values"]), (TWO_MODE, LEGACY))
-        self.app.gait_trajectory_var.set(TWO_MODE)
+        self.assertFalse(any(isinstance(w, ttk.Combobox) for w in geometry.winfo_children()))
+        self.assertNotIn("trajectory_strategy", widgets)
+        self.assertNotIn("phase_gain", self.app.gait_field_vars)
+        self.assertNotIn("profile_190", widgets)
         self.assertIn("后台自动判定", widgets["trajectory_status"]["text"])
+        # A stale/private variable cannot make simulation or execution legacy.
         self.app.gait_trajectory_var.set(LEGACY)
-        self.assertIn("未启用自动避杆", widgets["trajectory_status"]["text"])
+        self.assertIn("后台自动判定", widgets["trajectory_status"]["text"])
+        self.assertEqual(collect_gait_params(self.app, self.app.gait_params).trajectory_mode, TWO_MODE)
 
     def test_projected_edge_updates_readonly_spacing_without_rounding_model(self):
         from motor_control.gait_avoidance import TWO_MODE
@@ -400,14 +405,14 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertEqual(self.app.gait_field_vars["d_mm"].get(), "220.0")
         collected = collect_gait_params(self.app, self.app.gait_params)
         self.assertEqual(collected.geometry.arm_length_mm, 190)
-        self.assertEqual(collected.geometry.d_mm, 220)  # legacy preserved
+        self.assertEqual(collected.geometry.d_mm, math.sqrt(3)*190)
         self.assertEqual(effective_geometry(collected).d_mm, math.sqrt(3)*190)
         self.assertNotEqual(effective_geometry(collected).d_mm, float(entry.get()))
         self.assertEqual(parse_gait_params(collected.as_document()), collected)
         self.assertFalse(self.app.gait_calibrated_var.get())
         self.assertIsNone(self.app._gait_last_report)
 
-    def test_spacing_strategy_switch_preserves_legacy_draft(self):
+    def test_stale_strategy_and_spacing_cannot_restore_legacy_draft(self):
         from motor_control.gait_avoidance import TWO_MODE, LEGACY
         from motor_control.ui.gait_tab import collect_gait_params
         self.app.gait_field_vars["arm_length_mm"].set("190")
@@ -416,15 +421,13 @@ class GaitLayoutTests(unittest.TestCase):
         self.app.gait_trajectory_var.set(TWO_MODE)
         self.assertEqual(entry.get(), "329.089653")
         self.app.gait_trajectory_var.set(LEGACY)
-        self.assertEqual(str(entry["state"]), "normal")
-        self.assertEqual(entry.get(), "350.123456789")
+        self.assertEqual(str(entry["state"]), "readonly")
+        self.assertEqual(entry.get(), "329.089653")
         self.assertEqual(collect_gait_params(self.app, self.app.gait_params).geometry.d_mm,
-                         350.123456789)
+                         math.sqrt(3)*190)
         self.app.gait_field_vars["d_mm"].set("220")
-        with self.assertRaisesRegex(ValueError, "中心距"):
-            collect_gait_params(self.app, self.app.gait_params)
-        self.app.gait_trajectory_var.set(TWO_MODE)
-        collect_gait_params(self.app, self.app.gait_params)  # no stale-d rejection
+        self.assertEqual(collect_gait_params(self.app, self.app.gait_params).geometry.d_mm,
+                         math.sqrt(3)*190)
 
     def test_invalid_projection_input_never_reuses_old_spacing(self):
         from motor_control.gait_avoidance import TWO_MODE, LEGACY
@@ -441,8 +444,7 @@ class GaitLayoutTests(unittest.TestCase):
         collect_gait_params(self.app, self.app.gait_params)  # ignored in two-mode
         self.assertEqual(self.app.gait_widgets["spacing_entry"].get(), "329.089653")
         self.app.gait_trajectory_var.set(LEGACY)
-        with self.assertRaises(ValueError):
-            collect_gait_params(self.app, self.app.gait_params)
+        self.assertEqual(collect_gait_params(self.app, self.app.gait_params).trajectory_mode, TWO_MODE)
 
     def test_changing_initial_placement_resets_ledger_and_zero(self):
         # 2026-09-24 初始摆放（红杆在横梁左/右）= 坐标基准：切换即账本

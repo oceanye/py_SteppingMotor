@@ -91,11 +91,50 @@ class ProfileMigrationTests(unittest.TestCase):
         self.assertEqual(app.gait_params.geometry.arm_length_mm, 190)
         self.assertFalse(app.gait_params.calibration_confirmed)
 
-    def test_startup_flags_legacy_but_never_silently_rewrites_it(self):
+    def test_startup_migrates_legacy_with_exact_backup_and_only_once(self):
         self.app._startup_warnings = []
         self.app._load_gait_params()
-        self.assertIn("应用190 mm两模态", self.app._startup_warnings[0])
-        self.assertEqual(self.app.state_store.paths.gait_params.read_bytes(), self.original)
+        self.assertIn("自动迁移", self.app._startup_warnings[0])
+        self.assertEqual(self.app.gait_params.trajectory_mode, TWO_MODE)
+        self.assertEqual(self.app.gait_params.geometry.arm_length_mm, 190)
+        backups = list(self.root.glob("*.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), self.original)
+        self.assertIsNone(self.app.gait_params.mr1_zero_deg)
+        self.assertIsNone(self.app.gait_params.calibration_fingerprint)
+        current = self.app.state_store.paths.gait_params.read_bytes()
+        self.app._startup_warnings = []
+        self.app._load_gait_params()
+        self.assertEqual(self.app._startup_warnings, [])
+        self.assertEqual(self.app.state_store.paths.gait_params.read_bytes(), current)
+        self.assertEqual(list(self.root.glob("*.backup-*")), backups)
+        self.assertEqual(self.app.commands, [])
+
+    def test_startup_backup_failure_keeps_source_and_blocks_later_overwrite(self):
+        app = self.app
+        app._startup_warnings = []
+        with patch.object(app.state_store, "backup_gait_params", side_effect=StateStoreError("disk")):
+            app._load_gait_params()
+        self.assertEqual(app.gait_params.trajectory_mode, TWO_MODE)
+        self.assertFalse(app.gait_params.calibration_confirmed)
+        self.assertIsNone(app.gait_params.mr2_zero_deg)
+        self.assertEqual(app.state_store.paths.gait_params.read_bytes(), self.original)
+        with self.assertRaises(StateStoreError):
+            app._save_gait_params(app.gait_params)
+        self.assertIn("迁移未完成", app._startup_warnings[-1])
+        self.assertEqual(app.commands, [])
+
+    def test_startup_save_failure_keeps_source_and_backup(self):
+        app = self.app
+        app._startup_warnings = []
+        with patch("motor_control.state_store.os.replace", side_effect=OSError("disk")):
+            app._load_gait_params()
+        self.assertTrue(app._gait_profile_migration_error)
+        self.assertEqual(app.state_store.paths.gait_params.read_bytes(), self.original)
+        self.assertEqual(next(self.root.glob("*.backup-*")).read_bytes(), self.original)
+        app._load_gait_params()  # Startup retry after the storage problem is fixed.
+        self.assertIsNone(app._gait_profile_migration_error)
+        self.assertEqual(app.state_store.load_gait_params()["trajectory_mode"], TWO_MODE)
 
     def test_connection_busy_simulation_and_estop_refuse_without_writes(self):
         app = self.app

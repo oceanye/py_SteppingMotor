@@ -15,7 +15,7 @@ from dataclasses import replace
 from motor_control.gait_planner import (
     GaitParams, INITIAL_PLACEMENTS, LOW_NODE_PHASE_DEG,
 )
-from motor_control.gait_avoidance import LEGACY, TWO_MODE
+from motor_control.gait_avoidance import TWO_MODE
 from motor_control.ui.common import PAD, reset_canvas_view
 from motor_control.ui.gait_twin import (
     build_twin_panel, draw_twin, refresh_twin_panel, sync_twin_start_fields,
@@ -34,7 +34,6 @@ GEOMETRY_FIELDS = (
 )
 GAP_FIELDS = (("safety_margin_mm", "参考安全间隙 δ (mm)"),)
 RUN_FIELDS = (
-    ("phase_gain", "旧模式增益 k（两模态忽略）"),
     ("swing_speed_deg_s", "公转峰值速度 (°/s)"),
     ("rotation_limit_deg", "线缆角度限位 ±(°)"),
     ("lift_mm", "实际抬足行程 (mm)"),
@@ -154,8 +153,7 @@ def build_gait_tab(app, parent) -> None:
     app.gait_state_var = tk.StringVar(value="")
     app.gait_calibrated_var = tk.BooleanVar(value=False)
     app.gait_trajectory_var = tk.StringVar(value=TWO_MODE)
-    # Separate derived display from the legacy draft; toggling strategies
-    # must not overwrite the saved legacy spacing or round the model scale.
+    # The desktop has one strategy; retain a private variable for view refresh.
     app.gait_derived_spacing_var = tk.StringVar(value="—")
     app.gait_trajectory_var.trace_add("write", lambda *_: _invalidate_calibration(app))
     app._gait_loading_fields = False
@@ -168,7 +166,7 @@ def build_gait_tab(app, parent) -> None:
         text=(
             "旋转联动只按角度计算；中心距和六边形尺寸不改变电机转角。实机按 S0–S7 逐阶段确认，"
             "旋转轴需支持 SYNC 的同一 ESP32。两模态按当前站位自动判断，腿—高杆净间隙不合格禁止执行；"
-            "旧模式保留历史行为。接触和支撑仍需现场确认。"
+            "本机构采用190 mm投影边长的自动避让。接触和支撑仍需现场确认。"
         ),
         foreground="#334155", wraplength=680,
         justify="left",
@@ -230,16 +228,11 @@ def _build_params_column(app, parent) -> None:
     note(inner, 1, "只选择左/右足与顺/逆动作，无需选择 HIGH / LOW。\n"
          "后台按当前站位判断本步横梁扫掠：跨高杆 → HIGH；不跨 → LOW。\n"
          "每次换步重新判断，不与按钮固定绑定；自动判定不代表避让校验通过。")
-    run_fields = tuple(field for field in RUN_FIELDS if field[0] != "phase_gain") + GAP_FIELDS
+    run_fields = RUN_FIELDS + GAP_FIELDS
     for row, (key, label) in enumerate(run_fields, 2):
         add_number_field(inner, row, key, label)
     note(inner, len(run_fields)+2, "两模态仅填写投影边长 a：腿投影长度 R=a，中心距 d=√3a 自动派生。"
          "腿/杆投影宽度和δ仍需实测，不能调小数值强行放行。抬高不替代平面避让。")
-    app.gait_widgets["profile_190"] = ttk.Button(
-        inner, text="应用190 mm两模态",
-        command=app._gait_apply_190_two_mode_clicked)
-    app.gait_widgets["profile_190"].grid(
-        row=len(run_fields)+3, column=0, columnspan=3, sticky="w", padx=6, pady=6)
 
     inner = pages["calibration"].content
     note(inner, 0, "先在“电机绑定与状态”页设置 PPR、减速比和升降导程，\n"
@@ -307,21 +300,9 @@ def _build_params_column(app, parent) -> None:
     for row, (key, label) in enumerate(GEOMETRY_FIELDS + PREVIEW_FIELDS, 1):
         add_number_field(inner, row, key, label)
     note(inner, len(GEOMETRY_FIELDS + PREVIEW_FIELDS)+1,
-         "中心距显示值仅供参考，计算保留完整精度；旧策略仍可独立输入中心距。"
+         "中心距显示值仅供参考，计算保留完整精度，不能独立输入中心距。"
          "壳体/横梁高度参数为额外结构诊断，"
          "不用于豁免腿的平面冲突；壳体包络应包含电机、轴承和连接件。")
-    row = len(GEOMETRY_FIELDS + PREVIEW_FIELDS)+2
-    ttk.Label(inner, text="历史兼容策略（非模态选择）", wraplength=185).grid(
-        row=row, column=0, sticky="w", padx=6)
-    app.gait_widgets["trajectory_strategy"] = ttk.Combobox(
-        inner, textvariable=app.gait_trajectory_var,
-        values=(TWO_MODE, LEGACY), state="readonly", width=16)
-    app.gait_widgets["trajectory_strategy"].grid(
-        row=row, column=1, columnspan=2, sticky="ew", padx=6)
-    add_number_field(inner, row+1, "phase_gain", "旧模式增益 k（两模态忽略）")
-    note(inner, row+2, "正常避杆使用 two_mode_v1，由后台自动选 HIGH / LOW。"
-         "legacy_gain 仅兼容历史固定增益，不是另一种避杆模态，不能用它绕过避让失败。"
-         "保留旧配置，不静默更改既有标定。")
     for page in pages.values():
         page.bind_navigation()
 
@@ -483,34 +464,28 @@ def _build_run_column(app, parent) -> None:
 def _refresh_trajectory_status(app):
     label = getattr(app, "gait_widgets", {}).get("trajectory_status")
     if label is not None:
-        automatic = app.gait_trajectory_var.get() == TWO_MODE
         label.configure(
-            text="HIGH / LOW 后台自动判定" if automatic else "旧策略：未启用自动避杆",
-            foreground="#334155" if automatic else "#b42318")
+            text="HIGH / LOW 后台自动判定", foreground="#334155")
 
 
 def _refresh_geometry_fields(app):
     entry = getattr(app, "gait_widgets", {}).get("spacing_entry")
     if entry is None:
         return
-    automatic = app.gait_trajectory_var.get() == TWO_MODE
-    if automatic:
-        try:
-            edge = _field_number(app, "arm_length_mm")
-            if edge <= 0:
-                raise ValueError("边长必须大于0")
-            spacing = replace(app.gait_params.geometry, arm_length_mm=edge).touching_center_distance_mm
-            if not math.isfinite(spacing):
-                raise ValueError("中心距必须是有限数值")
-            display = f"{spacing:.6f}"
-        except (ValueError, tk.TclError):
-            display = "—"
-        app.gait_derived_spacing_var.set(display)
-        entry.configure(state="readonly", textvariable=app.gait_derived_spacing_var)
-    else:
-        entry.configure(state="normal", textvariable=app.gait_field_vars["d_mm"])
+    try:
+        edge = _field_number(app, "arm_length_mm")
+        if edge <= 0:
+            raise ValueError("边长必须大于0")
+        spacing = replace(app.gait_params.geometry, arm_length_mm=edge).touching_center_distance_mm
+        if not math.isfinite(spacing):
+            raise ValueError("中心距必须是有限数值")
+        display = f"{spacing:.6f}"
+    except (ValueError, tk.TclError):
+        display = "—"
+    app.gait_derived_spacing_var.set(display)
+    entry.configure(state="readonly", textvariable=app.gait_derived_spacing_var)
     app.gait_widgets["spacing_caption"].configure(
-        text="中心距 d=√3a（自动，mm）" if automatic else "旧策略中心距 d (mm)")
+        text="中心距 d=√3a（自动，mm）")
 
 
 def _invalidate_calibration(app):
@@ -532,7 +507,7 @@ def load_gait_fields(app) -> None:
 
     params = app.gait_params
     app._gait_loading_fields = True
-    app.gait_trajectory_var.set(params.trajectory_mode)
+    app.gait_trajectory_var.set(TWO_MODE)
     app.gait_placement_var.set(_placement_label(params))
     for key, _label in GEOMETRY_FIELDS + GAP_FIELDS:
         value = getattr(params.geometry, key)
@@ -575,12 +550,10 @@ def _field_number(app, key) -> float:
 def collect_gait_params(app, base: GaitParams) -> GaitParams:
     """从输入框收集并构造校验后的 GaitParams；非法抛 ValueError。"""
 
-    trajectory_mode = app.gait_trajectory_var.get()
     geometry_updates = {}
     for key, _label in GEOMETRY_FIELDS + GAP_FIELDS:
-        if key == "d_mm" and trajectory_mode == TWO_MODE:
-            # The visible field is derived/read-only. Retain the legacy value
-            # for compatibility, never parse it as an independent constraint.
+        if key == "d_mm":
+            # Ignore stale independent spacing from historical documents.
             continue
         value = _field_number(app, key)
         if key in INTEGER_FIELDS:
@@ -589,7 +562,8 @@ def collect_gait_params(app, base: GaitParams) -> GaitParams:
             value = int(value)
         geometry_updates[key] = value
     param_updates = {}
-    param_updates["trajectory_mode"] = trajectory_mode
+    geometry_updates["d_mm"] = math.sqrt(3) * geometry_updates["arm_length_mm"]
+    param_updates["trajectory_mode"] = TWO_MODE
     for key, _label in BEAT_FIELDS:
         value = _field_number(app, key)
         if key in INTEGER_FIELDS:
