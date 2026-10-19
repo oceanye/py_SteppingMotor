@@ -235,6 +235,11 @@ def _build_params_column(app, parent) -> None:
         add_number_field(inner, row, key, label)
     note(inner, len(run_fields)+2, "两模态仅填写投影边长 a：腿投影长度 R=a，中心距 d=√3a 自动派生。"
          "腿/杆投影宽度和δ仍需实测，不能调小数值强行放行。抬高不替代平面避让。")
+    app.gait_widgets["profile_190"] = ttk.Button(
+        inner, text="应用190 mm两模态",
+        command=app._gait_apply_190_two_mode_clicked)
+    app.gait_widgets["profile_190"].grid(
+        row=len(run_fields)+3, column=0, columnspan=3, sticky="w", padx=6, pady=6)
 
     inner = pages["calibration"].content
     note(inner, 0, "先在“电机绑定与状态”页设置 PPR、减速比和升降导程，\n"

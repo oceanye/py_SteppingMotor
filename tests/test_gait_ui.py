@@ -274,6 +274,7 @@ class GaitLayoutTests(unittest.TestCase):
                                    _gait_hardware_fingerprint=lambda: "test")
         self.app.log = lambda *_args, **_kwargs: None
         for name in ("_gait_record_zero_clicked", "_gait_save_params_clicked",
+                     "_gait_apply_190_two_mode_clicked",
                      "_gait_reload_params_clicked", "_gait_reestablish_baseline",
                      "_gait_run_dry_run", "_gait_start_run_clicked",
                      "_gait_play_preview_clicked", "_gait_stage_confirmed",

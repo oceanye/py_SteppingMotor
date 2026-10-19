@@ -380,6 +380,23 @@ def default_gait_params() -> GaitParams:
         d_mm=math.sqrt(3)*DEFAULT_PROJECTED_EDGE_MM)).validated()
 
 
+def apply_190_two_mode_profile(params: GaitParams) -> GaitParams:
+    """Explicit site migration, not an implicit legacy JSON reinterpretation.
+
+    Preserve measured envelopes, signs, speeds and selected start cells. Never
+    reuse zeros/calibration across this operator-requested model reset. Binding
+    and transmission parameters live in separate documents and are untouched.
+    """
+    return replace(
+        params, trajectory_mode=TWO_MODE,
+        geometry=replace(params.geometry, arm_length_mm=190.0,
+                         d_mm=math.sqrt(3)*190.0),
+        mr1_zero_deg=None, mr2_zero_deg=None,
+        mr1_zero_signature=None, mr2_zero_signature=None,
+        calibration_confirmed=False, calibration_fingerprint=None,
+    ).validated()
+
+
 def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
     """从 JSON 文档恢复参数；缺失字段用默认值，非法整体失败。"""
 

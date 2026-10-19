@@ -92,6 +92,38 @@ class StateStore:
     def save_gait_params(self, data: Mapping[str, Any]) -> None:
         self._save_object(self.paths.gait_params, data)
 
+    def backup_gait_params(self) -> Path | None:
+        """Keep an exact, uniquely named local copy before explicit migration.
+
+        Failure must abort the caller's migration. Missing files need no backup;
+        even malformed existing files are preserved byte-for-byte, not parsed.
+        """
+        path = self.paths.gait_params
+        try:
+            original = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise StateStoreError(f"cannot back up {path.name}: {exc}") from exc
+        backup = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=f"{path.name}.backup-", suffix=".json",
+                dir=path.parent, delete=False,
+            ) as handle:
+                backup = Path(handle.name)
+                handle.write(original)
+                handle.flush()
+                os.fsync(handle.fileno())
+            return backup
+        except OSError as exc:
+            if backup is not None:
+                try:
+                    backup.unlink()
+                except OSError:
+                    pass
+            raise StateStoreError(f"cannot back up {path.name}: {exc}") from exc
+
     @staticmethod
     def _load_object(path: Path) -> dict[str, Any] | None:
         if not path.exists():

@@ -9,6 +9,7 @@ __pycache__/
 .gear_tune.json
 .coordinated_bindings.json
 .gait_params.json
+.gait_params.json.backup-*
 logs/
 build_upload*.log
 

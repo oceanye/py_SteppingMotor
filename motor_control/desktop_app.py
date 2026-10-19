@@ -105,6 +105,7 @@ from motor_control.gait_planner import (
     LOW_NODE_PHASE_DEG,
     SWING_ARC_DEG,
     GaitParams,
+    apply_190_two_mode_profile,
     default_gait_params,
     parse_gait_params,
     plan_gait_stages,
@@ -1081,6 +1082,11 @@ class StepperGUI:
                     f"{parsed.initial_placement}（左右标注对调校正；几何与零位不变）")
             # Pulse coordinates do not establish physical support locations on restart.
             self.gait_params = replace(parsed, calibration_confirmed=False)
+            if (parsed.trajectory_mode != TWO_MODE
+                    or not math.isclose(parsed.geometry.arm_length_mm, 190.0, abs_tol=1e-6)):
+                self._startup_warnings.append(
+                    "⚠️ 本机仍使用非190mm两模态配置；本机构请在断开串口后点击"
+                    "步态页【应用190 mm两模态】。更新代码不会覆盖现场参数；切换后须重新记零标定。")
         except (ValueError, TypeError, OverflowError) as exc:
             self._startup_warnings.append(
                 f"⚠️ 步态参数无效（{exc}）；已回退为190mm默认投影参数，须重新确认标定")
@@ -2629,6 +2635,56 @@ class StepperGUI:
                  + f" X42S ID{driver_id} STOP → {resp or '无应答'}")
 
     # ── 步态页 UI 回调（Tk 线程） ──
+    def _gait_apply_190_two_mode(self):
+        """Offline-only explicit migration; backup/save precede all publication."""
+        with self.state_lock:
+            view = getattr(self, "gait_widgets", {}).get("twin", {})
+            sim = view.get("simulation")
+            if self._is_serial_connected():
+                raise GaitExecutorError("请先确认电机停止并断开串口，再切换190 mm两模态配置")
+            if view.get("start_busy") or (sim and sim.active):
+                raise GaitExecutorError("请先结束/重置模拟或当前执行流程，再切换配置")
+            self._gait_check_start_edit()
+            params = apply_190_two_mode_profile(self.gait_params)
+            backup = self.state_store.backup_gait_params()
+            self._save_gait_params(params)
+            self._gait_supports = tuple(params.initial_supports)
+            self._gait_beta_deg = params.initial_beam_deg
+            self._gait_run = None
+            self._gait_auto_run = False
+            # Do not clear an existing recovery/stop fault or touch axis ledgers.
+            self._gait_world_epoch = getattr(self, "_gait_world_epoch", 0) + 1
+            self._gait_last_report = None
+            view.pop("simulation", None)
+            view.pop("candidate", None)
+        return backup
+
+    @logged_action
+    def _gait_apply_190_two_mode_clicked(self):
+        if not messagebox.askokcancel(
+            "切换190 mm两模态（不动电机）",
+            "基于已保存参数切换；输入框中尚未保存的修改将放弃。\n"
+            "投影边长/腿长=190 mm，中心距=√3×190≈329.089653 mm，"
+            "HIGH/LOW由后台按当前站位自动判定。\n"
+            "保留绑定、方向、传动参数、速度、起步选格和腿/杆投影半宽、安全间隙；"
+            "不会自动认可这些尺寸，尤其旧配置0.2/0.2/0.1 mm必须现场核实。\n"
+            "先备份旧文件，再清除旋转零位/标定及旧尺度轨迹。"
+            "请确认电机停止并断开串口；应用后重新摆放、记零、评估四动作并确认标定。",
+        ):
+            return
+        try:
+            backup = self._gait_apply_190_two_mode()
+        except (GaitExecutorError, StateStoreError, ValueError) as exc:
+            messagebox.showwarning("配置未切换", str(exc))
+            return
+        stop_preview_animation(self)
+        load_gait_fields(self)
+        self.gait_report_var.set("已切换190 mm两模态；请重新评估，实机须重新记零并确认标定")
+        self.log("✓ 已保存190 mm两模态，中心距329.089653 mm；"
+                 + (f"原文件备份：{backup.name}；" if backup else "原文件不存在；")
+                 + "已清除旋转零位/标定，未发送电机指令；腿/杆投影半宽及间隙仍须实测核实")
+        self._refresh_gait_ui()
+
     def _build_gait_tab(self, parent):
         build_gait_tab_view(self, parent)
 

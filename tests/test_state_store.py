@@ -76,6 +76,28 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.load_axis_config(), previous)
         self.assertEqual(list(self.root.glob("*.tmp")), [])
 
+    def test_gait_backup_missing_is_noop_and_existing_bytes_are_exact(self):
+        self.assertIsNone(self.store.backup_gait_params())
+        # Include invalid JSON: backup must preserve even an unreadable config.
+        original = b"{broken\r\n"
+        self.store.paths.gait_params.write_bytes(original)
+        first = self.store.backup_gait_params()
+        second = self.store.backup_gait_params()
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.read_bytes(), original)
+        self.assertEqual(second.read_bytes(), original)
+        self.assertEqual(self.store.paths.gait_params.read_bytes(), original)
+
+    def test_gait_backup_read_and_write_failures_do_not_change_source(self):
+        self.store.save_gait_params({"schema": "gait-params-v1"})
+        original = self.store.paths.gait_params.read_bytes()
+        for target in ("motor_control.state_store.Path.read_bytes",
+                       "motor_control.state_store.tempfile.NamedTemporaryFile"):
+            with self.subTest(target=target), mock.patch(target, side_effect=OSError("disk")):
+                with self.assertRaises(StateStoreError):
+                    self.store.backup_gait_params()
+            self.assertEqual(self.store.paths.gait_params.read_bytes(), original)
+
 
 if __name__ == "__main__":
     unittest.main()
