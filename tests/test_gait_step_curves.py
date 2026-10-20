@@ -240,6 +240,35 @@ class StepCurveUITests(unittest.TestCase):
         self.assertNotIn("live_curve_reference", detail)
         self.assertFalse(detail["curve_canvas"].find_withtag("curve_reference"))
 
+    def test_lift_bars_use_fixed_lift_scale_during_simulation(self):
+        # 2026-10-20：柱状图曾用当前帧两腿 z 的最大值自归一化——任何
+        # 非零 z 都显示成满格（S2 一开场就顶格、S6 双降全程满格直到突
+        # 降 0）。固定标尺（lift_mm）后 S2 中段柱形应介于 0 与满格之间。
+        from motor_control.gait_simulation import GaitSimulation
+        sim = GaitSimulation(self.app.gait_params)
+        sim.begin("left", 60.0)
+        self.view["simulation"] = sim
+        self.view["mode_var"].set("sim")
+        n = 0
+        while not sim.frame.stage.startswith("S2 ") or n < 6:
+            sim.advance()
+            n += 1
+            if not sim.active or n > 60:
+                self.fail("未推进到 S2 中段")
+        twin.draw_twin(self.app)
+        c = self.view["canvas"]
+        item = c.find_withtag("lift_left")
+        self.assertTrue(item, "模拟播放中应绘制左腿柱状图")
+        y1, y2 = c.coords(item[0])[1], c.coords(item[0])[3]
+        length = abs(y2 - y1)
+        z = sim.frame.pose["feet"]["left"]["z_mm"]
+        lift = self.app.gait_params.lift_mm
+        self.assertGreater(z, 0)
+        self.assertLess(z, lift, "应停在 S2 中段而非完成全程")
+        self.assertGreater(length, 1.0, "中段柱形应可见（非零）")
+        self.assertLess(length, 27.0, "中段柱形不应满格")
+        self.assertLess(abs(length / 28.0 - z / lift), 0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -774,7 +774,11 @@ def _render_map(app, view):
         canvas.create_text(
             8, 26, anchor="nw", width=width-16, fill="#b45309", font=("Microsoft YaHei", 9),
             text=f"6爪最近(当前) {nearest[0]:.2f}mm（爪端到杆表面）", tags="hud_nearest")
-    max_z = max(1, *(abs(pose["feet"][side]["z_mm"]) for side in ("left", "right")))
+    # 柱状图标尺=本步抬升量（固定量程）。2026-10-20 修正：此前用当前帧
+    # 两腿 z 的最大值自归一化——任何非零 z 都显示成满格（S2 一开场就
+    # 在顶点、S6 双降全程满格直到突降 0），只有单腿动作时另一腿当标尺
+    # 才看得到变化；数字对但柱形不随动。
+    max_z = max(1.0, float(params.lift_mm))
     for side, fraction, label, color in (("left", 0.25, "左", "#2563eb"),
                                          ("right", 0.75, "右", "#ea580c")):
         x, y = width*fraction, height-45
