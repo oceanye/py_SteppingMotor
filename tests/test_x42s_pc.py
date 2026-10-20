@@ -725,6 +725,30 @@ class X42sGaitChainTests(unittest.TestCase):
 class X42sManualUnitsTests(unittest.TestCase):
     """双形态电机台架（2026-10-13）：直线=直驱丝杆 mm，旋转=减速电机°。"""
 
+    def test_restore_worker_mup_conversion_not_doubled(self):
+        # 2026-10-20：恢复 worker 曾在 Mup 分支把 mm→输出轴°换算做两遍
+        # （外部 ×360/lead 后 _x42s_move_conversion 内部再换算），速度被
+        # 放大 129600 倍必报"换算失败"。锁定：70mm 回移=224000 步@3200pps
+        # （1mm/s、lead 1、gear 1），不带二次换算。
+        app = _x42s_gait_app(lead_mms={"Mup1": 1.0, "Mup2": 1.0})
+        app.control_bindings = BindingSet.from_driver_id_mapping(
+            {"Mup1": 1, "Mr1": 2, "Mup2": 3, "Mr2": 4},
+            gear_ratios={"Mup1": 1.0, "Mup2": 1.0},
+            lead_mms={"Mup1": 1.0, "Mup2": 1.0})
+        app._gait_needs_recovery = True
+        app._gait_recovery_snapshot = {
+            "positions": {"Mup1": 70.0, "Mr1": 0.0, "Mup2": 0.0, "Mr2": 0.0},
+            "supports": ("A", "B"), "beta": 180.0}
+        with patch.object(desktop_app_module.threading, "Thread", _SyncThread), \
+             patch.object(desktop_app_module, "messagebox", SimpleNamespace(
+                 showwarning=lambda *a, **k: None,
+                 showinfo=lambda *a, **k: None)):
+            StepperGUI._x42s_restore_worker(app, {
+                "Mup1": -70.0, "Mr1": 0.0, "Mup2": 0.0, "Mr2": 0.0})
+        self.assertIn("X42S,1,MOVE,-224000,3200", app.commands)
+        self.assertFalse(app._gait_needs_recovery)   # 成功后清 recovery 锁
+        self.assertIsNone(app._gait_recovery_snapshot)
+
     def test_default_gear_for_role(self):
         # UI 草稿默认：Mup 直驱丝杆 1.0，Mr 减速电机 21.5（文档层缺省
         # 仍恒 21.5，不受影响）。

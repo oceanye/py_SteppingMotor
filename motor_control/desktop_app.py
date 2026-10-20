@@ -3271,11 +3271,13 @@ class StepperGUI:
                 failures.append(f"{role_value} 未绑定 X42S 驱动器")
                 continue
             if role_value.startswith("Mr"):
-                angle_deg, speed_deg_s = delta, 2.0
+                move_delta, move_speed = delta, 2.0   # 输出轴 °/°/s
             else:
-                deg_per_mm = 360.0 / binding.lead_mm
-                angle_deg, speed_deg_s = delta * deg_per_mm, 1.0 * deg_per_mm
-            steps, speed_pps = self._x42s_move_conversion(role, angle_deg, speed_deg_s)
+                # 机构 mm/mm/s——_x42s_move_conversion 内部按 lead_mm 换算
+                # 输出轴角度（2026-10-20 修正：此处曾再乘 360/lead 双重
+                # 换算，速度放大 129600 倍必报"换算失败"）。
+                move_delta, move_speed = delta, 1.0
+            steps, speed_pps = self._x42s_move_conversion(role, move_delta, move_speed)
             if steps is None or steps == 0 or speed_pps > X42S_SPEED_PPS_MAX:
                 failures.append(f"{role_value} 换算失败（位移/速度超限）")
                 continue
