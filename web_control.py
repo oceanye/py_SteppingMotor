@@ -37,6 +37,11 @@ MAX_REQUEST_TARGET = 2 * 1024
 MAX_STEPPER_AXIS = NUM_STEPPER_AXES - 1
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 INDEX_FILE = WEB_ROOT / "index.html"
+STATIC_ASSETS = {
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    **{f"/{name}.js": (f"{name}.js", "text/javascript; charset=utf-8")
+       for name in ("app", "common", "logical-motors", "legacy-steppers")},
+}
 
 
 class _ControlHTTPServer(ThreadingHTTPServer):
@@ -52,6 +57,14 @@ class _RequestHandler(BaseHTTPRequestHandler):
     server: _ControlHTTPServer
     protocol_version = "HTTP/1.1"
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (ConnectionError, TimeoutError):
+            # Normal on tab close, timeout abort or dropped Wi-Fi. Never try
+            # sending a second 500 response on the already closed socket.
+            self.close_connection = True
+
     def log_message(self, _format: str, *_args: object) -> None:
         # Keep the embedded server quiet; operational information is shown by
         # the desktop GUI instead of being written to stderr.
@@ -63,6 +76,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path in ("/", "/index.html"):
             self._serve_index()
+            return
+        if parsed.path in STATIC_ASSETS:
+            filename, mime = STATIC_ASSETS[parsed.path]
+            self._serve_asset(WEB_ROOT / filename, mime)
             return
         if parsed.path == "/api/status":
             self._invoke(self.server.owner.controller.web_get_status)
@@ -102,7 +119,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
         if len(self.path) > MAX_REQUEST_TARGET:
             self._error(HTTPStatus.REQUEST_URI_TOO_LONG, "请求路径过长")
             return None
-        parsed = urlsplit(self.path)
+        try:
+            parsed = urlsplit(self.path)
+        except ValueError:
+            self._error(HTTPStatus.BAD_REQUEST, "无效请求路径")
+            return None
         if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
             self._error(HTTPStatus.BAD_REQUEST, "无效请求路径")
             return None
@@ -116,6 +137,21 @@ class _RequestHandler(BaseHTTPRequestHandler):
         return parsed
 
     def _read_json_object(self) -> dict[str, Any] | None:
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            # Same-origin page only. This complements JSON/CORS checks; it is
+            # not authentication, and non-browser LAN clients still need trust.
+            try:
+                parsed_origin = urlsplit(origin)
+            except ValueError:
+                self._error(HTTPStatus.FORBIDDEN, "无效请求来源")
+                return None
+            if (parsed_origin.scheme not in ("http", "https")
+                    or parsed_origin.netloc.lower() != self.headers.get("Host", "").lower()
+                    or parsed_origin.username is not None
+                    or parsed_origin.path or parsed_origin.query or parsed_origin.fragment):
+                self._error(HTTPStatus.FORBIDDEN, "不支持跨域控制请求")
+                return None
         content_type = self.headers.get_content_type().lower()
         if content_type != "application/json":
             self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "仅接受 application/json")
@@ -262,22 +298,27 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 result = {"ok": True}
             elif not isinstance(result, Mapping):
                 result = {"ok": True, "result": result}
-            self._json(HTTPStatus.OK, result)
         except (ValueError, RuntimeError) as exc:
             self._error(HTTPStatus.CONFLICT, str(exc))
         except Exception:
             # Do not disclose serial, filesystem or implementation details to a
             # LAN client.  The GUI can log the original exception if desired.
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "控制器执行失败")
+        else:
+            self._json(HTTPStatus.OK, result)
 
     def _serve_index(self) -> None:
+        self._serve_asset(INDEX_FILE, "text/html; charset=utf-8")
+
+    def _serve_asset(self, path: Path, mime: str) -> None:
+        """Serve only the exact bundled allowlist, never a filesystem path from HTTP."""
         try:
-            content = INDEX_FILE.read_bytes()
+            content = path.read_bytes()
         except OSError:
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "网页文件不可用")
             return
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -286,7 +327,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
         )
         self.end_headers()

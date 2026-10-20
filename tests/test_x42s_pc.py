@@ -1,3 +1,4 @@
+from motor_control import x42s_runtime
 """2026-09-29 X42S UART PC 侧（feature/x42s-uart-actuator-binding 第二轮）。
 
 - 协议层：X42S 遥测/诊断/扫描/掉线行的保守解析（valid 位还原 None）、
@@ -400,6 +401,16 @@ class X42sPendingRefreshTests(unittest.TestCase):
         def configure(self, **kwargs):
             self.configured.update(kwargs)
 
+        def delete(self, *_args):
+            self.configured['canvas_cleared'] = True
+
+        def create_rectangle(self, *_args, **_kwargs):
+            pass
+
+        create_oval = create_rectangle
+        create_line = create_rectangle
+        create_text = create_rectangle
+
     def test_pending_x42s_binding_renders_waiting_without_crash(self):
         from motor_control.ui.coordinated_tab import refresh_coordinated_tab
 
@@ -424,6 +435,7 @@ class X42sPendingRefreshTests(unittest.TestCase):
         for role in ("Mup1", "Mr1", "Mup2", "Mr2"):
             self.assertIn("后端待接入", roles[role]["detail"].configured["text"])
             self.assertIn("连接串口", roles[role]["progress"].configured["text"])
+            self.assertTrue(roles[role]["canvas"].configured['canvas_cleared'])
 
 
 class _Var:
@@ -725,29 +737,10 @@ class X42sGaitChainTests(unittest.TestCase):
 class X42sManualUnitsTests(unittest.TestCase):
     """双形态电机台架（2026-10-13）：直线=直驱丝杆 mm，旋转=减速电机°。"""
 
-    def test_restore_worker_mup_conversion_not_doubled(self):
-        # 2026-10-20：恢复 worker 曾在 Mup 分支把 mm→输出轴°换算做两遍
-        # （外部 ×360/lead 后 _x42s_move_conversion 内部再换算），速度被
-        # 放大 129600 倍必报"换算失败"。锁定：70mm 回移=224000 步@3200pps
-        # （1mm/s、lead 1、gear 1），不带二次换算。
-        app = _x42s_gait_app(lead_mms={"Mup1": 1.0, "Mup2": 1.0})
-        app.control_bindings = BindingSet.from_driver_id_mapping(
-            {"Mup1": 1, "Mr1": 2, "Mup2": 3, "Mr2": 4},
-            gear_ratios={"Mup1": 1.0, "Mup2": 1.0},
-            lead_mms={"Mup1": 1.0, "Mup2": 1.0})
-        app._gait_needs_recovery = True
-        app._gait_recovery_snapshot = {
-            "positions": {"Mup1": 70.0, "Mr1": 0.0, "Mup2": 0.0, "Mr2": 0.0},
-            "supports": ("A", "B"), "beta": 180.0}
-        with patch.object(desktop_app_module.threading, "Thread", _SyncThread), \
-             patch.object(desktop_app_module, "messagebox", SimpleNamespace(
-                 showwarning=lambda *a, **k: None,
-                 showinfo=lambda *a, **k: None)):
-            StepperGUI._x42s_restore_worker(app, {
-                "Mup1": -70.0, "Mr1": 0.0, "Mup2": 0.0, "Mr2": 0.0})
-        self.assertIn("X42S,1,MOVE,-224000,3200", app.commands)
-        self.assertFalse(app._gait_needs_recovery)   # 成功后清 recovery 锁
-        self.assertIsNone(app._gait_recovery_snapshot)
+    def test_mup_conversion_not_doubled(self):
+        from motor_control.x42s_units import role_move_to_pulses
+        self.assertEqual(role_move_to_pulses(
+            -70, 1, linear=True, lead_mm=1, gear_ratio=1), (-224000, 3200))
 
     def test_default_gear_for_role(self):
         # UI 草稿默认：Mup 直驱丝杆 1.0，Mr 减速电机 21.5（文档层缺省
@@ -832,7 +825,7 @@ class X42sManualUnitsTests(unittest.TestCase):
         StepperGUI._x42s_manual_action(app, "enable")
         self.assertEqual(app.captured[-1][1][0], [("Mup1", 3, 1.0)])
         # 运动类动作仍要求当前角色已绑定（弹窗在 headless 下 patch 掉）。
-        with patch.object(desktop_app_module, "messagebox",
+        with patch.object(x42s_runtime, "messagebox",
                           SimpleNamespace(showwarning=lambda *a: None)):
             StepperGUI._x42s_manual_action(app, "plus")
         self.assertEqual(len(app.captured), 4)   # 未追加
@@ -874,7 +867,7 @@ class X42sManualUnitsTests(unittest.TestCase):
             return f"OK,X42S,{t[1]},EN,{t[3]}"
         app._send_and_read = rejecting
         warnings = []
-        with patch.object(desktop_app_module, "messagebox",
+        with patch.object(x42s_runtime, "messagebox",
                           SimpleNamespace(showwarning=lambda *a: warnings.append(a))):
             StepperGUI._x42s_manual_worker(
                 app, "enable", [("Mup1", 3, 1.0), ("Mr1", 1, 21.5)], None, None)

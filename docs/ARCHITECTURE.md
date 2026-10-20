@@ -1,6 +1,6 @@
 # PC 控制端架构
 
-当前硬件（2026-10-19）：ESP32-S3 → TTL-UART → 四台 X42S。
+当前硬件（2026-10-21审计）：ESP32-S3 → TTL-UART → 四台 X42S。
 `X42sActuatorState` 的反馈经减速比/导程换算到角色单位，`AxisProfile/Runtime`
 和30轴Pico拓扑仅用于历史 STEP/DIR 维护。GUI默认不开放该控制路径；
 默认固件不初始化其 GPIO/任务，并拒绝旧运动/诊断命令。GEAR及轨道D为独立子系统，不因DM退役移除。
@@ -28,6 +28,11 @@ LAN Web API ──────┘          │                       │
 | `motor_control/axis_math.py` | 参数校验、mm/°/steps、速度/延时换算 | 持久化、运动调度 |
 | `motor_control/axis_model.py` | `AxisProfile` 与以 steps 为规范坐标的 `AxisRuntime` | Tk 控件 |
 | `motor_control/coordinated_control.py` | 四个机构逻辑角色、绑定校验、进度投影和跨端状态快照 | 串口下发、自动轨迹 |
+| `motor_control/x42s_units.py` | 唯一X42S电机轴/机构单位/脉冲换算与共享常量 | Tk、串口、方向标定策略 |
+| `motor_control/x42s_runtime.py` | 桌面X42S点动、整组校验/失败停车、ACK/到位跟踪、轮询与遥测合并 | 创建窗口、建立串口会话、几何规划 |
+| `motor_control/gait_recovery.py` | 执行前参考指纹、四轴实测到位核验 | 自动反向运动或绕杆规划 |
+| `motor_control/gait_recovery_ui.py` | 恢复说明、人工确认、二次核验及账本原子更新 | MOVE/ZERO/EN |
+| `motor_control/ui/actuator_cards.py` | 按机构坐标绘制升降/旋转卡片，失信不画有效指针 | 原始电机角冒充输出角 |
 | `motor_control/protocol.py` | 文本命令编码、typed 回复和异步事件解析 | 线程、串口设备 |
 | `motor_control/serial_session.py` | 唯一 reader、请求串行化、回复匹配、事件分流 | 业务状态、Tk |
 | `motor_control/state_store.py` | 兼容旧 JSON 的读取和原子替换 | 参数含义和 UI |
@@ -38,6 +43,7 @@ LAN Web API ──────┘          │                       │
 | `motor_control/web_contract.py` | HTTP 服务依赖的控制接口 | HTTP 实现 |
 | `motor_control/desktop_app.py` | 组合模块、生命周期和 GUI 事件协调 | HTTP 路由、协议文本解析 |
 | `web_control.py` | HTTP 路由、输入边界和静态页面 | Tk、串口协议 |
+| `web/*.js` | 通用请求、四角色监控、历史维护、页面控制四模块 | 直接串口、X42S步态写入 |
 
 ## 不变量
 
@@ -65,6 +71,11 @@ LAN Web API ──────┘          │                       │
     reached/速度/遥测可信度判断运动，不以“目标字段非空”判断忙碌。
     历史后端才使用 `host_pulse_accounting`。整机姿态和间隙仍依赖机械与支点模型，非外部测量。
     三足分阶段步态有独立预检，不以只读绑定页的自动化状态替代执行门槛。
+12. X42S手动MOVE的ACK只证明命令接受。四轴换绑、记录基准及开始步态还检查待完成
+    命令；新的可信到位实测或精确STOP确认才能清除。双升降先整组验证，再顺序下发；
+    任一失败则停止所有已尝试启动的目标，停止未确认必须提示现场急停。
+13. 恢复前站位只核验，不生成未经避让规划的逆向路径。四轴到位、参考未变、人工确认
+    且确认后再检查一次，才恢复地图账本；不把ACK当DONE，也不发送驱动器ZERO。
 
 ## 线程所有权
 
@@ -84,6 +95,15 @@ LAN Web API ──────┘          │                       │
 
 ## 离线与现场验证
 
-本机可运行纯 Python `unittest`、`compileall` 和 fake-serial 测试。最终合并前，远端现场
-还必须验证同一轴直线→旋转→直线、Web 配置后立即 MOVE、运动中切换拒绝、DONE/ABORT、
-断线、ESTOP、Pico 节点离线和轨道租约到期。
+本机运行Python/Tk完整回归、fake-serial、生产HTTP适配器及Playwright多浏览器测试。
+命令和浏览器覆盖见[网页测试说明](WEB_CONTROL.md#模块与浏览器回归)。桌面测试使用临时
+配置并禁止serial.Serial，不接电机、不刷固件；Playwright不覆盖Tk或证明实物避让安全。
+
+当前X42S现场复测：四角色ID/减速比/导程/方向、反馈单位与目标区分、一次双侧基准、
+四种动作与连续换步、单/双升降点动、点动未结束禁止换绑、停止/急停/断连、人工回位后
+核验恢复、轨道租约到期。若同坐标连续性不能确认，按实际摆放重建一次双侧基准。
+旧“直线→旋转→直线/Pico离线/30轴配置”仅属于显式历史维护回归，不是当前X42S使用步骤。
+
+本轮按迁移风险拆出执行器运行层、单位换算、恢复核验和卡片绘制，保留StepperGUI继承
+方法名及原串口所有权。`desktop_app.py`仍承担组合、旧维护、步态桥接及生命周期，并非
+已完全细分；下一轮可分别抽出历史STEP/DIR和连接生命周期，不宜与避让控制公式重写混做。

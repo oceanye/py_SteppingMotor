@@ -1,5 +1,7 @@
 """Full application regressions: sim/live modes, selecting cells and timers."""
 import unittest
+import time
+from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from scripts.gui_smoke import isolated_gui, finish_simulation, run_smoke
@@ -7,6 +9,9 @@ from motor_control.gait_map import map_label, map_pads
 from motor_control.ui import gait_twin as twin
 from motor_control.ui.gait_curve import curve_payload
 from motor_control.ui.gait_twin_window import open_twin_window
+from motor_control import BindingSet, LogicalRole
+from motor_control.actuator_model import X42sActuatorState
+from motor_control.ui.coordinated_tab import refresh_coordinated_tab
 
 
 class GaitGuiWorkflowTests(unittest.TestCase):
@@ -27,6 +32,41 @@ class GaitGuiWorkflowTests(unittest.TestCase):
 
     def test_four_actions_full_gui_smoke(self):
         run_smoke(self.app)
+
+    def test_binding_cards_use_role_feedback_and_clear_stale_missing_and_rebound_canvas(self):
+        app = self.app
+        app.control_bindings = BindingSet.from_driver_id_mapping(
+            {'Mup1':1,'Mr1':2,'Mup2':3,'Mr2':4},
+            gear_ratios={'Mup1':1,'Mup2':1}, lead_mms={'Mup1':8,'Mup2':8})
+        app._is_serial_connected = lambda: True
+        for role in LogicalRole:
+            binding = app.control_bindings.for_role(role)
+            app._x42s_states[role.value] = X42sActuatorState(role,binding.driver_id).with_telemetry(
+                now=time.monotonic(), enabled=True, reached=True, speed=None,
+                measured_position=360 if role.value.startswith('Mup') else 1935)
+        control, snapshots = app._snapshot_coordinated_control_locked()
+        refresh_coordinated_tab(app, control, snapshots)
+        roles = app.coordinated_widgets['roles']
+        self.assertEqual(roles['Mup1']['position'].cget('text'),'8.000 mm')
+        self.assertEqual(roles['Mr1']['position'].cget('text'),'90.000 deg')
+        self.assertEqual(roles['Mr1']['state'].cget('text'),'X42S 已到位')
+        canvas = roles['Mr1']['canvas']
+        self.assertTrue(canvas.find_withtag('role_position'))
+        self.assertEqual(str(app.coordinated_widgets['direction']['Mr1']['jog_plus'].cget('state')), 'normal')
+        app._x42s_states['Mr1'] = replace(app._x42s_states['Mr1'],last_update_monotonic=time.monotonic()-4)
+        control, snapshots = app._snapshot_coordinated_control_locked()
+        refresh_coordinated_tab(app,control,snapshots)
+        self.assertFalse(canvas.find_withtag('role_position'))
+        self.assertIn('未确认',roles['Mr1']['position'].cget('text'))
+        # An incomplete snapshot must not retain any old axis pose or crash refresh.
+        refresh_coordinated_tab(app,control,[])
+        self.assertEqual(roles['Mr1']['position'].cget('text'),'--')
+        self.assertFalse(canvas.find_withtag('role_position'))
+        app.control_bindings = BindingSet.empty()
+        control, snapshots = app._snapshot_coordinated_control_locked()
+        refresh_coordinated_tab(app,control,snapshots)
+        self.assertEqual(roles['Mr1']['state'].cget('text'),'未绑定')
+        self.assertFalse(canvas.find_withtag('role_position'))
 
     def test_sim_start_apply_modes_and_rotated_large_window_selection(self):
         app, view = self.app, self.view

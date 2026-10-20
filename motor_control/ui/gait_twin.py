@@ -489,9 +489,9 @@ def refresh_twin_panel(app):
     interaction_busy = bool(getattr(app, "_gait_owned", {})) or bool(
         getattr(app, "_active_control_workers", 0)) or any(
             (axis_motion_active(a) if not str(a.get("position_source", "")).startswith("x42s") else
-             (not a.get("stale") and a.get("position_trusted") and
+             (a.get("command_pending") or (not a.get("stale") and a.get("position_trusted") and
               ((a.get("x42s") or {}).get("reached") is False or
-               abs((a.get("x42s") or {}).get("speed") or 0) > .01)))
+               abs((a.get("x42s") or {}).get("speed") or 0) > .01))))
             for a in snapshot.get("axes", {}).values())
     view["interaction_busy"] = bool(interaction_busy)
     if interaction_busy:

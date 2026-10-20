@@ -169,7 +169,9 @@ class RefreshDirectionCalibrationTests(unittest.TestCase):
             "Mr1": {"binding_valid": True, "state": "IDLE"},
             "Mr2": {"binding_valid": True, "state": "MOVING"},
             "Mup1": {"binding_valid": False, "state": "IDLE"},
-            "Mup2": {"binding_valid": True, "state": "X42S_ONLINE"},
+            "Mup2": {"binding_valid": True, "state": "X42S_ONLINE",
+                     "position_trusted": True, "in_progress": False,
+                     "x42s": {"enabled": True}},
         }
         direction = {
             role: {name: _FakeWidget() for name in
@@ -193,6 +195,11 @@ class RefreshDirectionCalibrationTests(unittest.TestCase):
         # X42S 在线正常同样可点动（2026-10-15：只认 IDLE 时永远灰）
         self.assertEqual(direction["Mup2"]["jog_plus"].configured["state"],
                          "normal")
+        for fields in ({"position_trusted": False}, {"in_progress": True},
+                       {"x42s": {"enabled": False}}):
+            _refresh_direction_calibration(app, {
+                **snapshots, "Mup2": {**snapshots["Mup2"], **fields}})
+            self.assertEqual(direction["Mup2"]["jog_plus"].configured["state"], "disabled")
 
 
 try:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .actuator_cards import draw_linear as _draw_linear, draw_rotary as _draw_rotary
 import math
 import tkinter as tk
 from tkinter import ttk
@@ -489,7 +490,8 @@ def build_coordinated_tab(app, parent) -> None:
         button.pack(side="left", padx=3)
         manual_button_map[action] = button
     app.coordinated_widgets["x42s_manual_buttons"] = manual_button_map
-    ttk.Label(manual, text="步态无需驱动器归零：摆好实物后在步态页一次记录双侧基准。",
+    ttk.Label(manual, text="步态无需驱动器归零：摆好实物后一次记录双侧基准。\n"
+              "Mup1+Mup2 为顺序下发的双侧点动（非硬件同步），请先确认支撑安全。",
               foreground="#64748b").pack(anchor="w", padx=6, pady=3)
     # 默认角色（Mup1 直线）的标签/范围/按钮文案初始化。
     apply_manual_debug_units(app)
@@ -657,6 +659,12 @@ def _refresh_direction_calibration(app, by_role) -> None:
         # 只认 IDLE 时 X42S 绑定四行点动永远灰，串口连着也无法标定）。
         movable = (bool(snapshot.get("binding_valid"))
                    and snapshot.get("state") in ("IDLE", "X42S_ONLINE"))
+        if snapshot.get("state") == "X42S_ONLINE":
+            movable = (movable and snapshot.get("position_trusted") is True
+                       and not snapshot.get("in_progress")
+                       and (snapshot.get("x42s") or {}).get("enabled") is True)
+        if getattr(app, "_gait_owned", {}):
+            movable = False
         if (snapshot.get("backend") == BACKEND_STEPDIR
                 and not getattr(app, "legacy_stepdir_enabled", True)):
             movable = False
@@ -664,109 +672,10 @@ def _refresh_direction_calibration(app, by_role) -> None:
             widgets[key].configure(state="normal" if movable else "disabled")
 
 
-def _draw_linear(canvas, snapshot):
-    canvas.delete("all")
-    width, height = 92, 112
-    canvas.create_rectangle(37, 9, 55, height - 9, outline="#94a3b8", width=2)
-    position = snapshot.get("position")
-    minimum = snapshot.get("travel_min")
-    maximum = snapshot.get("travel_max")
-    valid_range = (
-        isinstance(position, (int, float))
-        and isinstance(minimum, (int, float))
-        and isinstance(maximum, (int, float))
-        and math.isfinite(float(position))
-        and math.isfinite(float(minimum))
-        and math.isfinite(float(maximum))
-        and maximum > minimum
-    )
-    if valid_range:
-        fraction = max(0.0, min(1.0, (position - minimum) / (maximum - minimum)))
-        y = height - 9 - fraction * (height - 18)
-        canvas.create_rectangle(39, y, 53, height - 11, fill="#2f80ed", outline="")
-        canvas.create_line(25, y, 67, y, fill="#1565c0", width=2)
-        canvas.create_text(46, 4, text="max", anchor="s", fill="#64748b", font=("Arial", 7))
-        canvas.create_text(46, height - 3, text="min", anchor="n", fill="#64748b", font=("Arial", 7))
-    else:
-        canvas.create_text(
-            width / 2,
-            height / 2,
-            text="无有效\n行程范围",
-            justify="center",
-            fill="#64748b",
-            font=("Microsoft YaHei", 9),
-        )
 
 
-def _draw_rotary(canvas, snapshot):
-    canvas.delete("all")
-    center_x, center_y, radius = 46, 55, 36
-    canvas.create_oval(
-        center_x - radius,
-        center_y - radius,
-        center_x + radius,
-        center_y + radius,
-        outline="#94a3b8",
-        width=2,
-    )
-    for degree in range(0, 360, 45):
-        angle = math.radians(degree - 90)
-        x1 = center_x + (radius - 5) * math.cos(angle)
-        y1 = center_y + (radius - 5) * math.sin(angle)
-        x2 = center_x + radius * math.cos(angle)
-        y2 = center_y + radius * math.sin(angle)
-        canvas.create_line(x1, y1, x2, y2, fill="#64748b")
-    position = snapshot.get("position")
-    if isinstance(position, (int, float)) and math.isfinite(float(position)):
-        angle = math.radians((float(position) % 360.0) - 90.0)
-        x = center_x + (radius - 9) * math.cos(angle)
-        y = center_y + (radius - 9) * math.sin(angle)
-        canvas.create_line(center_x, center_y, x, y, fill="#1565c0", width=3)
-        canvas.create_oval(center_x - 3, center_y - 3, center_x + 3, center_y + 3, fill="#1565c0", outline="")
-        canvas.create_text(center_x, 101, text=f"{float(position) % 360.0:.1f}°", fill="#334155", font=("Consolas", 9))
-    else:
-        canvas.create_text(center_x, center_y, text="--", fill="#64748b", font=("Consolas", 12))
 
 
-def _draw_x42s(canvas, live):
-    """X42S 卡片：状态块 + 驱动器实测角度；不画行程刻度（电机角度无行程语义）。"""
-
-    canvas.delete("all")
-    width, height = 92, 112
-    online = bool(live.get("online"))
-    fault = live.get("fault")
-    color = "#b42318" if (fault or not online) else "#16803a"
-    canvas.create_rectangle(6, 8, width - 6, 46, outline=color, width=2)
-    canvas.create_text(
-        width / 2, 19, text="X42S", font=("Consolas", 10, "bold"), fill=color
-    )
-    canvas.create_text(
-        width / 2, 36,
-        text=f"ID {live.get('driver_id', '?')}",
-        font=("Consolas", 9), fill="#334155",
-    )
-    canvas.create_text(
-        width / 2, 58, text="在线" if online else "掉线",
-        font=("Microsoft YaHei", 9), fill=color,
-    )
-    canvas.create_text(
-        width / 2, 72, text=fault or "无故障",
-        font=("Consolas", 8),
-        fill="#b42318" if fault else "#64748b",
-    )
-    measured = live.get("measured_position")
-    if measured is None:
-        canvas.create_text(
-            width / 2, 92, text="--", font=("Consolas", 12), fill="#64748b"
-        )
-    else:
-        trusted = bool(live.get("telemetry_trusted"))
-        canvas.create_text(
-            width / 2, 92, text=f"{float(measured):.0f}",
-            font=("Consolas", 12, "bold"),
-            fill="#1565c0" if trusted else "#b26a00",
-        )
-    canvas.create_text(width / 2, height - 5, text="deg", font=("Arial", 7), fill="#64748b")
 
 
 def refresh_coordinated_tab(app, control, snapshots) -> None:
@@ -775,13 +684,23 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
     by_role = {item["role"]: item for item in snapshots}
     _refresh_direction_calibration(app, by_role)
     for role in LOGICAL_ROLE_ORDER:
-        snapshot = by_role[role.value]
+        snapshot = by_role.get(role.value, {
+            "role": role.value, "state": "INVALID", "position": None,
+            "position_trusted": False, "binding_error": "本次状态缺失，位置未知"})
         widgets = app.coordinated_widgets["roles"][role.value]
         status_widget = app.coordinated_widgets["binding_status"][role.value]
         state = str(snapshot.get("state", "INVALID"))
         color = STATE_COLORS.get(state, "#b42318")
+        state_text = STATE_TEXT.get(state, state)
+        if state == "X42S_ONLINE":
+            if not snapshot.get("position_trusted"):
+                state_text, color = "X42S 反馈待确认", "#b26a00"
+            elif snapshot.get("in_progress"):
+                state_text, color = "X42S 运动中", "#1565c0"
+            else:
+                state_text = "X42S 已到位" if (snapshot.get("x42s") or {}).get("enabled") else "X42S 未使能"
         widgets["state"].configure(
-            text=STATE_TEXT.get(state, state), foreground=color
+            text=state_text, foreground=color
         )
         # A periodic live refresh must not erase validation feedback for an
         # unsaved draft in the binding editor.
@@ -795,7 +714,7 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
         unit = snapshot.get("unit") or ("mm" if role.value.startswith("Mup") else "°")
         trusted = bool(snapshot.get("position_trusted"))
         if isinstance(position, (int, float)) and math.isfinite(float(position)):
-            prefix = "" if trusted else "≈ "
+            prefix = "" if trusted else "未确认 "
             widgets["position"].configure(
                 text=f"{prefix}{float(position):.3f} {unit}",
                 foreground="#1565c0" if trusted else "#b26a00",
@@ -821,9 +740,9 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
                 temperature = live.get("temperature_c")
                 progress_parts = []
                 if error is not None:
-                    progress_parts.append(f"跟随误差 {float(error):.1f}")
+                    progress_parts.append(f"电机轴误差 {float(error):.1f}°")
                 if speed is not None:
-                    progress_parts.append(f"速度 {float(speed):.1f}")
+                    progress_parts.append(f"电机轴速度 {float(speed):.1f} rpm")
                 if temperature is not None:
                     progress_parts.append(f"{float(temperature):.0f}°C")
                 age = live.get("last_update_age_ms")
@@ -833,7 +752,6 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
                 if live.get("stale"):
                     progress += " · 数据陈旧"
                 widgets["progress"].configure(text=progress)
-                _draw_x42s(widgets["canvas"], live)
             else:
                 # 后端待接入（启动未轮询/未连接）：如实显示等待态。
                 widgets["detail"].configure(
@@ -842,6 +760,12 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
                 widgets["progress"].configure(
                     text="连接串口并轮询后显示驱动器实测"
                 )
+            # Same role units and freshness as Web; never show motor degrees
+            # in a card labelled mm or draw an old online canvas after rebind.
+            if role.value.startswith("Mup"):
+                _draw_linear(widgets["canvas"], snapshot)
+            else:
+                _draw_rotary(widgets["canvas"], snapshot)
             continue
         if binding:
             axis = binding["axis"]
@@ -855,7 +779,7 @@ def refresh_coordinated_tab(app, control, snapshots) -> None:
                 f"模式 {snapshot.get('mode')} · 软件脉冲估算 · 非实测"
             )
         else:
-            detail = "未绑定物理步进轴"
+            detail = "未绑定物理执行器"
         widgets["detail"].configure(text=detail)
 
         requested = snapshot.get("requested_steps")

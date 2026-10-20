@@ -109,8 +109,9 @@ class DesktopWebController:
         """Return a thread-safe snapshot containing JSON-compatible values."""
 
         app = self._app
+        legacy_enabled = getattr(app, "legacy_stepdir_enabled", True)
         topology_axes = [
-            stepper_axis_topology(axis) for axis in range(NUM_STEPPER_AXES)
+            stepper_axis_topology(axis) for axis in range(NUM_STEPPER_AXES if legacy_enabled else 0)
         ]
         with app.state_lock:
             connected = app._is_serial_connected()
@@ -159,7 +160,7 @@ class DesktopWebController:
                     "local_axis": topology_axes[axis]["local_axis"],
                     "pins": topology_axes[axis]["pins"],
                 }
-                for axis in range(NUM_STEPPER_AXES)
+                for axis in range(len(topology_axes))
             ]
             motors = [
                 dict(axis=axis, label=MOTOR_AXIS_LABELS[axis], **app._motor_status[axis])
@@ -231,13 +232,13 @@ class DesktopWebController:
             "motor_axes": motors,
             "track_detail": track,
             "coordinated_control": coordinated_control,
-            "legacy_stepdir_enabled": getattr(app, "legacy_stepdir_enabled", True),
+            "legacy_stepdir_enabled": legacy_enabled,
             "logical_motors": logical_motors,
             "topology": {
-                "total_axes": NUM_STEPPER_AXES,
-                "local_axes": NUM_LOCAL_STEPPER_AXES,
-                "pico_nodes": NUM_PICO_NODES,
-                "axes_per_pico": PICO_AXES_PER_NODE,
+                "total_axes": len(topology_axes),
+                "local_axes": NUM_LOCAL_STEPPER_AXES if legacy_enabled else 0,
+                "pico_nodes": NUM_PICO_NODES if legacy_enabled else 0,
+                "axes_per_pico": PICO_AXES_PER_NODE if legacy_enabled else 0,
                 "axes": topology_axes,
             },
         }
@@ -369,6 +370,8 @@ class DesktopWebController:
 
     def web_stepper_stop(self, axis: int) -> dict[str, Any]:
         app = self._app
+        if not getattr(app, "legacy_stepdir_enabled", True):
+            raise RuntimeError("历史 STEP/DIR 控制已停用；X42S 请使用桌面停止或全局急停")
         generation = app._ensure_web_control_available()
         try:
             axis = int(axis)

@@ -2,7 +2,7 @@
 
 按《REQUIREMENTS_2026-09-28_X42S_UART_ACTUATOR_BINDING》§12：遥测必须区分
 command（指令位置）/ measured（驱动器回报的实测位置）/ error（跟随误差），
-轮询起步 10–20Hz。本模块只做纯数据模型与新鲜度/可信度判定，不含串口、
+实际刷新周期约 700ms/台。本模块只做纯数据模型与新鲜度/可信度判定，不含串口、
 线程或 Tk 依赖——数据来源（X42S 后端）自里程碑 M4 起接入。
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import time
+import math
 from typing import Sequence
 
 from .coordinated_control import (
@@ -19,7 +20,7 @@ from .coordinated_control import (
     X42S_DRIVER_ID_MIN,
 )
 
-# 10–20Hz 轮询 ⇒ 两个周期（200ms）内视为新鲜；500ms 起视为失联。
+# 缓存新鲜度 1500ms、陈旧提示 3000ms；失联仍以固件 OFFLINE 为准。
 TELEMETRY_FRESH_MAX_AGE_MS = 1500
 TELEMETRY_STALE_AGE_MS = 3000
 # 2026-10-20 实机定案：四台轮转全量轮询的每台刷新周期≈700ms
@@ -75,6 +76,12 @@ class X42sActuatorState:
             raise ValueError("driver_id 必须在 1..255（0 为广播地址，禁止绑定）")
         if self.fault is not None and self.fault not in KNOWN_X42S_FAULTS:
             raise ValueError(f"未知异常标签：{self.fault}")
+        for name in ("command_position", "measured_position", "position_error",
+                     "speed", "current_a", "temperature_c", "last_update_monotonic"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool)
+                    or not isinstance(value, (int, float)) or not math.isfinite(value)):
+                raise ValueError(f"{name} 必须为有限数值或 None")
 
     @classmethod
     def offline(cls, role: LogicalRole, driver_id: int) -> "X42sActuatorState":
@@ -88,7 +95,7 @@ class X42sActuatorState:
         now: float | None = None,
         **fields: object,
     ) -> "X42sActuatorState":
-        """记录一次成功轮询：online=True 并刷新时间戳（字段不得为 None 值）。"""
+        """记录成功轮询；None 表示本轮未知，必须清除旧值而非冒充新样本。"""
 
         stamp = time.monotonic() if now is None else float(now)
         updates = dict(fields)

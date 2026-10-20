@@ -1,0 +1,12 @@
+{
+  "name": "stepping-motor-offline-browser-tests",
+  "private": true,
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:edge": "playwright test --project=edge",
+    "test:e2e:report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1"
+  }
+}

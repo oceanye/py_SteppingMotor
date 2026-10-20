@@ -51,7 +51,15 @@ class BaselineWorkflowTests(unittest.TestCase):
                 with self.subTest(role=role, fields=fields):
                     app = baseline_app()
                     original = app.gait_params
-                    app._x42s_states[role] = replace(app._x42s_states[role], **fields)
+                    if any(isinstance(v, float) and v != v for v in fields.values()):
+                        # The data model itself rejects NaN. Also force corrupt
+                        # data here to keep testing the baseline's second guard.
+                        with self.assertRaises(ValueError):
+                            replace(app._x42s_states[role], **fields)
+                        for name, value in fields.items():
+                            object.__setattr__(app._x42s_states[role], name, value)
+                    else:
+                        app._x42s_states[role] = replace(app._x42s_states[role], **fields)
                     app._x42s_preflight_state = lambda role, driver: app._x42s_states[role.value]
                     with self.assertRaises(GaitExecutorError):
                         app._gait_capture_baseline(original)

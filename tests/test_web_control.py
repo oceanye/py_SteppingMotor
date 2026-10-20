@@ -98,18 +98,35 @@ class WebControlTests(unittest.TestCase):
         page = content.decode("utf-8")
         self.assertIn("<!doctype html>", page.lower())
         self.assertIn('id="estop"', page)
-        self.assertIn("/api/status", page)
         self.assertIn('id="speedPresets"', page)
-        self.assertIn('id="sppr${a}"', page)
-        self.assertIn('id="slead${a}"', page)
-        self.assertIn("confirm_high_rate:highRate", page)
-        self.assertIn("axisConfigIsDirty(axis)", page)
         self.assertIn('id="logicalMotors"', page)
         self.assertIn("只读监控", page)
-        self.assertIn("host_pulse_accounting", page)
-        self.assertIn("refreshInFlight", page)
-        self.assertIn("typeof position==='number'", page)
-        self.assertIn("item.target_position", page)
+        self.assertIn('type="module" src="/app.js"', page)
+        self.assertIn("script-src 'self'", headers['content-security-policy'])
+
+    def test_only_bundled_assets_are_served(self):
+        for name in ('app.js', 'common.js', 'logical-motors.js', 'legacy-steppers.js', 'styles.css'):
+            status, headers, content = self.request('GET', '/' + name)
+            self.assertEqual(status, 200)
+            self.assertIn('text/css' if name.endswith('.css') else 'text/javascript', headers['content-type'])
+            self.assertEqual(headers['x-content-type-options'], 'nosniff')
+            self.assertTrue(content)
+        for path in ('/desktop_app.py', '/.coordinated_bindings.json', '/web/app.js', '/styles.css.bak'):
+            self.assertEqual(self.request('GET', path)[0], 404)
+
+    def test_origin_is_checked_before_any_command(self):
+        for origin in ('http://foreign.invalid', 'null', 'http://[bad'):
+            self.connection.request('POST', '/api/estop', body='{}', headers={
+                'Content-Type':'application/json', 'Origin':origin})
+            response = self.connection.getresponse()
+            self.assertEqual(response.status, 403)
+            response.read()
+        self.assertEqual(self.controller.calls, [])
+        self.connection.request('POST', '/api/estop', body='{}', headers={
+            'Content-Type':'application/json', 'Origin':f'http://127.0.0.1:{self.server.bound_port}'})
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 200)
+        response.read()
 
     def test_logical_binding_write_and_auto_start_routes_do_not_exist(self):
         for path in ("/api/logical-motors/bindings", "/api/coordinated/start"):

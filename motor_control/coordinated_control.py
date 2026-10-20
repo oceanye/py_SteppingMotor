@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from .axis_math import DEFAULT_LEAD_MM, MODE_LINEAR, MODE_ROTARY, coerce_lead_mm
+from .x42s_units import motor_degrees_to_role
 from .axis_model import AxisProfile, AxisRuntime
 from .topology import NUM_STEPPER_AXES, stepper_axis_topology, validate_stepper_axis
 
@@ -884,13 +885,10 @@ def build_coordinated_snapshot(
             # 角色语义单位（2026-10-12 步态链）：Mr=输出轴角度°，Mup=输出轴
             # 角度经 lead_mm 换算的机构 mm——与 stepdir 后端的角色单位一致，
             # 孪生 z_mm/终位比对无需分后端换算。原始电机轴遥测在 x42s 子字典。
-            if spec.required_mode == MODE_LINEAR:
-
-                def _to_role_units(value, _gear=gear):
-                    out = _to_output_shaft(value, _gear)
-                    return None if out is None else out * binding.lead_mm / 360.0
-            else:
-                _to_role_units = _to_output_shaft
+            def _to_role_units(value, _gear=gear):
+                return motor_degrees_to_role(
+                    value, linear=spec.required_mode == MODE_LINEAR,
+                    gear_ratio=_gear, lead_mm=binding.lead_mm)
             if not connected:
                 card_state = "DISCONNECTED"
             elif safety_state != "normal":
@@ -926,7 +924,9 @@ def build_coordinated_snapshot(
                     "target_position": _to_role_units(
                         live["command_position"], gear
                     ),
-                    "position_trusted": bool(live["telemetry_trusted"]),
+                    "position_trusted": (connected and safety_state == "normal"
+                                         and live["fault"] is None
+                                         and bool(live["telemetry_trusted"])),
                     "unit": ("mm" if spec.required_mode == MODE_LINEAR else "deg"),
                     "gear_ratio": gear,
                     "lead_mm": binding.lead_mm,
@@ -935,10 +935,13 @@ def build_coordinated_snapshot(
                     "requested_steps": None,
                     "last_update_age_ms": live["last_update_age_ms"],
                     "stale": bool(live["stale"]),
-                    "in_progress": (live["reached"] is not True
-                                    or live["speed"] is None
-                                    or not math.isfinite(live["speed"])
-                                    or abs(live["speed"]) > 0.01),
+                    # Idle firmware can omit speed; a fresh reached flag is
+                    # evidence of idle, not perpetual motion. Unknown/stale
+                    # samples remain conservative and cannot enable controls.
+                    "in_progress": (not bool(live["telemetry_trusted"])
+                                    or live["reached"] is not True
+                                    or (live["speed"] is not None
+                                        and abs(live["speed"]) > 0.01)),
                     "continuous": False,
                     "x42s": live,
                 }

@@ -424,9 +424,9 @@ def _build_run_column(app, parent) -> None:
     app.gait_widgets["reset"] = ttk.Button(
         control, text="重置流程", command=app._gait_reset_run)
     app.gait_widgets["reset"].pack(side="left", padx=3)
-    # 2026-10-20：中止/卡住后按执行前快照低速回移（仅 X42S 后端）。
+    # 中止后人工安全回位，再按执行前快照核验；不直接反向驱动电机。
     app.gait_widgets["restore_pre_run"] = ttk.Button(
-        control, text="↩ 恢复到本次开始前",
+        control, text="↩ 核验恢复站位",
         command=getattr(app, "_gait_restore_pre_run_clicked", lambda: None))
     app.gait_widgets["restore_pre_run"].pack(side="left", padx=3)
     live = ttk.Frame(live_area)

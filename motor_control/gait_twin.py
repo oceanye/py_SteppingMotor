@@ -26,6 +26,8 @@ def axis_motion_active(axis):
     Legacy pulse axes retain their original pending-target semantics.
     """
     if str(axis.get("position_source", "")).startswith("x42s"):
+        if axis.get("command_pending"):
+            return True
         # No live actuator: allow offline simulation. Physical reference edits
         # still have their own online/enabled/fresh-feedback preflight.
         if (axis.get("binding_valid") is False or axis.get("state") in (
