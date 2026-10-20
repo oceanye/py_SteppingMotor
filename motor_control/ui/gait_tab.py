@@ -302,20 +302,6 @@ def _build_params_column(app, parent) -> None:
     ttk.Button(inner, text="查看首次准备与日常运行指引",
                command=lambda: messagebox.showinfo("步态基准操作指引", BASELINE_GUIDE)).grid(
                    row=row, column=0, columnspan=3, sticky="w", padx=6, pady=4)
-    row += 1
-    # 2026-10-20：线缆缠绕计数（参考=首次基准/人工解绕，记基准不清零）。
-    app.gait_widgets["unwind_label"] = ttk.Label(
-        inner, text="线缆缠绕：Mr1 --° / Mr2 --°", foreground="#475569")
-    app.gait_widgets["unwind_label"].grid(
-        row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
-    ttk.Button(inner, text="已人工解绕（重置计数）",
-               command=getattr(app, "_gait_unwind_reset_clicked", lambda: None)
-               ).grid(row=row, column=2, sticky="w", padx=4, pady=(4, 0))
-    row += 1
-    note(inner, row,
-         "缠绕计数跟随驱动器累计角、跨步不清零（±{limit:g}° 窗口内自由走）；\n"
-         "只有人工理过线缆或驱动器断电重新上电后才点【已人工解绕】。".format(
-             limit=app.gait_params.rotation_limit_deg))
 
     inner = pages["geometry"].content
     note(inner, 0, "平面验核只使用俯视投影：边长 a = 中心到顶点距离 = 腿投影长度。"
@@ -338,10 +324,21 @@ def _build_params_column(app, parent) -> None:
     ttk.Button(
         buttons, text="放弃修改并重读", command=app._gait_reload_params_clicked
     ).pack(side="left", padx=3)
+    # 2026-10-20：基准入口与线缆缠绕计数同一行（用户要求同页；且独立
+    # 行会把小窗口（720x380）下的参数视口压到几像素——高DPI可达性
+    # 测试抓出的回归）。
+    baseline_row = ttk.Frame(parent)
+    baseline_row.grid(row=2, column=0, sticky="ew", padx=6, pady=4)
     app.gait_widgets["prepare_baseline"] = ttk.Button(
-        parent, text="确认摆放并记录双侧基准（首次/恢复）",
+        baseline_row, text="确认摆放并记录双侧基准（首次/恢复）",
         command=app._gait_reestablish_baseline)
-    app.gait_widgets["prepare_baseline"].grid(row=2, column=0, sticky="ew", padx=6, pady=4)
+    app.gait_widgets["prepare_baseline"].pack(side="left")
+    app.gait_widgets["unwind_label"] = ttk.Label(
+        baseline_row, text="  缠绕 Mr1 --°/Mr2 --°", foreground="#475569")
+    app.gait_widgets["unwind_label"].pack(side="left", padx=(8, 0))
+    ttk.Button(baseline_row, text="已人工解绕",
+               command=getattr(app, "_gait_unwind_reset_clicked", lambda: None)
+               ).pack(side="left", padx=4)
     app.gait_widgets["readiness"] = ttk.Label(parent, text="", justify="left", wraplength=280)
     app.gait_widgets["readiness"].grid(
         row=3, column=0, sticky="ew", padx=6, pady=(0, 4))
