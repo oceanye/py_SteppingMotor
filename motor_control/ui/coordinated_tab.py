@@ -248,15 +248,8 @@ def build_coordinated_tab(app, parent) -> None:
         justify="left",
     ).pack(anchor="w", padx=8, pady=5)
 
-    # 2026-10-20：绑定编辑器（含手动调试）与四电机状态并排——纵向腾出
-    # 一整块高度，减少滚动需求（用户反馈方向标定四行被挤出视口）。
-    split = ttk.Frame(parent)
-    split.grid(row=1, column=0, sticky="ew", **PAD)
-    split.columnconfigure(0, weight=3)
-    split.columnconfigure(1, weight=2)
-
-    binding_frame = ttk.LabelFrame(split, text="逻辑电机绑定（当前硬件：X42S UART）")
-    binding_frame.grid(row=0, column=0, sticky="nsew")
+    binding_frame = ttk.LabelFrame(parent, text="逻辑电机绑定（当前硬件：X42S UART）")
+    binding_frame.grid(row=1, column=0, sticky="ew", **PAD)
 
     # 后端单选：v1 stepdir（原样）或 v2 x42s_uart（schema v2 文档）。
     backend_row = ttk.Frame(binding_frame)
@@ -501,8 +494,12 @@ def build_coordinated_tab(app, parent) -> None:
     # 默认角色（Mup1 直线）的标签/范围/按钮文案初始化。
     apply_manual_debug_units(app)
 
-    cards = ttk.LabelFrame(split, text="四电机状态（位置来源按后端标注）")
-    cards.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+    # 2026-10-20（二轮）：四电机状态嵌在绑定框内右侧、顶部与 X42S 手动
+    # 调试（row=7）平齐——手动调试以下宽度不大，右挂不撑宽整页；纵向
+    # 仍省出原第三行的高度。
+    cards = ttk.LabelFrame(binding_frame, text="四电机状态（位置来源按后端标注）")
+    cards.grid(row=7, column=6, rowspan=2, sticky="nsew", padx=(8, 4))
+    binding_frame.columnconfigure(6, weight=1)
     for column in range(2):
         cards.columnconfigure(column, weight=1, uniform="role")
     for row in range(2):

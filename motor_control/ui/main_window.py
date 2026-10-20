@@ -90,10 +90,13 @@ def build_ui(app, log_dir, num_motor_axes):
     app.notebook.add(coordinated_tab, text="🧭 电机绑定与状态")
     # 2026-10-20：整页包进滚动容器——安全边界+绑定编辑器+四角色卡+
     # 方向标定四行的总高度超出小屏可用高度，底部方向标定被裁掉。
+    # bind_navigation 必须在内容构建后调用（滚轮全局路由在其中挂载；
+    # 初版漏调导致滚轮仍只认滚动条）。
     from .scrollable import ScrollableFrame
     coordinated_scroll = ScrollableFrame(coordinated_tab, width=980, height=760)
     coordinated_scroll.pack(fill="both", expand=True)
     app._build_coordinated_tab(coordinated_scroll.content)
+    coordinated_scroll.bind_navigation()
 
     stepper_tab = ttk.Frame(app.notebook)
     stepper_index = app.notebook.index("end")
