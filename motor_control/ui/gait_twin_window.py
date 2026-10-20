@@ -89,7 +89,7 @@ def refresh_twin_window(app, main):
     if not detail:
         return
     for key in ("snapshot", "last_pose", "history", "mode_var", "show_path", "start_left",
-                "start_right", "select_side", "start_busy", "curve_live", "curve_plan",
+                "start_right", "select_side", "start_busy", "interaction_busy", "curve_live", "curve_plan",
                 "curve_plan_report", "curve_plan_key", "simulation", "candidate",
                 "live_curve_reference", "live_curve_timeline", "encoder_curve", "rotate_map_var"):
         if key in main:

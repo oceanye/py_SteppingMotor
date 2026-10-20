@@ -807,6 +807,7 @@ class GaitLayoutTests(unittest.TestCase):
         self.app._gait_check_start_edit = controller._gait_check_start_edit
         self.app._gait_apply_start_pair = controller._gait_apply_start_pair
         view = self.app.gait_widgets['twin']
+        view['mode_var'].set('live')  # Explicit physical edit, not virtual origin.
         view['start_left'].set(map_label('C'))
         view['start_right'].set(map_label('A'))
         with patch('motor_control.ui.gait_twin.messagebox.askokcancel', return_value=False):
@@ -837,6 +838,7 @@ class GaitLayoutTests(unittest.TestCase):
         self.app._refresh_gait_ui = lambda: refresh_twin_panel(self.app)
         self.app.gait_field_vars['lift_mm'].set('42.5')
         view = self.app.gait_widgets['twin']
+        view['mode_var'].set('live')
         view['start_left'].set(map_label('C'))
         view['start_right'].set(map_label('A'))
         with patch('motor_control.ui.gait_twin.messagebox.askokcancel', return_value=True):

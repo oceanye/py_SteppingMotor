@@ -148,8 +148,13 @@ class RollingDisplayUITests(unittest.TestCase):
         for action, side in (("L+", "left"), ("R-", "right")):
             _gait_mode_selected(self.app, action)
             after = curve_payload(self.app, self.view)
-            for key in ("data", "current", "start", "end"):
-                self.assertEqual(after[key], before[key])
+            self.assertEqual(after["current"], before["current"])
+            self.assertEqual(after["end"]-after["start"], 90)
+            self.assertGreater(after["end"], after["current"])
+            self.assertTrue(after["forecast"])
+            self.assertGreater(after["forecast"][-1][0], after["current"])
+            # A bounded lookahead may clip old data, but must not clear it.
+            self.assertEqual(after["data"][-1], before["data"][-1])
             c = self.view["canvas"]
             lines = [i for i in c.find_withtag("candidate_ghost") if c.type(i) == "line"]
             self.assertTrue(lines)

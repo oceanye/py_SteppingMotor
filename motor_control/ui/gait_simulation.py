@@ -11,7 +11,9 @@ def _view(app):
 
 
 def _busy(app):
-    return bool(getattr(app, "_gait_owned", {})) or _view(app).get("start_busy", False)
+    view = _view(app)
+    return bool(getattr(app, "_gait_owned", {})) or bool(getattr(app, "_active_control_workers", 0)) or view.get(
+        "interaction_busy", view.get("start_busy", False))
 
 
 def _message(app, text):
@@ -47,6 +49,7 @@ def cancel_simulation(app, *, pause=False):
 
 def reset_simulation(app):
     if _busy(app):
+        _message(app, "实机正在执行；请完成或中止后再重置模拟")
         return
     from .gait_tab import stop_preview_animation
     from .gait_twin import draw_twin
@@ -114,6 +117,7 @@ def toggle_simulation(app):
     view = _view(app)
     if _busy(app):
         app.log("实机轴忙，不能启动累计模拟")
+        _message(app, "实机正在执行；请完成或中止后再启动模拟")
         return
     sim = view.get("simulation")
     if sim is None:
@@ -123,6 +127,8 @@ def toggle_simulation(app):
     try:
         if simulation_key(_params(app)) != simulation_key(sim.params):
             raise ValueError("参数已变化，请重置模拟；旧路线不能混用新参数")
+        if tuple(view[f"start_{s}"].get() for s in ("left", "right")) != tuple(map_label(n) for n in sim.origin):
+            raise ValueError("起步选择尚未应用，请先点击【应用模拟起点】；连续走步请保留原起点选择")
         if sim.active:
             if not sim.paused:
                 cancel_simulation(app, pause=True)
@@ -139,6 +145,8 @@ def toggle_simulation(app):
         _message(app, f"模拟未推进：{exc}")
         app.log(f"模拟未推进：{exc}")
         view["mode_var"].set("sim")
+        from .gait_candidate import select_candidate
+        select_candidate(app)  # Show failed clearance/route instead of an empty chart.
         draw_twin(app)
         return
     view["mode_var"].set("sim")

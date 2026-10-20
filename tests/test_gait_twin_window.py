@@ -88,6 +88,7 @@ class TwinWindowTests(unittest.TestCase):
         self.root.geometry("1024x620")
         self.root.update()
         self.view = self.app.gait_widgets["twin"]
+        self.view["mode_var"].set("live")
         self.canvas = self.view["canvas"]
         self.pose = {"phi_deg": 0, "beta_deg": 180, "route_pads": {},
                      "feet": {"left": {"center": (-1, 0), "psi_deg": 30, "z_mm": 0},
@@ -292,6 +293,7 @@ class TwinWindowTests(unittest.TestCase):
 
     def test_plan_cache_rebuilds_only_when_report_or_parameters_change(self):
         self.prepare_plan()
+        self.view.pop("curve_plan_report", None)  # Mode changes now render immediately.
         with patch.object(twin, "plan_tip_series", wraps=twin.plan_tip_series) as compute:
             twin.draw_twin(self.app)
             twin.draw_twin(self.app)

@@ -61,6 +61,7 @@ class CurveTimeline:
     def __init__(self):
         self.history = deque(maxlen=6000)
         self.measured = deque(maxlen=1800)
+        self.feedback = deque(maxlen=1800)
         self.elapsed_s = 0.0
         self.step = 0
 
@@ -71,12 +72,15 @@ class CurveTimeline:
             self.history.append((self.elapsed_s+t, values, segment))
         for t, values, segment in clip_series(list(measured), 0., reached):
             self.measured.append((self.elapsed_s+t, values, (self.step, segment)))
+        for t, values, segment in clip_series(list(reference.get("feedback", ())), 0., reached):
+            self.feedback.append((self.elapsed_s+t, values, (self.step, segment)))
         self.elapsed_s += reached
 
     def clear(self):
         """Clear display trails without rewinding the current world/clock."""
         self.history.clear()
         self.measured.clear()
+        self.feedback.clear()
 
 
 class EncoderCurveBuffer:

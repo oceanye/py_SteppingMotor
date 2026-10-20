@@ -102,7 +102,7 @@ class StepCurveUITests(unittest.TestCase):
             _gait_mode_selected(self.app, selection)
             self.assertTrue(self.view["canvas"].find_withtag("candidate_ghost"))
             self.assertEqual(self.view["candidate"]["report"].side, "left" if selection[0] == "L" else "right")
-            self.assertEqual(self.view["mode_var"].get(), "live")
+            self.assertEqual(self.view["mode_var"].get(), "sim")
             self.assertIs(self.app.gait_params, params)
         self.app._save_gait_params.assert_not_called()
         self.app._send_and_read.assert_not_called()
@@ -111,6 +111,44 @@ class StepCurveUITests(unittest.TestCase):
         _gait_mode_selected(self.app, "L+")
         self.assertNotIn("candidate", self.view)
         self.assertFalse(self.view["canvas"].find_withtag("candidate_ghost"))
+
+    def test_x42s_feedback_curves_are_modelled_and_gap_safe_not_fake_measurements(self):
+        run = self.make_live_run()
+        self.snapshot.update(source="x42s_measured", measured=True,
+                             axes={r: {"position_trusted": True, "stale": False}
+                                   for r in ("Mup1", "Mr1", "Mup2", "Mr2")})
+        twin.refresh_twin_panel(self.app)
+        self.snapshot["pose"]["phi_deg"] = 10
+        twin.refresh_twin_panel(self.app)
+        payload = curve_payload(self.app, self.view)
+        self.assertEqual(len(payload["feedback"]), 2)
+        self.assertFalse(payload["measured"])
+        self.assertIn("X42S反馈推算", payload["status"])
+        self.assertTrue(self.view["curve_canvas"].find_withtag("curve_feedback"))
+        ref = self.view["live_curve_reference"]
+        saved = list(ref["feedback"])
+        self.snapshot["axes"]["Mr1"]["stale"] = True
+        twin.refresh_twin_panel(self.app)
+        self.assertEqual(list(ref["feedback"]), saved)
+        self.snapshot["axes"]["Mr1"]["stale"] = False
+        pose = self.snapshot["pose"]
+        self.snapshot.update(pose=None, measured=False, state="stale")
+        twin.refresh_twin_panel(self.app)
+        self.assertEqual(list(ref["feedback"]), saved)
+        self.snapshot.update(pose=pose, measured=True, state="estimated")
+        pose["phi_deg"] = 20
+        twin.refresh_twin_panel(self.app)
+        self.assertNotEqual(ref["feedback"][-1][2], saved[-1][2])
+        # Next run archives feedback without connecting across a missing sample.
+        self.app._gait_run = SimpleNamespace(params=run.params, twin_report=run.twin_report,
+                                             twin_psis=(30., 30.))
+        self.snapshot["reference_key"] = id(self.app._gait_run)
+        pose["phi_deg"] = 0
+        twin.refresh_twin_panel(self.app)
+        self.assertTrue(self.view["live_curve_timeline"].feedback)
+        twin.clear_twin_history(self.app)
+        self.assertFalse(self.view["live_curve_timeline"].feedback)
+        self.assertFalse(self.view["live_curve_reference"]["feedback"])
 
     def test_candidate_after_two_simulated_steps_uses_new_stance_without_accumulating(self):
         from motor_control.ui.gait_tab import _gait_mode_selected

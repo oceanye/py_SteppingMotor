@@ -1,4 +1,6 @@
 """Cross-step sliding distance display, shared by both observation windows."""
+from collections import deque
+
 from motor_control.gait_curve import (
     CURVE_Y_MIN_MM, CURVE_Y_MAX_MM, CurveTimeline, EncoderCurveBuffer,
     clip_series, rolling_window, time_at_phi,
@@ -7,7 +9,7 @@ from motor_control.gait_curve import (
 
 def sync_live_reference(app, view):
     """Called only on the main view; never sample axes or drive a motor."""
-    from .gait_twin import plan_tip_series
+    from .gait_twin import plan_tip_series, tip_surface_distances
     encoder = view.setdefault("encoder_curve", EncoderCurveBuffer())
     run = getattr(app, "_gait_run", None)
     snapshot = view.get("snapshot", {})
@@ -38,13 +40,30 @@ def sync_live_reference(app, view):
         psis = getattr(run, "twin_psis", (30., 30.))
         series = plan_tip_series(report, run.params, psis)
         reference = {"key": key, "report": report, "series": series, "current_s": 0.0,
-                     "offset_s": timeline.elapsed_s, "segment": timeline.step}
+                     "offset_s": timeline.elapsed_s, "segment": timeline.step,
+                     "feedback": deque(maxlen=1800), "feedback_segment": 0, "feedback_valid": False}
         view["live_curve_reference"] = reference
         view.pop("candidate", None)
     pose = snapshot.get("pose")
     if pose is not None:
         reference["current_s"] = max(reference["current_s"], time_at_phi(
             report, [p[0] for p in reference["series"]], pose["phi_deg"]))
+    # Feed only trusted measured-axis snapshots, never command targets or the
+    # frozen pose. Distances are MODEL projections, not measured clearances.
+    axes = snapshot.get("axes", {})
+    feedback_valid = (pose is not None and snapshot.get("source") == "x42s_measured"
+                      and snapshot.get("measured") is True
+                      and len(axes) == 4 and all(a.get("position_trusted") and not a.get("stale")
+                                                for a in axes.values())
+                      and snapshot.get("state") in ("estimated", "waiting"))
+    if feedback_valid:
+        point = (reference["current_s"], tuple(tip_surface_distances(pose, run.params)),
+                 reference["feedback_segment"])
+        if not reference["feedback"] or reference["feedback"][-1] != point:
+            reference["feedback"].append(point)
+    elif reference["feedback_valid"]:
+        reference["feedback_segment"] += 1
+    reference["feedback_valid"] = feedback_valid
 
 
 def curve_payload(app, view):
@@ -53,7 +72,7 @@ def curve_payload(app, view):
     mode = _mode(app, view)
     params = _view_params(app, view, mode)
     candidate = current_candidate(app, view)
-    data, measured, forecast, grey = [], [], [], False
+    data, measured, feedback, forecast, grey = [], [], [], [], False
     current, clock, status = 0., "累计S4模型时间 (s)", "等待选择动作或开始模拟"
     if mode == "plan":
         report = getattr(app, "_gait_last_report", None)
@@ -76,6 +95,13 @@ def curve_payload(app, view):
             data = list(sim.curve)
             current = getattr(sim, "curve_time_s", data[-1][0] if data else 0.)
             status = "模拟跨步滑窗 · 非实测"
+            if sim.active:
+                key = (sim.params, sim.step_psis)
+                if view.get("curve_plan_report") is not sim.report or view.get("curve_plan_key") != key:
+                    view["curve_plan"] = plan_tip_series(sim.report, sim.params, sim.step_psis)
+                    view.update(curve_plan_report=sim.report, curve_plan_key=key)
+                forecast = [(sim.curve_step_start_s+t, tuple(v), "plan") for t, v in view["curve_plan"]]
+                status += " · 灰色=当前步计划"
     else:
         reference = view.get("live_curve_reference")
         grey, status = True, "灰色=计划参考滑窗 · 不代表间隙实测"
@@ -87,6 +113,10 @@ def curve_payload(app, view):
             data = list(timeline.history) + [(offset+t, v, seg) for t, v, seg in points]
             current = offset + reference["current_s"]
             measured = list(timeline.measured)
+            feedback = list(timeline.feedback) + [(offset+t, v, (segment, seg))
+                                                 for t, v, seg in reference.get("feedback", ())]
+            if feedback:
+                status = "灰色=计划 · 彩色=X42S反馈推算（非间隙实测）"
             encoder = view.get("encoder_curve")
             if encoder and encoder.step_key == reference["key"]:
                 measured.extend((offset+t, v, (segment, seg)) for t, v, seg in encoder.samples)
@@ -104,8 +134,12 @@ def curve_payload(app, view):
         # history and never a new clock origin or an executed sample.
         forecast = [(current+t, tuple(v), "candidate") for t, v in view["curve_plan"]]
         status += " · 候选参考（未执行）"
-    start, end = rolling_window(current)
+    # Reserve bounded lookahead for a candidate/current step. Otherwise after
+    # t>90s the cursor is at the right edge and every future candidate vanishes.
+    ahead = min(30., max(0., forecast[-1][0]-current)) if forecast else 0.
+    start, end = rolling_window(current+ahead)
     return dict(data=clip_series(data, start, end), measured=clip_series(measured, start, end),
+                feedback=clip_series(feedback, start, end),
                 forecast=clip_series(forecast, start, end),
                 current=current, start=start, end=end, grey=grey, clock=clock,
                 status=status, delta=params.geometry.safety_margin_mm)
@@ -133,7 +167,8 @@ def draw_curve(app, view):
     for slot in range(6):
         col, row = slot % 3, slot // 3
         x, y = 8+col*(width-16)/3, 12+row*17
-        color = "#9ca3af" if payload["grey"] else CURVE_COLORS[row][col]
+        color = ("#9ca3af" if payload["grey"] and not (payload["feedback"] or payload["measured"])
+                 else CURVE_COLORS[row][col])
         canvas.create_line(x, y, x+10, y, fill=color, width=2, tags="curve_legend")
         canvas.create_text(x+13, y, anchor="w", text=f"{'左' if row == 0 else '右'}{col+1}",
                            fill=color, font=("Microsoft YaHei", 8), tags="curve_legend")
@@ -143,21 +178,23 @@ def draw_curve(app, view):
         canvas.create_line(left, py(payload["delta"]), right, py(payload["delta"]),
                            fill="#f59e0b", dash=(2, 3), tags="curve_delta")
 
-    def lines(data, *, grey, measured=False):
+    def lines(data, *, grey, measured=False, feedback=False):
         for segment in _curve_segments(data, payload["start"]):
             for slot in range(6):
                 points = [c for t, vals, _ in segment for c in (px(t), py(vals[slot]))]
                 tag = f"curve_{'left' if slot < 3 else 'right'}_{slot%3}"
                 canvas.create_line(*points, fill="#b4b4b4" if grey else CURVE_COLORS[slot//3][slot%3],
                                    width=1.5, dash=(4, 3) if grey else (),
-                                   tags=(tag, "curve_measured" if measured else "curve_reference" if grey else "curve_model"))
+                                   tags=(tag, "curve_feedback" if feedback else "curve_measured" if measured
+                                         else "curve_reference" if grey else "curve_model"))
             points = [c for t, vals, _ in segment for c in (px(t), py(min(vals)))]
             canvas.create_line(*points, fill="#737373" if grey else "#111827", width=2,
                                dash=(4, 3) if grey else (), tags="curve_min")
     lines(payload["data"], grey=payload["grey"])
     lines(payload["forecast"], grey=True)
     lines(payload["measured"], grey=False, measured=True)
-    values = [v for _, vals, _ in payload["data"]+payload["measured"]+payload["forecast"] for v in vals]
+    lines(payload["feedback"], grey=False, feedback=True)
+    values = [v for _, vals, _ in payload["data"]+payload["measured"]+payload["feedback"]+payload["forecast"] for v in vals]
     if values:
         best = min(values)
         canvas.create_text(right-4, top-4, anchor="se", font=("Microsoft YaHei", 8, "bold"),

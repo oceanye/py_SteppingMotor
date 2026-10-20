@@ -162,7 +162,8 @@ def plan_tip_series(report, params, psis=(30.0, 30.0)):
 def sync_twin_start_fields(app):
     view = app.gait_widgets.get("twin")
     if view:
-        for side, name in zip(("left", "right"), app.gait_params.initial_supports):
+        sim = view.get("simulation") if _mode(app, view) == "sim" else None
+        for side, name in zip(("left", "right"), sim.origin if sim else app.gait_params.initial_supports):
             view[f"start_{side}"].set(map_label(name))
 
 
@@ -187,6 +188,8 @@ def clear_twin_history(app):
     reference = view.get("live_curve_reference")
     if reference is not None:
         reference["retain_from_s"] = reference["current_s"]
+        if reference.get("feedback") is not None:
+            reference["feedback"].clear()
     if view.get("encoder_curve"):
         view["encoder_curve"].samples.clear()
     _draw(app, view)
@@ -197,8 +200,15 @@ def apply_twin_start(app):
     from motor_control.state_store import StateStoreError
     from motor_control.ui.gait_tab import collect_gait_params, load_gait_fields, stop_preview_animation
     view = app.gait_widgets["twin"]
+    if _mode(app, view) != "live":
+        from .gait_simulation import reset_simulation
+        if reset_simulation(app) is not None:
+            view["select_side"].set("")
+        return
     names = {map_label(n): n for n in map_pads()}
     try:
+        if start_edit_busy(app, view):
+            raise GaitExecutorError("实机尚未确认静止，不能修改实机起步基准；纯模拟请切换到模拟组")
         left, right = (names[view[f"start_{s}"].get()] for s in ("left", "right"))
         beta, _ = start_pair_reference((left, right))
         with app.state_lock:
@@ -208,8 +218,8 @@ def apply_twin_start(app):
                 "确认起步位置（不移动电机）",
                 f"左足：{map_label(left)}；右足：{map_label(right)}；横梁 β₀={beta:g}°。\n"
                 "请先人工摆到选定两格，三爪均踩低节点，所有轴静止。\n"
-                "应用后清除旧轨迹、旧旋转零位与标定确认；不会改变电机脉冲坐标。\n"
-                "随后须重新记两侧旋转零位并确认标定。"):
+                "应用后清除旧轨迹、旧旋转基准与标定确认；不会改变驱动器坐标。\n"
+                "随后点击【确认摆放并记录双侧基准】一次即可；无需驱动器归零。"):
             return
         app._gait_apply_start_pair(left, right, params=params)  # Rechecks idle after the dialog.
     except (ValueError, KeyError, GaitExecutorError, StateStoreError) as exc:
@@ -225,7 +235,7 @@ def apply_twin_start(app):
 def _map_click(app, event, view=None):
     view = view if view is not None else app.gait_widgets["twin"]
     side = view["select_side"].get()
-    if side not in ("left", "right") or view.get("start_busy"):
+    if side not in ("left", "right") or start_edit_busy(app, view):
         return
     project = view.get("project")
     if project is None:
@@ -235,7 +245,72 @@ def _map_click(app, event, view=None):
     if math.dist(project(pads[name]), (event.x, event.y)) > view["map_scale"] / math.sqrt(3):
         return
     view[f"start_{side}"].set(map_label(name))
+    start_selection_changed(app)
+
+
+def start_edit_busy(app, view):
+    """Virtual selections never change the hardware world reference."""
+    if _mode(app, view) == "live":
+        return (bool(getattr(app, "_gait_owned", {})) or bool(getattr(app, "_active_control_workers", 0))
+                or view.get("start_busy", False))
+    from .gait_simulation import _busy
+    sim = view.get("simulation")
+    return _busy(app) or bool(sim and sim.active)
+
+
+def start_selection_changed(app):
+    view = app.gait_widgets["twin"]
+    view.pop("candidate", None)
+    if _mode(app, view) != "live":
+        app.gait_report_var.set("起步选择待应用：点击【应用模拟起点】（重置虚拟站位，不改实机基准）")
     draw_twin(app)
+
+
+def sync_twin_mode(app):
+    """One variable drives operation group, map, curves and both windows."""
+    view = app.gait_widgets.get("twin")
+    if not view:
+        return
+    from .gait_simulation import _busy, cancel_simulation
+    mode = view["mode_var"].get()
+    if _busy(app) and mode != "live":
+        view["mode_var"].set("live")
+        mode = "live"
+    old = view.get("selection_mode", "sim")
+    new = "live" if mode == "live" else "sim"
+    if old != new:
+        view.setdefault("start_drafts", {})[old] = tuple(view[f"start_{s}"].get() for s in ("left", "right"))
+        names = view["start_drafts"].get(new) or tuple(map_label(n) for n in app.gait_params.initial_supports)
+        for side, name in zip(("left", "right"), names):
+            view[f"start_{side}"].set(name)
+        view["select_side"].set("")
+        view.pop("candidate", None)
+    view["selection_mode"] = new
+    if mode != "sim":
+        cancel_simulation(app, pause=True)
+    draw_twin(app)
+
+
+def _update_controls(app, view):
+    from .gait_simulation import _busy
+    busy = _busy(app)
+    sim = view.get("simulation")
+    active = bool(sim and sim.active)
+    for choice in app.gait_widgets.get("action_choices", ()):
+        choice.configure(state="disabled" if busy or active else "normal")
+    for control in (*view.get("mode_controls", ()), *app.gait_widgets.get("operation_controls", ())):
+        control.configure(state="disabled" if busy else "normal")
+    for key in ("sim_btn", "sim_reset", "sim_cancel"):
+        control = app.gait_widgets.get(key)
+        if control is not None:
+            control.configure(state="disabled" if busy or (key == "sim_cancel" and not active) else "normal")
+    locked = start_edit_busy(app, view)
+    for control, idle_state in view.get("start_controls", ()):
+        control.configure(state="disabled" if locked else idle_state)
+    live = _mode(app, view) == "live"
+    view["apply_button"].configure(text="应用实机起步位置" if live else "应用模拟起点")
+    view["start_frame"].configure(text="实机起步两格（需人工摆放并重记基准）" if live else
+                                "模拟起步两格（仅虚拟位置，不改实机基准）")
 
 
 def build_twin_panel(app, parent):
@@ -263,7 +338,7 @@ def build_twin_panel(app, parent):
     table = ttk.Frame(panel)
     table.grid(row=8, column=0, sticky="ew", padx=6, pady=3)
     table.columnconfigure((0, 1, 2), weight=1)
-    for col, text in enumerate(("实机电机 / 轴", "实机估算坐标", "实机指令目标")):
+    for col, text in enumerate(("实机电机 / 轴", "实机反馈坐标", "实机指令目标")):
         ttk.Label(table, text=text, foreground="#64748b").grid(row=0, column=col, sticky="w")
     rows = {}
     for row, role in enumerate(ROLES, 1):
@@ -282,7 +357,7 @@ def build_twin_panel(app, parent):
                        "XY 为中心距=1的估算；Z 为本步位移，非接触检测。\n"
                        "轨迹为足中心+三爪端；隐藏更早路径、重复静止线及落脚编号。\n"
                        "执行中显示虚线预计落点；真机灰线=跨步计划参考（非实测）。\n"
-                       "X42S 轴位来自驱动器反馈；地图及间隙由模型推算，不是外部测距。\n"
+                       "X42S彩线=驱动器轴位反馈的模型推算；地图及间隙不是外部测距。\n"
                        "点选四动作即看候选；模拟下一步才演示完整阶段并累计站位/路径。\n"
                        "模拟有独立账本；轴表始终显示实机，不随模拟变化。\n"
                        "重置模拟才回起点。四个【开始…移】按钮是真机入口。",
@@ -295,7 +370,7 @@ def build_twin_panel(app, parent):
             "select_side": tk.StringVar(value=""),
             "start_left": tk.StringVar(), "start_right": tk.StringVar(),
             "title": title, "plan_slot": plan_slot,
-            "mode_var": tk.StringVar(value="live"),
+            "mode_var": app.gait_op_mode_var,
             "mode_controls": [],
             "curve_live": deque(maxlen=CURVE_MAX_POINTS),
             "curve_plan": [], "curve_seg": 0, "curve_last_t": None}
@@ -341,6 +416,7 @@ def build_twin_panel(app, parent):
     chart_hint.grid(row=4, column=0, sticky="ew", padx=6)
 
     start = ttk.LabelFrame(panel, text="起步两格（仅设置，不移动电机）")
+    view["start_frame"] = start
     start.grid(row=5, column=0, sticky="ew", padx=6, pady=3)
     start.columnconfigure(1, weight=1)
     options = tuple(map_label(n) for n in map_pads())
@@ -351,7 +427,7 @@ def build_twin_panel(app, parent):
         choice = ttk.Combobox(start, textvariable=view[f"start_{side}"], values=options,
                               state="readonly", width=12)
         choice.grid(row=row, column=1, sticky="ew", padx=3, pady=2)
-        choice.bind("<<ComboboxSelected>>", lambda _e: _draw(app, view))
+        choice.bind("<<ComboboxSelected>>", lambda _e: start_selection_changed(app))
         view["start_controls"].extend(((radio, "normal"), (choice, "readonly")))
     browse = ttk.Radiobutton(start, text="仅浏览", variable=view["select_side"], value="")
     browse.grid(row=2, column=0)
@@ -408,18 +484,22 @@ def refresh_twin_panel(app):
         axis_motion_active(a)
         for a in snapshot.get("axes", {}).values())
     view["start_busy"] = busy
-    if busy:
+    # Unknown/stale feedback blocks physical reference editing, but is not
+    # evidence of an executing command and must not kill offline simulation.
+    interaction_busy = bool(getattr(app, "_gait_owned", {})) or bool(
+        getattr(app, "_active_control_workers", 0)) or any(
+            (axis_motion_active(a) if not str(a.get("position_source", "")).startswith("x42s") else
+             (not a.get("stale") and a.get("position_trusted") and
+              ((a.get("x42s") or {}).get("reached") is False or
+               abs((a.get("x42s") or {}).get("speed") or 0) > .01)))
+            for a in snapshot.get("axes", {}).values())
+    view["interaction_busy"] = bool(interaction_busy)
+    if interaction_busy:
         from .gait_simulation import cancel_simulation
         cancel_simulation(app)
-        view["mode_var"].set("live")
+        if view["mode_var"].get() != "live":
+            view["mode_var"].set("live")
         view.pop("candidate", None)
-    sim = view.get("simulation")
-    for choice in app.gait_widgets.get("action_choices", ()):
-        choice.configure(state="disabled" if busy or (sim and sim.active) else "normal")
-    for control in view.get("mode_controls", ()):
-        control.configure(state="disabled" if busy else "normal")
-    for control, idle_state in view["start_controls"]:
-        control.configure(state="disabled" if busy else idle_state)
     healthy = snapshot.get("state") in ("estimated", "waiting")
     route = snapshot.get("pose", {}).get("route") if snapshot.get("pose") else None
     view["status"].configure(text="实机状态：" + snapshot["message"] + (f"\n{route}" if route else ""),
@@ -514,7 +594,7 @@ def twin_projection(width, height, xmin, xmax, ymin, ymax,
 
 
 def _mode(app, view):
-    if getattr(app, "_gait_owned", {}) or view.get("start_busy"):
+    if getattr(app, "_gait_owned", {}) or view.get("interaction_busy", False):
         return "live"
     var = view.get("mode_var")
     try:
@@ -525,6 +605,7 @@ def _mode(app, view):
 
 def _draw(app, view):
     """Both windows render one snapshot/history; no second sampler or worker."""
+    _update_controls(app, view)
     _draw_map(app, view)
     from motor_control.ui.gait_twin_window import refresh_twin_window
     refresh_twin_window(app, view)
@@ -588,7 +669,7 @@ def _render_map(app, view):
     view["project"], view["map_scale"] = project, scale*zoom
     _update_title(app, view, mode, snapshot, live)
     selected = {view[f"start_{side}"].get(): side for side in ("left", "right")}
-    applied = dict(zip(("left", "right"), app.gait_params.initial_supports))
+    applied = dict(zip(("left", "right"), sim.origin if sim else app.gait_params.initial_supports))
 
     background_key = (width, height, zoom, pan_x, pan_y, rotation_deg, tuple(route_pads),
                       tuple(selected.items()), tuple(applied.items()))

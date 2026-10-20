@@ -1075,6 +1075,15 @@ class StepperGUI:
         axis_book.select(self.stepper_axis_tabs[selected_axis])
 
     def _refresh_coordinated_ui(self, *, reschedule=True):
+        try:
+            self._refresh_coordinated_ui_once()
+        finally:
+            # A display callback error is logged by Tk, but must not silently
+            # kill all future status/map refreshes (including stop controls).
+            if reschedule and not self._closing and getattr(self, "coordinated_widgets", None):
+                self._coordinated_refresh_after = self.root.after(200, self._refresh_coordinated_ui)
+
+    def _refresh_coordinated_ui_once(self):
         if self._closing or not getattr(self, "coordinated_widgets", None):
             return
         with self.state_lock:
@@ -1094,10 +1103,6 @@ class StepperGUI:
         if self._binding_editor_dirty:
             self._show_binding_draft_validation()
         self._refresh_gait_ui()
-        if reschedule and not self._closing:
-            self._coordinated_refresh_after = self.root.after(
-                200, self._refresh_coordinated_ui
-            )
 
     # ═════════════ 三足轮换步态：参数 / 标定 / 分阶段执行 ═════════════
     def _load_gait_params(self):
@@ -1227,7 +1232,7 @@ class StepperGUI:
             self.gait_params if params is None else params, initial_pad_pair=pair,
             initial_placement=placement, beam_reference_deg=beta))
         self.log(f"✓ 起步位置已设置：左足 {left}，右足 {right}，β₀={beta:g}°；"
-                 "未移动电机，须重新记两侧零位并确认标定")
+                 "未移动电机，请确认摆放并记录双侧基准一次；无需驱动器归零")
 
     @logged_action
     def _gait_capture_baseline(self, params):

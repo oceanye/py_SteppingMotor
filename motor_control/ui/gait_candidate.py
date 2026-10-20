@@ -11,7 +11,8 @@ def stance_key(app, source):
     view = app.gait_widgets["twin"]
     sim = view.get("simulation")
     if source == "sim" and sim is not None:
-        return (id(sim), sim.supports, sim.segment)
+        return (id(sim), sim.supports, sim.segment,
+                tuple(view[f"start_{s}"].get() for s in ("left", "right")))
     return (getattr(app, "_gait_supports", app.gait_params.initial_supports),
             getattr(app, "_gait_beta_deg", app.gait_params.initial_beam_deg),
             getattr(app, "_gait_world_epoch", 0),
@@ -23,7 +24,8 @@ def select_candidate(app):
     from .gait_twin import _mode, draw_twin
     view = app.gait_widgets["twin"]
     sim = view.get("simulation")
-    if getattr(app, "_gait_owned", {}) or view.get("start_busy") or (sim and sim.active):
+    from .gait_simulation import _busy
+    if _busy(app) or (sim and sim.active):
         return
     source = _mode(app, view)
     if source == "plan":  # Compatibility-only old preview state, not a GUI mode.
@@ -43,6 +45,9 @@ def select_candidate(app):
             else:
                 if simulation_key(params) != simulation_key(sim.params):
                     raise ValueError("参数已变化，请重置模拟")
+                from motor_control.gait_map import map_label
+                if tuple(view[f"start_{s}"].get() for s in ("left", "right")) != tuple(map_label(n) for n in sim.origin):
+                    raise ValueError("起步选择尚未应用，请点击【应用模拟起点】")
                 basis = sim
             report, psis = basis.preview(side, arc), basis.psis
         else:
@@ -61,14 +66,16 @@ def select_candidate(app):
         app.gait_report_var.set("虚线落点候选（未移动） · " + report.message)
     except (ValueError, KeyError, tk.TclError) as exc:
         app.gait_report_var.set(f"候选未生成：{exc}")
+        app.log(f"候选未生成：{exc}")
     draw_twin(app)
 
 
 def current_candidate(app, view):
     from .gait_twin import _mode
+    from .gait_simulation import _busy
     candidate = view.get("candidate")
     sim = view.get("simulation")
-    if (not candidate or getattr(app, "_gait_owned", {}) or view.get("start_busy")
+    if (not candidate or _busy(app)
             or (sim and sim.active) or candidate["source"] != _mode(app, view)
             or candidate["stance"] != stance_key(app, candidate["source"])):
         return None
@@ -91,6 +98,8 @@ def draw_candidate(app, view):
     if candidate is None or "project" not in view:
         return
     report, params = candidate["report"], candidate["params"]
+    if not report.samples:
+        return
     sample = report.samples[-1]
     slot = 0 if report.side == "left" else 1
     psi = sample.psi_deg + candidate["psis"][slot] - 30

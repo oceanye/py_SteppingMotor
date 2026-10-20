@@ -135,7 +135,8 @@ def _gait_mode_selected(app, value: str) -> None:
 
     view = app.gait_widgets.get("twin", {})
     sim = view.get("simulation")
-    if getattr(app, "_gait_owned", {}) or view.get("start_busy") or (sim and sim.active):
+    from .gait_simulation import _busy
+    if _busy(app) or (sim and sim.active):
         app.gait_mode_var.set(("L" if app.gait_side_var.get() == "left" else "R")
                              + ("+" if float(app.gait_arc_var.get()) > 0 else "-"))
         return
@@ -180,7 +181,7 @@ def build_gait_tab(app, parent) -> None:
         warning,
         text=(
             "旋转联动只按角度计算；中心距和六边形尺寸不改变电机转角。实机按 S0–S7 逐阶段确认，"
-            "旋转轴需支持 SYNC 的同一 ESP32。两模态按当前站位自动判断，腿—高杆净间隙不合格禁止执行；"
+            "X42S 通过同一 ESP32 协调执行。两模态按当前站位自动判断，腿—高杆净间隙不合格禁止执行；"
             "本机构采用190 mm投影边长的自动避让。接触和支撑仍需现场确认。"
         ),
         foreground="#334155", wraplength=680,
@@ -345,14 +346,19 @@ def _build_run_column(app, parent) -> None:
     ops = ttk.Frame(parent)
     ops.grid(row=0, column=0, sticky="ew", padx=4, pady=(0, 2))
     app.gait_op_mode_var = tk.StringVar(value="sim")
+    app.gait_widgets["operation_controls"] = []
     for value, text in (("sim", "🟣 模拟"), ("live", "🔴 S0–S7 分阶段执行")):
-        ttk.Radiobutton(ops, text=text, value=value,
-                        variable=app.gait_op_mode_var).pack(side="left", padx=3)
+        control = ttk.Radiobutton(ops, text=text, value=value,
+                                 variable=app.gait_op_mode_var)
+        control.pack(side="left", padx=3)
+        app.gait_widgets["operation_controls"].append(control)
     sim_area = ttk.Frame(parent)
     live_area = ttk.Frame(parent)
 
     def _select_operation_group(*_args):
-        show_sim = app.gait_op_mode_var.get() == "sim"
+        from .gait_twin import sync_twin_mode
+        sync_twin_mode(app)
+        show_sim = app.gait_op_mode_var.get() != "live"
         (sim_area if show_sim else live_area).grid(row=1, column=0, sticky="ew", padx=4)
         (live_area if show_sim else sim_area).grid_remove()
     # var 写入即切组：radiobutton 点击与测试 var.set 走同一条路。
@@ -382,10 +388,10 @@ def _build_run_column(app, parent) -> None:
     app.gait_widgets["sim_btn"] = ttk.Button(
         sim_buttons, text="▶ 模拟下一步", command=lambda: toggle_simulation(app))
     app.gait_widgets["sim_btn"].pack(side="left", padx=3)
-    ttk.Button(sim_buttons, text="取消本步",
-               command=lambda: discard_simulation_step(app)).pack(side="left", padx=3)
-    ttk.Button(sim_buttons, text="重置模拟",
-               command=lambda: reset_simulation(app)).pack(side="left", padx=3)
+    for key, text, command in (("sim_cancel", "取消本步", discard_simulation_step),
+                               ("sim_reset", "重置模拟", reset_simulation)):
+        app.gait_widgets[key] = ttk.Button(sim_buttons, text=text, command=lambda c=command: c(app))
+        app.gait_widgets[key].pack(side="left", padx=3)
     app.gait_widgets["sim_status"] = ttk.Label(
         sim_area, text="曲线跨步滑动；地图仅显示上步淡色、当前深色。清路径不重置站位。",
         wraplength=260, foreground="#7c3aed", justify="left")
