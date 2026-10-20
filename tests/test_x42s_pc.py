@@ -349,9 +349,9 @@ class SnapshotMergeTests(unittest.TestCase):
         faulted = {"Mr1": self._live_state(fault="over_temp")}
         _, motors = _x42s_snapshot(self.fixture, self.bindings, faulted)
         self.assertEqual(motors["Mr1"]["state"], "X42S_FAULT")
-        stale = {"Mr1": self._live_state()}  # now=1.7 ⇒ age=800ms > 500
+        stale = {"Mr1": self._live_state()}  # now=4.2 ⇒ age≈3.3s > 3000（2026-10-20 阈值放宽）
         _, motors = _x42s_snapshot(self.fixture, self.bindings, stale,
-                                   now=1.7)
+                                   now=4.2)
         self.assertEqual(motors["Mr1"]["state"], "X42S_STALE")
         self.assertFalse(motors["Mr1"]["position_trusted"])
         live = {"Mr1": self._live_state()}

@@ -20,8 +20,13 @@ from .coordinated_control import (
 )
 
 # 10–20Hz 轮询 ⇒ 两个周期（200ms）内视为新鲜；500ms 起视为失联。
-TELEMETRY_FRESH_MAX_AGE_MS = 200
-TELEMETRY_STALE_AGE_MS = 500
+TELEMETRY_FRESH_MAX_AGE_MS = 1500
+TELEMETRY_STALE_AGE_MS = 3000
+# 2026-10-20 实机定案：四台轮转全量轮询的每台刷新周期≈700ms
+# （25ms tick × 4 台 × 7 帧事务），运动中挂起探测≈300ms——旧值
+# 200/500ms 意味着常态遥测永远"不新鲜"：孪生态势图恒显示"已冻结
+# （断连/失信）"，姿态/柱状图不画（分阶段执行画面全静止的根因）。
+# 掉线检测由固件层 OFFLINE 判定承担，age 阈值只管缓存新鲜度。
 
 # 驱动器可上报的异常标签（§9 安全集；具体与 X42S 状态字的映射待手册核对）。
 KNOWN_X42S_FAULTS: tuple[str, ...] = (

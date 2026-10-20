@@ -33,9 +33,9 @@ class X42sRuntimeTests(unittest.TestCase):
 
     def test_firmware_sample_age_is_not_reset_by_receipt(self):
         app = _x42s_gait_app()
-        app._apply_x42s_reply(LogicalRole.MR1, 2, parse_line(status(age=1500)))
+        app._apply_x42s_reply(LogicalRole.MR1, 2, parse_line(status(age=2000)))
         state = app._x42s_states["Mr1"]
-        self.assertGreaterEqual(state.age_ms(), 1500)
+        self.assertGreaterEqual(state.age_ms(), 2000)
         self.assertFalse(state.telemetry_trusted)
 
     def test_invalid_fields_clear_previous_valid_values(self):
@@ -86,7 +86,7 @@ class X42sRuntimeTests(unittest.TestCase):
                     self.assertEqual(app._gait_wait_terminal(102, 0.1), "ABORTED")
 
     def test_stale_or_unknown_position_cannot_complete_segment(self):
-        for kwargs in ({"age": 1000}, {"mask": 0}):
+        for kwargs in ({"age": 2000}, {"mask": 0}):
             with self.subTest(**kwargs):
                 app = _x42s_gait_app()
                 app._send_and_read = lambda *_a, **_k: status(**kwargs)
@@ -95,10 +95,12 @@ class X42sRuntimeTests(unittest.TestCase):
 
     def test_staggered_background_samples_are_refreshed_before_start(self):
         app = _x42s_gait_app()
-        # 四台按 2Hz 轮询时，最早一台已经超过 200ms；不能要求碰巧同时新鲜。
+        # 2026-10-20 阈值放宽后（fresh=1500/stale=3000，四台轮询周期
+        # ≈700ms/台），错峰样本须整体过期（>1.5s）才触发开始前逐台刷新；
+        # 轮询节奏内的正常错峰（0.6s 级）本来就全程新鲜。
         for i, (role, state) in enumerate(app._x42s_states.items()):
             app._x42s_states[role] = replace(
-                state, last_update_monotonic=time.monotonic() - (0.6 - i * 0.125))
+                state, last_update_monotonic=time.monotonic() - (2.6 - i * 0.2))
         run, _ = app._gait_begin_run("left", arc_deg=-60)
         self.assertIsNotNone(run)
         self.assertEqual([c for c in app.commands if c.startswith("X42S,S,")],
@@ -109,7 +111,7 @@ class X42sRuntimeTests(unittest.TestCase):
         app = _x42s_gait_app()
         state = app._x42s_states["Mr1"]
         app._x42s_states["Mr1"] = replace(
-            state, last_update_monotonic=time.monotonic() - 1)
+            state, last_update_monotonic=time.monotonic() - 2)
         app._send_and_read = lambda *_a, **_k: ""
         with self.assertRaises(GaitExecutorError):
             app._gait_begin_run("left", arc_deg=-60)
@@ -122,7 +124,7 @@ class X42sRuntimeTests(unittest.TestCase):
         app.state_store = SimpleNamespace(save_gait_params=lambda _doc: None)
         state = app._x42s_states["Mr1"]
         app._x42s_states["Mr1"] = replace(
-            state, last_update_monotonic=time.monotonic() - 1)
+            state, last_update_monotonic=time.monotonic() - 2)
         self.assertEqual(app._gait_record_role_zero("Mr1"), 0)
         self.assertEqual(app.commands, ["X42S,S,2"])
 
