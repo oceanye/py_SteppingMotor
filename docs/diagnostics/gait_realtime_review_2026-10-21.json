@@ -1,0 +1,175 @@
+{
+  "commit": "3c95f9d",
+  "scope": "Offline review; no serial IO or site config writes. Geometry uses shipped 190 mm defaults and actual GUI A/B starting routes. Injection examples are not measured hardware logs.",
+  "playwright": {
+    "flaky": 0,
+    "skipped": 0,
+    "coverage": "Web only; production HTTP adapter with fake hardware",
+    "passed": 120
+  },
+  "previous_python_full": {
+    "duration_s": 365.285,
+    "passed": 647
+  },
+  "current_focused_regression": {
+    "duration_s": 120.155,
+    "passed": 42
+  },
+  "terminal_checks": [
+    {
+      "case": "pre_move_sample",
+      "send": "sent",
+      "terminal": "DONE",
+      "wait_s": 0.451,
+      "target_motor_deg": 215,
+      "measured_motor_deg": 0,
+      "speed_rpm": 0,
+      "age_ms": 800
+    },
+    {
+      "case": "wrong_endpoint",
+      "send": "sent",
+      "terminal": "DONE",
+      "wait_s": 0.451,
+      "target_motor_deg": 215,
+      "measured_motor_deg": 0,
+      "speed_rpm": 0,
+      "age_ms": 5
+    },
+    {
+      "case": "still_moving",
+      "send": "sent",
+      "terminal": "DONE",
+      "wait_s": 0.451,
+      "target_motor_deg": 215,
+      "measured_motor_deg": 215,
+      "speed_rpm": 10,
+      "age_ms": 5
+    }
+  ],
+  "post_step_display": [
+    {
+      "case": "temporary_stale",
+      "before": "estimated",
+      "during": "untrusted",
+      "after": "axis_only",
+      "permanent_invalid": true
+    },
+    {
+      "case": "one_quantum_jitter",
+      "before": "estimated",
+      "during": "axis_only",
+      "after": "axis_only",
+      "permanent_invalid": true
+    }
+  ],
+  "geometry": {
+    "edge_mm": 190,
+    "leg_radius_mm": 4,
+    "rod_radius_mm": 5,
+    "safety_gap_mm": 2
+  },
+  "gui_four_actions": [
+    {
+      "side": "left",
+      "arc": 60,
+      "route": [
+        "A",
+        "C",
+        "B",
+        180
+      ],
+      "mode": "low_junction",
+      "feasible": true,
+      "leg_lower_bound_mm": 27.581523,
+      "sampled_leg_margin_mm": 28.200321,
+      "curve_min_tip_mm": 50.35778,
+      "model_S4_s": 18.75
+    },
+    {
+      "side": "left",
+      "arc": -60,
+      "route": [
+        "A",
+        "邻座(0,-1)",
+        "B",
+        180
+      ],
+      "mode": "high_junction",
+      "feasible": true,
+      "leg_lower_bound_mm": 8.167727,
+      "sampled_leg_margin_mm": 11.409478,
+      "curve_min_tip_mm": 17.409478,
+      "model_S4_s": 28.092844
+    },
+    {
+      "side": "right",
+      "arc": 60,
+      "route": [
+        "B",
+        "邻座(0,-1)",
+        "A",
+        360
+      ],
+      "mode": "high_junction",
+      "feasible": true,
+      "leg_lower_bound_mm": 8.167727,
+      "sampled_leg_margin_mm": 11.409478,
+      "curve_min_tip_mm": 17.409478,
+      "model_S4_s": 28.092844
+    },
+    {
+      "side": "right",
+      "arc": -60,
+      "route": [
+        "B",
+        "C",
+        "A",
+        360
+      ],
+      "mode": "low_junction",
+      "feasible": true,
+      "leg_lower_bound_mm": 27.581523,
+      "sampled_leg_margin_mm": 28.200321,
+      "curve_min_tip_mm": 50.35778,
+      "model_S4_s": 18.75
+    }
+  ],
+  "synthetic_leg_overlap_example": {
+    "phi": -20,
+    "phase_error": -20,
+    "tip_curve_min_mm": 40.137556,
+    "whole_leg_margin_mm": -3.160829,
+    "physical_leg_gap_mm": -1.160829,
+    "rod": "邻座(0,-1)·90°高杆",
+    "leg": 1
+  },
+  "realtime_statistics": {
+    "asynchronous_samples": {
+      "state": "estimated",
+      "marked_measured": true,
+      "ages_ms": {
+        "Mup1": 0,
+        "Mr1": 1400,
+        "Mup2": 0,
+        "Mr2": 0
+      }
+    },
+    "clear_live_paths": {
+      "completed_before": 2,
+      "completed_after": 0
+    },
+    "mixed_minimum": {
+      "current_feedback_min_mm": 20,
+      "future_plan_min_mm": -3,
+      "display_text": [
+        "窗口最低 -3.00mm"
+      ]
+    },
+    "progress_label": {
+      "before_periodic_refresh": "S4 12/60",
+      "after_periodic_refresh": "",
+      "tk_errors": 0
+    }
+  }
+}
