@@ -1339,6 +1339,15 @@ class StepperGUI:
                     params, mr1_zero_deg=positions["Mr1"], mr2_zero_deg=positions["Mr2"],
                     mr1_zero_signature=self._gait_zero_signature("Mr1", params),
                     mr2_zero_signature=self._gait_zero_signature("Mr2", params),
+                    # 缠绕参考仅首次锚定；日常记基准不刷新（2026-10-20：
+                    # 旧实现每次基准清缠绕计数，用户在已缠一圈处记基准后
+                    # 下一步立即误拦"超过线缆窗口"）。
+                    mr1_unwind_deg=(positions["Mr1"]
+                                    if params.mr1_unwind_deg is None
+                                    else params.mr1_unwind_deg),
+                    mr2_unwind_deg=(positions["Mr2"]
+                                    if params.mr2_unwind_deg is None
+                                    else params.mr2_unwind_deg),
                     calibration_confirmed=True, calibration_fingerprint=fingerprint)
                 self._save_gait_params(prepared)
                 self._gait_supports = tuple(prepared.initial_supports)
@@ -1697,20 +1706,25 @@ class StepperGUI:
             axis = self._gait_role_axis(role)
         except GaitExecutorError:
             return None
-        zero = (params.mr1_zero_deg if role == "Mr1"
-                else params.mr2_zero_deg)
+        # 2026-10-20：缠绕参考=unwind（首次基准/人工解绕时锚定，记基准
+        # 不刷新）；未建立时退回零位（首版行为兼容）。
+        reference = (params.mr1_unwind_deg if role == "Mr1"
+                     else params.mr2_unwind_deg)
+        if reference is None:
+            reference = (params.mr1_zero_deg if role == "Mr1"
+                         else params.mr2_zero_deg)
         if axis >= X42S_AXIS_HANDLE_BASE:
             position = self._x42s_role_output_units(LogicalRole(role))
             if position is None:
                 return None
-            return position - (zero if zero is not None else 0.0)
+            return position - (reference if reference is not None else 0.0)
         with self.state_lock:
             runtime = self.axis_runtime[axis]
             if not runtime.position_trusted:
                 return None
             position = self.axis_profiles[axis].units_from_steps(
                 runtime.position_steps)
-        return position - (zero if zero is not None else 0.0)
+        return position - (reference if reference is not None else 0.0)
 
     def _gait_landing_route(self, side, params, *, pads=None,
                             arc_deg=SWING_ARC_DEG):
@@ -2494,9 +2508,25 @@ class StepperGUI:
 
         if self._closing:
             return
+        self._refresh_unwind_label()
         refresh = getattr(self, "_refresh_gait_panel", None)
         if refresh is not None:
             refresh(progress_text)
+
+    def _refresh_unwind_label(self):
+        """标定页线缆缠绕角实时显示（Mr1/Mr2，参考=unwind 基准）。"""
+
+        label = (getattr(self, "gait_widgets", None) or {}).get("unwind_label")
+        if label is None:
+            return
+        parts = []
+        for side, role_value in (("left", "Mr1"), ("right", "Mr2")):
+            theta = self._gait_swing_theta_deg(side, self.gait_params)
+            parts.append(f"{role_value} {'--' if theta is None else f'{theta:+.1f}'}°")
+        try:
+            label.configure(text="线缆缠绕：" + " / ".join(parts))
+        except tk.TclError:
+            pass
 
     # ── GaitExecutor 宿主协议的实现（控制工作线程调用） ──
     def _gait_send_relative(self, axis, delta, speed):
@@ -3215,6 +3245,43 @@ class StepperGUI:
 
     def _gait_abort_clicked(self):
         self._gait_abort_run()
+        self._refresh_gait_ui()
+
+    def _gait_unwind_reset_clicked(self):
+        """人工解绕/重新理线后重置线缆缠绕计数（2026-10-20）。
+
+        缠绕参考平时锚定在首次基准，只有线缆被人工理过（或驱动器断电
+        清零后绝对角坐标系重置）才点本按钮：把两台参考刷成当前绝对角，
+        θ 归零。
+        """
+        title = "重置线缆缠绕计数"
+        if self.control_bindings.backend != BACKEND_X42S_UART:
+            messagebox.showinfo(title, "当前后端暂不支持（仅 X42S）。")
+            return
+        if not self._is_serial_connected():
+            messagebox.showwarning(title, "串口未连接。")
+            return
+        thetas = {}
+        for side, role_value in (("left", "Mr1"), ("right", "Mr2")):
+            theta = self._gait_swing_theta_deg(side, self.gait_params)
+            if theta is None:
+                messagebox.showwarning(
+                    title, f"{role_value} 实测位置缺失，不能读取当前缠绕角。")
+                return
+            thetas[role_value] = theta
+        current = {role_value: self._x42s_role_output_units(LogicalRole(role_value))
+                   for role_value in ("Mr1", "Mr2")}
+        if not messagebox.askyesno(
+                title,
+                "当前缠绕计数：Mr1 {Mr1:+.1f}° / Mr2 {Mr2:+.1f}°\n\n".format(**thetas)
+                + "仅在你已人工解开/重新理过线缆（或驱动器断电重新上电）后确认——"
+                  "重置后两台缠绕角从 0 重新起算。\n\n确认重置？"):
+            return
+        self._save_gait_params(replace(
+            self.gait_params,
+            mr1_unwind_deg=current["Mr1"], mr2_unwind_deg=current["Mr2"]))
+        self.log("↩ 线缆缠绕计数已重置（Mr1/Mr2 参考=当前绝对角）；"
+                 "步态标定状态不受影响")
         self._refresh_gait_ui()
 
     def _gait_restore_pre_run_clicked(self):

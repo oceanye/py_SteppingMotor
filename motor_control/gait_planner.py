@@ -223,6 +223,12 @@ class GaitParams:
     # 标定基准：记零时各 Mr 轴的软件坐标（度）；ψ 基准固定为 30°
     mr1_zero_deg: float | None = None
     mr2_zero_deg: float | None = None
+    # 线缆缠绕参考（2026-10-20）：=首次基准/人工解绕时的 Mr 绝对输出轴
+    # 角。缠绕量 θ=当前绝对角−此参考；记基准不刷新它（旧实现用零位当
+    # 参考，每次记基准 θ 清零——用户在已缠一圈处记基准后，下一步立即
+    # 误拦"超过线缆窗口"）。
+    mr1_unwind_deg: float | None = None
+    mr2_unwind_deg: float | None = None
     # Δψ/φ；不受中心距/升降行程影响。2026-09-21 应用户要求默认 2 → -2：
     # 公转 +60°、摆动电机 (k+1)φ = -60°（与公转反向），世界自转 -120°
     # （三重对称下与 +120° 终点等效，但路径短、方向相反，线缆缠绕少）。
@@ -274,10 +280,11 @@ class GaitParams:
         for name in ("mr1_sign", "mr2_sign", "mup1_lift_sign", "mup2_lift_sign"):
             if getattr(self, name) not in (1, -1):
                 raise ValueError(f"方向符号 {name} 必须是 +1 或 -1")
-        for name in ("mr1_zero_deg", "mr2_zero_deg"):
+        for name in ("mr1_zero_deg", "mr2_zero_deg",
+                     "mr1_unwind_deg", "mr2_unwind_deg"):
             value = getattr(self, name)
             if value is not None and not math.isfinite(value):
-                raise ValueError(f"零位 {name} 必须是有限数值")
+                raise ValueError(f"{name} 必须是有限数值")
         # 2026-09-21 放开负增益：k=-2 表示摆动电机与公转反向转 60°。
         # 终点仍须落在三重对称低节点（k×60° 必须是 120° 的整数倍）。
         if (not math.isfinite(self.phase_gain)
@@ -355,6 +362,8 @@ class GaitParams:
             "mup2_lift_sign": self.mup2_lift_sign,
             "mr1_zero_deg": self.mr1_zero_deg,
             "mr2_zero_deg": self.mr2_zero_deg,
+            "mr1_unwind_deg": self.mr1_unwind_deg,
+            "mr2_unwind_deg": self.mr2_unwind_deg,
             "phase_gain": self.phase_gain,
             "trajectory_mode": self.trajectory_mode,
             "initial_placement": self.initial_placement,
@@ -503,6 +512,8 @@ def parse_gait_params(value: Mapping[str, Any] | None) -> GaitParams:
         mup2_lift_sign=_sign("mup2_lift_sign"),
         mr1_zero_deg=_opt_number("mr1_zero_deg"),
         mr2_zero_deg=_opt_number("mr2_zero_deg"),
+        mr1_unwind_deg=_opt_number("mr1_unwind_deg"),
+        mr2_unwind_deg=_opt_number("mr2_unwind_deg"),
         phase_gain=_number("phase_gain", GaitParams.phase_gain),
         trajectory_mode=value.get("trajectory_mode", LEGACY),
         initial_placement=initial_placement,

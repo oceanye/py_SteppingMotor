@@ -302,6 +302,20 @@ def _build_params_column(app, parent) -> None:
     ttk.Button(inner, text="查看首次准备与日常运行指引",
                command=lambda: messagebox.showinfo("步态基准操作指引", BASELINE_GUIDE)).grid(
                    row=row, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+    row += 1
+    # 2026-10-20：线缆缠绕计数（参考=首次基准/人工解绕，记基准不清零）。
+    app.gait_widgets["unwind_label"] = ttk.Label(
+        inner, text="线缆缠绕：Mr1 --° / Mr2 --°", foreground="#475569")
+    app.gait_widgets["unwind_label"].grid(
+        row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
+    ttk.Button(inner, text="已人工解绕（重置计数）",
+               command=getattr(app, "_gait_unwind_reset_clicked", lambda: None)
+               ).grid(row=row, column=2, sticky="w", padx=4, pady=(4, 0))
+    row += 1
+    note(inner, row,
+         "缠绕计数跟随驱动器累计角、跨步不清零（±{limit:g}° 窗口内自由走）；\n"
+         "只有人工理过线缆或驱动器断电重新上电后才点【已人工解绕】。".format(
+             limit=app.gait_params.rotation_limit_deg))
 
     inner = pages["geometry"].content
     note(inner, 0, "平面验核只使用俯视投影：边长 a = 中心到顶点距离 = 腿投影长度。"
