@@ -159,13 +159,16 @@ def apply_manual_debug_units(app) -> None:
     侧预换算，worker 语义不变）。同时切 Spinbox 范围与默认值。
     """
 
-    role = LogicalRole(app.x42s_manual_role_var.get())
+    role_text = app.x42s_manual_role_var.get()
     widgets = app.coordinated_widgets.get("x42s_manual_unit", {})
     value_label, speed_label = widgets.get("value"), widgets.get("speed")
     value_spin, speed_spin = widgets.get("value_spin"), widgets.get("speed_spin")
     if value_label is None or speed_label is None:
         return
-    if ROLE_SPECS[role].required_mode == MODE_LINEAR:
+    # 2026-10-20：双升降同步选项（Mup1+Mup2）按直线单位处理。
+    is_linear = (role_text == "Mup1+Mup2"
+                 or ROLE_SPECS[LogicalRole(role_text)].required_mode == MODE_LINEAR)
+    if is_linear:
         value_label.configure(text="行程(mm):")
         speed_label.configure(text="速度(mm/s):")
         if value_spin is not None:
@@ -432,8 +435,8 @@ def build_coordinated_tab(app, parent) -> None:
         manual_inputs,
         textvariable=app.x42s_manual_role_var,
         state="readonly",
-        width=6,
-        values=[role.value for role in LOGICAL_ROLE_ORDER],
+        width=10,
+        values=[role.value for role in LOGICAL_ROLE_ORDER] + ["Mup1+Mup2"],
     )
     role_combo.pack(side="left", padx=2)
     # 切角色即切单位（标签/范围/默认值），desktop_app 提供回调。

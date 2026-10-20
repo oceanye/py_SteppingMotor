@@ -897,8 +897,14 @@ class StepperGUI:
             messagebox.showwarning(title, "串口未连接：请先连接 ESP32。")
             return
         role_value = self.x42s_manual_role_var.get()
-        role = LogicalRole(role_value)
-        binding = self.control_bindings.for_role(role)
+        # 2026-10-20：双升降同步（"Mup1+Mup2"=两台丝杆同动，调试回位用）。
+        dual_lift = role_value == "Mup1+Mup2"
+        linear_lead = None
+        if dual_lift:
+            role = binding = None
+        else:
+            role = LogicalRole(role_value)
+            binding = self.control_bindings.for_role(role)
         # 全部 X42S 绑定目标（2026-10-15 台架教训：驱动器使能是单台易失
         # 的，断开串口/驱动器断电即清空——使能/失能改为一键全部，换台测
         # 试不再因漏点某台使能而 E2 弹窗）。
@@ -913,12 +919,32 @@ class StepperGUI:
                 messagebox.showwarning(title, "没有任何角色绑定 X42S 驱动器。")
                 return
             targets = all_targets
+            is_linear = ROLE_SPECS[LogicalRole(targets[0][0])].required_mode == MODE_LINEAR
+        elif dual_lift:
+            lifts = []
+            for each in ("Mup1", "Mup2"):
+                each_binding = self.control_bindings.for_role(LogicalRole(each))
+                if each_binding is None or each_binding.kind != "x42s":
+                    messagebox.showwarning(title, f"{each} 未绑定 X42S 驱动器。")
+                    return
+                lifts.append((each, each_binding.driver_id,
+                              each_binding.gear_ratio, each_binding.lead_mm))
+            if not math.isclose(lifts[0][3], lifts[1][3]):
+                messagebox.showwarning(
+                    title, f"Mup1/Mup2 导程不同（{lifts[0][3]:g}/{lifts[1][3]:g}mm），"
+                    "暂不支持同步升降。")
+                return
+            targets = [(r, i, g) for r, i, g, _l in lifts]
+            linear_lead = lifts[0][3]
+            is_linear = True
         else:
             if binding is None or binding.kind != "x42s":
                 messagebox.showwarning(title, f"{role_value} 未绑定 X42S 驱动器。")
                 return
             targets = [(role_value, binding.driver_id, binding.gear_ratio)]
-        is_linear = ROLE_SPECS[role].required_mode == MODE_LINEAR
+            is_linear = ROLE_SPECS[role].required_mode == MODE_LINEAR
+            if is_linear:
+                linear_lead = binding.lead_mm
         unit = "mm" if is_linear else "°"
 
         angle_deg = speed_deg_s = None
@@ -944,8 +970,8 @@ class StepperGUI:
                     else "速度需为正（输出轴 °/s）。")
                 return
             if is_linear:
-                # 机构 mm → 输出轴角度（丝杆导程 mm/圈）。
-                deg_per_mm = 360.0 / binding.lead_mm
+                # 机构 mm → 输出轴角度（丝杆导程 mm/圈；双升降用公共导程）。
+                deg_per_mm = 360.0 / linear_lead
                 angle_deg = value * deg_per_mm
                 speed_deg_s = speed * deg_per_mm
             else:
@@ -965,26 +991,32 @@ class StepperGUI:
         targets[0]（当前选中角色）。
         """
         if action in ("plus", "minus"):
-            role_value, driver_id, gear = targets[0]
-            # 输出轴角度/速度 → 电机轴脉冲/pps（与固件 X42S_PULSE_PER_REV 同源）。
-            steps = round(angle_deg * gear * X42S_PULSE_PER_REV / 360.0)
-            if action == "minus":
-                steps = -steps
-            speed_pps = max(1, round(speed_deg_s * gear * X42S_PULSE_PER_REV / 360.0))
-            if steps == 0:
-                self._post_ui(lambda: self.log(
-                    f"⚠️ {role_value} 角度换算后不足 1 脉冲（减速比 ×{gear:g}），未发令"))
-                return
-            if speed_pps > 100000:
-                self._post_ui(lambda: self.log(
-                    f"⚠️ {role_value} 速度换算后 {speed_pps}pps 超限（>100000），未发令"))
-                return
-            command = build_x42s_move_command(driver_id, steps, speed_pps)
-            ok, reason = self._send_manual_x42s(
-                command, role_value, driver_id, steps, speed_pps)
-            if not ok:
+            # 2026-10-20：逐台遍历（双升降同步=两台同动；单台=1 项）。
+            # 台间留静默间隔（同 enable：驱动器背靠背帧会整批丢）。
+            failures = []
+            for role_value, driver_id, gear in targets:
+                # 输出轴角度/速度 → 电机轴脉冲/pps（与固件 X42S_PULSE_PER_REV 同源）。
+                steps = round(angle_deg * gear * X42S_PULSE_PER_REV / 360.0)
+                if action == "minus":
+                    steps = -steps
+                speed_pps = max(1, round(
+                    speed_deg_s * gear * X42S_PULSE_PER_REV / 360.0))
+                if steps == 0:
+                    failures.append(f"{role_value}·ID{driver_id} → 位移不足 1 脉冲")
+                    continue
+                if speed_pps > 100000:
+                    failures.append(f"{role_value}·ID{driver_id} → 速度 {speed_pps}pps 超限")
+                    continue
+                command = build_x42s_move_command(driver_id, steps, speed_pps)
+                ok, reason = self._send_manual_x42s(
+                    command, role_value, driver_id, steps, speed_pps)
+                if not ok:
+                    failures.append(f"{role_value}·ID{driver_id} → {reason}")
+                time.sleep(0.05)
+            if failures:
+                detail = "\n".join(failures)
                 self._post_ui(lambda: messagebox.showwarning(
-                    "X42S 手动调试", f"命令未被接受：\n{command}\n→ {reason}"))
+                    "X42S 手动调试", f"未被接受的命令：\n{detail}"))
             return
         if action in ("enable", "disable"):
             word = "使能" if action == "enable" else "失能"
@@ -1003,11 +1035,23 @@ class StepperGUI:
                     "X42S 手动调试",
                     f"{word}失败的驱动器：\n{detail}"))
             return
-        # stop/zero：单台（当前选中角色）。
-        role_value, driver_id, _gear = targets[0]
+        # stop：逐台（双升降同步时停两台；单台=1 项）。
         if action == "stop":
-            command = build_x42s_stop_command(driver_id)
-        elif action == "zero":
+            failures = []
+            for role_value, driver_id, _gear in targets:
+                command = build_x42s_stop_command(driver_id)
+                ok, reason = self._send_manual_x42s(command, role_value, driver_id)
+                if not ok:
+                    failures.append(f"{role_value}·ID{driver_id} → {reason}")
+                time.sleep(0.05)
+            if failures:
+                detail = "\n".join(failures)
+                self._post_ui(lambda: messagebox.showwarning(
+                    "X42S 手动调试", f"未被接受的命令：\n{detail}"))
+            return
+        # zero：单台（action 层已提示改用步态页基准，此路仅防御）。
+        role_value, driver_id, _gear = targets[0]
+        if action == "zero":
             command = build_x42s_zero_command(driver_id)
         else:  # pragma: no cover - 按钮不会产生其他值
             return
@@ -1302,6 +1346,7 @@ class StepperGUI:
                 self._gait_needs_recovery = False
                 self._gait_auto_run = False
                 self._gait_run = None
+                self._gait_recovery_snapshot = None  # 新基准使旧快照失效
                 self._gait_world_epoch = getattr(self, "_gait_world_epoch", 0) + 1
                 self._gait_last_report = None
             self.log(f"✓ 双侧起步基准已记录并确认：Mr1={positions['Mr1']:+.3f}°，"
@@ -2058,6 +2103,13 @@ class StepperGUI:
                     f"{role.value} 实测位置缺失（§12 不回退 0）；"
                     "先确认该台遥测正常")
             positions[role.value] = position
+        # 2026-10-20：执行前快照——中止/卡住后【↩ 恢复到本次开始前】
+        # 按此低速回移四台并恢复站位/横梁角账本（零位基准不变）。
+        self._gait_recovery_snapshot = {
+            "positions": dict(positions),
+            "supports": tuple(self._gait_supports),
+            "beta": float(self._gait_beta_deg),
+        }
         swing_role = "Mr1" if side == "left" else "Mr2"
         support_role = "Mr2" if side == "left" else "Mr1"
         sign = params.mr1_sign if swing_role == "Mr1" else params.mr2_sign
@@ -3164,6 +3216,94 @@ class StepperGUI:
     def _gait_abort_clicked(self):
         self._gait_abort_run()
         self._refresh_gait_ui()
+
+    def _gait_restore_pre_run_clicked(self):
+        """中止/卡住后：按本次开始前的快照低速回移四台，恢复站位账本。
+
+        2026-10-20：执行前快照在 _gait_begin_run_x42s 记录（四台实测 +
+        支撑位 + 横梁角）。恢复本身是低速逐台运动，完成后清 recovery
+        锁并恢复账本——零位基准未变，可直接重新开始。
+        """
+        title = "恢复到本次开始前"
+        snap = getattr(self, "_gait_recovery_snapshot", None)
+        if snap is None:
+            messagebox.showinfo(title, "没有可恢复的执行前快照（尚未开始过步态）。")
+            return
+        if getattr(self, "_gait_owned", {}):
+            messagebox.showwarning(title, "步态仍占用四轴；请先【⛔ 中止】再恢复。")
+            return
+        if self.control_bindings.backend != BACKEND_X42S_UART:
+            messagebox.showinfo(title, "当前后端暂不支持自动恢复（仅 X42S）。")
+            return
+        if not self._is_serial_connected():
+            messagebox.showwarning(title, "串口未连接：请先连接 ESP32。")
+            return
+        deltas = {}
+        for role_value in ("Mup1", "Mr1", "Mup2", "Mr2"):
+            current = self._x42s_role_output_units(LogicalRole(role_value))
+            if current is None:
+                messagebox.showwarning(
+                    title, f"{role_value} 实测位置缺失，不能自动恢复。")
+                return
+            deltas[role_value] = snap["positions"][role_value] - current
+        moves = [f"{r}: 回移 {d:+.2f}{'mm' if r.startswith('Mup') else '°'}"
+                 for r, d in deltas.items() if abs(d) > 0.05]
+        preview = "\n".join(moves) or "（四台已在原位，仅恢复站位账本）"
+        if not messagebox.askyesno(
+                title,
+                "将低速把四台移回本次开始前的实测位置，并恢复站位/横梁角账本：\n"
+                + preview + "\n\n确认开始恢复？"):
+            return
+        if self._start_control_worker(self._x42s_restore_worker, deltas) is None:
+            self.log("⛔ 控制器忙，稍后再点恢复")
+
+    def _x42s_restore_worker(self, deltas):
+        """恢复 worker：逐台低速 MOVE 回快照位置（旋转输出轴 2°/s、
+        直线机构 1mm/s），台间静默间隔；全部成功才恢复账本并清 recovery。"""
+        failures = []
+        for role_value in ("Mr1", "Mr2", "Mup1", "Mup2"):
+            delta = deltas.get(role_value, 0.0)
+            if abs(delta) <= 0.05:
+                continue
+            role = LogicalRole(role_value)
+            binding = self.control_bindings.for_role(role)
+            if binding is None or binding.kind != "x42s":
+                failures.append(f"{role_value} 未绑定 X42S 驱动器")
+                continue
+            if role_value.startswith("Mr"):
+                angle_deg, speed_deg_s = delta, 2.0
+            else:
+                deg_per_mm = 360.0 / binding.lead_mm
+                angle_deg, speed_deg_s = delta * deg_per_mm, 1.0 * deg_per_mm
+            steps, speed_pps = self._x42s_move_conversion(role, angle_deg, speed_deg_s)
+            if steps is None or steps == 0 or speed_pps > X42S_SPEED_PPS_MAX:
+                failures.append(f"{role_value} 换算失败（位移/速度超限）")
+                continue
+            command = build_x42s_move_command(binding.driver_id, steps, speed_pps)
+            ok, reason = self._send_manual_x42s(
+                command, role_value, binding.driver_id, steps, speed_pps)
+            if not ok:
+                failures.append(f"{role_value}·ID{binding.driver_id} → {reason}")
+                continue
+            time.sleep(0.05)   # 台间静默间隔
+
+        def finish():
+            if failures:
+                messagebox.showwarning(
+                    "恢复未完成", "以下台未回移成功（可手动处理后重试恢复）：\n"
+                    + "\n".join(failures))
+                return
+            snap = getattr(self, "_gait_recovery_snapshot", None)
+            if snap is not None:
+                self._gait_needs_recovery = False
+                self._gait_supports = tuple(snap["supports"])
+                self._gait_beta_deg = float(snap["beta"])
+                self._gait_recovery_snapshot = None
+            self._gait_run = None
+            self.log("✅ 已恢复到本次开始前（四台位置+站位/横梁角账本；"
+                     "零位基准未变，可直接重新开始）")
+            self._refresh_gait_ui()
+        self._post_ui(finish)
 
     def _gait_reset_run(self):
         self._gait_auto_run = False

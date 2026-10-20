@@ -413,6 +413,11 @@ def _build_run_column(app, parent) -> None:
     app.gait_widgets["reset"] = ttk.Button(
         control, text="重置流程", command=app._gait_reset_run)
     app.gait_widgets["reset"].pack(side="left", padx=3)
+    # 2026-10-20：中止/卡住后按执行前快照低速回移（仅 X42S 后端）。
+    app.gait_widgets["restore_pre_run"] = ttk.Button(
+        control, text="↩ 恢复到本次开始前",
+        command=getattr(app, "_gait_restore_pre_run_clicked", lambda: None))
+    app.gait_widgets["restore_pre_run"].pack(side="left", padx=3)
     live = ttk.Frame(live_area)
     live.grid(row=1, column=0, sticky="w", pady=3)
     # 执行入口与四种换位方式一一对应，方向由按钮显式携带，不依赖预览区
@@ -955,6 +960,13 @@ def refresh_gait_panel(app, progress_text=None) -> None:
         state="normal" if active else "disabled")
     app.gait_widgets["reset"].configure(
         state="normal" if snapshot is not None else "disabled")
+    restore = app.gait_widgets.get("restore_pre_run")
+    if restore is not None:
+        # 有执行前快照且步态未占用四轴时可恢复（中止/卡住后的回位入口）。
+        restore.configure(
+            state="normal" if (getattr(app, "_gait_recovery_snapshot", None)
+                               is not None and not getattr(app, "_gait_owned", {}))
+            else "disabled")
     app.gait_widgets["progress"].configure(text=progress_text or "")
     refresh_twin_panel(app)
     # 2026-10-08 阶段标签没内容时是空行，把 5×5 图压出视口（实操区比

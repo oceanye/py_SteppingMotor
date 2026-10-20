@@ -88,7 +88,12 @@ def build_ui(app, log_dir, num_motor_axes):
     coordinated_tab = ttk.Frame(app.notebook)
     app.tab_index_coordinated = app.notebook.index("end")
     app.notebook.add(coordinated_tab, text="🧭 电机绑定与状态")
-    app._build_coordinated_tab(coordinated_tab)
+    # 2026-10-20：整页包进滚动容器——安全边界+绑定编辑器+四角色卡+
+    # 方向标定四行的总高度超出小屏可用高度，底部方向标定被裁掉。
+    from .scrollable import ScrollableFrame
+    coordinated_scroll = ScrollableFrame(coordinated_tab, width=980, height=760)
+    coordinated_scroll.pack(fill="both", expand=True)
+    app._build_coordinated_tab(coordinated_scroll.content)
 
     stepper_tab = ttk.Frame(app.notebook)
     stepper_index = app.notebook.index("end")
