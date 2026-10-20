@@ -570,8 +570,18 @@ class GaitLayoutTests(unittest.TestCase):
         combo = next(w for w in page.content.winfo_children() if isinstance(w, ttk.Combobox))
         before = page.canvas.yview()
         value = combo.get()
-        combo.event_generate("<MouseWheel>", delta=-120)
+        # 2026-10-20 滚轮改全局路由+指针包含检查：事件带真实屏幕坐标，
+        # 且窗口需置顶（指针命中判定 winfo_containing 会被遮挡窗口截走）。
+        self.root.update_idletasks()
+        self.root.attributes("-topmost", True)
         self.root.update()
+        try:
+            combo.event_generate("<MouseWheel>", delta=-120,
+                                 rootx=combo.winfo_rootx() + 5,
+                                 rooty=combo.winfo_rooty() + 5)
+            self.root.update()
+        finally:
+            self.root.attributes("-topmost", False)
         self.assertEqual(combo.get(), value)
         self.assertGreater(page.canvas.yview()[0], before[0])
         self.assertFalse(self.errors)

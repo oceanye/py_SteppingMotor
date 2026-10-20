@@ -42,18 +42,34 @@ class ScrollableFrame(ttk.Frame):
     def bind_navigation(self):
         """Call after adding children; wheel events stay local to this viewport."""
         def bind_tree(widget):
-            widget.bind("<MouseWheel>", self._wheel, add="+")
-            widget.bind("<Button-4>", self._wheel, add="+")
-            widget.bind("<Button-5>", self._wheel, add="+")
             widget.bind("<Button-1>", self._mark_pointer_focus, add="+")
             widget.bind("<FocusIn>", self._reveal_focus, add="+")
             widget.bind("<KeyPress-Tab>", self._keyboard_focus, add="+")
             for child in widget.winfo_children():
                 bind_tree(child)
-        self.canvas.bind("<MouseWheel>", self._wheel, add="+")
         bind_tree(self.content)
+        # 2026-10-20：Windows 把滚轮发给"焦点控件"——Label/Frame 无焦点
+        # 时滚轮事件根本到不了本视图（用户被迫点住滚动条拖）。改为全局
+        # 挂载+指针包含检查：鼠标指在哪块滚动区，滚轮就归谁；不在本区
+        # 时不消费（return None），多个滚动区（绑定页/步态页）互不干扰。
+        # 原 per-widget 滚轮绑定移除（与全局路径重复会双倍滚动）。
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.canvas.bind_all(seq, self._wheel, add="+")
+
+    def _contains_pointer(self, event):
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        if widget is None:
+            # 窗口管理器不可用（withdrawn/无显示）：退回事件源控件判断。
+            widget = event.widget
+        while widget is not None:
+            if widget is self:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
 
     def _wheel(self, event):
+        if not self._contains_pointer(event):
+            return  # 指针不在本视图：让其他滚动区处理
         delta = getattr(event, "delta", 0)
         direction = -1 if delta > 0 or getattr(event, "num", None) == 4 else 1
         if self.canvas.yview() != (0.0, 1.0):

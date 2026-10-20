@@ -234,7 +234,6 @@ def build_coordinated_tab(app, parent) -> None:
     """Build the binding editor and four role cards."""
 
     parent.columnconfigure(0, weight=1)
-    parent.rowconfigure(2, weight=1)
     app.coordinated_widgets = {"roles": {}, "binding_status": {}}
 
     warning = ttk.LabelFrame(parent, text="安全边界")
@@ -249,8 +248,15 @@ def build_coordinated_tab(app, parent) -> None:
         justify="left",
     ).pack(anchor="w", padx=8, pady=5)
 
-    binding_frame = ttk.LabelFrame(parent, text="逻辑电机绑定（当前硬件：X42S UART）")
-    binding_frame.grid(row=1, column=0, sticky="ew", **PAD)
+    # 2026-10-20：绑定编辑器（含手动调试）与四电机状态并排——纵向腾出
+    # 一整块高度，减少滚动需求（用户反馈方向标定四行被挤出视口）。
+    split = ttk.Frame(parent)
+    split.grid(row=1, column=0, sticky="ew", **PAD)
+    split.columnconfigure(0, weight=3)
+    split.columnconfigure(1, weight=2)
+
+    binding_frame = ttk.LabelFrame(split, text="逻辑电机绑定（当前硬件：X42S UART）")
+    binding_frame.grid(row=0, column=0, sticky="nsew")
 
     # 后端单选：v1 stepdir（原样）或 v2 x42s_uart（schema v2 文档）。
     backend_row = ttk.Frame(binding_frame)
@@ -495,8 +501,8 @@ def build_coordinated_tab(app, parent) -> None:
     # 默认角色（Mup1 直线）的标签/范围/按钮文案初始化。
     apply_manual_debug_units(app)
 
-    cards = ttk.LabelFrame(parent, text="四电机状态（位置来源按后端标注）")
-    cards.grid(row=2, column=0, sticky="nsew", **PAD)
+    cards = ttk.LabelFrame(split, text="四电机状态（位置来源按后端标注）")
+    cards.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
     for column in range(2):
         cards.columnconfigure(column, weight=1, uniform="role")
     for row in range(2):
@@ -535,7 +541,7 @@ def build_coordinated_tab(app, parent) -> None:
     _build_direction_calibration(app, parent)
 
     readiness = ttk.LabelFrame(parent, text="自主步态就绪度（不替代分阶段人工确认联动）")
-    readiness.grid(row=4, column=0, sticky="ew", **PAD)
+    readiness.grid(row=3, column=0, sticky="ew", **PAD)
     ready_label = ttk.Label(
         readiness,
         text="未就绪",
@@ -573,7 +579,7 @@ def _direction_sign_text(role_value: str, sign: int) -> str:
 def _build_direction_calibration(app, parent) -> None:
     frame = ttk.LabelFrame(
         parent, text="逐电机调试与方向标定（真实方向 vs 驱动方向）")
-    frame.grid(row=3, column=0, sticky="ew", **PAD)
+    frame.grid(row=2, column=0, sticky="ew", **PAD)
     headings = ("角色", "当前方向符号", "调试点动（驱动单个电机）",
                 "点动“轴+”后机构实际方向（记录）")
     for column, text in enumerate(headings):
