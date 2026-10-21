@@ -584,8 +584,15 @@ def _field_number(app, key) -> float:
     return value
 
 
-def collect_gait_params(app, base: GaitParams) -> GaitParams:
-    """从输入框收集并构造校验后的 GaitParams；非法抛 ValueError。"""
+def collect_gait_params(app, base: GaitParams, *, include_signs=True) -> GaitParams:
+    """从输入框收集并构造校验后的 GaitParams；非法抛 ValueError。
+
+    include_signs=False：方向符号保留 base 的已标定值——【开始】按钮
+    路径使用（2026-10-21 实机教训：界面 sign 下拉与磁盘脱钩的瞬间
+    （加载时序/误触），"开始"无条件收集界面值把用户的实测标定静默
+    覆盖成默认 +1，导致方向镜像排查一整天）。符号只在标定页显式
+    修改或【保存参数】时收集。
+    """
 
     geometry_updates = {}
     for key, _label in GEOMETRY_FIELDS + GAP_FIELDS:
@@ -608,11 +615,12 @@ def collect_gait_params(app, base: GaitParams) -> GaitParams:
                 raise ValueError(f"步态参数 {key} 必须是整数")
             value = int(value)
         param_updates[key] = value
-    for key, _label, _hint in SIGN_FIELDS:
-        raw = app.gait_sign_vars[key].get()
-        if raw not in ("+1", "-1"):
-            raise ValueError(f"方向符号 {key} 必须是 +1 或 -1")
-        param_updates[key] = int(raw)
+    if include_signs:
+        for key, _label, _hint in SIGN_FIELDS:
+            raw = app.gait_sign_vars[key].get()
+            if raw not in ("+1", "-1"):
+                raise ValueError(f"方向符号 {key} 必须是 +1 或 -1")
+            param_updates[key] = int(raw)
     confirmed = bool(app.gait_calibrated_var.get())
     param_updates["calibration_confirmed"] = confirmed
     # Ordinary save/start may retain a confirmation, never re-sign changed

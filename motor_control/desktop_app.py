@@ -2670,8 +2670,13 @@ class StepperGUI(X42sRuntimeMixin):
             return
         refresh_gait_panel_view(self, progress_text)
 
-    def _gait_params_from_ui(self):
-        """收集输入框 → 校验后的 GaitParams；非法时弹窗并返回 None。"""
+    def _gait_params_from_ui(self, *, include_signs=True):
+        """收集输入框 → 校验后的 GaitParams；非法时弹窗并返回 None。
+
+        include_signs=False 供【开始】按钮路径：保留已标定的方向符号
+        （2026-10-21 实机教训：界面 sign 与磁盘脱钩时"开始"无条件收集
+        会把实测标定静默覆盖成界面默认值）。
+        """
 
         if getattr(self, "_gait_profile_migration_error", None):
             messagebox.showwarning("配置迁移未完成", "请修复文件问题并重启GUI；旧文件备份完成前不能保存或驱动电机")
@@ -2680,7 +2685,8 @@ class StepperGUI(X42sRuntimeMixin):
             messagebox.showwarning("步态占用", "执行期间不能保存/更换参数，请先完成或中止")
             return None
         try:
-            return collect_gait_params(self, self.gait_params)
+            return collect_gait_params(self, self.gait_params,
+                                       include_signs=include_signs)
         except (ValueError, GaitExecutorError) as exc:
             messagebox.showerror("步态参数无效", str(exc))
             return None
@@ -2796,7 +2802,9 @@ class StepperGUI(X42sRuntimeMixin):
         from motor_control.ui.gait_simulation import cancel_simulation
         cancel_simulation(self)
         self._gait_auto_run = False   # 新一次摆动从人工确认开始
-        params = self._gait_params_from_ui()
+        # 方向符号不随"开始"收集（2026-10-21：界面/磁盘脱钩时静默覆盖
+        # 实测标定）；符号仅在标定页显式修改或【保存参数】时进文件。
+        params = self._gait_params_from_ui(include_signs=False)
         if params is None:
             return
         self._save_gait_params(params)
