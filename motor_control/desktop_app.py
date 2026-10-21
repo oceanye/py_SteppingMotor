@@ -1146,15 +1146,13 @@ class StepperGUI(X42sRuntimeMixin):
                     params, mr1_zero_deg=positions["Mr1"], mr2_zero_deg=positions["Mr2"],
                     mr1_zero_signature=self._gait_zero_signature("Mr1", params),
                     mr2_zero_signature=self._gait_zero_signature("Mr2", params),
-                    # 缠绕参考仅首次锚定；日常记基准不刷新（2026-10-20：
-                    # 旧实现每次基准清缠绕计数，用户在已缠一圈处记基准后
-                    # 下一步立即误拦"超过线缆窗口"）。
-                    mr1_unwind_deg=(positions["Mr1"]
-                                    if params.mr1_unwind_deg is None
-                                    else params.mr1_unwind_deg),
-                    mr2_unwind_deg=(positions["Mr2"]
-                                    if params.mr2_unwind_deg is None
-                                    else params.mr2_unwind_deg),
+                    # 2026-10-21（二版）语义修订：记基准=全部账本对齐当前
+                    # 物理（含缠绕参考）。记基准的合法场景本来就是"断电后/
+                    # 重新摆放"（驱动器断电清零绝对角、旧缠绕参考即刻失效）；
+                    # 正常连续换步不点记基准，缠绕账本由 unwrap 自动徘徊，
+                    # 不受影响——旧"仅首次锚定"版在断电后账本错位不自愈。
+                    mr1_unwind_deg=positions["Mr1"],
+                    mr2_unwind_deg=positions["Mr2"],
                     calibration_confirmed=True, calibration_fingerprint=fingerprint)
                 self._save_gait_params(prepared)
                 self._gait_supports = tuple(prepared.initial_supports)

@@ -27,6 +27,14 @@ def verify_pre_run_restore(app):
     try:
         with app.state_lock:
             differences = verify()
+        # 2026-10-21：跳变校验——驱动器断电后绝对角清零、或机构被大幅
+        # 手动搬动时，快照坐标已不在同一坐标系，"差值"失去回位语义。
+        jumped = [r for r, d in differences.items() if abs(d) > 360.0]
+        if jumped:
+            raise ValueError(
+                "以下轴与快照差距超过一整圈（驱动器断电或机构被手动搬动过）："
+                + "、".join(jumped)
+                + "。快照已不可信——请手动摆好机构后重建双侧基准。")
         remaining = {role: delta for role, delta in differences.items()
                      if abs(delta) > RECOVERY_TOLERANCE}
         if remaining:
