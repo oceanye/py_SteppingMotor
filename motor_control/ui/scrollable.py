@@ -78,8 +78,10 @@ class ScrollableFrame(ttk.Frame):
 
     def _mark_pointer_focus(self, event):
         # 鼠标按下时 widget 级绑定先于 ttk class 绑定设置焦点执行，
-        # 记下 (控件, 时刻)；随后 0.5s 内该子树获得的 FocusIn 都是点击
-        # 聚焦，不参与键盘导航的滚动露出。
+        # 记下 (控件, 时刻)；随后 2s 内该子树获得的 FocusIn 都是点击
+        # 聚焦（含弹窗关闭后焦点回落——2026-10-21 用户报"点使能后画面
+        # 跳走"，弹窗关闭距点击常超旧 0.5s 窗口），不参与键盘导航的
+        # 滚动露出。
         # FocusIn.time can be Tk's string "??". Use the same monotonic clock
         # for both callbacks, as on main; do not subtract event payloads.
         self._pointer_click = (event.widget, time.monotonic())
@@ -93,7 +95,7 @@ class ScrollableFrame(ttk.Frame):
         # 刚从后台激活、坐标未同步时滚动目标被算成 0）——点击聚焦直接
         # 跳过，并且任何滚动前先同步几何。
         click = getattr(self, "_pointer_click", None)
-        if click is not None and 0 <= time.monotonic() - click[1] < 0.5:
+        if click is not None and 0 <= time.monotonic() - click[1] < 2.0:
             node = event.widget
             while node is not None:
                 if node is click[0]:
