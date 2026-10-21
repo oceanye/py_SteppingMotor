@@ -2244,7 +2244,7 @@ class StepperGUI(X42sRuntimeMixin):
             theta = self._gait_swing_theta_deg(side, self.gait_params)
             parts.append(f"{role_value} {'--' if theta is None else f'{theta:+.1f}'}°")
         try:
-            label.configure(text="  缠绕 " + "/".join(parts))
+            label.configure(text="线缆缠绕：" + " / ".join(parts))
         except tk.TclError:
             pass
 

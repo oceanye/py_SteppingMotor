@@ -207,7 +207,9 @@ def _build_params_column(app, parent) -> None:
     from motor_control.ui.scrollable import ScrollableFrame
 
     parent.columnconfigure(0, weight=1)
-    parent.rowconfigure(0, weight=1)
+    # minsize：小窗（720x380 高DPI）下参数视口至少保留一条可滚动的带
+    # ——否则内容加行后 canvas 被压到个位数像素，键盘可达性全失。
+    parent.rowconfigure(0, weight=1, minsize=160)
     book = ttk.Notebook(parent)
     book.grid(row=0, column=0, sticky="nsew")
     app.gait_widgets["params_book"] = book
@@ -324,24 +326,23 @@ def _build_params_column(app, parent) -> None:
     ttk.Button(
         buttons, text="放弃修改并重读", command=app._gait_reload_params_clicked
     ).pack(side="left", padx=3)
-    # 2026-10-20：基准入口与线缆缠绕计数同一行（用户要求同页；且独立
-    # 行会把小窗口（720x380）下的参数视口压到几像素——高DPI可达性
-    # 测试抓出的回归）。
-    baseline_row = ttk.Frame(parent)
-    baseline_row.grid(row=2, column=0, sticky="ew", padx=6, pady=4)
+    # 2026-10-21（用户实机反馈）：基准按钮与解绕分两行——同一行在默认
+    # 窗口宽度下放不下（解绕按钮被挤出可视区）。
     app.gait_widgets["prepare_baseline"] = ttk.Button(
-        baseline_row, text="确认摆放并记录双侧基准（首次/恢复）",
+        parent, text="确认摆放并记录双侧基准（首次/恢复）",
         command=app._gait_reestablish_baseline)
-    app.gait_widgets["prepare_baseline"].pack(side="left")
+    app.gait_widgets["prepare_baseline"].grid(row=2, column=0, sticky="ew", padx=6, pady=4)
+    unwind_row = ttk.Frame(parent)
+    unwind_row.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 2))
     app.gait_widgets["unwind_label"] = ttk.Label(
-        baseline_row, text="  缠绕 Mr1 --°/Mr2 --°", foreground="#475569")
-    app.gait_widgets["unwind_label"].pack(side="left", padx=(8, 0))
-    ttk.Button(baseline_row, text="已人工解绕",
+        unwind_row, text="线缆缠绕：Mr1 --° / Mr2 --°", foreground="#475569")
+    app.gait_widgets["unwind_label"].pack(side="left")
+    ttk.Button(unwind_row, text="已人工解绕（重置计数）",
                command=getattr(app, "_gait_unwind_reset_clicked", lambda: None)
-               ).pack(side="left", padx=4)
+               ).pack(side="left", padx=6)
     app.gait_widgets["readiness"] = ttk.Label(parent, text="", justify="left", wraplength=280)
     app.gait_widgets["readiness"].grid(
-        row=3, column=0, sticky="ew", padx=6, pady=(0, 4))
+        row=4, column=0, sticky="ew", padx=6, pady=(0, 4))
 
 
 def _build_run_column(app, parent) -> None:
