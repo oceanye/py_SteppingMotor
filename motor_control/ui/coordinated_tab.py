@@ -496,19 +496,19 @@ def build_coordinated_tab(app, parent) -> None:
     # 默认角色（Mup1 直线）的标签/范围/按钮文案初始化。
     apply_manual_debug_units(app)
 
-    # 2026-10-20（三轮）：四电机状态独立成行、四卡横排 1×4——右挂方案
-    # 会把行高撑到卡片高度（手动调试下方大段空白）且被推离左边内容；
-    # 1×4 高度减半、宽度用满编辑器行宽，纵向横向都紧凑。
+    # 2026-10-21（四轮）：四卡 2×2——1×4 超出屏幕宽度（用户实机反馈）。
     cards = ttk.LabelFrame(parent, text="四电机状态（位置来源按后端标注）")
     cards.grid(row=2, column=0, sticky="ew", **PAD)
-    for column in range(4):
+    for column in range(2):
         cards.columnconfigure(column, weight=1, uniform="role")
+    for row in range(2):
+        cards.rowconfigure(row, weight=1, uniform="role")
 
     positions = {
         LogicalRole.MUP1.value: (0, 0),
-        LogicalRole.MR1.value: (0, 1),
-        LogicalRole.MUP2.value: (0, 2),
-        LogicalRole.MR2.value: (0, 3),
+        LogicalRole.MR1.value: (1, 0),
+        LogicalRole.MUP2.value: (0, 1),
+        LogicalRole.MR2.value: (1, 1),
     }
     for role in LOGICAL_ROLE_ORDER:
         spec = ROLE_SPECS[role]
