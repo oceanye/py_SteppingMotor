@@ -1103,9 +1103,20 @@ class StepperGUI(X42sRuntimeMixin):
                     if (state is None or state.driver_id != driver_id or not state.online
                             or not state.enabled or state.fault is not None
                             or not state.telemetry_trusted):
+                        # 2026-10-21：带上具体原因——保护故障时指明清除
+                        # 手段（用户实机：Mup2 过流自动失能后反复使能无效，
+                        # 因 fault 挂起需显式清保护）。
+                        if state is not None and state.fault is not None:
+                            raise GaitExecutorError(
+                                f"{role.value} 保护故障（{state.fault}）：请在驱动器屏幕"
+                                "按两下 Enter 或将该台断电重启清除保护，再重新使能；"
+                                "原基准未改动")
+                        detail = ("离线" if state is None or not state.online
+                                  else "未使能" if not state.enabled
+                                  else "遥测不新鲜")
                         raise GaitExecutorError(
-                            f"{role.value} 状态未就绪：检查在线、使能、故障并等待新鲜遥测；"
-                            "原基准未改动，不需要重新标定方向或驱动器归零")
+                            f"{role.value} 状态未就绪（{detail}）：检查在线、使能并等待"
+                            "新鲜遥测；原基准未改动，不需要重新标定方向或驱动器归零")
                     if (not state.reached or (state.speed is not None
                             and (not math.isfinite(state.speed) or abs(state.speed) > 0.5))):
                         raise GaitExecutorError(f"{role.value} 未确认到位静止，不能建立基准")
@@ -2564,6 +2575,10 @@ class StepperGUI(X42sRuntimeMixin):
         t0 = time.monotonic()
         deadline = t0 + timeout_s
         next_poll = t0 + X42S_WAIT_BLIND_S
+        # 2026-10-21：等待期间周期刷新 UI（4Hz）。此前 progress 回调只在
+        # "组完成"时刷新——单组长运动（S5B 落脚 70s）全程画面静止，升降
+        # 柱状图/姿态不随动（用户实机报障）；遥测数据链经验证无误。
+        next_ui_refresh = t0
         while True:
             if (self._control_worker_cancelled()
                     or (getattr(self, "_gait_run", None) is not None
@@ -2572,6 +2587,9 @@ class StepperGUI(X42sRuntimeMixin):
             now = time.monotonic()
             if now >= deadline:
                 return "TIMEOUT"
+            if now >= next_ui_refresh:
+                next_ui_refresh = now + 0.25
+                self._post_ui(self._refresh_gait_ui)
             if now < next_poll:
                 time.sleep(min(0.02, next_poll - now))
                 continue
