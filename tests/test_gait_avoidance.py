@@ -263,6 +263,13 @@ class TwoModeGeometryTests(unittest.TestCase):
 
 
 class TwoModeExecutionTests(unittest.TestCase):
+    def setUp(self):
+        # 2026-10-21 晶格镜像临时闸默认拦 LOW 方向；离线执行链测试模拟
+        # 的是全镜像修复后的正常行为，关闭闸。
+        self._gate = patch("motor_control.desktop_app.LATTICE_MIRROR_LOW_GATE", False)
+        self._gate.start()
+        self.addCleanup(self._gate.stop)
+
     def test_execution_reclassifies_after_completed_step_like_simulation(self):
         app = app_fixture()
         sim = GaitSimulation(app.gait_params)

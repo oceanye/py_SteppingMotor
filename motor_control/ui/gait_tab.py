@@ -141,7 +141,8 @@ def _gait_mode_selected(app, value: str) -> None:
                              + ("+" if float(app.gait_arc_var.get()) > 0 else "-"))
         return
     app.gait_side_var.set("left" if value[0] == "L" else "right")
-    app.gait_arc_var.set("60.0" if value[1] == "+" else "-60.0")
+    # 2026-10-21 晶格镜像定案：四选项 arc 与按钮同规则取反（"+"=模型 -60）。
+    app.gait_arc_var.set("-60.0" if value[1] == "+" else "60.0")
     from .gait_candidate import select_candidate
     select_candidate(app)
 
@@ -434,11 +435,15 @@ def _build_run_column(app, parent) -> None:
     live.grid(row=1, column=0, sticky="w", pady=3)
     # 执行入口与四种换位方式一一对应，方向由按钮显式携带，不依赖预览区
     # 当前选择（防止"看逆向、走顺向"误操作）。
+    # 2026-10-21 晶格镜像定案：实机晶格与模型 y 镜像（模型北=实机南），
+    # 文案的顺/逆按用户俯视视角（站左足侧）——arc 取反绑定：左顺移执行
+    # 模型 -60（实机画面顺时针/向北绕），配 avoidance bearing 翻转
+    # （见 gait_planner）实现"跨杆步正确避让"。
     for row, row_actions in enumerate((
-        (("start_left_cw", "开始左顺移", "left", 60.0),
-         ("start_left_ccw", "开始左逆移", "left", -60.0)),
-        (("start_right_cw", "开始右顺移", "right", 60.0),
-         ("start_right_ccw", "开始右逆移", "right", -60.0)),
+        (("start_left_cw", "开始左顺移", "left", -60.0),
+         ("start_left_ccw", "开始左逆移", "left", 60.0)),
+        (("start_right_cw", "开始右顺移", "right", -60.0),
+         ("start_right_ccw", "开始右逆移", "right", 60.0)),
     )):
         for col, (key, text, side, arc) in enumerate(row_actions):
             app.gait_widgets[key] = ttk.Button(

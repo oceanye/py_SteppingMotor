@@ -139,6 +139,12 @@ from motor_control.ui import (
     sync_binding_editor as sync_binding_editor_view,
 )
 from motor_control.x42s_runtime import X42sRuntimeMixin, X42S_DEBUG_JOG_DEG_S
+
+# 2026-10-21 晶格镜像临时闸（LOW 直连方向禁用）：实机晶格与模型 y 镜像
+# 定案后，LOW 方向的间隙认证仍在镜像世界进行（实机跨杆风险）。全镜像
+# 修复（方位/相位/爪尖三角族整体翻）完成前置 True；离线测试模拟的是
+# 修复后的正常行为，可 patch 为 False。
+LATTICE_MIRROR_LOW_GATE = True
 from motor_control.x42s_units import (
     X42S_PULSE_PER_REV, X42S_AXIS_HANDLE_BASE, X42S_SPEED_PPS_MAX,
 )
@@ -1633,6 +1639,17 @@ class StepperGUI(X42sRuntimeMixin):
             params, side=side, route=route, arc_deg=arc_deg)
         if auto_avoidance and not report.feasible:
             raise GaitExecutorError("两模态腿—高杆避让未通过，禁止抬足：" + report.message)
+        # 2026-10-21 晶格镜像临时闸：实机晶格与模型 y 镜像已定案，LOW
+        # 直连方向的间隙认证在镜像世界进行——实机存在跨红杆风险（用户
+        # 实录：+60 判"不跨"实机跨杆）。带高节点绕行（HIGH）的方向经
+        # 按钮弧向对调后实机不经过红杆、安全；LOW 方向在全镜像修复
+        # （方位/相位/爪尖三角族整体翻）完成前硬性禁用。
+        if (LATTICE_MIRROR_LOW_GATE and auto_avoidance
+                and report.modality == "low_junction"):
+            raise GaitExecutorError(
+                "该方向为低节点直连：其避障判定尚未适配实机晶格的镜像方位，"
+                "存在跨红杆风险——临时禁用。请改用另一方向（带高节点绕行），"
+                "或等待晶格全镜像修复后恢复。")
         self.log(f"步态角度联动校验（{route[0]}→{route[1]}，支点{route[2]}，"
                  f"{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°）：{report.message}")
         # legacy 保留历史碰撞仅提示行为；两模态的腿—高杆门槛已在上方
@@ -1878,6 +1895,14 @@ class StepperGUI(X42sRuntimeMixin):
             params, side=side, route=route, arc_deg=arc_deg)
         if auto_avoidance and not report.feasible:
             raise GaitExecutorError("两模态腿—高杆避让未通过，禁止抬足：" + report.message)
+        # 2026-10-21 晶格镜像临时闸（与 stepdir 分支同源）：LOW 直连方向
+        # 的间隙认证在镜像世界进行，实机有跨红杆风险，全镜像修复前禁用。
+        if (LATTICE_MIRROR_LOW_GATE and auto_avoidance
+                and report.modality == "low_junction"):
+            raise GaitExecutorError(
+                "该方向为低节点直连：其避障判定尚未适配实机晶格的镜像方位，"
+                "存在跨红杆风险——临时禁用。请改用另一方向（带高节点绕行），"
+                "或等待晶格全镜像修复后恢复。")
         self.log(f"步态角度联动校验（{route[0]}→{route[1]}，支点{route[2]}，"
                  f"{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°）：{report.message}")
         clearance_warnings: list[str] = []

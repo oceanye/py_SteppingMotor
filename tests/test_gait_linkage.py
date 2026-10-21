@@ -297,8 +297,9 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
             gait_side_var=_Var(), gait_arc_var=_Var(), gait_widgets={},
             _gait_run_dry_run=lambda interactive=True: calls.append(interactive),
         )
-        for value, side, arc in (("L+", "left", "60.0"), ("L-", "left", "-60.0"),
-                                 ("R+", "right", "60.0"), ("R-", "right", "-60.0")):
+        # 2026-10-21 晶格镜像定案：四选项 arc 取反（"+"=模型 -60）
+        for value, side, arc in (("L+", "left", "-60.0"), ("L-", "left", "60.0"),
+                                 ("R+", "right", "-60.0"), ("R-", "right", "60.0")):
             with patch("motor_control.ui.gait_candidate.select_candidate") as candidate:
                 _gait_mode_selected(app, value)
                 candidate.assert_called_once_with(app)

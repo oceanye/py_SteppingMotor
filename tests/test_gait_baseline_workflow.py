@@ -26,6 +26,12 @@ def baseline_app():
 
 
 class BaselineWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        # 2026-10-21 晶格镜像临时闸默认拦 LOW 方向；离线预检测试关闸。
+        self._gate = patch("motor_control.desktop_app.LATTICE_MIRROR_LOW_GATE", False)
+        self._gate.start()
+        self.addCleanup(self._gate.stop)
+
     def test_pair_is_saved_once_with_nonzero_measured_offsets_and_no_motor_writes(self):
         app = baseline_app()
         params = app._gait_capture_baseline(app.gait_params)
