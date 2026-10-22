@@ -161,8 +161,8 @@ class StepCurveUITests(unittest.TestCase):
         self.view["mode_var"].set("sim")
         before = (sim.supports, sim.psis, list(sim.history.points))
         _gait_mode_selected(self.app, "R-")
-        # 2026-10-22（二版）：弧向换回原始绑定（"R-"=模型 -60）
-        self.assertEqual(self.view["candidate"]["report"].route, sim.route("right", -60))
+        # 2026-10-22（三版）："R-"=模型 +60（对调绑定）
+        self.assertEqual(self.view["candidate"]["report"].route, sim.route("right", 60))
         self.assertEqual((sim.supports, sim.psis, list(sim.history.points)), before)
         self.assertEqual(sim.completed_steps, 2)
 
