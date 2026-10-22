@@ -1,7 +1,7 @@
 {
   "schema": "motor-diagnostics-v1",
   "session_id": "20261020T004515-d8ae96ebd1",
-  "closed": false,
+  "closed": true,
   "started_utc": "2026-10-20T00:45:15.482626+00:00",
   "limits": {
     "max_bytes_per_file": 2000000,
@@ -22,5 +22,14 @@
       "diagnostics.py": "cd40fcf2fcddbc3a180e8374a0860bb3f94984176b52d6a8c86888d9a214a057",
       "gait_executor.py": "4a0da6c191f981bda498197bd6f7faabfb242779646e2bc9777444f85ad42850"
     }
-  }
+  },
+  "health": {
+    "session_id": "20261020T004515-d8ae96ebd1",
+    "queued": 0,
+    "dropped": 0,
+    "write_errors": 0,
+    "last_error": null,
+    "closed": true
+  },
+  "ended_utc": "2026-10-20T02:32:40.262292+00:00"
 }
