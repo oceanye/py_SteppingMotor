@@ -106,6 +106,11 @@ def _x42s_snapshot(fixture, bindings, states=None, *, connected=True,
     return control, {motor["role"]: motor for motor in motors}
 
 
+# 2026-10-21 晶格镜像临时闸（全拦实机 two_mode 步态）：离线测试模拟
+# 的是全镜像修复后的正常行为——测试进程内关闸（模块级，不 stop）。
+from unittest.mock import patch as _gate_patch
+_gate_patch("motor_control.desktop_app.LATTICE_MIRROR_ALL_GATE", False).start()
+
 class X42sProtocolTests(unittest.TestCase):
     def test_fault_tag_set_locked_to_model(self):
         # 三处标签集（协议/模型/固件）必须一致，否则遥测会被静默丢弃。

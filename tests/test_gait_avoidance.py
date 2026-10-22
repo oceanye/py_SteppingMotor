@@ -49,6 +49,11 @@ def complete(app, side, arc):
     return run, report
 
 
+# 2026-10-21 晶格镜像临时闸（全拦实机 two_mode 步态）：离线测试模拟
+# 的是全镜像修复后的正常行为——测试进程内关闸（模块级，不 stop）。
+from unittest.mock import patch as _gate_patch
+_gate_patch("motor_control.desktop_app.LATTICE_MIRROR_ALL_GATE", False).start()
+
 class TwoModeGeometryTests(unittest.TestCase):
     def test_projected_edge_190_is_the_only_scale_for_all_four_actions(self):
         # User-confirmed planar edge. Intentionally leave the old d=220;
@@ -263,13 +268,6 @@ class TwoModeGeometryTests(unittest.TestCase):
 
 
 class TwoModeExecutionTests(unittest.TestCase):
-    def setUp(self):
-        # 2026-10-21 晶格镜像临时闸默认拦 LOW 方向；离线执行链测试模拟
-        # 的是全镜像修复后的正常行为，关闭闸。
-        self._gate = patch("motor_control.desktop_app.LATTICE_MIRROR_LOW_GATE", False)
-        self._gate.start()
-        self.addCleanup(self._gate.stop)
-
     def test_execution_reclassifies_after_completed_step_like_simulation(self):
         app = app_fixture()
         sim = GaitSimulation(app.gait_params)

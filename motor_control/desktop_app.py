@@ -100,7 +100,7 @@ from motor_control.serial_session import (
 )
 from motor_control.state_store import StateStore, StateStoreError
 from motor_control.gait_executor import GaitExecutor, GaitExecutorError
-from motor_control.gait_recovery import recovery_reference
+from motor_control.gait_recovery import RECOVERY_TOLERANCE, recovery_reference
 from motor_control.gait_avoidance import TWO_MODE, leg_clearance
 from motor_control.gait_planner import (
     LOW_NODE_PHASE_DEG,
@@ -140,11 +140,13 @@ from motor_control.ui import (
 )
 from motor_control.x42s_runtime import X42sRuntimeMixin, X42S_DEBUG_JOG_DEG_S
 
-# 2026-10-21 晶格镜像临时闸（LOW 直连方向禁用）：实机晶格与模型 y 镜像
-# 定案后，LOW 方向的间隙认证仍在镜像世界进行（实机跨杆风险）。全镜像
-# 修复（方位/相位/爪尖三角族整体翻）完成前置 True；离线测试模拟的是
-# 修复后的正常行为，可 patch 为 False。
+# 2026-10-21 晶格镜像临时闸（二版：全方向禁用实机 two_mode 步态）：
+# 实机晶格与模型 y 镜像定案后，间隙认证/绕行曲线活在镜像世界——LOW
+# 直连跨实机杆，HIGH 绕行避的是模型杆位、在实机同样不安全（用户实机
+# HIGH 绕行中 Mr1 堵转=疑似蹭杆）。全镜像修复完成前置 True；离线测试
+# 模拟的是修复后的正常行为，可 patch 为 False。
 LATTICE_MIRROR_LOW_GATE = True
+LATTICE_MIRROR_ALL_GATE = True
 from motor_control.x42s_units import (
     X42S_PULSE_PER_REV, X42S_AXIS_HANDLE_BASE, X42S_SPEED_PPS_MAX,
 )
@@ -1648,17 +1650,15 @@ class StepperGUI(X42sRuntimeMixin):
             params, side=side, route=route, arc_deg=arc_deg)
         if auto_avoidance and not report.feasible:
             raise GaitExecutorError("两模态腿—高杆避让未通过，禁止抬足：" + report.message)
-        # 2026-10-21 晶格镜像临时闸：实机晶格与模型 y 镜像已定案，LOW
-        # 直连方向的间隙认证在镜像世界进行——实机存在跨红杆风险（用户
-        # 实录：+60 判"不跨"实机跨杆）。带高节点绕行（HIGH）的方向经
-        # 按钮弧向对调后实机不经过红杆、安全；LOW 方向在全镜像修复
-        # （方位/相位/爪尖三角族整体翻）完成前硬性禁用。
-        if (LATTICE_MIRROR_LOW_GATE and auto_avoidance
-                and report.modality == "low_junction"):
+        # 2026-10-21 晶格镜像临时闸（二版：全方向拦）：LOW 直连跨实机
+        # 杆；HIGH 绕行的避让曲线按模型杆位设计，在镜像实机同样不安全
+        # （实录：绕行中 Mr1 堵转=疑似蹭杆）。全镜像修复前实机 two_mode
+        # 步态整体暂停。
+        if (LATTICE_MIRROR_ALL_GATE and auto_avoidance):
             raise GaitExecutorError(
-                "该方向为低节点直连：其避障判定尚未适配实机晶格的镜像方位，"
-                "存在跨红杆风险——临时禁用。请改用另一方向（带高节点绕行），"
-                "或等待晶格全镜像修复后恢复。")
+                "实机晶格与模型存在镜像方位差，全部避障判定暂不可信——"
+                "实机步态暂停，等待晶格全镜像修复。单台调试（绑定页点动/"
+                "手动调试区）不受影响。")
         self.log(f"步态角度联动校验（{route[0]}→{route[1]}，支点{route[2]}，"
                  f"{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°）：{report.message}")
         # legacy 保留历史碰撞仅提示行为；两模态的腿—高杆门槛已在上方
@@ -1904,14 +1904,13 @@ class StepperGUI(X42sRuntimeMixin):
             params, side=side, route=route, arc_deg=arc_deg)
         if auto_avoidance and not report.feasible:
             raise GaitExecutorError("两模态腿—高杆避让未通过，禁止抬足：" + report.message)
-        # 2026-10-21 晶格镜像临时闸（与 stepdir 分支同源）：LOW 直连方向
-        # 的间隙认证在镜像世界进行，实机有跨红杆风险，全镜像修复前禁用。
-        if (LATTICE_MIRROR_LOW_GATE and auto_avoidance
-                and report.modality == "low_junction"):
+        # 2026-10-21 晶格镜像临时闸（二版，与 stepdir 分支同源）：全方向
+        # 拦——HIGH 绕行曲线在镜像实机同样不安全。全镜像修复前暂停。
+        if (LATTICE_MIRROR_ALL_GATE and auto_avoidance):
             raise GaitExecutorError(
-                "该方向为低节点直连：其避障判定尚未适配实机晶格的镜像方位，"
-                "存在跨红杆风险——临时禁用。请改用另一方向（带高节点绕行），"
-                "或等待晶格全镜像修复后恢复。")
+                "实机晶格与模型存在镜像方位差，全部避障判定暂不可信——"
+                "实机步态暂停，等待晶格全镜像修复。单台调试（绑定页点动/"
+                "手动调试区）不受影响。")
         self.log(f"步态角度联动校验（{route[0]}→{route[1]}，支点{route[2]}，"
                  f"{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°）：{report.message}")
         clearance_warnings: list[str] = []
@@ -3056,6 +3055,59 @@ class StepperGUI(X42sRuntimeMixin):
     def _gait_restore_pre_run_clicked(self):
         from motor_control.gait_recovery_ui import verify_pre_run_restore
         verify_pre_run_restore(self)
+
+    def _gait_auto_restore_run(self, deltas):
+        """自动低速回位 worker（2026-10-21 二版，应用户要求加回）。
+
+        前置（gait_recovery_ui 已保证）：四轴与快照差全部在小位移阈值内、
+        通过核验与人工确认。逐台低速回移（旋转输出轴 2°/s、直线 1mm/s，
+        台间静默间隔），全部成功后恢复站位账本；任一失败即停、不动账本。
+        """
+        failures = []
+        for role_value in ("Mr1", "Mr2", "Mup1", "Mup2"):
+            delta = deltas.get(role_value, 0.0)
+            if abs(delta) <= RECOVERY_TOLERANCE:
+                continue
+            role = LogicalRole(role_value)
+            binding = self.control_bindings.for_role(role)
+            if binding is None or binding.kind != "x42s":
+                failures.append(f"{role_value} 未绑定")
+                continue
+            if role_value.startswith("Mr"):
+                move_delta, move_speed = delta, 2.0     # 输出轴 °/°/s
+            else:
+                move_delta, move_speed = delta, 1.0     # 机构 mm/mm/s
+            steps, speed_pps = self._x42s_move_conversion(role, move_delta, move_speed)
+            if steps is None or steps == 0 or speed_pps > X42S_SPEED_PPS_MAX:
+                failures.append(f"{role_value} 换算失败（位移/速度超限）")
+                continue
+            command = build_x42s_move_command(binding.driver_id, steps, speed_pps)
+            ok, reason = self._send_manual_x42s(
+                command, role_value, binding.driver_id, steps, speed_pps)
+            if not ok:
+                failures.append(f"{role_value}·ID{binding.driver_id} → {reason}")
+                break   # 一台失败即停，保持其余位置便于人工评估
+            time.sleep(0.05)
+
+        def finish():
+            if failures:
+                messagebox.showwarning(
+                    "自动回位未完成",
+                    "以下轴未回移成功（已停止，可人工处理后重新核验）：\n"
+                    + "\n".join(failures))
+                return
+            snap = getattr(self, "_gait_recovery_snapshot", None)
+            if snap is not None:
+                self._gait_supports = tuple(snap["supports"])
+                self._gait_beta_deg = float(snap["beta"])
+                self._gait_needs_recovery = False
+                self._gait_recovery_snapshot = None
+                self._gait_run = None
+                self._gait_auto_run = False
+            self.log("✅ 自动回位完成：四轴已回到执行前位置，站位账本已恢复"
+                     "（低速逐台，未重新标定）")
+            self._refresh_gait_ui()
+        self._post_ui(finish)
 
 
     def _gait_reset_run(self):

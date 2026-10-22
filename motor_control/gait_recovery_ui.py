@@ -1,10 +1,14 @@
-"""Desktop recovery dialog and atomic ledger commit; no motion commands."""
+"""Desktop recovery dialog and atomic ledger commit; small-delta auto path."""
 import time
 from tkinter import messagebox
 
 from .coordinated_control import BACKEND_X42S_UART
 from .gait_executor import GaitExecutorError
 from .gait_recovery import RECOVERY_TOLERANCE, recovery_differences, recovery_reference
+
+# 2026-10-21：小位移自动回位阈值——回程扫掠范围小、无高杆认证也可控；
+# 超过的仍走人工回位（大范围回程的避杆路径未经认证）。
+AUTO_RESTORE_MAX = 30.0
 
 
 def verify_pre_run_restore(app):
@@ -37,6 +41,24 @@ def verify_pre_run_restore(app):
                 + "。快照已不可信——请手动摆好机构后重建双侧基准。")
         remaining = {role: delta for role, delta in differences.items()
                      if abs(delta) > RECOVERY_TOLERANCE}
+        # 2026-10-21：小位移自动回位（应用户要求加回；原全人工版在
+        # audit 重构中丢失）。全部差值 ≤ AUTO_RESTORE_MAX 时提供自动
+        # 低速逐台回移；超过则维持人工流程（大范围回程避杆未认证）。
+        if remaining and all(abs(d) <= AUTO_RESTORE_MAX for d in differences.values()):
+            detail = "\n".join(
+                f"{role}：需回移 {delta:+.2f}"
+                + (" mm" if role.startswith("Mup") else "°")
+                for role, delta in sorted(remaining.items()))
+            if messagebox.askyesno(title,
+                    "各轴与执行前差距都在小位移范围（≤30 单位），可自动回位：\n\n"
+                    + detail
+                    + "\n\n将以低速逐台回移（旋转 2°/s、直线 1mm/s），完成即恢复"
+                      "站位账本。回移路径为直线小步、不带高杆避让认证——请确认"
+                      "机构周围无障碍后继续。\n\n自动回位？"):
+                if app._start_control_worker(
+                        app._gait_auto_restore_run, dict(remaining)) is None:
+                    app.log("⛔ 控制器忙，稍后再点核验恢复")
+            return
         if remaining:
             detail = "\n".join(
                 f"{role}：目标 {snap['positions'][role]:.2f}，尚差 {delta:+.2f}"

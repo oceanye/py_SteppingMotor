@@ -76,6 +76,11 @@ def mechanism(limit=720.0):
     return app
 
 
+# 2026-10-21 晶格镜像临时闸（全拦实机 two_mode 步态）：离线测试模拟
+# 的是全镜像修复后的正常行为——测试进程内关闸（模块级，不 stop）。
+from unittest.mock import patch as _gate_patch
+_gate_patch("motor_control.desktop_app.LATTICE_MIRROR_ALL_GATE", False).start()
+
 class LandingSequenceTests(unittest.TestCase):
     def test_landing_settles_swing_leg_before_dual_descent(self):
         # 2026-09-24 应用户实机反馈重构落脚：单腿降顶部重心偏移、硬顶

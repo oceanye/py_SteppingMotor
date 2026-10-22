@@ -206,11 +206,7 @@ class HistoryTests(unittest.TestCase):
 
 
 class MapExecutionTests(unittest.TestCase):
-    def setUp(self):
-        # 2026-10-21 晶格镜像临时闸默认拦 LOW 方向；离线测试关闸。
-        self._gate = patch("motor_control.desktop_app.LATTICE_MIRROR_LOW_GATE", False)
-        self._gate.start()
-        self.addCleanup(self._gate.stop)
+    # 晶格镜像临时闸已由模块级 patch 关闭（文件顶部）。
 
     def app(self):
         app = linked_app()
