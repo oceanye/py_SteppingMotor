@@ -155,7 +155,7 @@ def toggle_simulation(app):
 
 
 def _tick(app):
-    from .gait_twin import draw_twin, tip_surface_distances
+    from .gait_twin import draw_twin, leg_surface_distances
     view = _view(app)
     view.pop("simulation_job", None)
     sim = view.get("simulation")
@@ -171,7 +171,7 @@ def _tick(app):
     # Planar distance changes during S4. Lifting/confirmation time must not
     # scroll the relevant swing off screen; use the same model clock as live.
     curve_t = sim.curve_step_start_s + time_at_phi(sim.report, sim.swing_times, sim.frame.pose["phi_deg"])
-    point = (curve_t, tip_surface_distances(sim.frame.pose, sim.params), sim.segment)
+    point = (curve_t, leg_surface_distances(sim.frame.pose, sim.params), sim.segment)
     if not sim.curve or sim.curve[-1] != point:
         sim.curve.append(point)
     _message(app, f"模拟 {sim.frame.stage} · 已完成 {sim.completed_steps} 步\n"

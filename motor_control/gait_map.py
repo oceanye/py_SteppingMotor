@@ -38,8 +38,9 @@ def in_map(name):
 def start_pair_reference(pair):
     """Validate ordered (left, right) pads, return (beam angle, placement).
 
-    beta points from right foot to left foot. Shared-edge high rods fall on
-    the left for beta=0/120/240 and on the right for beta=60/180/300.
+    beta points from right foot to left foot. The returned placement token is
+    a legacy persisted key, NOT physical handedness after y mirroring. Use
+    gait_coordinates.rod_side_for_pair for operator-facing high-rod labels.
     """
     if (not isinstance(pair, (tuple, list)) or len(pair) != 2
             or any(not isinstance(p, str) or not in_map(p) for p in pair)):

@@ -86,7 +86,8 @@ class CurveTimeline:
 class EncoderCurveBuffer:
     """Future UI-thread adapter boundary, empty unless genuine data arrives.
 
-    Adapter must supply calibrated six-tip distances, source='encoder', and
+    Adapter must supply six WHOLE-leg surface gaps (including arm/rod radii,
+    not yet subtracting delta), source='encoder', and
     the current step token. X is S4 model-progress time, NOT encoder wall time.
     No adapter/serial acquisition is provided here and pulse data never feeds
     this buffer. New step/world binds invalidate all previous measurements.
@@ -107,7 +108,7 @@ class EncoderCurveBuffer:
         numbers = (s4_model_time_s, *values)
         if len(values) != 6 or any(isinstance(v, bool) or not isinstance(v, (int, float))
                                    or not math.isfinite(v) for v in numbers):
-            raise ValueError("编码器曲线需要有限时间和六爪距离")
+            raise ValueError("编码器曲线需要有限时间和六条整腿表面间隙")
         if s4_model_time_s < 0 or (self.samples and s4_model_time_s < self.samples[-1][0]):
             raise ValueError("编码器模型进度时间不能倒退")
         self.samples.append((s4_model_time_s, values, 0))

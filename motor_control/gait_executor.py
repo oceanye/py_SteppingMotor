@@ -4,8 +4,9 @@
 把它变成对既有运动链路的顺序调用：
 
 - 组序 = 时间序：上一组全部到达终态（DONE）才发下一组；
-- S4同步组：一条SYNC原子下发，两轴共用五次进度；宿主不支持则拒绝，
-  不通过独立MOVE近似同步；
+- S4组：STEP/DIR使用共享五次进度SYNC；X42S由宿主先校验双轴独立
+  进度的整腿扫掠包络并细分，再顺序梯形MOVE、双轴实测到位核验。
+  未具备对应执行能力/包络的宿主不得擅自降级；
 - 任何一轴 ABORT/TIMEOUT/下发失败 → 停掉本次用到的全部轴，状态
   置为 aborted/failed，后续阶段拒绝执行（ABORT 后位置不可信，运动
   链路本身也会拒绝）。
@@ -14,7 +15,7 @@
 
 - ``role_axis(role_name) -> int``          绑定解析；缺失抛 GaitExecutorError
 - ``send_relative(axis, delta, speed) -> str``   "sent" / "noop" / "failed"
-- ``send_synchronized(moves, duration_s) -> str``  原子同步组，仅允许"sent"
+- ``send_synchronized(moves, duration_s) -> str``  经后端校验的双轴组，仅允许"sent"
 - ``send_synchronized_endpoint(moves, duration_s, endpoints) -> str``
   分段组使用同一 S4 原点的累计终点，段间等待双轴 DONE，不累计相对取整误差
 - ``wait_terminal(axis, timeout_s) -> str``      "DONE"/"ABORTED"/"TIMEOUT"/"CANCELLED"
@@ -67,6 +68,8 @@ class GaitExecutor:
         self._lock = threading.Lock()
         self._stop_requested = False
         self._cancelled_before_motion = False
+        self._progress_text = ""
+        self._group_index = 0
 
     # ── UI/状态读取 ─────────────────────────────────────────
 
@@ -102,6 +105,7 @@ class GaitExecutor:
                 "move_group_count":
                     0 if stage is None else len(stage.move_groups),
                 "last_error": self.last_error,
+                "progress_text": self._progress_text,
             }
 
     def request_stop(self) -> None:
@@ -157,6 +161,7 @@ class GaitExecutor:
             if stage is None or stage.is_motion_stage:
                 return False
             self._stage_index += 1
+            self._progress_text = ""
             if self._stage_index >= len(self.stages):
                 self.state = "done"
             return True
@@ -187,6 +192,7 @@ class GaitExecutor:
                     f"{stage.stage_id} 是确认型阶段，请走确认推进"
                 )
             self.state = "running"
+            self._progress_text = f"{stage.stage_id} 第0/{len(stage.move_groups)}组"
 
         self._host.log(
             f"▶ 步态 {stage.stage_id} {stage.title}："
@@ -246,10 +252,14 @@ class GaitExecutor:
     ) -> bool:
         total = len(stage.move_groups)
         for group_index, group in enumerate(stage.move_groups):
+            with self._lock:
+                self._group_index = group_index
             if self._abort_check(stage):
                 return False
             if not self._run_group(stage, group, group_index):
                 return False
+            with self._lock:
+                self._progress_text = f"{stage.stage_id} 第{group_index + 1}/{total}组"
             if progress is not None:
                 progress(stage.stage_id, group_index + 1, total)
         return True
@@ -270,7 +280,7 @@ class GaitExecutor:
                     sender = getattr(self._host, "send_synchronized", None)
                     result = None if sender is None else sender(moves, expected_s)
                 if result != "sent":
-                    raise GaitExecutorError("固件/宿主不支持原子同步轨迹或预检未通过；不允许独立 MOVE 降级")
+                    raise GaitExecutorError("固件/宿主不支持该联动轨迹或预检未通过；不允许未校验的独立 MOVE 降级")
                 dispatched = [(axis, m.role) for (axis, _, _), m in zip(moves, group)]
             except Exception as exc:
                 self._stop_stage_axes(stage, "同步下发失败")
@@ -280,6 +290,15 @@ class GaitExecutor:
             return self._run_independent_group(stage, group)
 
         timeout_s = GROUP_TIMEOUT_FACTOR * expected_s + GROUP_TIMEOUT_MARGIN_S
+        wait_group = getattr(self._host, "wait_group", None)
+        if wait_group is not None:
+            terminal = wait_group([a for a, _ in dispatched], timeout_s)
+            if terminal != "DONE":
+                self._stop_stage_axes(stage, "联动组实测未到位")
+                self._fail("aborted" if terminal in ("ABORTED", "CANCELLED") else "failed",
+                           f"联动组 {terminal}；恢复可靠支撑后核验站位，无需反复标定")
+                return False
+            return not self._abort_check(stage)
         for axis, role in dispatched:
             terminal = self._host.wait_terminal(axis, timeout_s)
             if terminal != "DONE":
@@ -324,6 +343,15 @@ class GaitExecutor:
         timeout_s = (
             GROUP_TIMEOUT_FACTOR * expected_s + GROUP_TIMEOUT_MARGIN_S
         )
+        wait_group = getattr(self._host, "wait_group", None)
+        if dispatched and wait_group is not None:
+            terminal = wait_group([a for a, _ in dispatched], timeout_s)
+            if terminal != "DONE":
+                self._stop_stage_axes(stage, "运动组实测未到位")
+                self._fail("aborted" if terminal in ("ABORTED", "CANCELLED") else "failed",
+                           f"运动组 {terminal}；先确认可靠支撑，再核验站位")
+                return False
+            return not self._abort_check(stage)
         for axis, role in dispatched:
             terminal = self._host.wait_terminal(axis, timeout_s)
             if terminal == "DONE":

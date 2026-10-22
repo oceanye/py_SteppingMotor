@@ -567,8 +567,8 @@ ROLE_SIGN_FIELD = {
 def _direction_sign_text(role_value: str, sign: int) -> str:
     """符号含义文案：+1=轴坐标增大即约定正方向，−1=相反。"""
     rotary = role_value.startswith("Mr")
-    positive = "俯视逆时针(ψ增)" if rotary else "抬起"
-    negative = "俯视顺时针(ψ减)" if rotary else "下降"
+    positive = "支撑时横梁俯视逆时针" if rotary else "抬起"
+    negative = "支撑时横梁俯视顺时针" if rotary else "下降"
     return f"{sign:+d}：轴+ ⇒ 实际{positive if sign > 0 else negative}"
 
 
@@ -599,12 +599,12 @@ def _build_direction_calibration(app, parent) -> None:
         jog_frame = ttk.Frame(frame)
         jog_frame.grid(row=row, column=2, sticky="w", padx=4, pady=2)
         jog_plus = ttk.Button(
-            jog_frame, text=f"⟲ 轴+{amount}{unit}" if rotary else f"▲ 轴+{amount}{unit}",
+            jog_frame, text=f"轴+{amount}{unit}" if rotary else f"▲ 轴+{amount}{unit}",
             width=9,
             command=lambda r=role.value: app._role_debug_move(r, True))
         jog_plus.pack(side="left", padx=2)
         jog_minus = ttk.Button(
-            jog_frame, text=f"⟳ 轴−{amount}{unit}" if rotary else f"▼ 轴−{amount}{unit}",
+            jog_frame, text=f"轴−{amount}{unit}" if rotary else f"▼ 轴−{amount}{unit}",
             width=9,
             command=lambda r=role.value: app._role_debug_move(r, False))
         jog_minus.pack(side="left", padx=2)
@@ -633,8 +633,9 @@ def _build_direction_calibration(app, parent) -> None:
         frame, foreground="#555", justify="left", wraplength=760,
         text=(
             "每台电机单独标定：① 串口连接后点【轴+】小步驱动（旋转 10°/直线 1mm，"
-            "按钮箭头是程序判定的驱动方向）；② 俯视观察机构真实运动；"
-            "③ 点对应【实际…】按钮记录符号（+1=轴坐标增大即真实正向，−1=相反）。"
+            "轴±不是实物顺逆时针）；② Mr 作为固定支撑足时，观察横梁绕该足的俯视方向，"
+            "不可把悬空腿自转方向当成同一判据；③ 用对应按钮记录横梁方向"
+            "（轴+使横梁逆时针→+1；顺时针→−1）。已实测确认的符号不要因模态变化重改。"
             "符号变更立即保存并使步态标定失效；Mr 符号变更后该侧零位作废，"
             "须重新记零。步态执行中四轴被占用，点动与改符号均被拒绝。"
         ),

@@ -106,10 +106,6 @@ def _x42s_snapshot(fixture, bindings, states=None, *, connected=True,
     return control, {motor["role"]: motor for motor in motors}
 
 
-# 2026-10-21 晶格镜像临时闸（全拦实机 two_mode 步态）：离线测试模拟
-# 的是全镜像修复后的正常行为——测试进程内关闸（模块级，不 stop）。
-from unittest.mock import patch as _gate_patch
-_gate_patch("motor_control.desktop_app.LATTICE_MIRROR_ALL_GATE", False).start()
 
 class X42sProtocolTests(unittest.TestCase):
     def test_fault_tag_set_locked_to_model(self):
@@ -510,9 +506,13 @@ def _x42s_gait_app(lead_mms=None, measured=(0.0, 0.0, 0.0, 0.0)):
             return ""
         t = command.split(",")
         if t[:2] == ["X42S", "S"]:
+            measured = app._fake_positions[int(t[2])]
             return (f"X42S,{t[2]},S,1,1,{app._reply_reached},"
-                    f"{app._reply_fault},0.0,0.0,0.0,0.0,0.0,25.0,5,0,7")
+                    f"{app._reply_fault},{measured},{measured},0.0,0.0,0.0,25.0,5,0,7")
         if t[0] == "X42S" and t[2] == "MOVE":
+            role = app.control_bindings.role_for_driver_id(int(t[1]))
+            origin = app._x42s_states[role.value].measured_position
+            app._fake_positions[int(t[1])] = origin + int(int(t[3])*3600/3200)/10
             return f"ACK,X42S,{t[1]},MOVE,{t[3]},{t[4]}"
         if t[0] == "X42S" and t[2] == "STOP":
             return f"OK,X42S,{t[1]},STOP"
@@ -521,6 +521,7 @@ def _x42s_gait_app(lead_mms=None, measured=(0.0, 0.0, 0.0, 0.0)):
         return "ERR:unexpected " + command
 
     app._reply_reached, app._reply_fault = "1", "none"
+    app._fake_positions = dict(zip((1, 2, 3, 4), measured))
     app._send_and_read = controller
     return app
 
@@ -632,6 +633,9 @@ class X42sGaitChainTests(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         # 首个同步组把当前实测机构坐标锚定为旋转显示原点（单位=机构坐标）。
         self.assertEqual(app._gait_run.rotation_start, {102: 0.0, 104: 0.0})
+        with patch.object(desktop_app_module, "X42S_WAIT_BLIND_S", 0):
+            for axis in (102, 104):
+                self.assertEqual(app._gait_wait_terminal(axis, .2), "DONE")
         # 分段组：累计终点相对当前实测求本段位移（闭环反馈不累计取整误差）。
         app.commands.clear()
         self.assertEqual(
@@ -644,7 +648,8 @@ class X42sGaitChainTests(unittest.TestCase):
             round(60 * 21.5 * 3200 / 360), round(10 * 21.5 * 3200 / 360)),
             app.commands)
         # 首个分段组锚定 stage 起点实测（origin 语义见下一用例）。
-        self.assertEqual(app._gait_run.x42s_sync_origin, {102: 0.0, 104: 0.0})
+        for axis, expected in ((102, 30.), (104, -30.)):
+            self.assertAlmostEqual(app._gait_run.x42s_sync_origin[axis], expected, delta=.01)
 
     def test_send_synchronized_x42s_segments_anchor_stage_origin(self):
         # stage 起点非零（连续第二步起步）：endpoint=相对 stage 起点的累计
@@ -682,6 +687,9 @@ class X42sGaitChainTests(unittest.TestCase):
             app.commands)
         # 第二段：实测走到 90/−90，累计终点 75/−75 → 位移 15/−15
         # （错位公式会得出 −10 错误方向）。
+        with patch.object(desktop_app_module, "X42S_WAIT_BLIND_S", 0):
+            for axis in (102, 104):
+                self.assertEqual(app._gait_wait_terminal(axis, .2), "DONE")
         app.commands.clear()
         set_meas(90.0, -90.0)
         self.assertEqual(
@@ -697,15 +705,24 @@ class X42sGaitChainTests(unittest.TestCase):
     def test_wait_terminal_x42s_done_fault_timeout(self):
         app = _x42s_gait_app()
         app._gait_run = None
+        token = object()
+        app._gait_owned = {102: token}
+        app._move_reservation[102] = token
         with patch.object(desktop_app_module, "X42S_WAIT_BLIND_S", 0.02), \
              patch.object(desktop_app_module, "X42S_WAIT_POLL_S", 0.02):
+            self.assertEqual(app._gait_send_relative(102, 10, 8), "sent")
             self.assertEqual(
                 StepperGUI._gait_wait_terminal(app, 102, 1.0), "DONE")
+            self.assertEqual(app._gait_send_relative(102, 10, 8), "sent")
             app._reply_fault = "stall"
             self.assertEqual(
                 StepperGUI._gait_wait_terminal(app, 102, 1.0), "ABORTED")
             app._reply_fault = "none"
             app._reply_reached = "0"
+            # A cached peer fault remains an abort until actual fresh feedback
+            # clears it; changing only a fake driver's future reply is not reset.
+            role = LogicalRole.MR1
+            app._apply_x42s_reply(role, 2, parse_line(app._send_and_read("X42S,S,2")))
             self.assertEqual(
                 StepperGUI._gait_wait_terminal(app, 102, 0.1), "TIMEOUT")
 

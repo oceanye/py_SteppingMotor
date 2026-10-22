@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -168,7 +169,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "请求体过大")
             return None
         try:
-            value = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw = self.rfile.read(length)
+            self._body_consumed = True
+            value = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._error(HTTPStatus.BAD_REQUEST, "JSON 格式错误")
             return None
@@ -354,7 +357,42 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def _error(self, status: HTTPStatus, message: str) -> None:
+        self._discard_small_rejected_body()
         self._json(status, {"ok": False, "error": message})
+
+    def _discard_small_rejected_body(self) -> None:
+        """Avoid a Windows TCP reset discarding the 4xx response with unread data.
+
+        Never execute or parse a rejected body. Bound both bytes and TOTAL wait;
+        malformed, chunked or large requests are simply closed as before.
+        """
+        if self.command != "POST" or getattr(self, "_body_consumed", False):
+            return
+        if self.headers.get("Transfer-Encoding") is not None:
+            return
+        try:
+            remaining = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return
+        if not 0 < remaining <= min(MAX_REQUEST_BODY, 4096):
+            return
+        previous_timeout = self.connection.gettimeout()
+        deadline = time.monotonic()+.2
+        try:
+            while remaining:
+                budget = deadline-time.monotonic()
+                if budget <= 0:
+                    break
+                self.connection.settimeout(budget)
+                data = self.rfile.read1(remaining)
+                if not data:
+                    break
+                remaining -= len(data)
+            self._body_consumed = not remaining
+        except (OSError, TimeoutError):
+            pass
+        finally:
+            self.connection.settimeout(previous_timeout)
 
 
 class WebControlServer:

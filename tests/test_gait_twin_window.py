@@ -278,23 +278,27 @@ class TwinWindowTests(unittest.TestCase):
             frame=SimpleNamespace(time_s=101), curve=((0, [-100]*6, 5), (11, [12]*6, 5), (101, [15]*6, 5)))
         twin._draw_curve(self.app, self.view)
         c = self.view["curve_canvas"]
-        self.assertEqual(c.itemcget(c.find_withtag("curve_best")[0], "text"), "窗口最低 12.00mm")
+        self.assertIn("已执行窗最低 12.00mm", c.itemcget(c.find_withtag("curve_best")[0], "text"))
         self.assertTrue(c.find_withtag("curve_delta"))
 
-    def test_plan_checks_six_tips_and_updates_coordinates(self):
+    def test_plan_checks_six_whole_legs_and_updates_coordinates(self):
         self.prepare_plan()
-        with patch.object(twin, "_tip_surface", side_effect=(20, 21, 22, 1, 2, 3)) as surface:
+        details = [dict(gap_mm=v, margin_mm=v-2, closest_point=(0, 0),
+                        side="left" if i < 3 else "right", leg=i%3+1, rod="B")
+                   for i, v in enumerate((20, 21, 22, 1, 2, 3))]
+        with patch.object(twin, "leg_surface_details", return_value=details) as surface:
             twin.draw_twin(self.app)
-        self.assertEqual(surface.call_count, 6)
+        self.assertTrue(surface.called)
         text = self.canvas.itemcget(self.canvas.find_withtag("hud_nearest")[0], "text")
         self.assertIn("1.00mm", text)
-        self.assertIn("非整腿净间隙", text)
+        self.assertIn("扣δ余量 -1.00mm", text)
+        self.assertIn("右腿1", text)
         self.assertIn("评估位置（非实机）", self.view["coordinates"].cget("text"))
 
     def test_plan_cache_rebuilds_only_when_report_or_parameters_change(self):
         self.prepare_plan()
         self.view.pop("curve_plan_report", None)  # Mode changes now render immediately.
-        with patch.object(twin, "plan_tip_series", wraps=twin.plan_tip_series) as compute:
+        with patch.object(twin, "plan_leg_series", wraps=twin.plan_leg_series) as compute:
             twin.draw_twin(self.app)
             twin.draw_twin(self.app)
             self.assertEqual(compute.call_count, 1)

@@ -1,6 +1,7 @@
 import http.client
 import json
 import unittest
+import time
 
 from web_control import WebControlServer
 
@@ -134,6 +135,19 @@ class WebControlTests(unittest.TestCase):
                 status, data = self.request_json("POST", path, {})
                 self.assertEqual(status, 404)
                 self.assertIn("未知路径", data["error"])
+
+    def test_rejected_origin_with_incomplete_body_has_bounded_wait(self):
+        start = time.monotonic()
+        self.connection.putrequest('POST', '/api/estop')
+        self.connection.putheader('Origin', 'http://foreign.invalid')
+        self.connection.putheader('Content-Type', 'application/json')
+        self.connection.putheader('Content-Length', '100')
+        self.connection.endheaders()  # Deliberately never send the claimed body.
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 403)
+        response.read()
+        self.assertLess(time.monotonic()-start, 1.5)
+        self.assertEqual(self.controller.calls, [])
 
     def test_status_exposes_current_30_axis_topology(self):
         status, data = self.request_json("GET", "/api/status")

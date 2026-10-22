@@ -1,8 +1,9 @@
 """Angle-only two-mode leg/high-rod paths (no IO, no hardware assumptions).
 
-The executable path is the polyline, NOT the rational generating curve. Each
-edge is sent as one rest-to-rest, common-clock SYNC; preview and certification
-use these same edges. All three radial legs, including their roots, are checked.
+The nominal path is the polyline, NOT the rational generating curve. STEP/DIR
+uses rest-to-rest common-clock SYNC along its edges. X42S separately refines
+and certifies independent-progress regions in gait_x42s_plan; its trapezoids
+do not share that clock. All three radial legs, including roots, are checked.
 """
 from __future__ import annotations
 
@@ -83,7 +84,13 @@ def avoidance_path(bearing_deg: float, arc_deg: float) -> AvoidancePath:
     high_error = abs((midpoint-90+60) % 120-60)
     if min(low_error, high_error) > 0.5:
         raise ValueError("当前支点方位未对准高低杆晶格；请重建基准")
-    modality = LOW if low_error <= high_error else HIGH
+    # Decide from the actual high-rod directions swept by the beam, not a
+    # button name or a freely flipped phase family. With touching hexagons,
+    # the pivot's three high nodes (radius R < d) cover the shared junctions.
+    sweep_sign = 1 if arc_deg > 0 else -1
+    crosses_high = any(1e-6 < ((bearing_deg-(90+120*k))*sweep_sign) % 360
+                       < abs(arc_deg)-1e-6 for k in range(3))
+    modality = HIGH if crosses_high else LOW
     n = 1 if modality == LOW else SEGMENTS
     sign = 1 if arc_deg > 0 else -1
     knots = []
@@ -103,17 +110,8 @@ def leg_clearance(center, psi_deg, geometry, pads):
     this is conservative for the existing hub-to-tip model. Does not model
     a different robot having only vertical posts at its three tips.
     """
-    from .gait_planner import point_segment_distance
-    worst = (math.inf, "", 0)
-    for arm in range(3):
-        angle = math.radians(psi_deg+120*arm)
-        tip = (center[0]+geometry.arm_length_mm*math.cos(angle),
-               center[1]-geometry.arm_length_mm*math.sin(angle))
-        for pad in pads:
-            for j, node in enumerate(pad.high_nodes(geometry.arm_length_mm)):
-                margin = (point_segment_distance(node, center, tip)
-                          - geometry.arm_radius_mm-geometry.node_radius_mm
-                          - geometry.safety_margin_mm)
-                if margin < worst[0]:
-                    worst = (margin, f"{pad.name}·{90+120*j}°高杆", arm+1)
-    return worst
+    from .gait_clearance import leg_gaps
+    rods = [(f"{pad.name}·{90+120*j}°高杆", *node) for pad in pads
+            for j, node in enumerate(pad.high_nodes(geometry.arm_length_mm))]
+    worst = min(leg_gaps(center, psi_deg, geometry, rods), key=lambda d: d["margin_mm"])
+    return worst["margin_mm"], worst["rod"], worst["leg"]

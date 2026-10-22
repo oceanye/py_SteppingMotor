@@ -30,10 +30,6 @@ from motor_control.gait_planner import (
 )
 
 
-# 2026-10-21 晶格镜像临时闸（全拦实机 two_mode 步态）：离线测试模拟
-# 的是全镜像修复后的正常行为——测试进程内关闸（模块级，不 stop）。
-from unittest.mock import patch as _gate_patch
-_gate_patch("motor_control.desktop_app.LATTICE_MIRROR_ALL_GATE", False).start()
 
 class SmoothstepTests(unittest.TestCase):
     def test_endpoints_and_midpoint(self):
@@ -177,7 +173,7 @@ class TrajectoryTests(unittest.TestCase):
         self.assertIn("A·90°高节点", report.as_summary()["message"])
         mirror = plan_swing_trajectory(GaitParams().validated(), side="right")
         self.assertEqual(mirror.hub_passover_nodes,
-                         ("邻座(-1,2)·330°高节点", "邻座(0,1)·90°高节点"))  # 2026-10-22 镜像
+                         ("B·210°高节点", "A·330°高节点"))  # C 支撑，B→A，而非地图外误路线
 
 
 class StagePlanTests(unittest.TestCase):

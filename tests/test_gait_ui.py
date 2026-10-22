@@ -28,10 +28,6 @@ from motor_control.gait_planner import (
 )
 
 
-# 2026-10-21 晶格镜像临时闸（全拦实机 two_mode 步态）：离线测试模拟
-# 的是全镜像修复后的正常行为——测试进程内关闸（模块级，不 stop）。
-from unittest.mock import patch as _gate_patch
-_gate_patch("motor_control.desktop_app.LATTICE_MIRROR_ALL_GATE", False).start()
 
 class TipTrackGeometryTests(unittest.TestCase):
     """爪端轨迹折线与爪-红杆最近表面距离的纯几何（无需 Tk）。"""
@@ -643,6 +639,10 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertFalse(anim["playing"] or anim["paused"])
 
     def test_live_canvas_follows_pulses_and_freezes_on_disconnect(self):
+        from unittest.mock import patch
+        # Test geometry/disconnect, not CPU-dependent expiry during Tk layout.
+        # The production 1s freshness check has separate stale-frame tests.
+        self.enterContext(patch("motor_control.coordinated_control.time.monotonic", return_value=100.))
         from motor_control import AxisMotionTelemetry
         from motor_control.ui.gait_twin import refresh_twin_panel
         from test_gait_twin import linked_app
@@ -671,7 +671,7 @@ class GaitLayoutTests(unittest.TestCase):
         # 2026-09-30 按用户要求：5×5 上放大后看最近足——6 爪中与高杆最近
         # 者黄圈高亮 + mm 数字（口径=爪端到杆表面）。
         self.assertTrue(canvas.find_withtag("nearest_tip"))
-        self.assertIn("6爪最近", canvas.itemcget(
+        self.assertIn("整腿当前", canvas.itemcget(
             canvas.find_withtag("hud_nearest")[0], "text"))
         # 运动足画三爪端轨迹；世界姿态未动的支撑足不画重复零长线。
         self.assertTrue(canvas.find_withtag("history_tips_left_0"))
@@ -789,6 +789,8 @@ class GaitLayoutTests(unittest.TestCase):
         self.assertFalse(self.errors)
 
     def test_clear_path_preserves_live_pose_motor_ledger_and_zoom(self):
+        from unittest.mock import patch
+        self.enterContext(patch("motor_control.coordinated_control.time.monotonic", return_value=100.))
         from motor_control.ui.gait_twin import refresh_twin_panel
         from test_gait_twin import linked_app, DigitalTwinTests
         controller = linked_app()

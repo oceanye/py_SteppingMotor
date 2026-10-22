@@ -17,6 +17,37 @@ from motor_control.gait_avoidance import lattice_coordinates
 PAD_CENTERS = {"A": (-1.0, 0.0), "B": (0.0, 0.0),
                "C": (-0.5, -math.sqrt(3) / 2)}
 ROLES = ("Mup1", "Mr1", "Mup2", "Mr2")
+# Display-only coherence budget: about one four-driver polling cycle. This is
+# NOT a simultaneous measurement or a clearance/control safety guarantee.
+MAX_POSE_SAMPLE_SKEW_MS = 750
+
+
+def reference_displaced(axes, final_positions):
+    """Positive movement evidence, not a temporary telemetry gap, breaks stance."""
+    for axis in axes:
+        if axis.get("command_pending"):
+            return True
+        if not axis.get("position_trusted") or axis.get("stale"):
+            continue
+        old, new = final_positions.get(axis["role"]), axis.get("position")
+        if not _finite(old) or not _finite(new):
+            continue
+        tolerance = 1e-9
+        if str(axis.get("position_source", "")).startswith("x42s"):
+            # Same two motor-pulse tolerance as endpoint confirmation; convert
+            # to role units, never compare linear mm with rotary degrees.
+            gear = axis.get("gear_ratio")
+            if not _finite(gear) or gear <= 0:
+                continue
+            tolerance = 720 / 3200 / gear
+            if axis["role"].startswith("Mup"):
+                lead = axis.get("lead_mm")
+                if not _finite(lead) or lead <= 0:
+                    continue
+                tolerance *= lead / 360
+        if abs(new - old) > tolerance:
+            return True
+    return False
 
 
 def axis_motion_active(axis):
@@ -60,17 +91,21 @@ class TwinHistory:
         self.world_key = None
         self.clear()
 
-    def clear(self, snapshot=None):
+    def clear(self, snapshot=None, *, preserve_steps=False):
+        completed = getattr(self, "completed_steps", 0) if preserve_steps else 0
+        current = getattr(self, "current_step", 0) if preserve_steps else 0
+        reference = getattr(self, "_last_reference", None) if preserve_steps else None
+        done = getattr(self, "_last_done", None) if preserve_steps else None
         self.points.clear()
         self.landings.clear()
-        self.completed_steps = 0
+        self.completed_steps = completed
         self._segment = 0
-        self.current_step = 0
+        self.current_step = current
         self.segment_steps = {}
-        self._last_reference = None
+        self._last_reference = reference
         self._healthy = False
         self._last_done = (snapshot.get("reference_key")
-                           if snapshot and snapshot.get("step_done") else None)
+                           if snapshot and snapshot.get("step_done") else done)
         if snapshot:
             self.world_key = snapshot.get("world_key")
 
@@ -166,6 +201,14 @@ def build_twin_snapshot(
               "xy_unit": "beam_length", "axes": motors,
               "pose": None, "target_pose": None, "state": "unavailable",
               "message": "等待四个电机绑定", "reference_key": None}
+    result["axes_measured"] = result["measured"]
+    if all_x42s:
+        ages = [a.get("last_update_age_ms") for a in motors.values()]
+        known = len(ages) == 4 and all(_finite(a) and a >= 0 for a in ages)
+        skew = max(ages) - min(ages) if known else None
+        result.update(sample_skew_ms=skew, oldest_sample_age_ms=max(ages) if known else None,
+                      pose_coherent=known and skew <= MAX_POSE_SAMPLE_SKEW_MS)
+        result["measured"] = result["measured"] and result["pose_coherent"]
     if any(r not in motors or not motors[r].get("binding_valid") for r in ROLES):
         return result
     if context is not None:
@@ -178,6 +221,10 @@ def build_twin_snapshot(
         "IDLE", "STARTING", "MOVING", "CONTINUOUS", "X42S_ONLINE"}
     if bad_states or any(not motors[r].get("position_trusted") for r in ROLES):
         result.update(state="untrusted", message="断连 / 停止 / 位置失信；保留最近有效估算")
+        return result
+    if all_x42s and not result["pose_coherent"]:
+        detail = "未知" if result["sample_skew_ms"] is None else f"{result['sample_skew_ms']:.0f}ms"
+        result.update(state="untrusted", message=f"四轴采样时差 {detail}；冻结姿态，保留各轴读数")
         return result
     if needs_recovery:
         result.update(state="untrusted", message="流程中止，需重建基准；保留最近有效估算")

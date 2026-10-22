@@ -28,6 +28,7 @@ def x42s_axis(role, **overrides):
         "stale": False,
         "continuous": False,
         "executed_steps": None,
+        "last_update_age_ms": 5,
     }
     card.update(overrides)
     return card

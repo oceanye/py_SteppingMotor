@@ -22,6 +22,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 from .gait_avoidance import LEGACY, TWO_MODE, MODE_NAMES, avoidance_path, leg_clearance, lattice_coordinates
 from .gait_map import start_pair_reference
+from .gait_coordinates import direction
 
 # ── 角度约定 ──────────────────────────────────────────────
 # 对外 API 一律用"度"；内部三角函数换算弧度。
@@ -90,8 +91,7 @@ def smoothstep5(s: float) -> float:
 
 
 def _dir(deg: float) -> tuple[float, float]:
-    rad = math.radians(deg)
-    return (math.cos(rad), -math.sin(rad))
+    return direction(deg)
 
 
 def _dot(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -177,6 +177,10 @@ class GaitGeometry:
         return self
 
 
+# 兼容说明（2026-10-22 系统修复）：以下 red_left/red_right 是历史持久化键。
+# 晶格 y 镜像后，键名已不等于实际红杆侧；保留其支座/β/零位以免静默改现场。
+# 现有 UI 与基准确认必须用 gait_coordinates.rod_side_for_pair 派生真实左右。
+# 下方 2026-09-28 注释仅记录旧坐标语义，不再作为现行显示依据。
 # 初始摆放 → (左足/右足支座, 横梁基准角)。红杆在横梁左/右侧的两种
 # 镜像摆法；程序账本原点由它派生（无传感器，全靠人工按实际摆放选择）。
 # 2026-09-28 实机校正左右：判据是"紧挨横梁的红杆"在从左足看向右足的
@@ -598,7 +602,7 @@ def swing_center(
 # 左摆动（A→C，支点 B）：中心从 A(180°) 顺 60° 到 C(120°)。
 LEFT_SWING = ("A", "C", "B", 180.0)
 # 右摆动（B→A，支点 C）：中心从 B(C→B 方位 300°) 到 A(C→A 方位 240°)。
-RIGHT_SWING = ("B", "A", "C", 60.0)
+RIGHT_SWING = ("B", "A", "C", 300.0)
 
 
 @dataclass(frozen=True)
@@ -876,6 +880,10 @@ def plan_swing_trajectory(
                    + ("模型通过，实机还需覆盖脉冲误差。" if feasible else
                       "未通过：禁止新模式实机执行；抬高不替代平面避杆。")
                    + " 紧贴晶格参考；非实测碰撞传感器。")
+    from .gait_coordinates import projection_warning
+    warning = projection_warning(geometry)
+    if warning:
+        message += " ⚠ " + warning
     return DryRunReport(
         feasible=feasible,
         min_margin_mm=minimum,
@@ -907,7 +915,7 @@ class RoleMove:
 
 @dataclass(frozen=True)
 class GaitStage:
-    """阶段及运动组；synchronized组须原子下发、共用五次进度，无MOVE降级。"""
+    """阶段及运动组；默认共享五次进度，X42S需另认证独立进度包络后细分。"""
 
     stage_id: str
     title: str
@@ -918,6 +926,8 @@ class GaitStage:
     group_durations: tuple[float, ...] = ()
     # Ideal absolute offsets from S4 start, rounded cumulatively at the host.
     sync_endpoints: tuple[tuple[float, float], ...] = ()
+    execution_profile: str = "shared_quintic"
+    certified_margin_mm: float | None = None
 
     @property
     def is_motion_stage(self) -> bool:
@@ -1044,8 +1054,9 @@ def plan_gait_stages(
                 )
             )
 
-    # S4 每条角度折线段一次原子下发。固件共享时基/主进度，不用两条
-    # 独立梯形 MOVE 近似同步，也不把 Δq=180 替换成终点等效的 60。
+    # S4 名义角度折线及共享时基（STEP/DIR执行/模拟参考）。X42S宿主必须
+    # 经 gait_x42s_plan 认证并细分，不能把独立梯形MOVE冒充这条时间曲线，
+    # 也不把 Δq=180 替换成终点等效的 60。
     _spin, swing_delta_total, support_delta_total = angular_targets(params, arc_deg)
     duration_s = 1.875 * abs(arc_deg) / params.swing_speed_deg_s
     segment_groups = [(RoleMove(swing_role, swing_sign * swing_delta_total,

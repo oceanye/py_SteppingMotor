@@ -22,6 +22,12 @@ def status(*, online=1, enabled=1, reached=1, measured=215,
             f"215,{measured},0,0,0,25,{age},0,{mask}")
 
 
+def issue_move(app):
+    token = app._gait_owned.get(102, object())
+    app._gait_owned[102] = app._move_reservation[102] = token
+    assert app._gait_send_relative(102, 10, 8) == "sent"
+
+
 class X42sRuntimeTests(unittest.TestCase):
     def test_offline_reply_must_not_revive_cached_driver(self):
         app = _x42s_gait_app()
@@ -56,6 +62,7 @@ class X42sRuntimeTests(unittest.TestCase):
 
     def test_terminal_reply_updates_position_used_by_next_segment(self):
         app = _x42s_gait_app()
+        issue_move(app)
         app._send_and_read = lambda *_a, **_k: status(measured=215)
         with patch.object(desktop_app, "X42S_WAIT_BLIND_S", 0):
             self.assertEqual(app._gait_wait_terminal(102, 0.2), "DONE")
@@ -65,6 +72,8 @@ class X42sRuntimeTests(unittest.TestCase):
         app = _x42s_gait_app()
         run, _ = app._gait_begin_run("left", arc_deg=-60)
         run.x42s_sync_origin = {102: 0.0, 104: 0.0}
+        issue_move(app)
+        app.commands.clear()
         controller = app._send_and_read
         app._send_and_read = lambda *_a, **_k: status(measured=215)
         with patch.object(desktop_app, "X42S_WAIT_BLIND_S", 0):
@@ -81,6 +90,7 @@ class X42sRuntimeTests(unittest.TestCase):
         for kwargs in ({"online": 0}, {"enabled": 0}):
             with self.subTest(**kwargs):
                 app = _x42s_gait_app()
+                issue_move(app)
                 app._send_and_read = lambda *_a, **_k: status(**kwargs)
                 with patch.object(desktop_app, "X42S_WAIT_BLIND_S", 0):
                     self.assertEqual(app._gait_wait_terminal(102, 0.1), "ABORTED")
@@ -89,6 +99,7 @@ class X42sRuntimeTests(unittest.TestCase):
         for kwargs in ({"age": 2000}, {"mask": 0}):
             with self.subTest(**kwargs):
                 app = _x42s_gait_app()
+                issue_move(app)
                 app._send_and_read = lambda *_a, **_k: status(**kwargs)
                 with patch.object(desktop_app, "X42S_WAIT_BLIND_S", 0):
                     self.assertEqual(app._gait_wait_terminal(102, 0.05), "TIMEOUT")

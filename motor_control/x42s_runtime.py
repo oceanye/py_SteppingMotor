@@ -265,6 +265,11 @@ class X42sRuntimeMixin:
                     "acknowledged": False,
                     "target": None if origin is None else origin + steps * 360 / X42S_PULSE_PER_REV,
                 }
+                # Invalidate on the command attempt, even if it returns to the
+                # same coordinate between GUI frames or its ACK is lost.
+                run = getattr(self, "_gait_run", None)
+                if run is not None:
+                    run.twin_manual_invalid = True
         resp = self._send_and_read(command, soft_timeout=True, guard=allowed)
         reply = parse_line(resp) if resp else None
         if steps is None:

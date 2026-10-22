@@ -10,7 +10,7 @@ def build_twin_charts(parent, *, height=400):
                            sashwidth=8, sashrelief="raised", borderwidth=0,
                            opaqueresize=True)
     canvases = []
-    for title in ("平面移动 · 5×5", "爪端–高杆距离 (mm)"):
+    for title in ("平面移动 · 5×5", "整腿–高杆表面间隙 (mm)"):
         frame = ttk.LabelFrame(panes, text=title)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)

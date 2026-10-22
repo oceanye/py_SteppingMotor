@@ -76,10 +76,6 @@ def mechanism(limit=720.0):
     return app
 
 
-# 2026-10-21 晶格镜像临时闸（全拦实机 two_mode 步态）：离线测试模拟
-# 的是全镜像修复后的正常行为——测试进程内关闸（模块级，不 stop）。
-from unittest.mock import patch as _gate_patch
-_gate_patch("motor_control.desktop_app.LATTICE_MIRROR_ALL_GATE", False).start()
 
 class LandingSequenceTests(unittest.TestCase):
     def test_landing_settles_swing_leg_before_dual_descent(self):
@@ -120,7 +116,10 @@ class AngularLawTests(unittest.TestCase):
                 self.assertAlmostEqual(sample.psi_deg-30, 2*sample.phi_deg)
                 self.assertAlmostEqual(sample.swing_q_delta_deg, 3*sample.phi_deg)
                 self.assertAlmostEqual(sample.support_q_delta_deg, sample.phi_deg)
-            self.assertAlmostEqual(report.samples[-1].beta_deg, 120 if side == "left" else -180)  # 镜像
+            self.assertAlmostEqual(report.samples[-1].beta_deg, 120 if side == "left" else 60)
+            pads = {p.name: p for p in report.hexagons}
+            self.assertLess(math.dist(report.samples[0].center, pads[report.route[0]].center), 1e-8)
+            self.assertLess(math.dist(report.samples[-1].center, pads[report.route[1]].center), 1e-8)
 
     def test_default_negative_gain_swings_backwards(self):
         # 2026-09-21 默认 k=-2：Δψ=-2φ，Δq摆=(k+1)φ=-φ，支撑仍 +φ
@@ -263,7 +262,7 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
             app.gait_params, side="left", swing_psi_start_deg=30.0)
             if s.stage_id == "S4")
         self.assertAlmostEqual(fwd_s4.duration_s, s4.duration_s)
-        self.assertTrue(any("逆向" in line for line in app._logs))
+        self.assertTrue(any("模型弧向 -60°" in line for line in app._logs))
 
     def test_invalid_direction_selection_blocks_begin_run(self):
         app = mechanism()

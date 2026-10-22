@@ -172,6 +172,9 @@ class SimulationUITests(unittest.TestCase):
 
     def test_cumulative_two_steps_preview_and_large_window_without_physical_writes(self):
         from motor_control.ui.gait_twin_window import open_twin_window
+        # This scenario explicitly follows A→C (+60 model arc = UI L-).
+        from motor_control.ui.gait_tab import _gait_mode_selected
+        _gait_mode_selected(self.app, "L-")
         original = self.app.gait_params
         sim_ui.toggle_simulation(self.app)
         self.finish_ui_step()

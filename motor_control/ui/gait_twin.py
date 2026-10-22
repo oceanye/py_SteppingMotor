@@ -12,6 +12,7 @@ from collections import deque
 from tkinter import ttk, messagebox
 
 from motor_control.gait_avoidance import lattice_coordinates
+from motor_control.gait_coordinates import polar_point
 from motor_control.gait_planner import effective_geometry
 from motor_control.gait_twin import ROLES, TwinHistory, pad_center, axis_motion_active
 from motor_control.gait_map import map_pads, map_label, start_pair_reference
@@ -79,8 +80,8 @@ def high_rods_mm(params):
     for name, (nx, ny) in neighborhood_pads().items():
         cx, cy = nx * d, ny * d
         for j in range(3):
-            a = math.radians(90.0 + 120.0 * j)
-            rods.append((name, j, cx + arm * math.cos(a), cy + arm * math.sin(a)))
+            x, y = polar_point((cx, cy), arm, 90.0 + 120.0 * j)
+            rods.append((name, j, x, y))
     return rods
 
 
@@ -103,8 +104,7 @@ def foot_tips_mm(center_norm, psi_deg, params):
     cx, cy = center_norm[0] * d, center_norm[1] * d
     tips = []
     for k in range(3):
-        a = math.radians(psi_deg + 120.0 * k)
-        tips.append((cx + arm * math.cos(a), cy + arm * math.sin(a)))
+        tips.append(polar_point((cx, cy), arm, psi_deg + 120.0 * k))
     return tips
 
 
@@ -119,6 +119,38 @@ def tip_surface_distances(pose, params):
         for tip in foot_tips_mm(foot["center"], foot["psi_deg"], params):
             values.append(min(math.dist(tip, (r[2], r[3])) for r in rods) - node_r)
     return values
+
+
+def leg_surface_details(pose, params):
+    from motor_control.gait_clearance import leg_gaps
+    d = lattice_d_mm(params)
+    rods = [(f"{name}·{90+120*j}°高杆", x, y) for name, j, x, y in _rods_cached(params)]
+    result = []
+    for side in ("left", "right"):
+        foot = pose["feet"][side]
+        center = tuple(v*d for v in foot["center"])
+        result.extend(dict(item, side=side) for item in
+                      leg_gaps(center, foot["psi_deg"], params.geometry, rods))
+    return result
+
+
+def leg_surface_distances(pose, params):
+    """Six WHOLE-leg surface gaps; zero=overlap threshold, delta=safety threshold."""
+    return [item["gap_mm"] for item in leg_surface_details(pose, params)]
+
+
+def plan_leg_series(report, params, psis=(30., 30.)):
+    d = lattice_d_mm(params)
+    support = "right" if report.side == "left" else "left"
+    swing_slot = 0 if report.side == "left" else 1
+    result = []
+    for t, sample in zip(plan_sample_times(report, params), report.samples):
+        pose = {"feet": {
+            report.side: dict(center=tuple(v/d for v in sample.center),
+                              psi_deg=sample.psi_deg+psis[swing_slot]-30.),
+            support: dict(center=pad_center(report.route[2]), psi_deg=psis[1-swing_slot])}}
+        result.append((t, leg_surface_distances(pose, params)))
+    return result
 
 
 def plan_tip_series(report, params, psis=(30.0, 30.0)):
@@ -139,8 +171,7 @@ def plan_tip_series(report, params, psis=(30.0, 30.0)):
     support_slot = 1 - swing_slot
     support = []
     for k in range(3):
-        a = math.radians(psis[support_slot] + 120.0 * k)
-        tip = (px + arm * math.cos(a), py + arm * math.sin(a))
+        tip = polar_point((px, py), arm, psis[support_slot] + 120.0 * k)
         support.append(min(math.dist(tip, (r[2], r[3])) for r in rods) - node_r)
     # 6 条顺序固定 [左足0..2, 右足0..2]：支撑足占另一侧的三个槽位。
     times = plan_sample_times(report, params)
@@ -148,9 +179,7 @@ def plan_tip_series(report, params, psis=(30.0, 30.0)):
     for index, sample in enumerate(report.samples):
         swing_vals = []
         for k in range(3):
-            a = math.radians(sample.psi_deg + psis[swing_slot]-30.0 + 120.0 * k)
-            tip = (sample.center[0] + arm * math.cos(a),
-                   sample.center[1] + arm * math.sin(a))
+            tip = polar_point(sample.center, arm, sample.psi_deg + psis[swing_slot]-30.0 + 120.0 * k)
             swing_vals.append(min(math.dist(tip, (r[2], r[3])) for r in rods) - node_r)
         vals = [0.0] * 6
         vals[swing_slot * 3:swing_slot * 3 + 3] = swing_vals
@@ -180,7 +209,7 @@ def clear_twin_history(app):
             app._gait_last_report = None
         _draw(app, view)
         return
-    view["history"].clear(view["snapshot"])
+    view["history"].clear(view["snapshot"], preserve_steps=True)
     _clear_live_curve(view)
     timeline = view.get("live_curve_timeline")
     if timeline is not None:
@@ -348,9 +377,9 @@ def build_twin_panel(app, parent):
     legend = ttk.Label(panel, text="虚线落点=预估位置(左蓝/右橙) 紫=累计模拟 红=实机反馈推算\n"
                        "足色:蓝=左足 橙=右足 灰=断连冻结 绿点=低节点(落脚) 红点=高节点(红杆)\n"
                        "轨迹仅显示上一步淡色、当前步深色；虚线=预估位置。\n"
-                       "黄圈+数字=6爪中与红杆最近者(爪端到杆表面距离,mm)\n"
+                       "黄圈+数字=整腿最危险点；含腿厚/杆半径，非仅爪端。\n"
                        "曲线跨步累计90秒滑窗；纵轴固定−20～200mm，0=杆表面，负值红底。\n"
-                       "爪端为正不能证明整腿避碰；完整校验不变。超量程提示，不自动缩放。\n"
+                       "整腿表面间隙减δ=安全余量；静态帧不能替代连续扫掠校验。\n"
                        "画面:左键点一下(蓝框)=选中,滚轮缩放;移出自动取消 中键拖动=平移 双击=复位\n"
                        "固定5×5地图，B=(0,0)；默认上+Y、右+X，可整体逆时针旋转60°。\n"
                        "旋转仅改变视角，世界坐标/行列/动作方向不变；全图保留旋转选项。\n"
@@ -411,7 +440,7 @@ def build_twin_panel(app, parent):
 
     # Same data stream beside the map, not below it. No second sampler.
     view["curve_canvas"].bind("<Configure>", lambda _e: _draw_curve(app, view))
-    chart_hint = ttk.Label(panel, text="左：平面位置与路径；右：六爪端到高杆表面距离（非整腿净间隙）。拖动中间分隔条调宽；大图可最大化。",
+    chart_hint = ttk.Label(panel, text="左：平面位置与路径；右：六条整腿到高杆表面间隙（含腿厚；0=碰撞，δ=安全线）。拖动中间分隔条调宽；大图可最大化。",
                            wraplength=280, foreground="#64748b")
     chart_hint.grid(row=4, column=0, sticky="ew", padx=6)
 
@@ -502,14 +531,21 @@ def refresh_twin_panel(app):
         view.pop("candidate", None)
     healthy = snapshot.get("state") in ("estimated", "waiting")
     route = snapshot.get("pose", {}).get("route") if snapshot.get("pose") else None
-    view["status"].configure(text="实机状态：" + snapshot["message"] + (f"\n{route}" if route else ""),
+    ages = ""
+    if snapshot.get("source") == "x42s_measured":
+        stamp = lambda value: "未知" if value is None else f"{value:.0f}ms"
+        ages = (f"\n最老样本 {stamp(snapshot.get('oldest_sample_age_ms'))} · "
+                f"跨轴时差 {stamp(snapshot.get('sample_skew_ms'))}（非同时采样）")
+    view["status"].configure(text="实机状态：" + snapshot["message"] + (f"\n{route}" if route else "") + ages,
                              foreground="#1565c0" if healthy else "#b45309")
     for role, labels in view["rows"].items():
         axis = snapshot["axes"].get(role, {})
         unit = axis.get("unit", "")
         labels[0].configure(text=f"{role} / {axis.get('axis', '—')}")
         labels[1].configure(text=_coordinate(axis.get("position"), unit,
-                                            estimated=not axis.get("measured", False)))
+                                            estimated=not axis.get("measured", False))
+                            + (f" [{axis.get('last_update_age_ms', '—')}ms]"
+                               if snapshot.get("source") == "x42s_measured" else ""))
         labels[2].configure(text=_coordinate(axis.get("target_position"), unit))
         good = (axis.get("position_trusted") and axis.get("binding_valid")
                 and axis.get("state") in ("IDLE", "STARTING", "MOVING", "CONTINUOUS", "X42S_ONLINE")
@@ -552,7 +588,7 @@ def _record_live_curve(app, view, pose):
     if base is None:
         base = view["curve_t0"] = now
     try:
-        values = tip_surface_distances(pose, app.gait_params)
+        values = leg_surface_distances(pose, app.gait_params)
     except Exception:
         return
     view["curve_live"].append((now - base, values, view["curve_seg"]))
@@ -678,8 +714,7 @@ def _render_map(app, view):
         for name, center in all_pads.items():
             on_route = name in route_pads
             selection = selected.get(map_label(name))
-            nodes = [(center[0]+math.cos(math.radians(30+i*60))/math.sqrt(3),
-                      center[1]+math.sin(math.radians(30+i*60))/math.sqrt(3)) for i in range(6)]
+            nodes = [polar_point(center, 1/math.sqrt(3), 30+i*60) for i in range(6)]
             canvas.create_polygon(*(v for node in nodes for v in project(node)),
                                   fill=("#eff6ff" if selection == "left" else
                                         "#fff7ed" if selection == "right" else ""),
@@ -758,22 +793,19 @@ def _render_map(app, view):
         # 爪端正好落在节点环/六边形顶点上）。
         arm = params.geometry.arm_length_mm / lattice_d_mm(params)
         for i in range(3):
-            theta = math.radians(foot["psi_deg"] + i*120)
-            end = (foot["center"][0]+arm*math.cos(theta),
-                   foot["center"][1]+arm*math.sin(theta))
+            end = polar_point(foot["center"], arm, foot["psi_deg"]+120*i)
             tip_xy = project(end)
             canvas.create_line(x, y, *tip_xy, fill=color, width=3,
                                tags=f"{'sim' if sim is not None else 'live'}_{side}")
-            surface = _tip_surface(app, end, params, side, i)
-            if surface is not None and (nearest is None or surface < nearest[0]):
-                nearest = (surface, tip_xy)
         canvas.create_oval(x-5, y-5, x+5, y+5, outline=color,
                            fill=color, tags=f"{side}_center")
-    if nearest is not None:
-        _highlight_nearest(canvas, nearest[0], nearest[1])
-        canvas.create_text(
-            8, 26, anchor="nw", width=width-16, fill="#b45309", font=("Microsoft YaHei", 9),
-            text=f"6爪最近(当前) {nearest[0]:.2f}mm（爪端到杆表面）", tags="hud_nearest")
+    nearest = min(leg_surface_details(pose, params), key=lambda item: item["gap_mm"])
+    _highlight_nearest(canvas, nearest["gap_mm"], project(tuple(
+        v/lattice_d_mm(params) for v in nearest["closest_point"])))
+    canvas.create_text(
+        8, 26, anchor="nw", width=width-16, fill="#b91c1c" if nearest["margin_mm"] <= 0 else "#b45309",
+        font=("Microsoft YaHei", 9), text=_clearance_label(nearest, "当前" if live else "冻结"),
+        tags="hud_nearest")
     # 柱状图标尺=本步抬升量（固定量程）。2026-10-20 修正：此前用当前帧
     # 两腿 z 的最大值自归一化——任何非零 z 都显示成满格（S2 一开场就
     # 在顶点、S6 双降全程满格直到突降 0），只有单腿动作时另一腿当标尺
@@ -833,6 +865,12 @@ def _highlight_nearest(canvas, surface, tip_xy):
                        font=("Microsoft YaHei", 8, "bold"), tags="nearest_tip")
 
 
+def _clearance_label(item, source):
+    side = "左" if item["side"] == "left" else "右"
+    return (f"整腿{source} {item['gap_mm']:.2f}mm；扣δ余量 {item['margin_mm']:.2f}mm\n"
+            f"{side}腿{item['leg']} ↔ {item['rod']}（平面模型）")
+
+
 # ── 计划层（评估模拟）：轨迹 + 动画帧 ghost 足 + 最近足高亮 ──
 
 def _draw_plan_layer(app, view, report, project):
@@ -863,9 +901,7 @@ def _draw_plan_layer(app, view, report, project):
     for leg in range(3) if show_path else ():
         points = []
         for s in samples:
-            a = math.radians(s.psi_deg + offset + 120.0 * leg)
-            tip = (s.center[0] + geometry.arm_length_mm * math.cos(a),
-                   s.center[1] + geometry.arm_length_mm * math.sin(a))
+            tip = polar_point(s.center, geometry.arm_length_mm, s.psi_deg + offset + 120.0 * leg)
             points.extend(to_map(tip))
         if len(points) >= 4:
             canvas.create_line(*points, fill=CURVE_COLORS[swing_slot][leg], width=1.5,
@@ -881,9 +917,7 @@ def _draw_plan_layer(app, view, report, project):
     # （2026-09-30 按用户要求把两类线型对调）。
     x, y = to_map(sample.center)
     for leg in range(3):
-        a = math.radians(sample.psi_deg + offset + 120.0 * leg)
-        end = (sample.center[0] + geometry.arm_length_mm * math.cos(a),
-               sample.center[1] + geometry.arm_length_mm * math.sin(a))
+        end = polar_point(sample.center, geometry.arm_length_mm, sample.psi_deg + offset + 120.0 * leg)
         canvas.create_line(x, y, *to_map(end), fill="#2563eb", width=2,
                            tags="plan_ghost")
     canvas.create_oval(x-5, y-5, x+5, y+5, outline="#2563eb", width=2,
@@ -894,9 +928,7 @@ def _draw_plan_layer(app, view, report, project):
     pivot_mm = (pivot_norm[0] * d, pivot_norm[1] * d)
     px, py = to_map(pivot_mm)
     for leg in range(3):
-        a = math.radians(support_psi + 120.0 * leg)
-        end = (pivot_mm[0] + geometry.arm_length_mm * math.cos(a),
-               pivot_mm[1] + geometry.arm_length_mm * math.sin(a))
+        end = polar_point(pivot_mm, geometry.arm_length_mm, support_psi + 120.0 * leg)
         canvas.create_line(px, py, *to_map(end), fill="#94a3b8", width=2,
                            tags="plan_support")
     canvas.create_oval(px-5, py-5, px+5, py+5, outline="#475569", width=2,
@@ -907,25 +939,18 @@ def _draw_plan_layer(app, view, report, project):
     tx, ty = to_map((target_norm[0] * d, target_norm[1] * d))
     canvas.create_oval(tx-6, ty-6, tx+6, ty+6, outline="#16a34a", width=2,
                        dash=(3, 2), tags="plan_target")
-    # 当前帧六个爪端一并评估；不要把只计算摆动侧的结果标成“6爪”。
-    nearest = None
-    for center, psi in ((sample.center, sample.psi_deg+offset), (pivot_mm, support_psi)):
-        for leg in range(3):
-            a = math.radians(psi + 120.0 * leg)
-            tip = (center[0]+geometry.arm_length_mm*math.cos(a),
-                   center[1]+geometry.arm_length_mm*math.sin(a))
-            surface = _tip_surface(app, (tip[0]*k_norm, tip[1]*k_norm), params, report.side, leg)
-            if nearest is None or surface < nearest[0]:
-                nearest = (surface, to_map(tip))
-    if nearest is not None:
-        _highlight_nearest(canvas, nearest[0], nearest[1])
+    support_side = "right" if report.side == "left" else "left"
+    pose = {"feet": {
+        report.side: dict(center=tuple(v/d for v in sample.center), psi_deg=sample.psi_deg+offset),
+        support_side: dict(center=pivot_norm, psi_deg=support_psi)}}
+    nearest = min(leg_surface_details(pose, params), key=lambda item: item["gap_mm"])
+    _highlight_nearest(canvas, nearest["gap_mm"], to_map(nearest["closest_point"]))
     worst = report.min_margin_sample
     hud = (f"回放 φ={sample.phi_deg:.1f}° ψ={sample.psi_deg+offset:.1f}°"
            f"（{index + 1}/{len(samples)}）" if frame is not None else
            f"评估计划 {start}→{target} 绕{pivot}")
     hud_lines = [hud]
-    if nearest is not None:
-        hud_lines.append(f"6爪端当前最近 {nearest[0]:.2f}mm（非整腿净间隙）")
+    hud_lines.append(_clearance_label(nearest, "候选"))
     if worst is not None:
         hud_lines.append(f"整腿净间隙下界 {report.min_margin_mm:.2f}mm")
     canvas.create_text(8, 8, anchor="nw", fill="#1d4ed8", width=canvas.winfo_width()-16,

@@ -33,6 +33,40 @@ class GaitGuiWorkflowTests(unittest.TestCase):
     def test_four_actions_full_gui_smoke(self):
         run_smoke(self.app)
 
+    def test_curve_source_and_statistics_do_not_overlap_on_narrow_window(self):
+        self.root.geometry("1024x700")
+        self.root.update()
+        self.app.gait_widgets["action_choices"][0].invoke()
+        canvas = self.view["curve_canvas"]
+        source, statistics = canvas.bbox("curve_source"), canvas.bbox("curve_best")
+        self.assertGreaterEqual(statistics[1], source[3])
+        self.assertGreaterEqual(statistics[0], 0)
+        self.assertLessEqual(statistics[2], canvas.winfo_width())
+
+    def test_executor_group_progress_survives_periodic_tk_refresh(self):
+        from motor_control.gait_executor import GaitExecutor
+        from motor_control.gait_planner import plan_gait_stages
+        from test_gait_executor import FakeHost
+        host = FakeHost()
+        host.send_synchronized_endpoint = lambda moves, duration, endpoints: host.send_synchronized(moves, duration)
+        run = GaitExecutor(host, self.original, plan_gait_stages(self.original, side="left"), side="left")
+        run.rotation_start = None
+        while run.current_stage().stage_id != "S4":
+            run.execute_current_stage() if run.current_stage().is_motion_stage else run.advance_confirm()
+        self.app._gait_run = run
+        seen = []
+
+        def progress(*_):
+            self.app._refresh_gait_ui()
+            before = self.app.gait_widgets["progress"].cget("text")
+            self.app._refresh_coordinated_ui_once()
+            self.assertEqual(self.app.gait_widgets["progress"].cget("text"), before)
+            self.assertIn("S4", before)
+            seen.append(before)
+
+        self.assertTrue(run.execute_current_stage(progress))
+        self.assertTrue(seen)
+
     def test_binding_cards_use_role_feedback_and_clear_stale_missing_and_rebound_canvas(self):
         app = self.app
         app.control_bindings = BindingSet.from_driver_id_mapping(

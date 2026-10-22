@@ -1,5 +1,6 @@
 """Two-step map trails. Pure display, independent of the full world ledger."""
 import math
+from motor_control.gait_coordinates import polar_point
 
 FOOT_COLORS = {"left": "#2563eb", "right": "#ea580c"}
 PAST_COLORS = {"left": "#bfdbfe", "right": "#fed7aa"}
@@ -41,8 +42,7 @@ def draw_recent_paths(canvas, history, project, arm, prefix):
                              (f"{prefix}_tips_{side}_{k}", age_tag, step_tag))
                         tips = []
                         continue
-                    a = math.radians(psi+120*k)
                     cx, cy = point[index]
-                    tips.append((cx+arm*math.cos(a), cy+arm*math.sin(a)))
+                    tips.append(polar_point((cx, cy), arm, psi+120*k))
                 line(tips, color, 0.8 if age else 1.3,
                      (f"{prefix}_tips_{side}_{k}", age_tag, step_tag))

@@ -1,5 +1,6 @@
 """Side-coloured dashed landing forecasts, independent of current position."""
 import math
+from motor_control.gait_coordinates import polar_point
 import tkinter as tk
 
 from motor_control.gait_simulation import GaitSimulation, simulation_key
@@ -120,9 +121,8 @@ def draw_candidate(app, view):
                 return
     x, y = project(center)
     for leg in range(3):
-        angle = math.radians(psi+120*leg)
         arm = params.geometry.arm_length_mm/d
-        end = (center[0]+arm*math.cos(angle), center[1]+arm*math.sin(angle))
+        end = polar_point(center, arm, psi+120*leg)
         canvas.create_line(x, y, *project(end), fill=color, width=2, dash=(4, 3), tags=tag)
     canvas.create_line(x, y, *project(pad_center(report.route[2])), fill=color,
                        width=1.2, dash=(4, 3), tags=tag)

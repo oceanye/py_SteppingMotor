@@ -257,6 +257,17 @@ class _GaitHostAdapter:
     def stop_axes(self, axes):
         self._app._gait_stop_axes(axes)
 
+    def wait_group(self, axes, timeout_s):
+        if all(a >= X42S_AXIS_HANDLE_BASE for a in axes):
+            from motor_control.gait_x42s_wait import wait_moves
+            return wait_moves(self._app, axes, timeout_s,
+                              blind_s=X42S_WAIT_BLIND_S, poll_s=X42S_WAIT_POLL_S)
+        for axis in axes:
+            result = self.wait_terminal(axis, timeout_s)
+            if result != "DONE":
+                return result
+        return "DONE"
+
     def cancelled(self):
         return self._app._control_worker_cancelled()
 
@@ -551,8 +562,11 @@ class StepperGUI(X42sRuntimeMixin):
         )
         control["legacy_stepdir_enabled"] = getattr(self, "legacy_stepdir_enabled", True)
         pending = getattr(self, "_x42s_manual_pending", {})
+        gait_pending = getattr(self, "_gait_x42s_moves", {})
         for motor in motors:
-            if motor.get("driver_id") in pending and self._is_serial_connected():
+            driver_id = motor.get("driver_id")
+            if (self._is_serial_connected() and (driver_id in pending or
+                    (driver_id is not None and X42S_AXIS_HANDLE_BASE+driver_id in gait_pending))):
                 motor["command_pending"] = True
                 motor["in_progress"] = True
         return control, motors
@@ -1184,13 +1198,17 @@ class StepperGUI(X42sRuntimeMixin):
         if params is None:
             return
         supports = params.initial_supports
+        from motor_control.gait_coordinates import rod_side_for_pair
         stance_text = (f"左足在{supports[0]}、右足在{supports[1]}，三爪均踩低节点；"
-                       f"红杆在横梁{'右' if params.initial_placement == 'red_right' else '左'}侧"
+                       f"红杆在横梁{rod_side_for_pair(supports)}侧"
                        "（与步态页【初始摆放】选择一致）")
         if not messagebox.askokcancel(
                 "确认摆放并记录双侧基准",
                 f"请确认实物已处于所选起步位置：{stance_text}。\n"
-                "四轴已静止且支撑可靠；已核实方向、减速比、升降导程与真实投影尺寸。\n\n"
+                "四轴已静止且支撑可靠；已核实方向、减速比、升降导程与真实投影尺寸。\n"
+                f"当前腿投影半宽 {params.geometry.arm_radius_mm:g}mm，高杆半径 "
+                f"{params.geometry.node_radius_mm:g}mm，安全间隙 {params.geometry.safety_margin_mm:g}mm。\n"
+                "地图/红杆标签已统一镜像坐标，首次升级请核对实物与地图；不改变已保存方向。\n\n"
                 "确认后一次记录左右旋转基准并保存，无需分别记零、再次勾选或保存。"
                 "不移动电机、不发送驱动器ZERO、不改方向。\n"
                 "正常连续换步不要点此按钮；它会将地图基准重建到所选起步位置。"):
@@ -1207,7 +1225,8 @@ class StepperGUI(X42sRuntimeMixin):
     # ── 电机绑定页：逐角色调试点动与真实方向标定（2026-09-28）─────
     # 真实方向 vs 驱动方向：点动按"轴坐标 +/-"驱动单个角色绑定的轴，
     # 操作员俯视观察机构真实运动后记录符号——+1=轴坐标增大即约定正方向
-    # （Mr: 俯视逆时针/ψ 增大；Mup: 抬起），−1=相反。
+    # Mr 必须观察固定支撑腿驱动的横梁：Δβ=-sign·Δmotor，
+    # 模型角顺时针为正，横梁逆时针对应 sign=+1；不可混用悬空腿自转。
     ROLE_SIGN_FIELD = {
         "Mr1": "mr1_sign",
         "Mr2": "mr2_sign",
@@ -1216,10 +1235,10 @@ class StepperGUI(X42sRuntimeMixin):
     }
 
     def _role_positive_direction_text(self, role_name):
-        return "俯视逆时针" if role_name.startswith("Mr") else "抬起"
+        return "支撑时横梁俯视逆时针" if role_name.startswith("Mr") else "抬起"
 
     def _role_negative_direction_text(self, role_name):
-        return "俯视顺时针" if role_name.startswith("Mr") else "下降"
+        return "支撑时横梁俯视顺时针" if role_name.startswith("Mr") else "下降"
 
     @logged_action
     def _role_debug_move(self, role_name, axis_positive):
@@ -1649,7 +1668,7 @@ class StepperGUI(X42sRuntimeMixin):
         route = self._gait_landing_route(side, params, pads=pads, arc_deg=arc_deg)
         if route is None:
             raise GaitExecutorError(
-                f"该侧{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°落点处"
+                f"该侧模型弧向 {arc_deg:+g}°落点处"
                 "没有六边形支座；请核实站位与横梁角，或先交换摆动/支撑侧")
         report = plan_swing_trajectory(
             params, side=side, route=route, arc_deg=arc_deg)
@@ -1665,7 +1684,7 @@ class StepperGUI(X42sRuntimeMixin):
                 "实机步态暂停，等待晶格全镜像修复。单台调试（绑定页点动/"
                 "手动调试区）不受影响。")
         self.log(f"步态角度联动校验（{route[0]}→{route[1]}，支点{route[2]}，"
-                 f"{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°）：{report.message}")
+                 f"模型弧向 {arc_deg:+g}°）：{report.message}")
         # legacy 保留历史碰撞仅提示行为；两模态的腿—高杆门槛已在上方
         # 拦截，额外结构诊断仍提示。行程、固件、标定等操作门槛仍拦截。
         clearance_warnings: list[str] = []
@@ -1904,7 +1923,7 @@ class StepperGUI(X42sRuntimeMixin):
         route = self._gait_landing_route(side, params, pads=pads, arc_deg=arc_deg)
         if route is None:
             raise GaitExecutorError(
-                f"该侧{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°落点处"
+                f"该侧模型弧向 {arc_deg:+g}°落点处"
                 "没有六边形支座；请核实站位与横梁角，或先交换摆动/支撑侧")
         report = plan_swing_trajectory(
             params, side=side, route=route, arc_deg=arc_deg)
@@ -1918,7 +1937,7 @@ class StepperGUI(X42sRuntimeMixin):
                 "实机步态暂停，等待晶格全镜像修复。单台调试（绑定页点动/"
                 "手动调试区）不受影响。")
         self.log(f"步态角度联动校验（{route[0]}→{route[1]}，支点{route[2]}，"
-                 f"{'顺' if arc_deg > 0 else '逆'}向{abs(arc_deg):g}°）：{report.message}")
+                 f"模型弧向 {arc_deg:+g}°）：{report.message}")
         clearance_warnings: list[str] = []
         if not report.feasible:
             clearance_warnings.append(f"干跑校验不可行：{report.message}")
@@ -1950,14 +1969,16 @@ class StepperGUI(X42sRuntimeMixin):
                 binding.gear_ratio * X42S_PULSE_PER_REV / 360.0
                 if ROLE_SPECS[role].required_mode == MODE_ROTARY
                 else binding.gear_ratio * X42S_PULSE_PER_REV / binding.lead_mm)
-        phi_error = 2.0 / ppu[support_role]
-        psi_error = phi_error + 2.0 / ppu[swing_role]
+        # Two pulses for endpoint acceptance, plus wire 0.1deg / pulse
+        # quantization and the previous endpoint residual (four total).
+        phi_error = 4.0 / ppu[support_role]
+        psi_error = phi_error + 4.0 / ppu[swing_role]
         pulse_envelope = math.radians(phi_error) * geometry.d_mm + math.radians(psi_error) * geometry.arm_length_mm
         for lift_role in ("Mup1", "Mup2"):
             pulse_envelope += 0.5 / ppu[lift_role]
         phase_residual = abs((psi_now - LOW_NODE_PHASE_DEG + 60) % 120 - 60)
         if phase_stage is not None:
-            phase_residual = 0.5 / ppu[swing_role]
+            phase_residual = 4.0 / ppu[swing_role]
         pulse_envelope += geometry.arm_length_mm * math.radians(phase_residual)
         pulse_envelope += geometry.d_mm * math.radians(abs((bearing - expected_bearing + 180) % 360 - 180))
         if report.min_margin_mm <= pulse_envelope or (phase_stage is not None and phase_margin <= pulse_envelope):
@@ -1968,6 +1989,26 @@ class StepperGUI(X42sRuntimeMixin):
             clearance_warnings.append(
                 f"避障余量（最小间隙 {report.min_margin_mm:.2f}mm）可能不足以覆盖"
                 f"脉冲量化包络 {pulse_envelope:.2f}mm；建议提高减速比或修正几何")
+        if auto_avoidance:
+            from motor_control.gait_x42s_plan import certify_x42s_stages
+            try:
+                stages = certify_x42s_stages(stages, params, report, pulse_envelope)
+            except ValueError as exc:
+                raise GaitExecutorError(str(exc)) from exc
+            s4 = next(s for s in stages if s.stage_id == "S4")
+            self.log(f"X42S 真实执行包络：{len(s4.move_groups)} 段；"
+                     f"两轴任意进度差下整腿保守余量 {s4.certified_margin_mm:.3f}mm；"
+                     "逐台梯形 MOVE，非五次原子 SYNC；需实机验证跟随误差/机械刚度")
+            recorder = getattr(self, "diagnostics", None)
+            if recorder is not None:
+                from motor_control.gait_coordinates import action_key, rod_side_for_pair
+                recorder.event("motor", "gait.execution_plan", action=action_key(side, arc_deg),
+                               route=route, rod_side=rod_side_for_pair(tuple(supports)),
+                               geometry=geometry, signs=(params.mr1_sign, params.mr2_sign),
+                               report=report.as_summary(), error_budget_mm=pulse_envelope,
+                               execution_profile=s4.execution_profile, endpoints=s4.sync_endpoints,
+                               certified_margin_mm=s4.certified_margin_mm,
+                               initial_positions=positions)
         # 预检整个行程：分辨率/速度/线缆窗口（X42S 无软件行程限位）。
         with self.state_lock:
             if (getattr(self, "_active_control_workers", 0)
@@ -2024,6 +2065,11 @@ class StepperGUI(X42sRuntimeMixin):
         self._gait_run.twin_lift_start = twin_lift_start
         self._gait_run.twin_final_positions = None
         self._gait_run.twin_manual_invalid = False
+        self._gait_run.twin_report = report
+        swing_s4_psi = (psi_now if phase_stage is None else
+                        psi_now + phase_stage.move_groups[0][0].delta * sign)
+        self._gait_run.twin_psis = ((swing_s4_psi, support_psi) if side == "left"
+                                    else (support_psi, swing_s4_psi))
         self.log(f"步态执行器就绪（{side}，X42S）：{len(stages)} 个阶段，"
                  f"当前 ψ={psi_now:.1f}°（实测）")
         # 2026-10-19 修复：X42S 链路漏了 stepdir 版的实机层切换（1977 行），
@@ -2044,6 +2090,7 @@ class StepperGUI(X42sRuntimeMixin):
                 if self._move_reservation[a] is token:
                     self._move_reservation[a] = None
             self._gait_owned = {}
+            self._gait_x42s_moves = {}
 
     def _gait_angle_snapshot(self):
         """World/beam/joint angles: X42S=driver-measured; stepdir=pulse estimate."""
@@ -2105,7 +2152,7 @@ class StepperGUI(X42sRuntimeMixin):
 
     def _gait_twin_snapshot(self):
         """Read-only visual model; its output never enters motion/safety decisions."""
-        from motor_control.gait_twin import build_twin_snapshot, axis_motion_active
+        from motor_control.gait_twin import build_twin_snapshot, reference_displaced
 
         with self.state_lock:
             _control, axes = self._snapshot_coordinated_control_locked()
@@ -2127,10 +2174,8 @@ class StepperGUI(X42sRuntimeMixin):
                     and all(getattr(run.params, key) == getattr(params, key) for key in (
                         "mr1_zero_deg", "mr2_zero_deg", "mr1_sign", "mr2_sign",
                         "mup1_lift_sign", "mup2_lift_sign", "beam_reference_deg"))):
-                if run.twin_final_positions is not None and any(
-                        axis_motion_active(a)
-                        or a.get("position") != run.twin_final_positions.get(a["role"])
-                        for a in axes):
+                if (run.twin_final_positions is not None
+                        and reference_displaced(axes, run.twin_final_positions)):
                     # After independent manual/Web moves the grounded pivot is
                     # unknown. Keep axis readouts, do not invent a world pose.
                     run.twin_manual_invalid = True
@@ -2267,6 +2312,10 @@ class StepperGUI(X42sRuntimeMixin):
 
         if self._closing:
             return
+        run = getattr(self, "_gait_run", None)
+        if (getattr(run, "state", None) == "done" and hasattr(run, "route")
+                and not getattr(run, "ledger_finalized", False)):
+            self._gait_finish_if_done()
         self._refresh_unwind_label()
         refresh = getattr(self, "_refresh_gait_panel", None)
         if refresh is not None:
@@ -2351,7 +2400,7 @@ class StepperGUI(X42sRuntimeMixin):
 
     def _gait_send_synchronized_x42s(self, moves, duration_s,
                                      cumulative_targets=None):
-        """X42S"同步组"：逐台顺序 MOVE（相位差≈一次串口往返 ~15ms）。
+        """X42S 双轴分段组：逐台梯形 MOVE，不声称共享五次进度/固定相差。
 
         与执行器契约一致只认 "sent"；任何一台被拒即全组 failed（调用方
         会停掉全部四台）。分段组（sync_endpoints）用累计终点 − 当前实测
@@ -2359,19 +2408,31 @@ class StepperGUI(X42sRuntimeMixin):
         PC→ESP32 每条命令本身是一次串口往返，ESP32→驱动器侧由固件
         transact 串行化（2026-10-12 台架：背靠背帧会被驱动器整批丢弃）。
         """
-        if len(moves) != 2 or self._control_worker_cancelled():
+        if (len(moves) != 2 or len({m[0] for m in moves}) != 2
+                or self._control_worker_cancelled()):
             return "failed"
         run = getattr(self, "_gait_run", None)
         if cumulative_targets is not None and (run is None
                                                or len(cumulative_targets) != 2):
             return "failed"
+        if isinstance(run, GaitExecutor) and run.params.trajectory_mode == TWO_MODE:
+            stage = run.current_stage()
+            index = run._group_index
+            if (stage is None or stage.stage_id != "S4" or run.state != "running"
+                    or stage.execution_profile != "x42s_bounded_progress"
+                    or cumulative_targets is None or index >= len(stage.sync_endpoints)
+                    or tuple(cumulative_targets) != stage.sync_endpoints[index]
+                    or tuple(self._gait_role_axis(m.role) for m in stage.move_groups[index])
+                       != tuple(m[0] for m in moves)):
+                self.log("⛔ X42S 联动组与当前已校验的扫掠包络/阶段不匹配，未下发")
+                return "failed"
         planned = []
         for move_index, (axis, delta, speed) in enumerate(moves):
             if axis < X42S_AXIS_HANDLE_BASE or not math.isfinite(delta):
                 return "failed"
             driver_id = axis - X42S_AXIS_HANDLE_BASE
             role = self.control_bindings.role_for_driver_id(driver_id)
-            if role is None:
+            if role is None or ROLE_SPECS[role].required_mode != MODE_ROTARY:
                 return "failed"
             if cumulative_targets is not None:
                 endpoint = cumulative_targets[move_index]
@@ -2393,8 +2454,16 @@ class StepperGUI(X42sRuntimeMixin):
             if not math.isfinite(speed) or speed <= 0:
                 return "failed"
             steps, speed_pps = self._x42s_move_conversion(role, delta, speed)
-            if steps is None or speed_pps > X42S_SPEED_PPS_MAX:
+            if steps is None or abs(steps) > 20000000 or speed_pps > X42S_SPEED_PPS_MAX:
                 return "failed"
+            with self.state_lock:
+                state = self._x42s_states.get(role.value)
+                token = getattr(self, "_gait_owned", {}).get(axis)
+                if (token is None or self._move_reservation.get(axis) is not token
+                        or axis in getattr(self, "_gait_x42s_moves", {}) or state is None
+                        or not state.telemetry_trusted or not state.enabled or state.fault is not None
+                        or not state.reached or (state.speed is not None and abs(state.speed) > .01)):
+                    return "failed"  # Validate BOTH before the first write.
             planned.append((axis, role, steps, speed_pps))
         # 首个同步组把当前实测机构坐标记为旋转显示原点（单位=机构坐标，
         # 与 stepdir 的"步数原点"区分，读取方按句柄范围分派）。
@@ -2409,28 +2478,56 @@ class StepperGUI(X42sRuntimeMixin):
         sent = 0
         for axis, role, steps, speed_pps in planned:
             if steps == 0:
+                from motor_control.x42s_motion import MoveExpectation
+                with self.state_lock:
+                    token = getattr(self, "_gait_owned", {}).get(axis)
+                    state = self._x42s_states.get(role.value)
+                    if token is None or state is None or not state.telemetry_trusted:
+                        return "failed"
+                    if not hasattr(self, "_gait_x42s_moves"):
+                        self._gait_x42s_moves = {}
+                    self._gait_x42s_moves[axis] = MoveExpectation(
+                        token, state.measured_position, time.monotonic(), no_motion=True)
                 self.log(f"{role.value} 同步段终点已在当前实测位置（0 脉冲），跳过")
                 continue
             if self._gait_send_relative_x42s_send(
                     axis, role, steps, speed_pps) != "sent":
                 return "failed"
             sent += 1
-        self.log(f"角度同步轨迹（X42S 顺序 MOVE ×{sent}，相位差≈15ms "
-                 f"近似同步，目标时长 {duration_s:.2f}s）")
+        self.log(f"X42S 分段联动：顺序梯形 MOVE ×{sent}；等待双轴实测终点，"
+                 f"名义段时间 {duration_s:.2f}s（不含加减速/通讯/核验）")
         return "sent"
 
     def _gait_send_relative_x42s_send(self, axis, role, steps, speed_pps):
         """已换算好的 X42S MOVE 下发 + 确认式应答校验（同步组内部用）。"""
+        from motor_control.x42s_motion import MoveExpectation
+        from motor_control.gait_x42s_wait import owned_health_issue
         driver_id = axis - X42S_AXIS_HANDLE_BASE
         token = getattr(self, "_gait_owned", {}).get(axis)
         if token is None:
             return "failed"
         guard = lambda: (self._move_reservation[axis] is token
+                         and self.control_bindings.role_for_driver_id(driver_id) == role
+                         and owned_health_issue(self) is None
                          and not self._control_worker_cancelled())
         try:
             command = build_x42s_move_command(driver_id, steps, speed_pps)
         except ProtocolEncodingError:
             return "failed"
+        with self.state_lock:
+            state = self._x42s_states.get(role.value)
+            pending = getattr(self, "_gait_x42s_moves", None)
+            if pending is None:
+                pending = self._gait_x42s_moves = {}
+            if (not guard() or axis in pending or state is None
+                    or state.driver_id != driver_id or not state.telemetry_trusted
+                    or not state.enabled or state.fault is not None or not state.reached
+                    or (state.speed is not None and abs(state.speed) > .01)):
+                self.log(f"⛔ {role.value} 未取得新鲜静止起点，或上一段未核验到位")
+                return "failed"
+            expected = MoveExpectation(token, state.measured_position + steps * 360 / X42S_PULSE_PER_REV,
+                                       origin_motor_deg=state.measured_position)
+            pending[axis] = expected
         resp = self._send_and_read(command, guard=guard, soft_timeout=True)
         reply = parse_line(resp) if resp else None
         ok = (isinstance(reply, X42sMoveAck)
@@ -2439,12 +2536,16 @@ class StepperGUI(X42sRuntimeMixin):
         if not ok:
             self.log(f"⛔ {role.value} X42S 同步 MOVE 未被确认：{resp or '无应答'}")
             return "failed"
+        with self.state_lock:
+            if pending.get(axis) is not expected or not guard():
+                return "failed"
+            pending[axis] = replace(expected, acknowledged_at=time.monotonic())
         return "sent"
 
     def _gait_send_synchronized(self, moves, duration_s, *, cumulative_targets=None):
         """Preflight/reserve BOTH axes before one SYNC write; no serial motion fallback.
 
-        X42S 句柄走顺序 MOVE 近似同步（_gait_send_synchronized_x42s）。
+        X42S 使用已校验双轴进度包络的分段 MOVE（非原子五次同步）。
         """
         if len(moves) != 2 or self._control_worker_cancelled():
             return "failed"
@@ -2563,60 +2664,9 @@ class StepperGUI(X42sRuntimeMixin):
             time.sleep(0.02)
 
     def _gait_wait_terminal_x42s(self, axis, timeout_s):
-        """X42S 终态等待：每 X42S_WAIT_POLL_S 主动查单台状态。
-
-        DONE 判据 = 在线使能、无故障、实测位置新鲜、reached=1 且已过起步盲区
-        （覆盖"上一段到位标志未清"前沿）；保护故障/离线/失能 → ABORTED；超时
-        → TIMEOUT。查询落在固件 s_moving 降级路径上（运动中仅两帧探测，
-        不复发 2026-10-12 的轮询风暴卡死）。查询失败不立即判死，等
-        deadline 兜底。
-        """
-        driver_id = axis - X42S_AXIS_HANDLE_BASE
-        role = self.control_bindings.role_for_driver_id(driver_id)
-        if role is None:
-            return "ABORTED"
-        t0 = time.monotonic()
-        deadline = t0 + timeout_s
-        next_poll = t0 + X42S_WAIT_BLIND_S
-        # 2026-10-21：等待期间周期刷新 UI（4Hz）。此前 progress 回调只在
-        # "组完成"时刷新——单组长运动（S5B 落脚 70s）全程画面静止，升降
-        # 柱状图/姿态不随动（用户实机报障）；遥测数据链经验证无误。
-        next_ui_refresh = t0
-        while True:
-            if (self._control_worker_cancelled()
-                    or (getattr(self, "_gait_run", None) is not None
-                        and self._gait_run._stop_requested)):
-                return "CANCELLED"
-            now = time.monotonic()
-            if now >= deadline:
-                return "TIMEOUT"
-            if now >= next_ui_refresh:
-                next_ui_refresh = now + 0.25
-                self._post_ui(self._refresh_gait_ui)
-            if now < next_poll:
-                time.sleep(min(0.02, next_poll - now))
-                continue
-            next_poll = now + X42S_WAIT_POLL_S
-            resp = self._send_and_read(
-                build_x42s_status_command(driver_id), soft_timeout=True)
-            reply = parse_line(resp) if resp else None
-            if (isinstance(reply, X42sStatusReply)
-                    and reply.driver_id == driver_id):
-                # 到位查询也是位置数据源。下一同步段用累计终点−此实测位置，
-                # 不能等 2Hz 后台轮询才更新，否则会多走上一段的位移。
-                self._apply_x42s_reply(role, driver_id, reply)
-                if not reply.online or not reply.enabled:
-                    self.log(f"⛔ X42S ID{driver_id} 已离线或失能，不能确认到位")
-                    return "ABORTED"
-                if reply.fault is not None:
-                    self.log(f"⛔ X42S ID{driver_id} 保护故障 {reply.fault}")
-                    return "ABORTED"
-                if (reply.reached
-                        and reply.measured_position is not None
-                        and reply.age_ms <= TELEMETRY_FRESH_MAX_AGE_MS
-                        and time.monotonic() - t0 >= X42S_WAIT_BLIND_S):
-                    return "DONE"
-            time.sleep(0.02)
+        from motor_control.gait_x42s_wait import wait_moves
+        return wait_moves(self, (axis,), timeout_s,
+                          blind_s=X42S_WAIT_BLIND_S, poll_s=X42S_WAIT_POLL_S)
 
     def _gait_stop_axes(self, axes):
         """立即失效并停轴（UI/工作线程都可调用；发送放独立线程）。
@@ -2648,13 +2698,19 @@ class StepperGUI(X42sRuntimeMixin):
             self.log(f"⛔ 轴{AXIS_LABEL[axis]} 步态中止停止")
 
     def _send_x42s_stop_command(self, driver_id):
-        """独立线程：确认式 X42S 单台 STOP；软超时，失败只记日志。"""
+        """Exact STOP acknowledgement; failure latches unconfirmed parking."""
         if not self._is_serial_connected():
+            with self.state_lock:
+                self._estop_unconfirmed = True
+            self.log(f"⛔ X42S ID{driver_id} 已断连，停车未确认，请现场处置")
             return
         resp = self._send_and_read(
             build_x42s_stop_command(driver_id), soft_timeout=True)
-        ok = resp and resp.startswith(f"OK,X42S,{driver_id},STOP")
-        self.log(("✓" if ok else "⚠️")
+        ok = bool(resp and resp.strip() == f"OK,X42S,{driver_id},STOP")
+        if not ok:
+            with self.state_lock:
+                self._estop_unconfirmed = True
+        self.log(("✓" if ok else "⛔ 停车未确认，禁止新动作，请现场确认并执行急停确认链：")
                  + f" X42S ID{driver_id} STOP → {resp or '无应答'}")
 
     # ── 步态页 UI 回调（Tk 线程） ──
@@ -2801,7 +2857,8 @@ class StepperGUI(X42sRuntimeMixin):
                                     getattr(self, "_gait_beta_deg", 180.0))
         self.gait_report_var.set(report.message)
         start, target, pivot, _bearing = report.route
-        direction = "顺向" if arc_deg > 0 else "逆向"
+        from motor_control.gait_coordinates import orbit_label
+        direction = orbit_label(arc_deg)
         alt_text = (f"，反向落点 {self._gait_preview_alt_pad}"
                     if self._gait_preview_alt_pad else "")
         self.log(
@@ -2866,8 +2923,8 @@ class StepperGUI(X42sRuntimeMixin):
         self.gait_arc_var.set(f"{run.arc_deg:g}")
         mode_var = getattr(self, "gait_mode_var", None)
         if mode_var is not None:
-            mode_var.set(("L" if side == "left" else "R")
-                         + ("+" if run.arc_deg > 0 else "-"))
+            from motor_control.gait_coordinates import action_key
+            mode_var.set(action_key(side, run.arc_deg))
         self._gait_last_report = report
         self._gait_last_report_key = (side, run.arc_deg)
         self._gait_preview_stance = (self._gait_supports, self._gait_beta_deg)
@@ -2918,10 +2975,9 @@ class StepperGUI(X42sRuntimeMixin):
         """本步全部阶段完成后的账本收尾：站位/横梁角更新 + 释放四轴。"""
 
         run = self._gait_run
-        if run is None or run.state != "done":
+        if run is None or run.state != "done" or getattr(run, "ledger_finalized", False):
             return
         start, target, pivot, _bearing = run.route
-        self._gait_supports = (target, pivot) if run.side == "left" else (pivot, target)
         support_role = "Mr2" if run.side == "left" else "Mr1"
         a = self._gait_role_axis(support_role)
         support_sign = run.params.mr2_sign if run.side == "left" else run.params.mr1_sign
@@ -2929,19 +2985,27 @@ class StepperGUI(X42sRuntimeMixin):
             # X42S：支撑侧公转角取驱动器实测（rotation_start 存机构坐标，
             # 2026-10-19 合并 main 时从旧内联收尾逻辑移植；_gait_pc_zero
             # 后 PC 侧零点与实测同系，账本随每步收尾滚动更新）。
-            pos = self._x42s_role_output_units(LogicalRole(support_role))
-            origin = (run.rotation_start or {}).get(a)
-            if pos is not None and origin is not None:
-                self._gait_beta_deg -= support_sign * (pos - origin)
-            else:
-                self.log("⚠️ 支撑侧实测位置缺失；横梁角未随换位更新，"
-                         "建议【重建物理基准】后再继续")
-            finals = {}
-            for role in LOGICAL_ROLE_ORDER:
-                value = self._x42s_role_output_units(role)
-                if value is not None:
+            with self.state_lock:
+                finals = {}
+                for role in LOGICAL_ROLE_ORDER:
+                    state = self._x42s_states.get(role.value)
+                    value = self._x42s_role_output_units(role)
+                    if (value is None or state is None or not state.enabled or not state.reached
+                            or (state.speed is not None and abs(state.speed) > .01)):
+                        # Keep ownership; the normal refresh retries after fresh
+                        # feedback. Never partially advance supports/beta.
+                        return
                     finals[role.value] = value
-            run.twin_final_positions = finals or None
+            pos = finals[support_role]
+            origin = (run.rotation_start or {}).get(a)
+            if origin is None:
+                self.log("⛔ 缺少本步旋转原点，未更新站位；需核验/重建物理基准")
+                self._gait_needs_recovery = True
+                run.state, run.last_error = "failed", "缺少本步旋转原点"
+                self._gait_release_ownership()
+                return
+            self._gait_beta_deg -= support_sign * (pos - origin)
+            run.twin_final_positions = finals
         else:
             actual_phi = support_sign * self.axis_profiles[a].units_from_steps(
                 self.axis_runtime[a].position_steps - run.rotation_start[a])
@@ -2950,6 +3014,8 @@ class StepperGUI(X42sRuntimeMixin):
                 role.value: self.axis_profiles[self._gait_role_axis(role.value)].units_from_steps(
                     self.axis_runtime[self._gait_role_axis(role.value)].position_steps)
                 for role in LOGICAL_ROLE_ORDER}
+        self._gait_supports = (target, pivot) if run.side == "left" else (pivot, target)
+        run.ledger_finalized = True
         self._gait_release_ownership()
         if getattr(self, "_gait_auto_run", False):
             self._gait_auto_run = False
@@ -3063,57 +3129,8 @@ class StepperGUI(X42sRuntimeMixin):
         verify_pre_run_restore(self)
 
     def _gait_auto_restore_run(self, deltas):
-        """自动低速回位 worker（2026-10-21 二版，应用户要求加回）。
-
-        前置（gait_recovery_ui 已保证）：四轴与快照差全部在小位移阈值内、
-        通过核验与人工确认。逐台低速回移（旋转输出轴 2°/s、直线 1mm/s，
-        台间静默间隔），全部成功后恢复站位账本；任一失败即停、不动账本。
-        """
-        failures = []
-        for role_value in ("Mr1", "Mr2", "Mup1", "Mup2"):
-            delta = deltas.get(role_value, 0.0)
-            if abs(delta) <= RECOVERY_TOLERANCE:
-                continue
-            role = LogicalRole(role_value)
-            binding = self.control_bindings.for_role(role)
-            if binding is None or binding.kind != "x42s":
-                failures.append(f"{role_value} 未绑定")
-                continue
-            if role_value.startswith("Mr"):
-                move_delta, move_speed = delta, 2.0     # 输出轴 °/°/s
-            else:
-                move_delta, move_speed = delta, 1.0     # 机构 mm/mm/s
-            steps, speed_pps = self._x42s_move_conversion(role, move_delta, move_speed)
-            if steps is None or steps == 0 or speed_pps > X42S_SPEED_PPS_MAX:
-                failures.append(f"{role_value} 换算失败（位移/速度超限）")
-                continue
-            command = build_x42s_move_command(binding.driver_id, steps, speed_pps)
-            ok, reason = self._send_manual_x42s(
-                command, role_value, binding.driver_id, steps, speed_pps)
-            if not ok:
-                failures.append(f"{role_value}·ID{binding.driver_id} → {reason}")
-                break   # 一台失败即停，保持其余位置便于人工评估
-            time.sleep(0.05)
-
-        def finish():
-            if failures:
-                messagebox.showwarning(
-                    "自动回位未完成",
-                    "以下轴未回移成功（已停止，可人工处理后重新核验）：\n"
-                    + "\n".join(failures))
-                return
-            snap = getattr(self, "_gait_recovery_snapshot", None)
-            if snap is not None:
-                self._gait_supports = tuple(snap["supports"])
-                self._gait_beta_deg = float(snap["beta"])
-                self._gait_needs_recovery = False
-                self._gait_recovery_snapshot = None
-                self._gait_run = None
-                self._gait_auto_run = False
-            self.log("✅ 自动回位完成：四轴已回到执行前位置，站位账本已恢复"
-                     "（低速逐台，未重新标定）")
-            self._refresh_gait_ui()
-        self._post_ui(finish)
+        """Compatibility entry: unverified reverse motion must never be sent."""
+        raise GaitExecutorError("自动回位没有经过整腿扫掠认证；请人工安全回位后核验，或重建摆放基准")
 
 
     def _gait_reset_run(self):

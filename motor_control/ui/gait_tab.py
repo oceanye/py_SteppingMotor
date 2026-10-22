@@ -16,6 +16,7 @@ from motor_control.gait_planner import (
     GaitParams, INITIAL_PLACEMENTS, LOW_NODE_PHASE_DEG,
 )
 from motor_control.gait_avoidance import TWO_MODE
+from motor_control.gait_coordinates import action_key, action_values, rod_side_for_pair
 from motor_control.ui.common import PAD, reset_canvas_view
 from motor_control.ui.gait_twin import (
     build_twin_panel, draw_twin, refresh_twin_panel, sync_twin_start_fields,
@@ -71,20 +72,18 @@ BASELINE_GUIDE = (
     "无需使用驱动器ZERO；它不是机械回原点，也不是步态准备的前置。"
 )
 
-# 2026-09-24 初始摆放（红杆在横梁左/右侧的镜像摆法）下拉：标签面向
-# 操作员，内部值进 params.initial_placement；β₀ 由摆放派生并联动覆写。
-# 2026-09-28 实机校正：左右标注对调（初版误按"第三支座C在哪侧"判，
-# 与"紧挨横梁的红杆在哪侧"恰相反）。左足A·右足B=红杆右侧（原有默认）。
+# The saved placement keys retain old coordinates. Mirrored-world labels are
+# derived geometrically, never by interpreting a legacy key's English suffix.
 PLACEMENT_LABELS = {
-    "red_left": "红杆在横梁左侧（左足B·右足A）",
-    "red_right": "红杆在横梁右侧（左足A·右足B）",
+    key: f"红杆在横梁{rod_side_for_pair(pair)}侧（左足{pair[0]}·右足{pair[1]}）"
+    for key, (pair, _beta) in INITIAL_PLACEMENTS.items()
 }
 LABEL_TO_PLACEMENT = {label: key for key, label in PLACEMENT_LABELS.items()}
 
 
 def _placement_label(params):
     if params.initial_pad_pair is not None:
-        side = "左" if params.initial_placement == "red_left" else "右"
+        side = rod_side_for_pair(params.initial_supports)
         return f"地图起步 · 红杆{side}侧 · β₀={params.initial_beam_deg:g}°"
     return PLACEMENT_LABELS[params.initial_placement]
 
@@ -137,12 +136,11 @@ def _gait_mode_selected(app, value: str) -> None:
     sim = view.get("simulation")
     from .gait_simulation import _busy
     if _busy(app) or (sim and sim.active):
-        app.gait_mode_var.set(("L" if app.gait_side_var.get() == "left" else "R")
-                             + ("+" if float(app.gait_arc_var.get()) > 0 else "-"))
+        app.gait_mode_var.set(action_key(app.gait_side_var.get(), float(app.gait_arc_var.get())))
         return
-    app.gait_side_var.set("left" if value[0] == "L" else "right")
-    # 2026-10-22（三版）：弧向与按钮同规则（"+"=模型 −60）。
-    app.gait_arc_var.set("-60.0" if value[1] == "+" else "60.0")
+    side, arc = action_values(value)
+    app.gait_side_var.set(side)
+    app.gait_arc_var.set(str(arc))
     from .gait_candidate import select_candidate
     select_candidate(app)
 
@@ -158,7 +156,7 @@ def build_gait_tab(app, parent) -> None:
     app.gait_side_var = tk.StringVar(value="left")
     # 换位方向（顺向 +60 / 逆向 -60）。gait_mode_var 是四个换位方式
     # （"L+/L-/R+/R-"）的合并选择，切换时同步下面两个变量。
-    app.gait_arc_var = tk.StringVar(value="60.0")
+    app.gait_arc_var = tk.StringVar(value=str(action_values("L+")[1]))
     app.gait_mode_var = tk.StringVar(value="L+")
     app._gait_preview_alt_pad = None
     app.gait_zero_vars = {
@@ -995,7 +993,9 @@ def refresh_gait_panel(app, progress_text=None) -> None:
             state="normal" if (getattr(app, "_gait_recovery_snapshot", None)
                                is not None and not getattr(app, "_gait_owned", {}))
             else "disabled")
-    app.gait_widgets["progress"].configure(text=progress_text or "")
+    app.gait_widgets["progress"].configure(
+        text=progress_text if progress_text is not None else
+        (snapshot.get("progress_text", "") if snapshot else ""))
     refresh_twin_panel(app)
     # 2026-10-08 阶段标签没内容时是空行，把 5×5 图压出视口（实操区比
     # 模拟区高出一截的"空行"来源）。空文字收起（grid_remove 不占行），

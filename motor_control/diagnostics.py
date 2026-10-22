@@ -116,7 +116,10 @@ def environment_summary(project_dir):
         except (OSError, subprocess.SubprocessError):
             summary[name] = "unavailable"
     summary["source_sha256"] = {}
-    for name in ("desktop_app.py", "serial_session.py", "diagnostics.py", "gait_executor.py"):
+    for name in ("desktop_app.py", "serial_session.py", "diagnostics.py", "gait_executor.py",
+                 "gait_coordinates.py", "gait_planner.py", "gait_avoidance.py",
+                 "gait_clearance.py", "gait_x42s_plan.py", "gait_x42s_wait.py",
+                 "x42s_motion.py", "x42s_runtime.py", "ui/gait_tab.py", "ui/gait_twin.py"):
         path = root / "motor_control" / name
         if path.is_file():
             summary["source_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
