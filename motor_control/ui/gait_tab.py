@@ -141,8 +141,8 @@ def _gait_mode_selected(app, value: str) -> None:
                              + ("+" if float(app.gait_arc_var.get()) > 0 else "-"))
         return
     app.gait_side_var.set("left" if value[0] == "L" else "right")
-    # 2026-10-21 晶格镜像定案：四选项 arc 与按钮同规则取反（"+"=模型 -60）。
-    app.gait_arc_var.set("-60.0" if value[1] == "+" else "60.0")
+    # 2026-10-22（二版）：弧向换回原始绑定（"+"=模型 +60），与四按钮一致。
+    app.gait_arc_var.set("60.0" if value[1] == "+" else "-60.0")
     from .gait_candidate import select_candidate
     select_candidate(app)
 
@@ -440,10 +440,13 @@ def _build_run_column(app, parent) -> None:
     # 模型 -60（实机画面顺时针/向北绕），配 avoidance bearing 翻转
     # （见 gait_planner）实现"跨杆步正确避让"。
     for row, row_actions in enumerate((
-        (("start_left_cw", "开始左顺移", "left", -60.0),
-         ("start_left_ccw", "开始左逆移", "left", 60.0)),
-        (("start_right_cw", "开始右顺移", "right", -60.0),
-         ("start_right_ccw", "开始右逆移", "right", 60.0)),
+        # 2026-10-22（二版）：按钮弧向换回原始绑定——晶格几何镜像（66f0b91
+        # 手术）已把方向翻转修进模型，10-21 的按钮对调与之叠加成双重补偿，
+        # 实机复测两种摆放方向皆反（用户实录定案）。
+        (("start_left_cw", "开始左顺移", "left", 60.0),
+         ("start_left_ccw", "开始左逆移", "left", -60.0)),
+        (("start_right_cw", "开始右顺移", "right", 60.0),
+         ("start_right_ccw", "开始右逆移", "right", -60.0)),
     )):
         for col, (key, text, side, arc) in enumerate(row_actions):
             app.gait_widgets[key] = ttk.Button(
