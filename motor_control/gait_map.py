@@ -18,7 +18,7 @@ def pad_name(i, j):
 def map_pads():
     """25 centers in beam-length units, with B at the world origin."""
     return {pad_name(col - row // 2, row):
-            (col - row // 2 + row / 2, math.sqrt(3) * row / 2)
+            (col - row // 2 + row / 2, -math.sqrt(3) * row / 2)
             for row in range(-2, 3) for col in range(-2, 3)}
 
 
@@ -50,5 +50,7 @@ def start_pair_reference(pair):
     di, dj = left[0] - right[0], left[1] - right[1]
     if (di, dj) not in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, -1), (-1, 1)):
         raise ValueError("左右足必须选择两个不同且共边相邻的六边形")
+    # 2026-10-22 晶格镜像定稿：beta 公式恢复原向（pad 坐标已翻，
+    # 此处再翻=双重翻转回归原始语义）；红杆侧判定随之还原。
     beta = float((round(math.degrees(math.atan2(math.sqrt(3)*dj/2, di+dj/2))/60) % 6)*60)
     return beta, "red_left" if beta % 120 == 0 else "red_right"

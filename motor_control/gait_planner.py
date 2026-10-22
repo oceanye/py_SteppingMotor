@@ -91,7 +91,7 @@ def smoothstep5(s: float) -> float:
 
 def _dir(deg: float) -> tuple[float, float]:
     rad = math.radians(deg)
-    return (math.cos(rad), math.sin(rad))
+    return (math.cos(rad), -math.sin(rad))
 
 
 def _dot(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -579,7 +579,7 @@ def default_hex_pads(geometry: GaitGeometry) -> dict[str, HexPad]:
         # 三角晶格：覆盖 A/B/C 外的一圈邻座。与爪臂半径无关的 d 只参与几何。
         for i in range(-2, 2):
             for j in range(-1, 3):
-                center = (d * (i + j / 2.0), d * math.sqrt(3) * j / 2.0)
+                center = (d * (i + j / 2.0), -d * math.sqrt(3) * j / 2.0)
                 if not any(math.dist(center, p.center) < 1e-8 for p in pads.values()):
                     pads[f"邻座({i},{j})"] = HexPad(f"邻座({i},{j})", center)
     return pads
@@ -598,7 +598,7 @@ def swing_center(
 # 左摆动（A→C，支点 B）：中心从 A(180°) 顺 60° 到 C(120°)。
 LEFT_SWING = ("A", "C", "B", 180.0)
 # 右摆动（B→A，支点 C）：中心从 B(C→B 方位 300°) 到 A(C→A 方位 240°)。
-RIGHT_SWING = ("B", "A", "C", 300.0)
+RIGHT_SWING = ("B", "A", "C", 60.0)
 
 
 @dataclass(frozen=True)
@@ -755,7 +755,7 @@ def gait_pads(params: GaitParams, pivot_name="B") -> dict[str, HexPad]:
         d = geometry.d_mm
         for i in range(pi-2, pi+3):
             for j in range(pj-2, pj+3):
-                center = (d*(i+j/2), d*math.sqrt(3)*j/2)
+                center = (d*(i+j/2), -d*math.sqrt(3)*j/2)
                 if not any(math.dist(center, p.center) < 1e-8 for p in pads.values()):
                     name = f"邻座({i},{j})"
                     pads[name] = HexPad(name, center)

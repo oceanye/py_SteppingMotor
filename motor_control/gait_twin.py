@@ -15,7 +15,7 @@ from motor_control.gait_avoidance import lattice_coordinates
 
 
 PAD_CENTERS = {"A": (-1.0, 0.0), "B": (0.0, 0.0),
-               "C": (-0.5, math.sqrt(3) / 2)}
+               "C": (-0.5, -math.sqrt(3) / 2)}
 ROLES = ("Mup1", "Mr1", "Mup2", "Mr2")
 
 
@@ -136,7 +136,7 @@ def pad_center(name):
     if name in PAD_CENTERS:
         return PAD_CENTERS[name]
     i, j = lattice_coordinates(name)
-    return i+j/2, math.sqrt(3)*j/2
+    return i+j/2, -math.sqrt(3)*j/2
 
 
 def build_twin_snapshot(
@@ -241,7 +241,7 @@ def _pose(params, positions, context):
     beta = bearing - (180.0 if side == "right" else 0.0) - phi
     px, py = pad_center(pivot)
     theta = math.radians(bearing - phi)
-    swing_center = (px + math.cos(theta), py + math.sin(theta))
+    swing_center = (px + math.cos(theta), py - math.sin(theta))
     feet = {}
     for foot, rotation, lift, sign, zero, lift_sign in (
         ("left", "Mr1", "Mup1", params.mr1_sign, params.mr1_zero_deg, params.mup1_lift_sign),

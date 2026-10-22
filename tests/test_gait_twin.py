@@ -98,7 +98,7 @@ class DigitalTwinTests(unittest.TestCase):
         self.assertAlmostEqual(pose["feet"]["right"]["psi_deg"], 30)
         x, y = pose["feet"]["left"]["center"]
         self.assertAlmostEqual(x, math.cos(math.radians(150.075)))
-        self.assertAlmostEqual(y, math.sin(math.radians(150.075)))
+        self.assertAlmostEqual(y, -math.sin(math.radians(150.075)))  # 镜像
         self.assertEqual(original, tuple(r.position_steps for r in app.axis_runtime))
         app._on_step_done(2, 800, 800)
         app._on_step_done(3, 267, 267)

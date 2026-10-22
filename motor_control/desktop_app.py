@@ -145,8 +145,11 @@ from motor_control.x42s_runtime import X42sRuntimeMixin, X42S_DEBUG_JOG_DEG_S
 # 直连跨实机杆，HIGH 绕行避的是模型杆位、在实机同样不安全（用户实机
 # HIGH 绕行中 Mr1 堵转=疑似蹭杆）。全镜像修复完成前置 True；离线测试
 # 模拟的是修复后的正常行为，可 patch 为 False。
-LATTICE_MIRROR_LOW_GATE = True
-LATTICE_MIRROR_ALL_GATE = True
+LATTICE_MIRROR_LOW_GATE = False
+# 2026-10-22 晶格全镜像v3 落地（格/杆/爪位整体 y 翻，判定/电机轨迹不动；
+# 对称验收：绕南 LOW 27.6=原版绕北镜像、绕北 HIGH 8.2=原版绕南镜像，
+# 四方向可行）。闸撤除，常量保留供快速回退。
+LATTICE_MIRROR_ALL_GATE = False
 from motor_control.x42s_units import (
     X42S_PULSE_PER_REV, X42S_AXIS_HANDLE_BASE, X42S_SPEED_PPS_MAX,
 )
@@ -1487,8 +1490,9 @@ class StepperGUI(X42sRuntimeMixin):
         for name, pad in pads.items():
             if name in (start, pivot) or not in_map(name):
                 continue
+            # 2026-10-22 晶格镜像：方位角与 sim.route 同步翻 y
             pad_bearing = math.degrees(math.atan2(
-                pad.center[1] - pads[pivot].center[1],
+                -(pad.center[1] - pads[pivot].center[1]),
                 pad.center[0] - pads[pivot].center[0]))
             bearing_err = abs((pad_bearing - landing_bearing + 180) % 360 - 180)
             radius_err = abs(math.dist(pad.center, pads[pivot].center)
@@ -1634,8 +1638,9 @@ class StepperGUI(X42sRuntimeMixin):
         start, pivot = supports if side == "left" else supports[::-1]
         bearing = beta_now + (180.0 if side == "right" else 0.0)
         pads = gait_pads(params, pivot)
+        # 2026-10-22 晶格镜像：方位角与落点匹配同步翻 y
         expected_bearing = math.degrees(math.atan2(
-            pads[start].center[1] - pads[pivot].center[1],
+            -(pads[start].center[1] - pads[pivot].center[1]),
             pads[start].center[0] - pads[pivot].center[0]))
         if abs((bearing - expected_bearing + 180) % 360 - 180) > 0.5:
             raise GaitExecutorError("横梁角与当前支座位置不一致；请重新建立 A/B 标定基准")
@@ -1890,8 +1895,9 @@ class StepperGUI(X42sRuntimeMixin):
         start, pivot = supports if side == "left" else supports[::-1]
         bearing = beta_now + (180.0 if side == "right" else 0.0)
         pads = gait_pads(params, pivot)
+        # 2026-10-22 晶格镜像：方位角与落点匹配同步翻 y
         expected_bearing = math.degrees(math.atan2(
-            pads[start].center[1] - pads[pivot].center[1],
+            -(pads[start].center[1] - pads[pivot].center[1]),
             pads[start].center[0] - pads[pivot].center[0]))
         if abs((bearing - expected_bearing + 180) % 360 - 180) > 0.5:
             raise GaitExecutorError("横梁角与当前支座位置不一致；请重新建立 A/B 标定基准")

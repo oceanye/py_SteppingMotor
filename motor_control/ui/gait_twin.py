@@ -45,7 +45,7 @@ def _neighborhood_pads():
                 continue
             name = f"邻座({key[0]},{key[1]})"
             merged.setdefault(name, (key[0] + key[1] / 2,
-                                     math.sqrt(3) * key[1] / 2))
+                                     -math.sqrt(3) * key[1] / 2))
     return merged
 
 

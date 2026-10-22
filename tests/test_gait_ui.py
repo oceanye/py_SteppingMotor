@@ -48,18 +48,18 @@ class TipTrackGeometryTests(unittest.TestCase):
         )
         track = tip_track_points(samples, self.GEOMETRY, 1)   # 腿2 = ψ+120°
         self.assertAlmostEqual(track[0][0], -10.0 * math.cos(math.radians(30)))
-        self.assertAlmostEqual(track[0][1], 10.0 * math.sin(math.radians(30)))
+        self.assertAlmostEqual(track[0][1], -10.0 * math.sin(math.radians(30)))
         # 终点 ψ+120°=270°：(5,0)+10·dir(270°)
         self.assertAlmostEqual(track[1][0], 5.0, places=9)
-        self.assertAlmostEqual(track[1][1], -10.0, places=9)
+        self.assertAlmostEqual(track[1][1], 10.0, places=9)  # 镜像
 
     def test_tip_rod_clearance_reports_nearest_rod_surface(self):
         from motor_control.ui.gait_tab import tip_rod_clearance, tip_track_points
         samples = (
             SwingSample(s=0.0, phi_deg=0.0, psi_deg=30.0, beta_deg=0.0,
                         center=(0.0, 0.0), margin_mm=None),
-            # ψ=90° 时腿1 爪端 (0,10) 正压 B 座 90° 高杆 (0,10)：
-            # 杆半径 5（Ø10 红杆）→ 表面距离 −5，必须选中这一对
+            # 2026-10-22 镜像：ψ=90° 爪端 (0,-10) 压 B 座镜像 90° 高杆
+            # (0,-10)（杆半径 5）→ 表面距离 −5
             SwingSample(s=1.0, phi_deg=60.0, psi_deg=90.0, beta_deg=120.0,
                         center=(0.0, 0.0), margin_mm=None),
         )
@@ -68,8 +68,8 @@ class TipTrackGeometryTests(unittest.TestCase):
         stats = tip_rod_clearance(tracks, (HexPad("B", (0.0, 0.0)),),
                                   self.GEOMETRY)
         surface, leg, index, label, tip, rod = stats
-        self.assertEqual((leg, index), (0, 1))
-        self.assertEqual(label, "B·90°高杆")
+        self.assertEqual((leg, index), (0, 1))  # 2026-10-22 镜像（实现翻后腿序保持）
+        self.assertEqual(label, "B·90°高杆")  # 2026-10-22 镜像（tag 沿用原角名）
         self.assertAlmostEqual(surface, -5.0, places=9)
         self.assertAlmostEqual(math.dist(tip, rod), 0.0, places=9)
 

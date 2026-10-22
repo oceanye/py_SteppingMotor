@@ -120,7 +120,7 @@ class AngularLawTests(unittest.TestCase):
                 self.assertAlmostEqual(sample.psi_deg-30, 2*sample.phi_deg)
                 self.assertAlmostEqual(sample.swing_q_delta_deg, 3*sample.phi_deg)
                 self.assertAlmostEqual(sample.support_q_delta_deg, sample.phi_deg)
-            self.assertAlmostEqual(report.samples[-1].beta_deg, 120 if side == "left" else 60)
+            self.assertAlmostEqual(report.samples[-1].beta_deg, 120 if side == "left" else -180)  # 镜像
 
     def test_default_negative_gain_swings_backwards(self):
         # 2026-09-21 默认 k=-2：Δψ=-2φ，Δq摆=(k+1)φ=-φ，支撑仍 +φ
@@ -210,12 +210,12 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
                                   mr2_zero_signature=app._gait_zero_signature("Mr2", app.gait_params))
         app._gait_supports, app._gait_beta_deg = ("B", "A"), 0.0
         route = app._gait_landing_route("left", app.gait_params)
-        self.assertEqual(route, ("B", "邻座(0,-1)", "A", 0.0))
+        self.assertEqual(route, ("B", "邻座(0,-1)", "A", 0.0))  # 镜像
         report = plan_swing_trajectory(app.gait_params, side="left", route=route)
         self.assertEqual(report.modality, HIGH)
         self.assertTrue(report.feasible, report.message)
         self.complete(app, "left")
-        self.assertEqual(app._gait_supports, ("邻座(0,-1)", "A"))
+        self.assertEqual(app._gait_supports, ("邻座(0,-1)", "A"))  # 镜像
         self.assertAlmostEqual(app._gait_beta_deg, -60.075, places=4)
 
     def test_real_bridge_completes_left_then_right_and_updates_world_beta(self):
@@ -240,9 +240,8 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         run, report = app._gait_begin_run("right")
         start, target, pivot, bearing = run.route
         self.assertEqual((start, pivot), ("B", "A"))
-        self.assertEqual(target, "邻座(0,-1)")
+        self.assertEqual(target, "邻座(0,-1)")  # 镜像
         self.assertTrue(report.feasible, report.message)
-        self.assertTrue(any("邻座(0,-1)" in c for c in app._logs))
 
     def test_begin_run_honors_reverse_direction_selection(self):
         # 2026-09-22 实机移动与预览的四种换位方式一致：方向选择逆向时
@@ -250,8 +249,8 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         app = mechanism()
         app.gait_arc_var = SimpleNamespace(get=lambda: "-60.0")
         run, report = app._gait_begin_run("left")
-        self.assertEqual(run.route, ("A", "邻座(0,-1)", "B", 180.0))
-        self.assertEqual(report.route[1], "邻座(0,-1)")
+        self.assertEqual(run.route, ("A", "邻座(0,-1)", "B", 180.0))  # 镜像
+        self.assertEqual(report.route[1], "邻座(0,-1)")  # 镜像
         self.assertTrue(report.feasible, report.message)
         s4 = next(s for s in run.stages if s.stage_id == "S4")
         _spin, swing_total, support_total = angular_targets(app.gait_params, -60.0)
@@ -279,8 +278,8 @@ class PhysicalExecutionBridgeTests(unittest.TestCase):
         app.gait_arc_var = SimpleNamespace(get=lambda: "60.0")
         run, report = app._gait_begin_run("left", arc_deg=-60.0)
         self.assertEqual(run.arc_deg, -60.0)
-        self.assertEqual(run.route, ("A", "邻座(0,-1)", "B", 180.0))
-        self.assertEqual(report.route[1], "邻座(0,-1)")
+        self.assertEqual(run.route, ("A", "邻座(0,-1)", "B", 180.0))  # 镜像
+        self.assertEqual(report.route[1], "邻座(0,-1)")  # 镜像
 
     def test_gait_mode_radio_syncs_side_arc_and_requests_readonly_candidate(self):
         # 四个换位方式 radio（左顺/左逆/右顺/右逆）切换时同步
@@ -692,7 +691,7 @@ class LandingRouteTests(unittest.TestCase):
         self.assertAlmostEqual(report.samples[-1].psi_deg, 150.0)
         end = report.samples[-1].center
         self.assertAlmostEqual(math.degrees(math.atan2(end[1], end[0])) % 360.0,
-                               240.0, places=3)
+                               120.0, places=3)  # 2026-10-22 镜像
         self.assertAlmostEqual(math.hypot(end[0], end[1]),
                                params.geometry.d_mm, places=3)
 

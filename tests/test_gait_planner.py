@@ -111,9 +111,10 @@ class GeometryTests(unittest.TestCase):
 
 
 def _add_scale(center, angle_deg, radius):
+    # 2026-10-22 镜像：与 planner._dir 同步翻 y
     rad = math.radians(angle_deg)
     return (center[0] + radius * math.cos(rad),
-            center[1] + radius * math.sin(rad))
+            center[1] - radius * math.sin(rad))
 
 
 class PointSegmentTests(unittest.TestCase):
@@ -176,7 +177,7 @@ class TrajectoryTests(unittest.TestCase):
         self.assertIn("A·90°高节点", report.as_summary()["message"])
         mirror = plan_swing_trajectory(GaitParams().validated(), side="right")
         self.assertEqual(mirror.hub_passover_nodes,
-                         ("B·210°高节点", "A·330°高节点"))
+                         ("邻座(-1,2)·330°高节点", "邻座(0,1)·90°高节点"))  # 2026-10-22 镜像
 
 
 class StagePlanTests(unittest.TestCase):
@@ -452,8 +453,8 @@ class MarginTests(unittest.TestCase):
         geometry = GaitGeometry().validated()
         start, end = arm_segment((0.0, 0.0), 90.0, 0, geometry)
         self.assertAlmostEqual(start[0], 0.0)
-        self.assertAlmostEqual(start[1], geometry.hub_radius_mm)
-        self.assertAlmostEqual(end[1], geometry.arm_length_mm)
+        self.assertAlmostEqual(start[1], -geometry.hub_radius_mm)  # 镜像
+        self.assertAlmostEqual(end[1], -geometry.arm_length_mm)  # 镜像
 
 
 class ReportTests(unittest.TestCase):

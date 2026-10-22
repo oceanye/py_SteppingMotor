@@ -74,8 +74,9 @@ class GaitSimulation:
         start, pivot = self.supports if side == "left" else self.supports[::-1]
         bearing = self.beta + (180.0 if side == "right" else 0.0)
         px, py = pad_center(pivot)
+        # 2026-10-22 晶格镜像：落点方位三角与 planner._dir 同步翻 y
         theta = math.radians(bearing-arc)
-        target = (px+math.cos(theta), py+math.sin(theta))
+        target = (px+math.cos(theta), py-math.sin(theta))
         for name, point in map_pads().items():
             if name not in (start, pivot) and math.dist(point, target) < 1e-6:
                 return start, name, pivot, bearing

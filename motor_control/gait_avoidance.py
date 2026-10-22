@@ -108,7 +108,7 @@ def leg_clearance(center, psi_deg, geometry, pads):
     for arm in range(3):
         angle = math.radians(psi_deg+120*arm)
         tip = (center[0]+geometry.arm_length_mm*math.cos(angle),
-               center[1]+geometry.arm_length_mm*math.sin(angle))
+               center[1]-geometry.arm_length_mm*math.sin(angle))
         for pad in pads:
             for j, node in enumerate(pad.high_nodes(geometry.arm_length_mm)):
                 margin = (point_segment_distance(node, center, tip)

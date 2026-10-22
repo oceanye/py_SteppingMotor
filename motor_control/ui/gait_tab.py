@@ -673,7 +673,7 @@ def tip_track_points(samples, geometry, arm_index):
         angle = math.radians(sample.psi_deg + 120.0 * arm_index)
         track.append((
             sample.center[0] + radius * math.cos(angle),
-            sample.center[1] + radius * math.sin(angle),
+            sample.center[1] - radius * math.sin(angle),
         ))
     return track
 
@@ -728,7 +728,7 @@ def frame_tip_clearance(report, geometry, index, rods):
     for leg in range(3):
         angle = math.radians(sample.psi_deg + 120.0 * leg)
         tip = (sample.center[0] + radius * math.cos(angle),
-               sample.center[1] + radius * math.sin(angle))
+               sample.center[1] - radius * math.sin(angle))
         for label, rod in rods:
             surface = math.dist(tip, rod) - geometry.node_radius_mm
             if best is None or surface < best[0]:

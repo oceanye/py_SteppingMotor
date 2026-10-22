@@ -50,7 +50,7 @@ class MapGeometryTests(unittest.TestCase):
                 angles.add(beta)
                 dx, dy = pads[left][0] - pads[right][0], pads[left][1] - pads[right][1]
                 self.assertAlmostEqual(math.cos(math.radians(beta)), dx)
-                self.assertAlmostEqual(math.sin(math.radians(beta)), dy)
+                self.assertAlmostEqual(math.sin(math.radians(beta)), -dy)  # 镜像：pad y 已翻
         self.assertEqual(angles, {0, 60, 120, 180, 240, 300})
 
     def test_bad_config_never_silently_falls_back_to_ab(self):
@@ -236,7 +236,7 @@ class MapExecutionTests(unittest.TestCase):
         self.assertEqual(len(set(modes)), 2)
         self.assertEqual(history.completed_steps, 4)
         pose = app._gait_twin_snapshot()['pose']
-        self.assertAlmostEqual(pose['feet']['left']['center'][1], math.sqrt(3))
+        self.assertAlmostEqual(pose['feet']['left']['center'][1], -math.sqrt(3))  # 镜像
         self.assertGreater(len(history.points), 4)
         before = list(app.commands)
         with self.assertRaisesRegex(GaitExecutorError, '5×5'):

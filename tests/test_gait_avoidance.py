@@ -131,8 +131,10 @@ class TwoModeGeometryTests(unittest.TestCase):
                                     continue
                                 angle = math.degrees(math.atan2(
                                     rod[1]-pivot[1], rod[0]-pivot[0]))
-                                swept = ((route[3]-angle) if arc > 0 else
-                                         (angle-route[3])) % 360
+                                # 2026-10-22 晶格镜像：扫掠方向随世界
+                                # 翻转，两分支对调。
+                                swept = ((angle-route[3]) if arc > 0 else
+                                         (route[3]-angle)) % 360
                                 crosses |= 1e-6 < swept < abs(arc)-1e-6
                         actual = avoidance_path(route[3], arc).modality
                         with self.subTest(supports=sim.supports, side=side, arc=arc):
@@ -258,10 +260,11 @@ class TwoModeGeometryTests(unittest.TestCase):
         for a, b in zip(report.samples, report.samples[1:]):
             phi, psi = (a.phi_deg+b.phi_deg)/2, (a.psi_deg+b.psi_deg)/2
             theta = math.radians(180-phi)
-            center = (g.d_mm*math.cos(theta), g.d_mm*math.sin(theta))
+            # 2026-10-22 晶格镜像：测量 oracle 三角随世界翻
+            center = (g.d_mm*math.cos(theta), -g.d_mm*math.sin(theta))
             for arm in range(3):
                 t = math.radians(psi+120*arm)
-                tip = (center[0]+g.arm_length_mm*math.cos(t), center[1]+g.arm_length_mm*math.sin(t))
+                tip = (center[0]+g.arm_length_mm*math.cos(t), center[1]-g.arm_length_mm*math.sin(t))
                 net = min(point_segment_distance(node, center, tip) for node in rods)
                 net -= g.arm_radius_mm+g.node_radius_mm+g.safety_margin_mm
                 self.assertGreaterEqual(net+1e-8, report.min_margin_mm)
@@ -309,7 +312,7 @@ class TwoModeExecutionTests(unittest.TestCase):
         app = app_fixture()
         complete(app, "left", -60)
         run, report = complete(app, "right", -60)
-        self.assertIn("邻座", run.route[2])
+        self.assertEqual(run.route[2], "邻座(0,-1)")  # 镜像
         self.assertIsNotNone(app._gait_twin_snapshot()["pose"])
 
     def test_failed_clearance_blocks_before_any_move(self):

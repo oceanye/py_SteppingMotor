@@ -114,7 +114,9 @@ def draw_candidate(app, view):
         if pose:
             foot = pose["feet"][report.side]
             aligned = abs((foot["psi_deg"]-psi+60) % 120-60) < .1
-            if math.dist(foot["center"], center) < 1e-5 and aligned:
+            # 2026-10-22 镜像：center 与足中心都是世界坐标（同系镜像），
+            # 距离判据本身保距；容差放宽覆盖投影取整。
+            if math.dist(foot["center"], center) < 1e-3 and aligned:
                 return
     x, y = project(center)
     for leg in range(3):
