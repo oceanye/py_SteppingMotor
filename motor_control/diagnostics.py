@@ -297,10 +297,27 @@ class DiagnosticRecorder:
     def _prune_closed(self, keep):
         # Restrict deletion to our CLOSED session manifests and known log files.
         try:
+            # Imported field evidence may be force-added despite logs/.gitignore.
+            # Never let local runtime retention delete versioned evidence.
+            protected = set()
+            if any((p / '.git').exists() for p in (self.project_dir, *self.project_dir.parents)):
+                try:
+                    result = subprocess.run(
+                        ['git', 'ls-files', '-z', '--', 'logs/diagnostics'],
+                        cwd=self.project_dir, capture_output=True, text=True,
+                        encoding='utf-8', errors='replace', timeout=3,
+                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                    if result.returncode != 0:
+                        self.event('gui', 'retention.skipped', level='WARNING', reason='Git index unavailable')
+                        return
+                    protected = {Path(name).parent.name for name in result.stdout.split('\0') if name}
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.exception('gui', 'retention.skipped', exc)
+                    return
             root = self.directory.parent.resolve()
             candidates = []
             for path in root.iterdir():
-                if (path.is_symlink() or not path.is_dir() or path.resolve().parent != root
+                if (path.name in protected or path.is_symlink() or not path.is_dir() or path.resolve().parent != root
                         or not re.fullmatch(r"\d{8}T\d{6}-[0-9a-f]{10}", path.name)):
                     continue
                 try:

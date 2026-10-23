@@ -260,6 +260,23 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue((first / "user-data.txt").is_file())
         self.assertFalse(second.directory.exists())
 
+    def test_retention_preserves_git_tracked_field_evidence(self):
+        self.recorder.close()
+        first = self.recorder.directory
+        (self.root / '.git').mkdir()
+        tracked = (first / 'session.json').relative_to(self.root).as_posix()+'\0'
+        with patch('motor_control.diagnostics.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout=tracked)):
+            self.recorder = DiagnosticRecorder(self.root, keep_sessions=0)
+        self.assertTrue((first / 'session.json').exists())
+
+    def test_retention_skips_deletion_when_git_index_cannot_be_checked(self):
+        self.recorder.close()
+        first = self.recorder.directory
+        (self.root / '.git').mkdir()
+        with patch('motor_control.diagnostics.subprocess.run', side_effect=OSError('git unavailable')):
+            self.recorder = DiagnosticRecorder(self.root, keep_sessions=0)
+        self.assertTrue(first.exists())
+
     def test_worker_inherits_action_and_exceptions_are_diagnosable(self):
         app = _x42s_gait_app()
         app.diagnostics = self.recorder

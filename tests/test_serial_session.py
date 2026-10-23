@@ -78,6 +78,51 @@ class SerialSessionTests(unittest.TestCase):
     def tearDown(self):
         self.session.close()
 
+    def test_cancel_read_and_join_precede_native_handle_close(self):
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        order = []
+        class NativeLikePort(FakeSerial):
+            def readline(self):
+                entered.set()
+                release.wait(2)
+                order.append('reader_finished')
+                finished.set()
+                return b''
+            def cancel_read(self):
+                order.append('cancel_read')
+                release.set()
+            def close(self):
+                order.append('close')
+                super().close()
+        session = SerialSession(NativeLikePort())
+        session.start()
+        self.assertTrue(entered.wait(1))
+        session.close()
+        self.assertTrue(finished.is_set())
+        self.assertEqual(order, ['cancel_read', 'reader_finished', 'close'])
+
+    def test_unfinished_reader_defers_close_instead_of_freeing_native_buffers(self):
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        class StuckPort(FakeSerial):
+            def readline(self):
+                entered.set()
+                release.wait(2)
+                return b''
+            def cancel_read(self):
+                pass
+            def close(self):
+                super().close()
+                closed.set()
+        session = SerialSession(StuckPort())
+        session.start()
+        self.assertTrue(entered.wait(1))
+        try:
+            session.close(join_timeout=.01)
+            self.assertFalse(closed.is_set())
+        finally:
+            release.set()
+        self.assertTrue(closed.wait(1))
+
     def test_step_and_node_events_are_split_from_move_reply(self):
         def respond(_data):
             self.port.feed(

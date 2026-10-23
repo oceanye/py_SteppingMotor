@@ -185,12 +185,32 @@ class SerialSession:
                 pending.error = SessionClosed("serial session closed")
                 pending.completed.set()
             reader = self._reader
+        # Windows pyserial owns OVERLAPPED buffers used by the read thread.
+        # Cancel and join BEFORE close frees them; closing concurrently can
+        # crash the interpreter, not merely raise SerialException.
+        cancel_read = getattr(self._serial, 'cancel_read', None)
+        if reader is not None and reader is not threading.current_thread() and callable(cancel_read):
+            try:
+                cancel_read()
+            except Exception as exc:
+                self._diagnose('serial.cancel_read_failed', error=str(exc))
+            reader.join(max(0.0, join_timeout))
+            if reader.is_alive():
+                self._diagnose('serial.close_deferred', reason='reader still owns I/O buffers')
+                def finish_close():
+                    reader.join()
+                    self._close_port()
+                threading.Thread(target=finish_close, name='serial-deferred-close', daemon=True).start()
+                return
+        self._close_port()
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(max(0.0, join_timeout))
+
+    def _close_port(self) -> None:
         try:
             self._serial.close()
         except Exception as exc:
             self._notify_error(SerialIoError(f"serial close failed: {exc}"))
-        if reader is not None and reader is not threading.current_thread():
-            reader.join(max(0.0, join_timeout))
         self._diagnose("serial.closed")
 
     def __enter__(self) -> "SerialSession":
