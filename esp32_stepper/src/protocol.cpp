@@ -441,6 +441,11 @@ static void handle_node(const String tok[], int n) {
 // 业务动作最终走逻辑角色/统一 motion API，不鼓励 GUI 直接拼这些帧。
 static void handle_x42s(const String tok[], int n) {
 #if X42S_UART_ENABLED
+  if (n == 2 && tok[1] == "INFO") {
+    // Capability revision + actual compile stamp, not the PC Git version.
+    serial_tx_printf("OK,X42S,INFO,2,%s %s", __DATE__, __TIME__);
+    return;
+  }
   if (n == 2 && tok[1] == "SCAN") { x42s_print_scan(); return; }
   if (n == 3 && tok[1] == "S") {
     int id = 0;

@@ -254,14 +254,14 @@ class WebControlTests(unittest.TestCase):
         status, data = self.request_json(
             "POST",
             "/api/motor",
-            {"mode": "FOC", "axis": 1, "action": "target", "target_deg": 12.5},
+            {"mode": "GEAR", "axis": 1, "action": "target", "target_deg": 12.5},
         )
 
         self.assertEqual(status, 200)
         self.assertTrue(data["ok"])
         self.assertEqual(
             self.controller.calls,
-            [("motor", "FOC", 1, "target", 12.5)],
+            [("motor", "GEAR", 1, "target", 12.5)],
         )
 
     def test_track_run_and_stop_success_reach_controller(self):

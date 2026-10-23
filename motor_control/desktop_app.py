@@ -280,6 +280,7 @@ class StepperGUI(X42sRuntimeMixin):
         self.root = root
         # Explicit archive maintenance opt-in; never inferred from old JSON.
         self.legacy_stepdir_enabled = os.environ.get("STEPPER_LEGACY_STEPDIR") == "1"
+        self.gear_enabled = os.environ.get("STEPPER_GEAR_ENABLED") == "1"
         self.state_store = StateStore(PROJECT_DIR)
         self._startup_warnings = []
         try:
@@ -477,8 +478,8 @@ class StepperGUI(X42sRuntimeMixin):
         if self.legacy_stepdir_enabled:
             self._load_calib()
         self._refresh_coordinated_ui()
-        self._load_foc_tune()
-        self._load_gear_tune()
+        if self.gear_enabled:
+            self._load_gear_tune()
         if web_server_factory is not None:
             self._start_web_server(web_server_factory)
         if self.diagnostics is not None:
@@ -1975,7 +1976,11 @@ class StepperGUI(X42sRuntimeMixin):
         psi_error = phi_error + 4.0 / ppu[swing_role]
         pulse_envelope = math.radians(phi_error) * geometry.d_mm + math.radians(psi_error) * geometry.arm_length_mm
         for lift_role in ("Mup1", "Mup2"):
-            pulse_envelope += 0.5 / ppu[lift_role]
+            from motor_control.x42s_motion import endpoint_tolerance
+            lift_binding = self.control_bindings.for_role(LogicalRole(lift_role))
+            # Both start/end acceptance residuals contribute to the envelope.
+            pulse_envelope += 2 * endpoint_tolerance(lift_role, lift_binding) * (
+                lift_binding.lead_mm / (360 * lift_binding.gear_ratio))
         phase_residual = abs((psi_now - LOW_NODE_PHASE_DEG + 60) % 120 - 60)
         if phase_stage is not None:
             phase_residual = 4.0 / ppu[swing_role]
@@ -2500,7 +2505,7 @@ class StepperGUI(X42sRuntimeMixin):
 
     def _gait_send_relative_x42s_send(self, axis, role, steps, speed_pps):
         """已换算好的 X42S MOVE 下发 + 确认式应答校验（同步组内部用）。"""
-        from motor_control.x42s_motion import MoveExpectation
+        from motor_control.x42s_motion import MoveExpectation, endpoint_tolerance
         from motor_control.gait_x42s_wait import owned_health_issue
         driver_id = axis - X42S_AXIS_HANDLE_BASE
         token = getattr(self, "_gait_owned", {}).get(axis)
@@ -2526,7 +2531,8 @@ class StepperGUI(X42sRuntimeMixin):
                 self.log(f"⛔ {role.value} 未取得新鲜静止起点，或上一段未核验到位")
                 return "failed"
             expected = MoveExpectation(token, state.measured_position + steps * 360 / X42S_PULSE_PER_REV,
-                                       origin_motor_deg=state.measured_position)
+                                       origin_motor_deg=state.measured_position,
+                                       tolerance_motor_deg=endpoint_tolerance(role, self.control_bindings.for_role(role)))
             pending[axis] = expected
         resp = self._send_and_read(command, guard=guard, soft_timeout=True)
         reply = parse_line(resp) if resp else None
@@ -3745,9 +3751,11 @@ class StepperGUI(X42sRuntimeMixin):
             with self.state_lock:
                 self._disconnecting = True
             if not self._stop_all_outputs(allow_closing=True):
+                with self.state_lock:
+                    self._disconnecting = False  # Allow a new stop verification, not movement.
                 messagebox.showerror(
                     "停车未确认",
-                    "控制器没有确认 ESTOP。串口仍可用时将保持连接并封锁新命令；"
+                    "尚未获得完整停车反馈。串口仍可用时将保持连接并封锁新命令；"
                     "请立即使用物理急停或断电，确认安全后重试断开。",
                 )
                 return
@@ -3793,7 +3801,7 @@ class StepperGUI(X42sRuntimeMixin):
             with self.state_lock:
                 self.serial_session = new_session
             new_session.start()
-            if not self._stop_all_outputs():
+            if not self._stop_all_outputs(bridge_handshake=True):
                 raise RuntimeError(
                     "连接安全握手失败：固件未精确确认 OK,ESTOP"
                 )
@@ -3807,12 +3815,11 @@ class StepperGUI(X42sRuntimeMixin):
             # 新会话位置从校准文件重载，旧差值基准跨会话无意义。
             self._last_land_gap_mm = None
             self.log(f"已连接 {self.port_var.get()} @ {self.baud_var.get()}")
-            self.foc_poll_running = True
-            threading.Thread(
-                target=self._foc_poll_loop,
-                args=(generation, new_session),
-                daemon=True,
-            ).start()
+            self._query_x42s_firmware_info()
+            self.foc_poll_running = self.gear_enabled
+            if self.gear_enabled:
+                threading.Thread(target=self._foc_poll_loop,
+                                 args=(generation, new_session), daemon=True).start()
             # X42S 遥测轮询：后台端不是 x42s_uart 时循环内空转（0.5s 一查），
             # 不发任何总线命令；换绑后无需重连即生效。
             self.x42s_poll_running = True
@@ -3946,8 +3953,8 @@ class StepperGUI(X42sRuntimeMixin):
                 self.v_focstate[axis].set("未连接")
                 self.v_foccur[axis].set("--")
                 self.v_focfault[axis].set("--")
-                self.notebook.tab(self.tab_index_foc[axis], state="normal")
-                self.notebook.tab(self.tab_index_gear[axis], state="normal")
+                if self.gear_enabled:
+                    self.notebook.tab(self.tab_index_gear[axis], state="normal")
 
         self._post_ui(update_ui)
         now = time.monotonic()
@@ -4042,10 +4049,10 @@ class StepperGUI(X42sRuntimeMixin):
                         self.running[axis] = False
                     for axis in range(NUM_MOTOR_AXES):
                         self._foc_enabled_ui[axis] = False
-                post_ui(lambda: self.v_track_status.set("硬件急停触发，已停止"))
+                    self._estop_unconfirmed = True
+                post_ui(lambda: self.v_track_status.set("硬件急停触发；X42S停车待核验"))
                 post_ui(lambda: self.log(
-                    "⚠️ 硬件急停触发：固件已停止全部步进/轨道并失能闭环轴；"
-                    "释放急停按钮后可重新操作"))
+                    "⚠️ 硬件急停触发：已请求停车；X42S需核验四轴反馈，释放按钮不自动解锁"))
             else:
                 with self.state_lock:
                     if not self._serial_source_is_current(generation, session):
@@ -4053,7 +4060,7 @@ class StepperGUI(X42sRuntimeMixin):
                     self._hardware_estop_active = False
                 post_ui(lambda: self.v_track_status.set("硬件急停已释放"))
                 post_ui(lambda: self.log(
-                    "硬件急停回路已恢复；请确认现场安全后再手动发起运动"))
+                    "硬件急停回路已恢复；请确认现场安全后点击【急停并核验】，不自动恢复运动"))
             return
         if isinstance(event, MotorFaultEvent):
             if 0 <= event.axis < NUM_MOTOR_AXES:
@@ -4112,6 +4119,11 @@ class StepperGUI(X42sRuntimeMixin):
         propagate_request_error=False,
         soft_timeout=False,
     ):
+        if cmd.split(",", 1)[0] == "FOC" and not getattr(self, "gear_enabled", False):
+            reason = "ERR:FOC retired; GEAR disabled"
+            if propagate_request_error:
+                raise RequestCancelled(reason)
+            return reason
         if (not getattr(self, "legacy_stepdir_enabled", True)
                 and cmd.split(",", 1)[0] in {"MOVE", "SYNC", "ENA", "STDIAG", "ENC", "NODE"}):
             reason = "ERR:legacy stepdir disabled; use X42S controls"
@@ -5460,29 +5472,12 @@ class StepperGUI(X42sRuntimeMixin):
             self.log(f"⚠️ FOC 调参读取失败: {e}")
 
     def _apply_foc_tune_to_firmware(self):
-        """连接成功后将已加载的 V/PA/VP 下发给固件；PP 在固件 NVS 里，不需要重发。"""
-        values = [
-            (self.v_focvlimit[axis].get(), self.v_focpangle[axis].get(),
-             self.v_focvp[axis].get())
-            for axis in range(NUM_MOTOR_AXES)
-        ]
-        def worker():
-            time.sleep(0.3)
-            for axis, (v, pa, vp) in enumerate(values):
-                self._send_and_read(f"FOC,{axis},V,{v:.1f}")
-                self._send_and_read(f"FOC,{axis},PA,{pa:.1f}")
-                self._send_and_read(f"FOC,{axis},VP,{vp:.2f}")
-            self.log("FOC 调参已下发固件")
-        self._start_control_worker(worker)
+        """Compatibility entry point; retired FOC settings never reach hardware."""
+        self.log("FOC 已退役，不下发旧参数")
 
     # ═════════════ FOC：命令 ═════════════
     def _send_foc(self, axis, sub_and_arg):
-        """例：_send_foc(0, 'EN,1') → 发 FOC,0,EN,1 → 日志记响应"""
-        cmd = f"FOC,{axis},{sub_and_arg}"
-        def worker():
-            resp = self._send_and_read(cmd)
-            self.log(f"{cmd} → {resp}")
-        self._start_control_worker(worker)
+        self.log("FOC 已退役，命令未发送")
 
     def _foc_goto(self, axis):
         self._send_foc(axis, f"A,{self.v_foctgt[axis].get():.1f}")
@@ -5546,6 +5541,8 @@ class StepperGUI(X42sRuntimeMixin):
             )
 
     def _foc_poll_loop(self, generation, session):
+        if not getattr(self, "gear_enabled", False):
+            return
         while (self.foc_poll_running
                and self._serial_source_is_current(generation, session)):
             if self._any_stepper_axis_busy():
@@ -5591,6 +5588,9 @@ class StepperGUI(X42sRuntimeMixin):
 
 
     def _update_foc_display(self, axis, state, cur, tgt, fault):
+        # GEAR retains the historical FOC wire namespace, but no FOC widgets.
+        if not getattr(self, "gear_enabled", False):
+            return
         self.v_focstate[axis].set(FOC_STATE_NAMES.get(state, "?"))
         try:
             cur_f = float(cur); tgt_f = float(tgt)
@@ -5607,10 +5607,7 @@ class StepperGUI(X42sRuntimeMixin):
         if self.stepper_in_progress[axis]: cur_text += " ⏸"
         self.v_foccur[axis].set(cur_text)
         self.v_focfault[axis].set("报警" if fault == "1" else "正常")
-        self.fw[axis]['fault_label'].config(foreground="red" if fault == "1" else "green")
         self.gw[axis]['fault_label'].config(foreground="red" if fault == "1" else "green")
-        # 两个模式都按响应门控（只激活当前模式的会真正生效）
-        self._apply_foc_gating(axis, state, fault)
         self._apply_gear_gating(axis, state, fault)
 
         if cur_f is not None and state == "2":
@@ -5621,6 +5618,8 @@ class StepperGUI(X42sRuntimeMixin):
             self._redraw_scope(axis)
 
     def _apply_gear_gating(self, axis, state, fault):
+        if not getattr(self, "gear_enabled", False):
+            return
         gw = self.gw[axis]
         if not self.ser or not self.ser.is_open:
             for w in gw['motion_btns'] + gw['cfg_widgets']:
@@ -5643,6 +5642,9 @@ class StepperGUI(X42sRuntimeMixin):
         gw['clear_btn'].config(state="normal" if is_fault else "disabled")
 
     def _apply_foc_gating(self, axis, state, fault):
+        # Kept for disconnect callbacks from older integrations; no FOC UI.
+        if axis >= len(self.fw) or not self.fw[axis]:
+            return
         fw = self.fw[axis]
         if not self.ser or not self.ser.is_open:
             for w in fw['motion_btns'] + fw['cfg_btns']:
@@ -5863,9 +5865,15 @@ class StepperGUI(X42sRuntimeMixin):
 
     # ═════════════ 模式自动检测 + tab 灰显 ═════════════
     def _query_mode_and_apply(self):
-        """连接成功后调一次。用户选 Auto 时发 MODE 命令自动检测；
-        用户选 FOC/GEAR 时直接强制应用，不查询固件。"""
+        """Only explicitly opted-in GEAR maintenance queries legacy MODE."""
+        if not getattr(self, "gear_enabled", False):
+            self.fw_mode_var.set("X42S")
+            self._fw_mode_cache = "X42S"
+            return
         sel = self.mode_select_var.get()
+        if sel == MODE_FOC:
+            self.log("FOC 已退役；不查询、不下发旧参数")
+            return
         with self.state_lock:
             generation = self._serial_generation
             session = self.serial_session
@@ -5874,7 +5882,7 @@ class StepperGUI(X42sRuntimeMixin):
             if self._serial_source_is_current(generation, session):
                 self._apply_mode_to_tabs(mode)
 
-        if sel in (MODE_FOC, MODE_GEAR):
+        if sel == MODE_GEAR:
             self.log(f"模式选择 = 强制 {sel}（跳过固件 MODE 查询）")
             self._post_ui(lambda: apply_if_current(sel))
             return
@@ -5892,18 +5900,17 @@ class StepperGUI(X42sRuntimeMixin):
             )
             if not self._serial_source_is_current(generation, session):
                 return
-            mode = MODE_FOC
+            mode = "UNKNOWN"
             if resp.startswith("MODE,"):
                 m = resp.split(",", 1)[1].strip().upper()
                 if m in (MODE_FOC, MODE_GEAR): mode = m
             else:
-                self.log(f"⚠️ 固件未返回 MODE（响应={resp!r}）。请烧含 MODE 命令的固件，"
-                         f"或用'强制 FOC/GEAR'手动选。先按 FOC 处理。")
+                self.log(f"⚠️ 固件未返回有效 MODE（响应={resp!r}），不下发 GEAR 参数")
             self._post_ui(lambda: apply_if_current(mode))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_mode_select_change(self):
-        """用户切换 Auto/FOC/GEAR radio 时调用。如果已连接，立即重新应用模式。"""
+        """Maintenance Auto/GEAR selection; FOC is retired."""
         sel = self.mode_select_var.get()
         self.log(f"模式选择 → {sel}")
         if self.ser and self.ser.is_open:
@@ -5911,21 +5918,16 @@ class StepperGUI(X42sRuntimeMixin):
 
     def _apply_mode_to_tabs(self, mode):
         """灰掉非当前模式的 tab，更新 mode 标签，下发对应模式的 tune。"""
+        if mode != MODE_GEAR or not getattr(self, "gear_enabled", False):
+            self.fw_mode_var.set("X42S")
+            self._fw_mode_cache = "X42S"
+            return
         self.fw_mode_var.set(mode)
         with self.state_lock:
             self._fw_mode_cache = mode
-        if mode == MODE_FOC:
-            self.mode_label.config(foreground="#1565c0")
-            for a in range(NUM_MOTOR_AXES):
-                self.notebook.tab(self.tab_index_foc[a],  state="normal")
-                self.notebook.tab(self.tab_index_gear[a], state="disabled")
-            # 自动跳到第一个 FOC tab
-            self.notebook.select(self.tab_index_foc[0])
-            self._apply_foc_tune_to_firmware()
-        elif mode == MODE_GEAR:
+        if mode == MODE_GEAR:
             self.mode_label.config(foreground="#2e7d32")
             for a in range(NUM_MOTOR_AXES):
-                self.notebook.tab(self.tab_index_foc[a],  state="disabled")
                 self.notebook.tab(self.tab_index_gear[a], state="normal")
             self.notebook.select(self.tab_index_gear[0])
             self._apply_gear_tune_to_firmware()
@@ -6075,9 +6077,14 @@ class StepperGUI(X42sRuntimeMixin):
         return generation
 
     @logged_action
-    def _stop_all_outputs(self, allow_closing=False):
-        """发送固件原子软件急停；返回是否收到精确确认。"""
+    def _stop_all_outputs(self, allow_closing=False, bridge_handshake=False):
+        """Bridge ACK plus per-X42S post-command standstill evidence.
+
+        Initial connection may stay open for diagnostics on bridge ACK alone;
+        it NEVER clears the motion latch without the four-axis evidence.
+        """
         with self.state_lock:
+            self._estop_unconfirmed = True
             if getattr(self, "_gait_owned", {}):
                 self._gait_needs_recovery = True
                 self._gait_auto_run = False
@@ -6098,18 +6105,37 @@ class StepperGUI(X42sRuntimeMixin):
             for axis in range(NUM_MOTOR_AXES):
                 self._foc_enabled_ui[axis] = False
             self._track_direction = "STOP"
+        sent_at = time.monotonic()
+        stop_generation = self._control_generation
         response = self._send_and_read("ESTOP", timeout=0.8, allow_closing=allow_closing)
-        confirmed = response == "OK,ESTOP"
+        bridge_ack = response == "OK,ESTOP"
+        from motor_control.x42s_safety import confirm_disabled_standstill
+        confirmed = bridge_ack and confirm_disabled_standstill(
+            self, sent_at, allow_closing=allow_closing)
         # 新固件 ESTOP 内部已全轴恢复锁定；这里再补发一次，兼容旧固件
         # 与 ESTOP 未确认场景，绝不让旋转电机停留在落地纠偏的失能态。
         self._force_relock_rot_axes(allow_closing=True)
         with self.state_lock:
+            confirmed = confirmed and self._control_generation == stop_generation
             self._estop_unconfirmed = not confirmed
             if confirmed:
                 getattr(self, "_x42s_manual_pending", {}).clear()
-        status = "已停止" if confirmed else "⚠ 停车未确认"
+        recorder = getattr(self, "diagnostics", None)
+        if recorder is not None:
+            recorder.event("motor", "safety.estop_result", bridge_ack=bridge_ack,
+                           drivers_confirmed=confirmed, level="INFO" if confirmed else "ERROR")
+        status = "停车核验通过" if confirmed else "⚠ 指令已发；停车未确认"
         self._post_ui(lambda value=status: self.v_track_status.set(value))
-        return confirmed
+        return bridge_ack if bridge_handshake else confirmed
+
+    def _emergency_stop_clicked(self):
+        def worker():
+            try:
+                self.web_emergency_stop()
+                self.log("停车核验通过；重新运动前请确认机械支撑与现场安全")
+            except Exception as exc:
+                self.log(f"⛔ 急停核验未通过：{exc}")
+        threading.Thread(target=worker, name="x42s-estop-confirm", daemon=True).start()
 
     def attach_web_server(self, server):
         """保存 WebControlServer 实例，供外部启动/关闭流程统一管理。"""
@@ -6153,15 +6179,7 @@ class StepperGUI(X42sRuntimeMixin):
 
     # ═════════════ FOC：自动调参（单轴）═════════════
     def _foc_autotune(self, axis):
-        if not self.ser or not self.ser.is_open:
-            messagebox.showerror("未连接", "请先连接串口"); return
-        if not messagebox.askokcancel(
-            "自动调参确认",
-            f"闭环 {MOTOR_AXIS_LABELS[axis]} 两阶段扫描 PA + VP，约 2 分钟。\n电机会来回转动，请先固定好。"):
-            return
-        self.fw[axis]['autotune_btn'].config(state="disabled")
-        if self._start_control_worker(self._foc_autotune_worker, axis) is None:
-            self.fw[axis]['autotune_btn'].config(state="normal")
+        self.log("FOC 已退役，不执行自动调参")
 
     def _step_response_test(self, axis, target, pre_settle=2.5, duration=5.0):
         metrics = self._autotune_runner.step_response_test(
@@ -6176,32 +6194,7 @@ class StepperGUI(X42sRuntimeMixin):
         )
 
     def _foc_autotune_worker(self, axis):
-        generation = getattr(self._control_context, "generation", None)
-        try:
-            result = self._autotune_runner.run_foc(axis)
-            if not result.completed:
-                return
-            best_pa = result.best_pa
-            best_vp = result.best_vp
-            def apply_result():
-                with self.state_lock:
-                    if (
-                        generation != self._control_generation
-                        or self._closing
-                        or self._disconnecting
-                        or self._estop_in_progress
-                        or self._hardware_estop_active
-                        or self._estop_unconfirmed
-                    ):
-                        return
-                self.v_focpangle[axis].set(float(best_pa))
-                self.fw[axis]['pangle_label'].config(text=f"{best_pa:.1f} (刚度)")
-                self.v_focvp[axis].set(float(best_vp))
-                self.fw[axis]['vp_label'].config(text=f"{best_vp:.2f} (阻尼)")
-                self._save_foc_tune()
-            self._post_ui(apply_result)
-        finally:
-            self._post_ui(lambda: self.fw[axis]['autotune_btn'].config(state="normal"))
+        self.log("FOC 已退役，不启动旧调参任务")
 
     # ═════════════ GEAR：自动调参（三阶段 Kp → Kd → Ki）═════════════
     def _gear_autotune(self, axis):

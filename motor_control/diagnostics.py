@@ -27,7 +27,8 @@ import uuid
 
 
 SCHEMA = "motor-diagnostics-v1"
-CHANNELS = ("gui", "motor", "telemetry")
+CHANNELS = ("gui", "motor", "telemetry", "events", "flight")
+LOG_FILE_PATTERN = r"(?:gui|motor|telemetry|events|flight)\.jsonl(?:\.\d+)?|session\.json"
 _operation = ContextVar("motor_diagnostic_operation", default=None)
 _active = {}
 _active_lock = threading.Lock()
@@ -119,7 +120,8 @@ def environment_summary(project_dir):
     for name in ("desktop_app.py", "serial_session.py", "diagnostics.py", "gait_executor.py",
                  "gait_coordinates.py", "gait_planner.py", "gait_avoidance.py",
                  "gait_clearance.py", "gait_x42s_plan.py", "gait_x42s_wait.py",
-                 "x42s_motion.py", "x42s_runtime.py", "ui/gait_tab.py", "ui/gait_twin.py"):
+                 "x42s_motion.py", "x42s_runtime.py", "x42s_safety.py",
+                 "diagnostic_policy.py", "ui/gait_tab.py", "ui/gait_twin.py"):
         path = root / "motor_control" / name
         if path.is_file():
             summary["source_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -127,12 +129,18 @@ def environment_summary(project_dir):
 
 
 class _JsonlHandler(RotatingFileHandler):
+    rotations = 0
+
+    def doRollover(self):
+        super().doRollover()
+        self.rotations += 1
+
     def handleError(self, _record):
         raise  # Let the writer mark a failure; do not recurse via stderr hooks.
 
 
 class DiagnosticRecorder:
-    """One writer, bounded queue, three rotating streams, explicit loss counters.
+    """One writer, bounded queue, five rotating streams, explicit loss counters.
 
     Queue overflow/disk failures never block control threads. They are visible in
     health(), the UI, session end and export metadata. Recent CLOSED sessions are
@@ -153,6 +161,8 @@ class DiagnosticRecorder:
         self._failed = 0
         self._last_error = None
         self._start = time.monotonic()
+        from .diagnostic_policy import EvidencePolicy
+        self._evidence_policy = EvidencePolicy()
         self._handlers = {c: _JsonlHandler(self.directory / f"{c}.jsonl",
                           maxBytes=max_bytes, backupCount=backups, encoding="utf-8")
                           for c in CHANNELS}
@@ -163,6 +173,10 @@ class DiagnosticRecorder:
                          "limits": {"max_bytes_per_file": max_bytes, "backups": backups,
                                     "queue_size": queue_size, "keep_closed_sessions": keep_sessions},
                          "metadata": sanitize(metadata or {})}
+        self.manifest["evidence_policy"] = {
+            "events": "actions, command writes/replies, safety and health transitions; no routine poll traffic",
+            "flight": "bounded pre-fault 20s / post-fault 10s, pre-buffer max4096 records",
+            "retention": "all streams rotate; dropped=0 does NOT imply complete session history"}
         self._write_manifest()
         self._thread = threading.Thread(target=self._write_loop, name="diagnostic-writer", daemon=True)
         self._thread.start()
@@ -206,7 +220,8 @@ class DiagnosticRecorder:
         with self._lock:
             return {"session_id": self.session_id, "queued": self._queue.qsize(),
                     "dropped": self._dropped, "write_errors": self._failed,
-                    "last_error": self._last_error, "closed": self._closed}
+                    "last_error": self._last_error, "closed": self._closed,
+                    "rotations": {c: h.rotations for c, h in self._handlers.items()}}
 
     def _write_loop(self):
         while True:
@@ -222,6 +237,11 @@ class DiagnosticRecorder:
                 with self._files_lock:
                     self._handlers[channel].emit(logging.LogRecord(
                         "motor.diagnostic", logging.INFO, "", 0, text, (), None))
+                    if channel not in ("events", "flight"):
+                        for target, evidence in self._evidence_policy.route(record):
+                            self._handlers[target].emit(logging.LogRecord(
+                                "motor.diagnostic", logging.INFO, "", 0,
+                                json.dumps(evidence, ensure_ascii=False, allow_nan=False), (), None))
             except Exception as exc:
                 with self._lock:
                     self._failed += 1
@@ -246,7 +266,7 @@ class DiagnosticRecorder:
         with self._files_lock:
             files = {p.name: p.read_text(encoding="utf-8", errors="replace")
                      for p in self.directory.iterdir() if p.is_file() and not p.is_symlink()
-                     and re.fullmatch(r"(?:gui|motor|telemetry)\.jsonl(?:\.\d+)?|session\.json", p.name)}
+                     and re.fullmatch(LOG_FILE_PATTERN, p.name)}
         files["session.json"] = json.dumps({**self.manifest, "health": self.health()}, ensure_ascii=False)
         return files
 
@@ -292,7 +312,7 @@ class DiagnosticRecorder:
             for path in sorted(candidates, reverse=True)[max(0, keep):]:
                 children = list(path.iterdir())
                 if not all(p.is_file() and not p.is_symlink() and p.resolve().parent == path.resolve()
-                           and (p.name == "session.json" or re.fullmatch(r"(?:gui|motor|telemetry)\.jsonl(?:\.\d+)?", p.name))
+                           and re.fullmatch(LOG_FILE_PATTERN, p.name)
                            for p in children):
                     continue
                 for child in children:

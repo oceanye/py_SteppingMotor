@@ -47,7 +47,7 @@ test('real server: four role units, measured position, needle and no phantom STE
   }
   await expect(page.locator('#legacySteppers')).toBeHidden();
   await expect(page.locator('[data-axis-card]')).toHaveCount(0);
-  await expect(page.getByText('独立 GEAR / FOC 电机（非四轴 X42S）')).toBeVisible();
+  await expect(page.getByText('独立 GEAR 电机（维护选项，默认关闭）')).toBeVisible();
 });
 
 test('live updates distinguish movement, target and measured zero',async({page,request})=>{
@@ -133,7 +133,7 @@ test('malformed status and unexpected role do not leave stale cards or inject ma
   await expect(page.locator('#conn')).toHaveText('网页服务连接中断');
 });
 
-test('invalid and empty GEAR/FOC target is handled locally without POST',async({page})=>{
+test('invalid and empty GEAR target is handled locally without POST',async({page})=>{
   const posts=capturePosts(page,'/api/motor');
   await open(page);
   for(const value of ['', '3601', '-3601']){
@@ -144,34 +144,33 @@ test('invalid and empty GEAR/FOC target is handled locally without POST',async({
   expect(posts).toEqual([]);
 });
 
-test('GEAR/FOC valid commands reach real adapter; user mode is not overwritten',async({page})=>{
+test('opted-in GEAR commands reach real adapter; retired FOC is rejected',async({page,request})=>{
   const posts=capturePosts(page,'/api/motor');
   await open(page);
   await page.locator('#target0').fill('-12.5');
   await page.locator('[data-motor="target"][data-axis="0"]').click();
-  await expect(page.locator('#toast')).toHaveText('GEAR / FOC 轴 1：target');
+  await expect(page.locator('#toast')).toHaveText('GEAR 轴 1：target');
   expect(posts[0]).toEqual({mode:'GEAR',axis:0,action:'target',target_deg:-12.5});
   for(const action of ['enable','zero','disable']){
     await page.locator(`[data-motor="${action}"][data-axis="0"]`).click();
-    await expect(page.locator('#toast')).toHaveText(`GEAR / FOC 轴 1：${action}`);
+    await expect(page.locator('#toast')).toHaveText(`GEAR 轴 1：${action}`);
   }
-  await page.locator('#mode0').selectOption('FOC');
-  await page.waitForTimeout(1100); // one status poll, selected command mode must remain
-  await expect(page.locator('#mode0')).toHaveValue('FOC');
-  await page.locator('[data-motor="target"][data-axis="0"]').click();
-  await expect(page.locator('#toast')).toContainText('当前固件模式是 GEAR');
+  await expect(page.locator('#mode0 option[value="FOC"]')).toHaveCount(0);
+  const result=await request.post('/api/motor',{data:{mode:'FOC',axis:0,action:'enable'}});
+  expect(result.status()).toBe(400);
+  expect((await result.json()).error).toContain('FOC 已退役');
 });
 
-test('FOC firmware initializes its own controls once, without impersonating X42S',async({page,request})=>{
+test('FOC status cannot restore retired controls; default-off GEAR leaves track D available',async({page,request})=>{
   const state=await controlledStatus(page,request);
   state.status.mode='FOC';
+  state.status.gear_enabled=false;
   await open(page);
-  await expect(page.locator('#mode0')).toHaveValue('FOC');
-  await expect(page.locator('#mode1')).toHaveValue('FOC');
-  await expect(page.locator('#firmwareMode')).toHaveText('固件模式：FOC');
-  await page.locator('#mode0').selectOption('GEAR');
+  await expect(page.locator('#gearSection')).toBeHidden();
+  await expect(page.locator('#trackFwd')).toBeVisible();
+  await expect(page.locator('[data-motor="enable"]').first()).toBeDisabled();
   await page.waitForTimeout(1100);
-  await expect(page.locator('#mode0')).toHaveValue('GEAR');
+  await expect(page.locator('#gearSection')).toBeHidden();
 });
 
 test('invalid track PWM does not create a lease or JS error',async({page})=>{
@@ -238,10 +237,10 @@ test('late lease reply after release does not restart movement',async({page})=>{
 test('estop requires explicit confirmation and displays failures honestly',async({page})=>{
   await open(page);
   await page.locator('#estop').click();
-  await expect(page.locator('#toast')).toHaveText('固件已确认全部软件停车命令');
+  await expect(page.locator('#toast')).toHaveText('停车核验已通过（不替代现场安全确认）');
   await page.route('**/api/estop',route=>route.fulfill({json:{ok:true,confirmed:false}}));
   await page.locator('#estop').click();
-  await expect(page.locator('#toast')).toContainText('急停未获固件确认');
+  await expect(page.locator('#toast')).toContainText('停车未确认');
 });
 
 test('explicit legacy UI preserves edited fields across polls and blocks unapplied move',async({page,request})=>{

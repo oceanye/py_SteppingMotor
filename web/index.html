@@ -16,7 +16,7 @@
     <section><h2>四逻辑电机绑定与状态</h2><p class="hint">只读监控。X42S 轴位来自驱动器反馈，按减速比/导程换算为 °/mm；整机姿态仍属模型推算。绑定与步态请在桌面 GUI 操作。历史 STEP/DIR 位置为脉冲估算。</p><div id="coordinatedReadiness" class="readiness">正在读取绑定状态…</div><div id="logicalMotors" class="grid"></div></section>
 
     <section id="legacySteppers" hidden><h2>历史 STEP/DIR 维护（30 轴，非当前硬件）</h2><div class="axis-toolbar"><label>控制器分组<select id="stepperGroup"></select></label><span id="topologyNote" class="topology-note">正在读取拓扑…</span></div><p class="hint">仅在显式启用历史维护模式时开放。当前四轴 X42S 不使用这些脉冲参数或原点。</p><div id="steppers" class="grid"></div></section>
-    <section><h2>独立 GEAR / FOC 电机（非四轴 X42S）</h2><p class="hint">本区为独立的 GEAR / FOC 子系统，不用于上方四个 X42S 角色。X42S 点动、基准和步态请使用桌面 GUI。</p><p id="firmwareMode" class="hint">固件模式未知</p><div id="motors" class="grid"></div></section>
+    <section id="gearSection" hidden><h2>独立 GEAR 电机（维护选项，默认关闭）</h2><p class="hint">FOC 已退役；本区不用于四个 X42S 角色。X42S 点动、基准和步态请使用桌面 GUI。</p><p id="firmwareMode" class="hint">固件模式未知</p><div id="motors" class="grid"></div></section>
     <section><h2>轨道 D（DRV8871）</h2>
       <div class="card">
         <div class="fields"><label>PWM（1–100%）<input id="trackPwm" type="number" value="60" min="1" max="100" step="1"></label><div><div class="state" style="margin-bottom:4px">状态</div><strong id="trackState">停止</strong></div></div>

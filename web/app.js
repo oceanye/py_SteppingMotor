@@ -4,7 +4,7 @@ import {updateSteppers} from './legacy-steppers.js';
 
 // These subsystems are NOT the four X42S roles.
 const motors=document.getElementById('motors');
-for(let a=0;a<2;a++) motors.insertAdjacentHTML('beforeend',`<div class="card"><div class="title"><span>GEAR / FOC 轴 ${a+1}</span><span id="mstate${a}" class="state">--</span></div><div class="fields"><label>控制模式<select id="mode${a}"><option>GEAR</option><option>FOC</option></select></label><label>目标角 (°)<input id="target${a}" type="number" value="0" min="-3600" max="3600" step="1"></label></div><div class="buttons"><button class="enable" data-motor="enable" data-axis="${a}">使能</button><button data-motor="zero" data-axis="${a}">归零</button><button class="stop" data-motor="disable" data-axis="${a}">失能</button><button class="go wide" data-motor="target" data-axis="${a}">发送目标角</button></div></div>`);
+for(let a=0;a<2;a++) motors.insertAdjacentHTML('beforeend',`<div class="card"><div class="title"><span>GEAR 轴 ${a+1}</span><span id="mstate${a}" class="state">--</span></div><div class="fields"><label>控制模式<select id="mode${a}"><option>GEAR</option></select></label><label>目标角 (°)<input id="target${a}" type="number" value="0" min="-3600" max="3600" step="1"></label></div><div class="buttons"><button class="enable" data-motor="enable" data-axis="${a}">使能</button><button data-motor="zero" data-axis="${a}">归零</button><button class="stop" data-motor="disable" data-axis="${a}">失能</button><button class="go wide" data-motor="target" data-axis="${a}">发送目标角</button></div></div>`);
 motors.addEventListener('click',e=>{
   const b=e.target.closest('button[data-motor]');
   if(!b || b.disabled)return;
@@ -13,7 +13,7 @@ motors.addEventListener('click',e=>{
     const body={mode:document.getElementById(`mode${axis}`).value,axis,action};
     if(action==='target')body.target_deg=num(`target${axis}`,-3600,3600);
     return api('/api/motor',body);
-  },`GEAR / FOC 轴 ${axis+1}：${action}`);
+  },`GEAR 轴 ${axis+1}：${action}`);
 });
 
 let holding=null,leaseTimer=null,trackPending=null;
@@ -67,9 +67,9 @@ document.getElementById('estop').addEventListener('click',()=>{
   cancelLease();
   act(async()=>{
     const result=await api('/api/estop',{});
-    if(result.confirmed!==true)throw new Error('急停未获固件确认，请检查现场并使用硬件急停');
+    if(result.confirmed!==true)throw new Error('停车未确认，请检查现场并按安全流程处置');
     return result;
-  },'固件已确认全部软件停车命令');
+  },'停车核验已通过（不替代现场安全确认）');
 });
 
 function setConnected(value){
@@ -89,11 +89,13 @@ async function refresh(){
     document.getElementById('legacySteppers').hidden=s.legacy_stepdir_enabled!==true;
     updateSteppers(s);
     setConnected(s.connected);
+    document.getElementById('gearSection').hidden=s.gear_enabled!==true;
+    for(const b of motors.querySelectorAll('button'))b.disabled=!s.connected||s.gear_enabled!==true;
     document.getElementById('conn').textContent=s.connected?'串口已连接':'服务在线 · 串口未连接';
     for(let i=0;i<2;i++)document.getElementById(`mstate${i}`).textContent=stateText(s.motors?.[i]);
     // Polling must not overwrite a user's selected command mode.
     document.getElementById('firmwareMode').textContent=`固件模式：${s.mode||'未知'}`;
-    if(!modeInitialized && ['GEAR','FOC'].includes(s.mode)){
+    if(!modeInitialized && s.mode==='GEAR'){
       for(let i=0;i<2;i++)if(!editedModes.has(i))document.getElementById(`mode${i}`).value=s.mode;
       modeInitialized=true;
     }

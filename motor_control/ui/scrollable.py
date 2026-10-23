@@ -57,7 +57,12 @@ class ScrollableFrame(ttk.Frame):
             self.canvas.bind_all(seq, self._wheel, add="+")
 
     def _contains_pointer(self, event):
-        widget = self.winfo_containing(event.x_root, event.y_root)
+        try:
+            widget = self.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):
+            # ttk popdown is a Tcl-only window; don't steal its wheel event or
+            # fall back to the underlying combobox and scroll the whole form.
+            return False
         if widget is None:
             # 窗口管理器不可用（withdrawn/无显示）：退回事件源控件判断。
             widget = event.widget

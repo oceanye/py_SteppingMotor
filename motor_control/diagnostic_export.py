@@ -11,10 +11,10 @@ import re
 import uuid
 import zipfile
 
-from .diagnostics import SCHEMA, environment_summary, sanitize
+from .diagnostics import SCHEMA, environment_summary, sanitize, LOG_FILE_PATTERN
 
 
-_LOG = re.compile(r"(?:gui|motor|telemetry)\.jsonl(?:\.\d+)?|session\.json")
+_LOG = re.compile(LOG_FILE_PATTERN)
 _LEGACY = re.compile(r"gui_\d{4}-\d{2}-\d{2}\.log|gui_stderr\.log|raw_\d{8}_\d{6}\.log")
 _SESSION = re.compile(r"\d{8}T\d{6}-[0-9a-f]{10}")
 
@@ -84,7 +84,9 @@ def export_bundle(project_dir, output=None, *, recorder=None, label="field-diagn
     active_id = None
     if recorder is not None:
         active_id = recorder.session_id
-        for name, content in recorder.snapshot_files().items():
+        priority = lambda name: (0 if name == "session.json" else 1 if name.startswith("events.")
+                                 else 2 if name.startswith("flight.") else 3, name)
+        for name, content in sorted(recorder.snapshot_files().items(), key=lambda pair: priority(pair[0])):
             if _LOG.fullmatch(name):
                 encoded = content.encode("utf-8")
                 cut = len(encoded) > max_file_bytes and ".jsonl" in name
@@ -98,7 +100,9 @@ def export_bundle(project_dir, output=None, *, recorder=None, label="field-diagn
                            and p.resolve().parent == diagnostic_root.resolve()
                            and p.name != active_id), reverse=True)
         for directory in sessions[:max(0, max_sessions-(1 if active_id else 0))]:
-            for path in sorted(directory.iterdir()):
+            for path in sorted(directory.iterdir(), key=lambda p: (
+                    0 if p.name == "session.json" else 1 if p.name.startswith("events.")
+                    else 2 if p.name.startswith("flight.") else 3, p.name)):
                 if _LOG.fullmatch(path.name) and _safe_file(path, log_root):
                     content, cut = _tail(path, max_file_bytes)
                     try:
@@ -119,14 +123,19 @@ def export_bundle(project_dir, output=None, *, recorder=None, label="field-diagn
                "error_motor_deg", "speed_motor_rpm", "current_a", "temperature_c",
                "online", "enabled", "reached", "fault", "age_ms")
     samples = []
+    sample_ids = set()
     for name, content in entries.items():
-        if "/telemetry.jsonl" not in name:
+        if not any(f"/{stream}.jsonl" in name for stream in ("telemetry", "flight", "events")):
             continue
         for line in content.decode("utf-8").splitlines():
             if not line.strip():
                 continue
             record = json.loads(line)
             if isinstance(record, dict) and record.get("event") == "x42s.telemetry":
+                identity = (record.get("session_id"), record.get("seq"))
+                if identity in sample_ids:
+                    continue
+                sample_ids.add(identity)
                 samples.append({**record.get("data", {}), **{k:record.get(k) for k in columns[:3]}})
     table = io.StringIO(newline="")
     writer = csv.DictWriter(table, fieldnames=columns, extrasaction="ignore")

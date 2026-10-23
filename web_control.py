@@ -260,8 +260,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self._keys(body, {"mode", "axis", "action"}, {"target_deg"})
         mode = body["mode"]
         action = body["action"]
-        if mode not in ("GEAR", "FOC"):
-            raise ValueError("mode 必须是 GEAR 或 FOC")
+        if mode != "GEAR":
+            raise ValueError("FOC 已退役；独立维护电机仅支持 GEAR")
         axis = self._integer(body["axis"], "axis", 0, 1)
         if action not in ("enable", "disable", "zero", "target"):
             raise ValueError("action 必须是 enable、disable、zero 或 target")

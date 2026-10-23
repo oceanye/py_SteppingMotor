@@ -355,6 +355,7 @@ bool x42s_ping(uint8_t id) {
   if (!id_valid(id)) return false;
   // 5.5.2 读固件/硬件版本：应答即在线证明（payload 含版本号，暂不解析）。
   if (!transact(id, x42s::kFcReadVersion, nullptr, 0, nullptr)) return false;
+  x42s::telemetry_invalidate_values(s_telemetry[id]);
   x42s::telemetry_mark_seen(s_telemetry[id], millis());
   return true;
 }
@@ -369,6 +370,7 @@ bool x42s_enable(uint8_t id, bool enable) {
     return false;
   if (!enable) s_moving[id] = false;  // 失能即停：清挂起态恢复全量轮询
   s_telemetry[id].enabled = enable;
+  x42s::telemetry_invalidate_values(s_telemetry[id]);
   x42s::telemetry_mark_seen(s_telemetry[id], millis());
   return true;
 }
@@ -380,6 +382,7 @@ bool x42s_stop(uint8_t id) {
   if (!transact(id, x42s::kFcStop, payload, sizeof(payload), nullptr))
     return false;
   s_moving[id] = false;  // 立即停止：无运动在途，恢复全量轮询
+  x42s::telemetry_invalidate_values(s_telemetry[id]);
   x42s::telemetry_mark_seen(s_telemetry[id], millis());
   return true;
 }
@@ -400,6 +403,7 @@ void x42s_estop() {
     // 3C 刷新。reached 直接清（§14.1-4）：迟到的 9F 上报不会重新点亮
     // 运动；恢复必须显式 x42s_enable。
     s_telemetry[id].reached = false;
+    x42s::telemetry_invalidate_values(s_telemetry[id]);
     s_moving[id] = false;  // 急停即弃挂起：恢复常规轮询暴露真实状态
   }
 }
@@ -452,6 +456,7 @@ bool x42s_move_relative(uint8_t id, int32_t steps, uint32_t speed_steps_s) {
     return false;
   x42s::Telemetry& t = s_telemetry[id];
   t.reached = false;
+  x42s::telemetry_invalidate_values(t);
   // 预估目标仅作无遥测时的占位显示；下次 33 轮询会覆盖为驱动器真值。
   t.command_position +=
       (float)steps * 360.0f / (float)X42S_PULSE_PER_REV;

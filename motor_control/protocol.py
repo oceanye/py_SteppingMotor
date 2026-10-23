@@ -789,6 +789,10 @@ def reply_matcher_for(command: str) -> ReplyMatcher:
                 tokens[1] == "*" or reply.node == node
             )
         if verb == "X42S" and len(tokens) >= 2:
+            if len(tokens) == 2 and tokens[1] == "INFO":
+                return (isinstance(reply, OkReply) and len(reply.values) == 4
+                        and reply.values[:2] == ("X42S", "INFO")
+                        and reply.values[2].isdigit() and bool(reply.values[3]))
             if tokens[1] == "SCAN":
                 return isinstance(reply, X42sScanReply)
             if tokens[1] == "SYNC":

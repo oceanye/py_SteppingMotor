@@ -52,7 +52,8 @@ class FakeDesktopApplication:
         self._track_direction = "STOP"
         self._track_last_response = ""
         self._track_lease_ms = 800
-        self._fw_mode_cache = "FOC"
+        self._fw_mode_cache = "GEAR"
+        self.gear_enabled = True  # Explicit maintenance opt-in in this fixture only.
         self._connected = True
 
         self.running = [False] * NUM_STEPPER_AXES
@@ -389,7 +390,7 @@ class DesktopWebControllerTests(unittest.TestCase):
 
     def test_unconfirmed_estop_latches_motion_but_allows_estop_retry(self):
         self.app.stop_all_result = False
-        with self.assertRaisesRegex(RuntimeError, "未获得固件确认"):
+        with self.assertRaisesRegex(RuntimeError, "停车未确认"):
             self.controller.web_emergency_stop()
         self.assertTrue(self.app._estop_unconfirmed)
         self.assertFalse(self.app._estop_in_progress)
@@ -615,7 +616,7 @@ class DesktopWebControllerTests(unittest.TestCase):
                     self.controller.web_stepper_move(0, "FWD", 1.0, value)
             with self.subTest(operation="target", value=value):
                 with self.assertRaises(ValueError):
-                    self.controller.web_motor_command("FOC", 0, "target", value)
+                    self.controller.web_motor_command("GEAR", 0, "target", value)
         self.assertFalse(self.app.move_called.is_set())
         self.assertEqual(self.app.serial_commands, [])
 
@@ -637,11 +638,11 @@ class DesktopWebControllerTests(unittest.TestCase):
         self.assertEqual(self.app.serial_commands[-1], ("STOP,29", 0.6, True))
 
         self.assertEqual(
-            self.controller.web_motor_command("foc", 1, "target", 12.34),
+            self.controller.web_motor_command("gear", 1, "target", 12.34),
             {
                 "ok": True,
                 "confirmed": True,
-                "mode": "FOC",
+                "mode": "GEAR",
                 "axis": 1,
                 "action": "target",
             },
@@ -660,11 +661,19 @@ class DesktopWebControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ERR:node timeout"):
             self.controller.web_stepper_stop(6)
         with self.assertRaisesRegex(RuntimeError, "ERR:node timeout"):
-            self.controller.web_motor_command("FOC", 0, "enable")
+            self.controller.web_motor_command("GEAR", 0, "enable")
 
         self.app.track_stop_response = "ERR:track failure"
         with self.assertRaisesRegex(RuntimeError, "ERR:track failure"):
             self.controller.web_track_command("stop")
+
+    def test_retired_foc_and_disabled_gear_never_send_commands(self):
+        with self.assertRaisesRegex(RuntimeError, "FOC 已退役"):
+            self.controller.web_motor_command("FOC", 0, "enable")
+        self.app.gear_enabled = False
+        with self.assertRaisesRegex(RuntimeError, "默认关闭"):
+            self.controller.web_motor_command("GEAR", 0, "enable")
+        self.assertEqual(self.app.serial_commands, [])
 
     def test_stop_endpoints_reject_unexpected_nonempty_replies(self):
         self.app.serial_response_override = "OK,1"

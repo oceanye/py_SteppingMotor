@@ -45,12 +45,11 @@ def build_ui(app, log_dir, num_motor_axes):
     ttk.Label(conn_frame, text="模式选择:").grid(row=1, column=0, sticky="e", **pad)
     mode_inner = ttk.Frame(conn_frame)
     mode_inner.grid(row=1, column=1, columnspan=8, sticky="w", **pad)
-    ttk.Radiobutton(mode_inner, text="Auto (固件自报)", variable=app.mode_select_var,
-                    value="Auto", command=app._on_mode_select_change).pack(side="left", padx=6)
-    ttk.Radiobutton(mode_inner, text="强制 FOC", variable=app.mode_select_var,
-                    value="FOC", command=app._on_mode_select_change).pack(side="left", padx=6)
-    ttk.Radiobutton(mode_inner, text="强制 GEAR", variable=app.mode_select_var,
-                    value="GEAR", command=app._on_mode_select_change).pack(side="left", padx=6)
+    ttk.Label(mode_inner, text="四轴 X42S · FOC 已退役 · 轨道 D 保留").pack(side="left", padx=6)
+    ttk.Button(mode_inner, text="急停并核验", command=app._emergency_stop_clicked).pack(side="left", padx=6)
+    if getattr(app, "gear_enabled", False):
+        ttk.Radiobutton(mode_inner, text="GEAR 维护", variable=app.mode_select_var,
+                        value="GEAR", command=app._on_mode_select_change).pack(side="left", padx=6)
 
     ttk.Label(conn_frame, text="网页服务:").grid(row=2, column=0, sticky="e", **pad)
     app.web_status_label = ttk.Label(
@@ -130,12 +129,7 @@ def build_ui(app, log_dir, num_motor_axes):
     app._build_paired_tab(paired_tab)
     if not getattr(app, "legacy_stepdir_enabled", True):
         app.notebook.tab(stepper_index, state="hidden")
-    for axis in range(num_motor_axes):
-        tab = ttk.Frame(app.notebook)
-        app.tab_index_foc[axis] = app.notebook.index("end")
-        app.notebook.add(tab, text=f"🧲 FOC {MOTOR_AXIS_LABELS[axis]}")
-        app._build_foc_tab(tab, axis)
-    for axis in range(num_motor_axes):
+    for axis in range(num_motor_axes if getattr(app, "gear_enabled", False) else 0):
         tab = ttk.Frame(app.notebook)
         app.tab_index_gear[axis] = app.notebook.index("end")
         app.notebook.add(tab, text=f"⚙ 减速 {MOTOR_AXIS_LABELS[axis]}")

@@ -22,11 +22,25 @@ from .x42s_units import (
     motor_degrees_to_role, role_move_to_pulses, role_to_output_degrees,
     output_degrees_to_pulses,
 )
+from .x42s_motion import endpoint_tolerance
 
 X42S_DEBUG_JOG_DEG_S = 8.4
 
 
 class X42sRuntimeMixin:
+    def _query_x42s_firmware_info(self):
+        response = self._send_and_read("X42S,INFO", timeout=.5, soft_timeout=True)
+        reply = parse_line(response) if response else None
+        known = (isinstance(reply, OkReply) and len(reply.values) == 4
+                 and reply.values[:2] == ("X42S", "INFO") and reply.values[2] == "2")
+        self._x42s_firmware_info = {"verified_revision": known, "reply": response or None}
+        recorder = getattr(self, "diagnostics", None)
+        if recorder is not None:
+            recorder.event("motor", "firmware.x42s_info", **self._x42s_firmware_info,
+                           level="INFO" if known else "WARNING")
+        self.log(("X42S 固件能力/构建："+response) if known else
+                 "⚠️ 未识别现场X42S固件构建：请核对/更新ESP32固件；PC版本不等于已烧录版本，旧速度0不证明静止")
+
     def _on_x42s_manual_role_change(self):
         """手动调试区角色切换：单位标签/范围/默认值随角色形态切换。"""
 
@@ -264,6 +278,7 @@ class X42sRuntimeMixin:
                     "sent_at": time.monotonic(),
                     "acknowledged": False,
                     "target": None if origin is None else origin + steps * 360 / X42S_PULSE_PER_REV,
+                    "tolerance": endpoint_tolerance(role_value, self.control_bindings.for_role(LogicalRole(role_value))),
                 }
                 # Invalidate on the command attempt, even if it returns to the
                 # same coordinate between GUI frames or its ACK is lost.
@@ -468,7 +483,7 @@ class X42sRuntimeMixin:
                     and state.telemetry_trusted and state.enabled
                     and state.reached is True and state.fault is None
                     and (state.speed is None or abs(state.speed) <= .01)
-                    and abs(state.measured_position - move["target"]) <= 720 / X42S_PULSE_PER_REV):
+                    and abs(state.measured_position - move["target"]) <= move.get("tolerance", 720 / X42S_PULSE_PER_REV)):
                 pending.pop(driver_id, None)
         recorder = getattr(self, "diagnostics", None)
         if recorder is not None:

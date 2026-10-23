@@ -233,6 +233,9 @@ class DesktopWebController:
             "track_detail": track,
             "coordinated_control": coordinated_control,
             "legacy_stepdir_enabled": legacy_enabled,
+            "gear_enabled": getattr(app, "gear_enabled", False),
+            "foc_enabled": False,
+            "x42s_firmware": getattr(app, "_x42s_firmware_info", None),
             "logical_motors": logical_motors,
             "topology": {
                 "total_axes": len(topology_axes),
@@ -511,6 +514,10 @@ class DesktopWebController:
         app = self._app
         generation = app._ensure_web_control_available()
         mode = str(mode).strip().upper()
+        if mode == MODE_FOC:
+            raise RuntimeError("FOC 已退役，请使用 X42S 控制")
+        if not getattr(app, "gear_enabled", False):
+            raise RuntimeError("GEAR 默认关闭；轨道 D 与四轴 X42S 不受影响")
         if mode not in (MODE_FOC, MODE_GEAR):
             raise ValueError("模式必须是 FOC 或 GEAR")
         action = str(action).strip().lower()
@@ -694,7 +701,7 @@ class DesktopWebController:
             try:
                 if not app._stop_all_outputs(allow_closing=True):
                     raise RuntimeError(
-                        "急停命令未获得固件确认；请立即使用物理断电急停"
+                        "停车未确认（网关应答不等于电机已停）；请按现场安全流程处置"
                     )
                 return {"ok": True, "confirmed": True}
             finally:
