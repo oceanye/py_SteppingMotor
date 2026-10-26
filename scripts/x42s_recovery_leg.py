@@ -6,6 +6,10 @@ coordinates, unchanged-pose confirmation and independent support. No outward
 motion, homing/ZERO/configuration writes, retries, or automatic next-axis move.
 Lifts stay >=0.05 mm above the inferred old bottom; physical zero is NOT proven.
 Another power cycle or manual movement requires a NEW reference review.
+
+An explicit manual-reference mode instead uses four previously operator-confirmed
+raw mechanical-zero readings, NEVER the historical power-cycle offsets. It only
+parks lifts at 5 mm and returns small rotary offsets (<=5 output degrees) to zero.
 """
 import argparse
 from dataclasses import dataclass
@@ -32,17 +36,41 @@ class RecoveryLeg:
     driver: int
     reviewed: dict
     target: float  # estimated historical mm or output degrees
+    zero_reference: dict | None = None
+
+    def relative_motor_deg(self, driver, raw):
+        if self.zero_reference is None:
+            return estimated_motor_deg(driver, raw)
+        return raw - self.zero_reference[driver]
+
+    def raw_target(self, target):
+        offset = -HISTORICAL[self.driver] if self.zero_reference is None else self.zero_reference[self.driver]
+        return target * SCALES[self.driver] + offset
+
+    def segment_limit(self):
+        # For manual-reference paired lifts this bounds the full independent
+        # progress rectangle below 0.5 mm, without comparing unequal timestamps.
+        return .4 if self.zero_reference is not None and self.driver in (1, 3) else .5
 
     def validate(self):
         if (self.driver not in SCALES or set(self.reviewed) != set(SCALES)
                 or not all(math.isfinite(v) for v in (*self.reviewed.values(), self.target))):
             raise ValueError('one known driver, four finite reviewed raw positions and target required')
-        values = {i: estimated_motor_deg(i, v) / SCALES[i] for i, v in self.reviewed.items()}
+        if self.zero_reference is not None:
+            if (set(self.zero_reference) != set(SCALES)
+                    or not all(math.isfinite(v) for v in self.zero_reference.values())):
+                raise ValueError('four finite previously confirmed mechanical-zero readings required')
+        values = {i: self.relative_motor_deg(i, v) / SCALES[i] for i, v in self.reviewed.items()}
         if any(not .045 <= values[i] <= 70.002 for i in (1, 3)):
             raise ValueError('lift reference outside reviewed recovery interval')
         if any(abs(values[i]) > 30 for i in (2, 4)):
             raise ValueError('rotary reference outside reviewed +/-30 output degrees')
         start = values[self.driver]
+        if self.zero_reference is not None:
+            if any(abs(values[i]) > 5 for i in (2, 4)) or any(values[i] < 5-.002 for i in (1, 3)):
+                raise ValueError('manual parking requires lifts >=5 mm and small rotary offsets <=5 degrees')
+            if self.target != (5. if self.driver in (1, 3) else 0.):
+                raise ValueError('manual-reference mode only parks lifts at 5 mm or rotary at zero')
         if self.driver in (1, 3):
             if not .05 <= self.target < start or start - self.target > 60.002:
                 raise ValueError('only inward lift travel to >=0.05 mm; no bottom homing')
@@ -57,7 +85,7 @@ class RecoveryLeg:
         while abs(current - self.target) > 1e-8:
             if self.driver in (1, 3):
                 if current > 2 + 1e-8:
-                    step, speed, boundary = .5, 1.25, max(2., self.target)
+                    step, speed, boundary = self.segment_limit(), 1.25, max(2., self.target)
                 elif current > .5 + 1e-8:
                     step, speed, boundary = .25, .25, max(.5, self.target)
                 else:
@@ -66,14 +94,22 @@ class RecoveryLeg:
             else:
                 speed = .5
                 direction = 1 if self.target > current else -1
-                current += direction * min(.5, abs(self.target - current))
+                # 0.5 output degree = 10.75 motor degrees at ratio 21.5.
+                # A .05-degree nominal grid consumes endpoint tolerance before
+                # feedback: real -1970.05 nominal -> -1969.9 encoded -> -1969.8
+                # measured (0.25 > 0.225). Align MANUAL intermediate waypoints
+                # to the driver's 0.1 motor-degree grid, keeping final zero and
+                # the original tolerance. No corrective retry or overshoot.
+                step = (math.floor(.5*SCALES[self.driver]*10)/10/SCALES[self.driver]
+                        if self.zero_reference is not None else .5)
+                current += direction * min(step, abs(self.target - current))
             pps = max(1, round(speed * SCALES[self.driver] * 3200 / 360))
             points.append((current, pps))
         return tuple(points)
 
 
 def steps_for(leg, raw, target):
-    nominal = target * SCALES[leg.driver] - HISTORICAL[leg.driver]
+    nominal = leg.raw_target(target)
     delta = nominal - raw
     direction = 1 if leg.target > leg.validate() else -1
     # Invert the FIRMWARE encoding floor(abs(pulses)*3600/3200)/10.
@@ -83,7 +119,7 @@ def steps_for(leg, raw, target):
     # This fixes quantization, NOT endpoint tolerance or servo error handling.
     units = math.floor(abs(delta) * 10 + 1e-8)
     steps = direction * (((units + 1) * 3200 - 1) // 3600)
-    maximum = .51 * SCALES[leg.driver] * 3200 / 360
+    maximum = (leg.segment_limit()+.01) * SCALES[leg.driver] * 3200 / 360
     if direction * delta <= 0 or not 0 < abs(steps) <= maximum:
         raise RuntimeError('no reverse correction/retry; segment outside reviewed bound')
     return steps, nominal
@@ -100,6 +136,8 @@ def group_waypoints(legs):
         raise ValueError('only one axis or same-type pair may return')
     if any(l.reviewed != legs[0].reviewed for l in legs):
         raise ValueError('all legs must share the same four-axis reviewed snapshot')
+    if any(l.zero_reference != legs[0].zero_reference for l in legs):
+        raise ValueError('all legs must share the same reviewed reference epoch')
     if len(legs) == 1:
         return tuple({legs[0].driver: point} for point in legs[0].waypoints())
     starts = {l.driver: l.validate() for l in legs}
@@ -111,10 +149,10 @@ def group_waypoints(legs):
         counts = []
         for leg in legs:
             i = leg.driver
-            step = .5
+            step = leg.segment_limit()
             if i in (1, 3):
-                trial = max(leg.target, previous[i] - .5)
-                step = .1 if trial <= .5 else .25 if trial <= 2 else .5
+                trial = max(leg.target, previous[i] - step)
+                step = min(step, .1 if trial <= .5 else .25 if trial <= 2 else .5)
             counts.append(max(1, math.ceil(abs(leg.target - previous[i]) / step - 1e-9)))
         remaining_groups = max(counts)
         targets, caps = {}, {}
@@ -148,7 +186,7 @@ def run_leg(session, recorder, _, leg, *, confirmed=False, stop_file=STOP_FILE):
     return run_legs(session, recorder, (leg,), confirmed=confirmed, stop_file=stop_file)
 
 
-def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE):
+def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE, hold_other_axes=False):
     points = group_waypoints(legs)
     by_id = {l.driver: l for l in legs}
     reviewed = legs[0].reviewed
@@ -157,11 +195,16 @@ def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE):
     enabled, enabling, moves = set(), None, {}
     held = dict(reviewed)
     bounds = {i: sorted((l.validate() * SCALES[i], l.target * SCALES[i])) for i, l in by_id.items()}
+    manual = legs[0].zero_reference is not None
+    if hold_other_axes and (not manual or len(by_id) != 1 or not set(by_id) <= {2, 4}):
+        raise ValueError('explicit holding mode only for a single manual-reference rotary trial')
+    holding = sorted(set(SCALES)-set(by_id)) if hold_other_axes else []
+    controlled = set(by_id) | set(holding)
 
     def check(i, r, now):
         if stop_file.exists():
             raise RuntimeError('operator stop')
-        if i not in by_id:
+        if i not in controlled:
             if r.enabled or not stationary(r) or abs(r.measured_position - reviewed[i]) > TOL[i]:
                 raise RuntimeError(f'passive ID{i} enabled/moving/drifted')
         elif i not in moves:
@@ -171,16 +214,20 @@ def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE):
                 raise RuntimeError('stationary held start required')
         elif (not r.enabled or moves[i].outside_travel(r.measured_position)
               or (r.measured_position is not None and not
-                  bounds[i][0] - TOL[i] <= estimated_motor_deg(i, r.measured_position) <= bounds[i][1] + TOL[i])):
+                  bounds[i][0] - TOL[i] <= by_id[i].relative_motor_deg(i, r.measured_position) <= bounds[i][1] + TOL[i])):
             raise RuntimeError(f'ID{i} outside reviewed recovery leg: {r.raw}')
 
     read_all(session, recorder, check_sample=check)
     recorder.event('motor', 'bench.recovery_leg_plan', driver_ids=list(by_id),
-        reviewed_raw_motor_deg=reviewed, historical_offset_motor_deg=HISTORICAL,
+        reviewed_raw_motor_deg=reviewed,
+        historical_offset_motor_deg=None if manual else HISTORICAL,
+        mechanical_zero_raw_motor_deg=legs[0].zero_reference,
+        reference_kind='operator_confirmed_manual' if manual else 'inferred_powercycle',
         estimated_targets={i: l.target for i, l in by_id.items()}, waypoints=points,
         hardware_synchronized=False, independently_supported_clear_fixture=True,
+        held_enabled_driver_ids=holding,
         absolute_position_independently_verified=False, home_completed=False)
-    for driver in by_id:
+    for driver in (*holding, *by_id):
         if session.request_line(f'X42S,{driver},EN,1', timeout=1) != f'OK,X42S,{driver},EN,1':
             raise RuntimeError('enable not exactly acknowledged')
         enabled.add(driver)
@@ -193,6 +240,12 @@ def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE):
             if now - sent > 3:
                 raise RuntimeError('fresh stationary enabled feedback unavailable')
         enabling = None
+    if hold_other_axes:
+        until = time.monotonic()+5
+        while time.monotonic() < until:
+            read_all(session, recorder, check_sample=check)
+        recorder.event('motor', 'bench.rotary_trial_hold_verified', duration_s=5,
+                       enabled_driver_ids=sorted(enabled), stationary_speed_limit_rpm=.01)
     for index, group in enumerate(points, 1):
         samples = read_all(session, recorder, check_sample=check)
         prepared = []
@@ -200,6 +253,18 @@ def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE):
             origin = samples[driver][0].measured_position
             steps, nominal = steps_for(by_id[driver], origin, target)
             prepared.append((driver, target, pps, origin, steps, nominal))
+        if manual and set(by_id) == {1, 3}:
+            # Preflight the ENTIRE pair progress envelope, including either
+            # axis finishing first, original endpoint tolerance included.
+            intervals = {}
+            for driver, target, pps, origin, steps, nominal in prepared:
+                lo, hi = sorted((by_id[driver].relative_motor_deg(driver, origin)/360, target))
+                intervals[driver] = (lo-TOL[driver]/360, hi+TOL[driver]/360)
+            spread = max(abs(intervals[1][0]-intervals[3][1]), abs(intervals[1][1]-intervals[3][0]))
+            recorder.event('motor', 'bench.manual_park_pair_envelope', index=index,
+                           maximum_independent_spread_mm=spread, limit_mm=.5)
+            if spread > .5:
+                raise RuntimeError('paired return progress rectangle exceeds 0.5 mm; no MOVE')
         evidence, progress, deadlines, nominals = {}, {}, {}, {}
         # Validate the WHOLE group before dispatch; then back-to-back requests.
         for driver, target, pps, origin, steps, nominal in prepared:
@@ -246,17 +311,21 @@ def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE):
                 for driver in by_id:
                     pos = samples[driver][0].measured_position
                     held[driver] = pos
-                    inferred[driver] = estimated_motor_deg(driver, pos) / SCALES[driver]
+                    inferred[driver] = by_id[driver].relative_motor_deg(driver, pos) / SCALES[driver]
                     recorder.event('motor', 'bench.recovery_leg_arrived', driver_id=driver,
-                        index=index, measured_raw_motor_deg=pos, inferred_historical_position=inferred[driver])
+                        index=index, measured_raw_motor_deg=pos,
+                        **{('position_from_manual_zero' if manual else 'inferred_historical_position'): inferred[driver]})
                 moves.clear()
                 if index % 5 == 0 or index == len(points):
-                    print(f'RECOVERY {list(by_id)} {index}/{len(points)} inferred={inferred}', flush=True)
+                    print(f'RECOVERY {list(by_id)} {index}/{len(points)} reference_positions={inferred}', flush=True)
                 break
     samples = read_all(session, recorder, check_sample=check)
     raw = {i: r.measured_position for i, (r, _) in samples.items()}
     return dict(driver_ids=list(by_id), raw_motor_deg=raw,
-        inferred_historical_position={i: estimated_motor_deg(i, v) / SCALES[i] for i, v in raw.items()},
+        **{('position_from_manual_zero' if manual else 'inferred_historical_position'):
+           {i: legs[0].relative_motor_deg(i, v) / SCALES[i] for i, v in raw.items()}},
+        mechanical_zero_raw_motor_deg=legs[0].zero_reference,
+        held_enabled_driver_ids=holding,
         home_completed=False, absolute_position_independently_verified=False,
         no_zero_or_config_writes=True, completed_waypoints=len(points))
 
@@ -271,24 +340,33 @@ def main():
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--port')
     parser.add_argument('--same-epoch-supported-return-confirmed', action='store_true')
+    parser.add_argument('--manual-zero-motor-deg', type=float, nargs=4)
+    parser.add_argument('--manual-reference-supported-return-confirmed', action='store_true')
     args = parser.parse_args()
-    leg = RecoveryLeg(args.driver, dict(zip(range(1, 5), args.reviewed_raw_motor_deg)), args.target)
+    reference = dict(zip(range(1, 5), args.manual_zero_motor_deg)) if args.manual_zero_motor_deg is not None else None
+    leg = RecoveryLeg(args.driver, dict(zip(range(1, 5), args.reviewed_raw_motor_deg)), args.target, reference)
     legs = (leg,)
     if args.with_paired_axis:
         other = {1: 3, 3: 1, 2: 4, 4: 2}[args.driver]
-        legs += (RecoveryLeg(other, dict(leg.reviewed), args.target),)
+        legs += (RecoveryLeg(other, dict(leg.reviewed), args.target, reference),)
     points = group_waypoints(legs)
-    validate_evidence()
+    if reference is None:
+        if args.manual_reference_supported_return_confirmed:
+            parser.error('manual confirmation requires four retained reference readings')
+        validate_evidence()
     print(f'PLAN IDs {[l.driver for l in legs]}: target {leg.target}; {len(points)} groups; NOT homing/hardware sync', flush=True)
     if not args.execute:
         return 0
-    if not args.port or not args.same_epoch_supported_return_confirmed or STOP_FILE.exists():
+    confirmed = args.same_epoch_supported_return_confirmed if reference is None else args.manual_reference_supported_return_confirmed
+    if not args.port or not confirmed or STOP_FILE.exists():
         parser.error('port, same-epoch independent support confirmation and clear stop required')
     return execute_test(args.port, tuple(l.driver for l in legs), lambda s, r, d: run_legs(s, r, legs, confirmed=True),
-        purpose='operator-reviewed inward recovery leg; historical position is inferred',
+        purpose=('operator-reviewed parking to 5 mm / rotary zero using retained manual reference; NOT homing'
+                 if reference is not None else 'operator-reviewed inward recovery leg; historical position is inferred'),
         event_prefix='bench.recovery_leg', diagnostic_max_bytes=32_000_000,
         test_context=dict(reviewed_raw_motor_deg=leg.reviewed, estimated_target=leg.target,
-            historical_offset_motor_deg=HISTORICAL, operator_confirmed_no_movement=True,
+            historical_offset_motor_deg=HISTORICAL if reference is None else None,
+            mechanical_zero_raw_motor_deg=reference, operator_confirmed_no_movement=reference is None,
             independent_support_confirmed=True, absolute_position_independently_verified=False,
             source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()))
 
