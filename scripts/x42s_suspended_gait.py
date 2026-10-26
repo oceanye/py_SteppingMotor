@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 from motor_control.gait_coordinates import action_values
 from motor_control.gait_executor import GaitExecutor
-from motor_control.gait_planner import parse_gait_params, plan_gait_stages
+from motor_control.gait_planner import parse_gait_params, plan_gait_stages, plan_swing_trajectory
 from motor_control.gait_simulation import GaitSimulation
 from motor_control.gait_x42s_plan import certify_x42s_stages
 from motor_control.protocol import X42sMoveAck
@@ -89,18 +89,22 @@ def validate_speed_scale(speed_scale):
     return float(speed_scale)
 
 
-def build_plan(params, action, *, profile='standard', speed_scale=1.):
+def build_plan(params, action, *, profile='standard', speed_scale=1., route=None,
+               rotary_segment_deg=1., paired_lift_step_mm=2.):
     """Preserve stage semantics/endpoints; only reduce speed/subdivide groups."""
     if (params.trajectory_mode != 'two_mode_v1' or params.lift_mm != 70
             or params.mup1_lift_sign != 1 or params.mup2_lift_sign != 1
             or params.geometry.arm_length_mm != 190):
         raise ValueError('bench requires verified 190 mm/two-mode/70 mm/positive-extension profile')
     speed_scale = validate_speed_scale(speed_scale)
+    if rotary_segment_deg not in (1., 4.) or paired_lift_step_mm not in (.4, 2.):
+        raise ValueError('unreviewed bench subdivision')
     floor, ceiling = lift_bounds(profile)
     p = replace(params, lift_mm=ceiling-floor, swing_speed_deg_s=speed_scale/3,
                 lift_speed_mm_s=1.25*speed_scale, settle_speed_mm_s=speed_scale)
     side, arc = action_values(action)
-    report = GaitSimulation(p).preview(side, arc)
+    report = (GaitSimulation(p).preview(side, arc) if route is None else
+              plan_swing_trajectory(p, side=side, arc_deg=arc, route=route))
     if not report.feasible:
         raise ValueError('model rejected the path; no motion')
     stages = certify_x42s_stages(plan_gait_stages(p, side=side, arc_deg=arc,
@@ -110,7 +114,7 @@ def build_plan(params, action, *, profile='standard', speed_scale=1.):
         if stage.stage_id == 'S4':
             groups, endpoints, durations, previous = [], [], [], (0., 0.)
             for group, end, duration in zip(stage.move_groups, stage.sync_endpoints, stage.group_durations):
-                count = max(1, math.ceil(max(abs(b-a) for a, b in zip(previous, end))))
+                count = max(1, math.ceil(max(abs(b-a) for a, b in zip(previous, end))/rotary_segment_deg))
                 for k in range(1, count+1):
                     endpoint = tuple(a+(b-a)*k/count for a, b in zip(previous, end))
                     groups.append(tuple(replace(m, delta=m.delta/count) for m in group))
@@ -131,6 +135,8 @@ def build_plan(params, action, *, profile='standard', speed_scale=1.):
                 while remaining > 1e-8:
                     h = heights[group[0].role]
                     step, speed = 2., min(m.speed for m in group)
+                    if len(group) == 2:
+                        step = min(step, paired_lift_step_mm)
                     if direction < 0:
                         if h > 2+1e-8:
                             step = min(step, h-2)
@@ -156,14 +162,16 @@ def build_plan(params, action, *, profile='standard', speed_scale=1.):
     return p, report, tuple(result)
 
 
-def checked_steps(driver, origin, target, rotary_origin):
+def checked_steps(driver, origin, target, rotary_origin, *, rotary_segment_deg=1.):
+    if rotary_segment_deg not in (1., 4.):
+        raise ValueError('unreviewed rotary subdivision')
     if driver not in SCALES or not all(math.isfinite(v) for v in (origin, target, rotary_origin)):
         raise ValueError('invalid axis or nonfinite target')
     scale = SCALES[driver]
     if driver in (1, 3):
         if not 0 <= target <= 70*scale or abs(target-origin) > 2.01*scale:
             raise ValueError('lift target/segment outside confirmed bounds')
-    elif abs(target-rotary_origin) > 180*scale+1e-7 or abs(target-origin) > 1.02*scale:
+    elif abs(target-rotary_origin) > 180*scale+1e-7 or abs(target-origin) > (rotary_segment_deg+.02)*scale:
         raise ValueError('rotary target/segment outside confirmed bounds')
     # Round inward: never command through the requested endpoint/bottom.
     steps = math.floor(abs(target-origin)*3200/360+1e-9)
@@ -187,10 +195,14 @@ def lift_pair_observation(samples, zero_reference):
 
 
 class SuspendedHost:
-    def __init__(self, session, recorder, reviewed, *, stop_file=STOP_FILE, profile='standard', zero_reference=None, speed_scale=1.):
+    def __init__(self, session, recorder, reviewed, *, stop_file=STOP_FILE, profile='standard', zero_reference=None, speed_scale=1., rotary_segment_deg=1., paired_progress_guard=False):
         self.lift_floor, self.lift_ceiling = lift_bounds(profile)
         self.profile = profile
         self.speed_scale = validate_speed_scale(speed_scale)
+        if rotary_segment_deg not in (1., 4.):
+            raise ValueError('unreviewed rotary subdivision')
+        self.rotary_segment_deg = rotary_segment_deg
+        self.paired_progress_guard = paired_progress_guard
         if set(reviewed) != {1, 2, 3, 4} or any(not math.isfinite(v) for v in reviewed.values()):
             raise ValueError('four finite explicitly reviewed motor coordinates required')
         # An explicitly operator-confirmed mechanical zero may have NONZERO raw
@@ -291,7 +303,8 @@ class SuspendedHost:
             reference = self.zero_reference[i]
             if i in (1, 3) and not self.lift_floor*360 <= target-reference <= self.lift_ceiling*360:
                 raise RuntimeError('absolute lift target outside selected profile')
-            steps = checked_steps(i, origin-reference, target-reference, self.origins[i]-reference)
+            steps = checked_steps(i, origin-reference, target-reference, self.origins[i]-reference,
+                                  rotary_segment_deg=self.rotary_segment_deg)
             cap = (1.25 if i in (1, 3) else 1.)*self.speed_scale
             # Keep the original slow approach even when bulk motion is 2x.
             if i in (1, 3) and target < origin:
@@ -304,6 +317,17 @@ class SuspendedHost:
                 raise RuntimeError('bench speed exceeds verified conservative cap')
             pps = max(1, round(speeds[i]*SCALES[i]*3200/360))
             planned.append((i, origin, target, steps, pps))
+        if self.paired_progress_guard and set(targets) == {1, 3}:
+            intervals = {}
+            for i, origin, target, _, _ in planned:
+                lo, hi = sorted(((origin-self.zero_reference[i])/360,
+                                 (target-self.zero_reference[i])/360))
+                intervals[i] = (lo-TOL[i]/360, hi+TOL[i]/360)
+            spread = max(abs(intervals[1][0]-intervals[3][1]), abs(intervals[1][1]-intervals[3][0]))
+            self.recorder.event('motor', 'bench.gait_pair_envelope', stage=self.stage,
+                                maximum_independent_spread_mm=spread, limit_mm=.5)
+            if spread > .5:
+                raise RuntimeError('paired lift progress rectangle exceeds 0.5 mm; no MOVE')
         # Validate the entire pair before the first MOVE; no retry on partial ACK.
         for i, origin, target, steps, pps in planned:
             if self.cancelled():
