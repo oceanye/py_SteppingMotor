@@ -46,7 +46,7 @@ def lift_bounds(profile):
 
 
 class SettledArrivalEvidence:
-    """Interior bench only: strengthen arrival, never waive a nonzero speed.
+    """Interior/2x bench: strengthen arrival, never waive a nonzero speed.
 
 Retain fresh post-ACK actual endpoint/zero-speed requirements, plus >=1 second
 of consecutively valid samples spanning <=the ORIGINAL position tolerance.
@@ -83,15 +83,22 @@ Travel/missing-feedback/deadline and post-arrival hold guards remain separate.
         return self.count >= 3 and at-self.first >= 1.
 
 
-def build_plan(params, action, *, profile='standard'):
+def validate_speed_scale(speed_scale):
+    if isinstance(speed_scale, bool) or speed_scale not in (1., 2.):
+        raise ValueError('bench speed scale must be explicitly 1 or 2')
+    return float(speed_scale)
+
+
+def build_plan(params, action, *, profile='standard', speed_scale=1.):
     """Preserve stage semantics/endpoints; only reduce speed/subdivide groups."""
     if (params.trajectory_mode != 'two_mode_v1' or params.lift_mm != 70
             or params.mup1_lift_sign != 1 or params.mup2_lift_sign != 1
             or params.geometry.arm_length_mm != 190):
         raise ValueError('bench requires verified 190 mm/two-mode/70 mm/positive-extension profile')
+    speed_scale = validate_speed_scale(speed_scale)
     floor, ceiling = lift_bounds(profile)
-    p = replace(params, lift_mm=ceiling-floor, swing_speed_deg_s=1/3, lift_speed_mm_s=1.25,
-                settle_speed_mm_s=1.0)
+    p = replace(params, lift_mm=ceiling-floor, swing_speed_deg_s=speed_scale/3,
+                lift_speed_mm_s=1.25*speed_scale, settle_speed_mm_s=speed_scale)
     side, arc = action_values(action)
     report = GaitSimulation(p).preview(side, arc)
     if not report.feasible:
@@ -163,13 +170,37 @@ def checked_steps(driver, origin, target, rotary_origin):
     return steps if target >= origin else -steps
 
 
+def lift_pair_observation(samples, zero_reference):
+    """Describe asynchronous measurements, NOT a simultaneous physical spread.
+
+    The timestamps are estimates from the bridge's age field, not a shared
+    encoder capture clock. Do not extrapolate or relax the 0.5 mm stop guard.
+    A stopped, equal-height endpoint cannot prove equality during motion.
+    """
+    heights = {i: (samples[i][0].measured_position-zero_reference[i])/360 for i in (1, 3)}
+    measured_at = {i: samples[i][1]-samples[i][0].age_ms/1000 for i in (1, 3)}
+    return dict(heights_mm=heights, sampled_spread_mm=abs(heights[1]-heights[3]),
+                estimated_sample_skew_ms=abs(measured_at[1]-measured_at[3])*1000,
+                ages_ms={i: samples[i][0].age_ms for i in (1, 3)},
+                speeds_motor_rpm={i: samples[i][0].speed for i in (1, 3)},
+                simultaneous_measurement=False, limit_mm=.5)
+
+
 class SuspendedHost:
-    def __init__(self, session, recorder, reviewed, *, stop_file=STOP_FILE, profile='standard'):
+    def __init__(self, session, recorder, reviewed, *, stop_file=STOP_FILE, profile='standard', zero_reference=None, speed_scale=1.):
         self.lift_floor, self.lift_ceiling = lift_bounds(profile)
         self.profile = profile
+        self.speed_scale = validate_speed_scale(speed_scale)
         if set(reviewed) != {1, 2, 3, 4} or any(not math.isfinite(v) for v in reviewed.values()):
             raise ValueError('four finite explicitly reviewed motor coordinates required')
-        if any(abs(reviewed[i]-self.lift_floor*360) > 1.8 for i in (1, 3)) or any(abs(reviewed[i]/21.5) > .5 for i in (2, 4)):
+        # An explicitly operator-confirmed mechanical zero may have NONZERO raw
+        # driver coordinates. Translate command/bounds only; never rewrite raw
+        # telemetry, driver zero, or an old power-cycle/history offset.
+        reference = {i: 0. for i in range(1, 5)} if zero_reference is None else dict(zero_reference)
+        if set(reference) != {1, 2, 3, 4} or any(not math.isfinite(v) for v in reference.values()):
+            raise ValueError('four finite manually confirmed zero references required')
+        self.zero_reference = reference
+        if any(abs(reviewed[i]-reference[i]-self.lift_floor*360) > 1.8 for i in (1, 3)) or any(abs((reviewed[i]-reference[i])/21.5) > .5 for i in (2, 4)):
             raise ValueError('only reviewed bottom/near-rotary-zero start; no automatic recovery')
         self.session, self.recorder, self.reviewed = session, recorder, dict(reviewed)
         self.stop_file = stop_file
@@ -236,7 +267,9 @@ class SuspendedHost:
         self.held = dict(self.origins)
         self.recorder.event('motor', 'bench.gait_origins', positions_motor_deg=self.origins,
                             no_zero_written=True, nominal_lift_start_mm=self.lift_floor,
-                            lift_profile=self.profile, lift_range_mm=[self.lift_floor, self.lift_ceiling])
+                            lift_profile=self.profile, lift_range_mm=[self.lift_floor, self.lift_ceiling],
+                            mechanical_zero_raw_motor_deg=self.zero_reference,
+                            raw_telemetry_preserved=True, speed_scale=self.speed_scale)
 
     def verify_hold(self, seconds=5.):
         """No movement, all four axes enabled, original strict hold checks."""
@@ -255,10 +288,18 @@ class SuspendedHost:
         planned = []
         for i, target in targets.items():
             origin = samples[i][0].measured_position
-            if i in (1, 3) and not self.lift_floor*360 <= target <= self.lift_ceiling*360:
+            reference = self.zero_reference[i]
+            if i in (1, 3) and not self.lift_floor*360 <= target-reference <= self.lift_ceiling*360:
                 raise RuntimeError('absolute lift target outside selected profile')
-            steps = checked_steps(i, origin, target, self.origins[i])
-            cap = 1.25 if i in (1, 3) else 1.
+            steps = checked_steps(i, origin-reference, target-reference, self.origins[i]-reference)
+            cap = (1.25 if i in (1, 3) else 1.)*self.speed_scale
+            # Keep the original slow approach even when bulk motion is 2x.
+            if i in (1, 3) and target < origin:
+                height = (origin-reference)/360-self.lift_floor
+                if height <= .5+TOL[i]/360:
+                    cap = .05
+                elif height <= 2+TOL[i]/360:
+                    cap = .25
             if not math.isfinite(speeds[i]) or not 0 < speeds[i] <= cap+1e-8:
                 raise RuntimeError('bench speed exceeds verified conservative cap')
             pps = max(1, round(speeds[i]*SCALES[i]*3200/360))
@@ -274,7 +315,7 @@ class SuspendedHost:
             now = time.monotonic()
             self.pending[i] = MoveExpectation(object(), quantized_target(origin, steps), now,
                 no_motion=not steps, origin_motor_deg=origin, tolerance_motor_deg=TOL[i])
-            self.evidence[i] = (SettledArrivalEvidence() if self.profile == 'interior'
+            self.evidence[i] = (SettledArrivalEvidence() if self.profile == 'interior' or self.speed_scale == 2
                                 else ArrivalEvidence())
             self.progress[i] = (now, origin)
             self.deadline = max(self.deadline, now+abs(steps)/pps+5)
@@ -295,7 +336,7 @@ class SuspendedHost:
             if not math.isfinite(delta):
                 raise RuntimeError('nonfinite linear delta')
             self.heights[i] = round(self.heights[i]+delta, 9)
-            targets[i] = self.heights[i]*360
+            targets[i] = self.zero_reference[i]+self.heights[i]*360
         self.dispatch(targets, {i: speed for i, _, speed in moves})
         return 'sent'
 
@@ -313,7 +354,11 @@ class SuspendedHost:
             samples = self.snapshot()
             if set(self.pending) == {1, 3} and all(samples[i][0].measured_position is not None for i in (1, 3)):
                 # These are asynchronous samples, not a synchronization claim.
-                if abs(samples[1][0].measured_position-samples[3][0].measured_position)/360 > .5:
+                observation = lift_pair_observation(samples, self.zero_reference)
+                if observation['sampled_spread_mm'] > .5:
+                    self.recorder.event('motor', 'bench.gait_pair_spread_stop', level='ERROR',
+                                        stage=self.stage, completed_groups=self.groups_completed,
+                                        **observation)
                     raise RuntimeError('paired lift samples differ by over 0.5 mm; stop for review')
             complete = True
             for i, move in self.pending.items():
@@ -350,18 +395,29 @@ class SuspendedHost:
                 raise RuntimeError('fresh stable endpoint timeout; no retry')
 
 
-def run_gait(session, recorder, _, params, report, stages, reviewed, *, profile='standard'):
+def run_gait(session, recorder, _, params, report, stages, reviewed, *, profile='standard', zero_reference=None, speed_scale=1., prepare_only=False):
     floor, ceiling = lift_bounds(profile)
     if params.lift_mm != ceiling-floor:
         raise ValueError('plan and execution lift profile mismatch')
-    host = SuspendedHost(session, recorder, reviewed, profile=profile)
+    speed_scale = validate_speed_scale(speed_scale)
+    if (params.swing_speed_deg_s != speed_scale/3
+            or params.lift_speed_mm_s != 1.25*speed_scale
+            or params.settle_speed_mm_s != speed_scale):
+        raise ValueError('plan and execution speed scale mismatch')
+    host = SuspendedHost(session, recorder, reviewed, profile=profile,
+                         zero_reference=zero_reference, speed_scale=speed_scale)
     host.prepare()
-    if profile == 'interior':
+    if profile == 'interior' or speed_scale == 2 or prepare_only:
         host.verify_hold()
+    if prepare_only:
+        return dict(prepare_only=True, groups_completed=0, speed_scale=speed_scale,
+                    positions_motor_deg=host.held,
+                    mechanical_zero_raw_motor_deg=host.zero_reference)
     executor = GaitExecutor(host, params, stages, side=report.side)
     recorder.event('motor', 'bench.gait_plan', modality=report.modality, route=report.route,
                    params=params.as_document(), stages=[asdict(s) for s in stages],
                    suspended_only=True, lift_profile=profile, lift_range_mm=[floor, ceiling],
+                   speed_scale=speed_scale, speed_is_command_cap_not_elapsed_time_guarantee=True,
                    contact_and_avoidance_not_physically_verified=True)
     while executor.current_stage() is not None:
         stage = executor.current_stage()
@@ -379,9 +435,10 @@ def run_gait(session, recorder, _, params, report, stages, reviewed, *, profile=
                 raise RuntimeError('confirmation stage failed')
     samples = host.snapshot()
     return dict(suspended_only=True, action_side=report.side, modality=report.modality,
-                lift_profile=profile, lift_range_mm=[floor, ceiling],
+                lift_profile=profile, lift_range_mm=[floor, ceiling], speed_scale=speed_scale,
                 groups_completed=host.groups_completed,
                 positions_motor_deg={i: r.measured_position for i, (r, _) in samples.items()},
+                mechanical_zero_raw_motor_deg=host.zero_reference,
                 max_endpoint_error_motor_deg=host.max_error,
                 contact_and_avoidance_not_physically_verified=True)
 
@@ -391,18 +448,25 @@ def main():
     parser.add_argument('--action', choices=('L+', 'L-', 'R+', 'R-'), default='L+')
     parser.add_argument('--lift-profile', choices=('standard', 'interior'), default='standard')
     parser.add_argument('--interior-profile-confirmed', action='store_true')
+    parser.add_argument('--speed-scale', type=float, choices=(1., 2.), default=1.)
+    parser.add_argument('--double-speed-confirmed', action='store_true')
+    parser.add_argument('--prepare-only', action='store_true',
+                        help='Enable and verify a five-second hold only; no MOVE')
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--port')
     parser.add_argument('--reviewed-motor-deg', nargs=4, type=float, metavar='DEG')
+    parser.add_argument('--manual-zero-motor-deg', nargs=4, type=float, metavar='DEG',
+                        help='Raw readings at a NEW operator-confirmed four-axis mechanical zero; no driver ZERO')
+    parser.add_argument('--manual-four-axis-zero-confirmed', action='store_true')
     parser.add_argument('--suspended-clearance-confirmed', action='store_true')
     parser.add_argument('--recorded-bottom-confirmed', action='store_true')
     args = parser.parse_args()
     params = parse_gait_params(json.loads((ROOT / '.gait_params.json').read_text(encoding='utf-8')))
-    p, report, stages = build_plan(params, args.action, profile=args.lift_profile)
+    p, report, stages = build_plan(params, args.action, profile=args.lift_profile, speed_scale=args.speed_scale)
     print(json.dumps(dict(action=args.action, modality=report.modality, route=report.route,
         stage_groups={s.stage_id: len(s.move_groups) for s in stages},
         final_rotary_offsets=next(s.sync_endpoints[-1] for s in stages if s.stage_id == 'S4'),
-        suspended_only=True, lift_profile=args.lift_profile,
+        suspended_only=True, lift_profile=args.lift_profile, speed_scale=args.speed_scale,
         lift_range_mm=lift_bounds(args.lift_profile)), ensure_ascii=False), flush=True)
     if not args.execute:
         return 0
@@ -411,18 +475,30 @@ def main():
         parser.error('execution requires explicit reviewed positions, suspended clearance and recorded bottom')
     if args.lift_profile == 'interior' and not args.interior_profile_confirmed:
         parser.error('interior profile changes lift travel; explicit confirmation required')
+    if args.speed_scale == 2 and not args.double_speed_confirmed:
+        parser.error('2x bench speed requires explicit confirmation')
     reviewed = dict(zip(range(1, 5), args.reviewed_motor_deg))
-    SuspendedHost(None, None, reviewed, profile=args.lift_profile)
+    reference = None
+    if args.manual_zero_motor_deg is not None:
+        if not args.manual_four_axis_zero_confirmed:
+            parser.error('manual software reference requires explicit FOUR-axis mechanical-zero confirmation')
+        reference = dict(zip(range(1, 5), args.manual_zero_motor_deg))
+    elif args.manual_four_axis_zero_confirmed:
+        parser.error('manual zero confirmation requires all four raw reference readings')
+    SuspendedHost(None, None, reviewed, profile=args.lift_profile, zero_reference=reference, speed_scale=args.speed_scale)
     if STOP_FILE.exists():
         parser.error('stop request exists; inspect it before any motion')
     return execute_test(args.port, (1, 2, 3, 4),
-        lambda s, r, d: run_gait(s, r, d, p, report, stages, reviewed, profile=args.lift_profile),
+        lambda s, r, d: run_gait(s, r, d, p, report, stages, reviewed,
+                               profile=args.lift_profile, zero_reference=reference,
+                               speed_scale=args.speed_scale, prepare_only=args.prepare_only),
         purpose='operator-authorized suspended one full gait; not field acceptance',
         # Longer complete gaits must retain more than the short-jog raw window.
         # Still bounded/rotating; manifest records the actual retention limits.
         event_prefix='bench.gait', diagnostic_max_bytes=32_000_000,
-        test_context=dict(action=args.action,
+        test_context=dict(action=args.action, speed_scale=args.speed_scale, prepare_only=args.prepare_only,
             reviewed_motor_deg=reviewed, lift_profile=args.lift_profile,
+            manual_zero_raw_motor_deg=reference,
             lift_range_mm=lift_bounds(args.lift_profile), max_rotary_offset_deg=180,
             suspended_clearance_confirmed=True, no_zero_or_config_writes=True,
             bench_source_sha256={name: hashlib.sha256((ROOT / 'scripts' / name).read_bytes()).hexdigest()
