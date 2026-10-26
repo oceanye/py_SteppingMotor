@@ -508,7 +508,7 @@ def _x42s_gait_app(lead_mms=None, measured=(0.0, 0.0, 0.0, 0.0)):
         if t[:2] == ["X42S", "S"]:
             measured = app._fake_positions[int(t[2])]
             return (f"X42S,{t[2]},S,1,1,{app._reply_reached},"
-                    f"{app._reply_fault},{measured},{measured},0.0,0.0,0.0,25.0,5,0,7")
+                    f"{app._reply_fault},{measured},{measured},0.0,0.0,0.0,25.0,5,0,63")
         if t[0] == "X42S" and t[2] == "MOVE":
             role = app.control_bindings.role_for_driver_id(int(t[1]))
             origin = app._x42s_states[role.value].measured_position
@@ -635,7 +635,7 @@ class X42sGaitChainTests(unittest.TestCase):
         self.assertEqual(app._gait_run.rotation_start, {102: 0.0, 104: 0.0})
         with patch.object(desktop_app_module, "X42S_WAIT_BLIND_S", 0):
             for axis in (102, 104):
-                self.assertEqual(app._gait_wait_terminal(axis, .2), "DONE")
+                self.assertEqual(app._gait_wait_terminal(axis, .7), "DONE")
         # 分段组：累计终点相对当前实测求本段位移（闭环反馈不累计取整误差）。
         app.commands.clear()
         self.assertEqual(
@@ -689,7 +689,7 @@ class X42sGaitChainTests(unittest.TestCase):
         # （错位公式会得出 −10 错误方向）。
         with patch.object(desktop_app_module, "X42S_WAIT_BLIND_S", 0):
             for axis in (102, 104):
-                self.assertEqual(app._gait_wait_terminal(axis, .2), "DONE")
+                self.assertEqual(app._gait_wait_terminal(axis, .7), "DONE")
         app.commands.clear()
         set_meas(90.0, -90.0)
         self.assertEqual(

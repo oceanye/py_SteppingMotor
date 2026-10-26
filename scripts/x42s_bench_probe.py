@@ -1,6 +1,7 @@
 """Bounded live X42S observation. Read-only unless --verify-stop is explicit.
 
-No MOVE/EN/ZERO/raw frame API; never changes binding or calibration files.
+No MOVE/enable/ZERO/raw frame API; never changes binding or calibration files.
+Explicit --verify-stop may send EN,0 if a fresh reply still reports enabled.
 Run only with exclusive access to the specified ESP32 serial port.
 """
 import argparse
@@ -77,7 +78,8 @@ def main():
         if args.verify_stop:
             sent = time.monotonic()
             ack = session.request_line('ESTOP', timeout=2, soft_timeout=True)
-            confirmed = ack == 'OK,ESTOP' and confirm_disabled_standstill(StopProbe(session), sent)
+            confirmed = ack == 'OK,ESTOP' and confirm_disabled_standstill(
+                StopProbe(session), sent, disable_enabled=True)
             print(f'STOP bridge_ack={ack!r} drivers_confirmed={confirmed}', flush=True)
             recorder.event('motor', 'safety.estop_result', bridge_ack=ack,
                            drivers_confirmed=confirmed, level='INFO' if confirmed else 'ERROR')

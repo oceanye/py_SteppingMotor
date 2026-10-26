@@ -23,7 +23,7 @@ class EvidencePolicy:
             severe = transition and (state[0] is False or bool(state[2]))
         text = " ".join(str(data.get(k, "")) for k in ("command", "line", "reply", "raw"))
         important = (record["channel"] == "gui" or severe or transition
-                     or event.startswith(("gait.", "safety.", "firmware.", "worker."))
+                     or event.startswith(("gait.", "safety.", "firmware.", "worker.", "bench."))
                      or any(word in text for word in (",MOVE,", ",STOP", ",EN,", "ESTOP", "OFFLINE")))
         routed = []
         if important:

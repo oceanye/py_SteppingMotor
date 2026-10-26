@@ -51,5 +51,31 @@ def arrived(move, reply, now, blind_s):
             and position is not None and math.isfinite(position)
             and reply.age_ms <= TELEMETRY_FRESH_MAX_AGE_MS
             and sample_at > move.acknowledged_at + (0 if move.no_motion else blind_s)
-            and (speed is None or (math.isfinite(speed) and abs(speed) <= .01))
+            # A position-only moving probe prints zero placeholders for invalid
+            # speed. Missing speed must not certify a completed live command.
+            and speed is not None and math.isfinite(speed) and abs(speed) <= .01
             and abs(position-move.target_motor_deg) <= move.tolerance_motor_deg)
+
+
+@dataclass
+class ArrivalEvidence:
+    """Two distinct, fresh stationary endpoint samples for ONE expectation.
+
+    A repeated cache frame, a single reached bit, or missing speed is not a
+    completion certificate. Use a separate instance for every command/axis.
+    """
+    previous: tuple[float, float] | None = None
+
+    def observe(self, move, reply, now, blind_s=.45):
+        if not arrived(move, reply, now, blind_s):
+            self.previous = None
+            return False
+        sample = (now-reply.age_ms/1000, reply.measured_position)
+        old = self.previous
+        if old is None or sample[0] < old[0]:
+            self.previous = sample
+            return False
+        if sample[0]-old[0] < .1:
+            return False
+        self.previous = sample
+        return abs(sample[1]-old[1]) <= move.tolerance_motor_deg

@@ -3,16 +3,21 @@ import math
 import time
 
 from .coordinated_control import BACKEND_X42S_UART, LOGICAL_ROLE_ORDER
-from .protocol import X42sStatusReply, parse_line, build_x42s_status_command
+from .protocol import (X42sStatusReply, parse_line, build_x42s_status_command,
+                       build_x42s_enable_command)
 from .x42s_motion import endpoint_tolerance
 
 
-def confirm_disabled_standstill(app, sent_at, *, allow_closing=False, timeout_s=3.0):
+def confirm_disabled_standstill(app, sent_at, *, allow_closing=False, timeout_s=3.0,
+                               disable_enabled=False):
     """Two distinct post-ESTOP samples per bound driver, disabled and stable.
 
     Disabled drivers need not report reached or clear a latched fault. Never
     infer stationary from old reached/zero-speed cache or from the bridge ACK.
     This proves observed standstill only, not a mechanical brake or support.
+    Default is read-only. Only an explicit ESTOP caller may opt into a single
+    acknowledged EN,0 per driver still reporting enabled AFTER that ESTOP.
+    Configuration writes can auto-enable a driver after the fast stop burst.
     """
     with app.state_lock:
         bindings = app.control_bindings
@@ -24,7 +29,7 @@ def confirm_disabled_standstill(app, sent_at, *, allow_closing=False, timeout_s=
         return False
     if len({b.driver_id for _, b in targets}) != 4:
         return False
-    previous, confirmed = {}, set()
+    previous, confirmed, attempted, disable_after = {}, set(), set(), {}
     deadline, index = time.monotonic()+timeout_s, 0
     def current():
         return app._control_generation == generation and app.control_bindings == bindings
@@ -37,11 +42,30 @@ def confirm_disabled_standstill(app, sent_at, *, allow_closing=False, timeout_s=
             allow_closing=allow_closing, guard=current)
         reply = parse_line(response) if response else None
         now = time.monotonic()
+        fresh_status = (isinstance(reply, X42sStatusReply) and reply.driver_id == driver_id
+                        and reply.online and reply.age_ms <= 1500
+                        and now-reply.age_ms/1000 > sent_at)
+        if (disable_enabled and fresh_status and reply.enabled
+                and driver_id not in attempted and current() and now < deadline):
+            attempted.add(driver_id)
+            ack = app._send_and_read(build_x42s_enable_command(driver_id, False),
+                timeout=min(.5, max(.01, deadline-time.monotonic())), soft_timeout=True,
+                allow_closing=allow_closing, guard=current)
+            if ack != f"OK,X42S,{driver_id},EN,0":
+                app.log(f"⛔ X42S ID{driver_id} 补充失能未获精确应答；保持运动锁定")
+                return False
+            disable_after[driver_id] = time.monotonic()
+            previous.pop(driver_id, None)
+            confirmed.discard(driver_id)
+            app.log(f"X42S ID{driver_id} 急停后仍使能：已补发失能，等待新鲜静止反馈")
+            # The status preceding EN,0 cannot prove its result.
+            continue
         valid = (isinstance(reply, X42sStatusReply) and reply.driver_id == driver_id
                  and reply.online and not reply.enabled
                  and reply.measured_position is not None
                  and math.isfinite(reply.measured_position)
-                 and reply.age_ms <= 1500 and now-reply.age_ms/1000 > sent_at
+                 and reply.age_ms <= 1500
+                 and now-reply.age_ms/1000 > disable_after.get(driver_id, sent_at)
                  and (reply.speed is None or abs(reply.speed) <= .01))
         if isinstance(reply, X42sStatusReply) and reply.driver_id == driver_id:
             app._apply_x42s_reply(role, driver_id, reply)

@@ -6111,7 +6111,7 @@ class StepperGUI(X42sRuntimeMixin):
         bridge_ack = response == "OK,ESTOP"
         from motor_control.x42s_safety import confirm_disabled_standstill
         confirmed = bridge_ack and confirm_disabled_standstill(
-            self, sent_at, allow_closing=allow_closing)
+            self, sent_at, allow_closing=allow_closing, disable_enabled=True)
         # 新固件 ESTOP 内部已全轴恢复锁定；这里再补发一次，兼容旧固件
         # 与 ESTOP 未确认场景，绝不让旋转电机停留在落地纠偏的失能态。
         self._force_relock_rot_axes(allow_closing=True)

@@ -100,6 +100,28 @@ class StopEvidenceTests(unittest.TestCase):
         self.assertTrue(app._estop_unconfirmed)
         app._disconnect_serial.assert_not_called()
 
+    def test_explicit_estop_recovers_driver_that_reenabled_after_zero(self):
+        for mode in ('recovers', 'stays_enabled', 'wrong_ack', 'read_only'):
+            clock = FakeClock()
+            with self.subTest(mode=mode), patch('time.monotonic',clock.monotonic), patch('time.sleep',clock.sleep):
+                app = self.app()
+                enabled = {1: True, 2: False, 3: False, 4: False}
+                def send(command, **kwargs):
+                    app.commands.append(command)
+                    if ',EN,' in command:
+                        self.assertTrue(kwargs['guard']())
+                        self.assertEqual(command, 'X42S,1,EN,0')
+                        if mode == 'recovers': enabled[1] = False
+                        return 'OK,X42S,2,EN,0' if mode == 'wrong_ack' else 'OK,X42S,1,EN,0'
+                    i = int(command.split(',')[-1])
+                    return f'X42S,{i},S,1,{int(enabled[i])},1,none,0,0,0,0,0,25,5,0,63'
+                app._send_and_read = send
+                result = confirm_disabled_standstill(app,clock.now,disable_enabled=mode!='read_only')
+                self.assertEqual(result, mode == 'recovers')
+                disables = [c for c in app.commands if ',EN,' in c]
+                self.assertEqual(disables, [] if mode == 'read_only' else ['X42S,1,EN,0'])
+                self.assertFalse(any(',MOVE,' in c or c.endswith(',EN,1') for c in app.commands))
+
 
 class RoleToleranceTests(unittest.TestCase):
     def test_recorded_half_degree_lift_error_not_a_rotary_waiver(self):

@@ -50,7 +50,7 @@ class ArrivalEvidenceTests(unittest.TestCase):
         self.assertEqual(app._gait_wait_terminal(102, 1), "ABORTED")
         self.assertEqual(app.commands, [])
 
-    def test_post_ack_actual_endpoint_succeeds_unknown_idle_speed_allowed(self):
+    def test_post_ack_actual_endpoint_requires_fresh_stationary_evidence(self):
         clock = FakeClock()
         with patch.object(desktop_app.time, "monotonic", clock.monotonic), \
                 patch.object(desktop_app.time, "sleep", clock.sleep):
@@ -58,6 +58,24 @@ class ArrivalEvidenceTests(unittest.TestCase):
             issue_move(app)
             self.assertEqual(app._gait_wait_terminal(102, 1), "DONE")
             self.assertFalse(app._gait_x42s_moves)
+
+    def test_position_only_reached_cannot_complete_a_live_command(self):
+        clock = FakeClock()
+        with patch('time.monotonic', clock.monotonic), patch('time.sleep', clock.sleep):
+            app = _x42s_gait_app()
+            issue_move(app)
+            app._send_and_read = lambda *_a, **_k: 'X42S,2,S,1,1,1,none,215,215,0,0,0,25,5,0,7'
+            self.assertEqual(app._gait_wait_terminal(102, 1.5), 'TIMEOUT')
+            self.assertIn(102, app._gait_x42s_moves)
+
+    def test_same_cached_endpoint_cannot_count_as_two_samples(self):
+        clock = FakeClock()
+        with patch('time.monotonic', clock.monotonic), patch('time.sleep', clock.sleep):
+            app = _x42s_gait_app()
+            issue_move(app)
+            app._send_and_read = lambda *_a, **_k: (
+                f'X42S,2,S,1,1,1,none,215,215,0,0,0,25,{max(0, round((clock.now-100.46)*1000))},0,63')
+            self.assertEqual(app._gait_wait_terminal(102, 1.5), 'TIMEOUT')
 
     def test_observed_overshoot_aborts_not_done(self):
         clock = FakeClock()

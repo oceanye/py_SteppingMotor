@@ -136,7 +136,18 @@ def export_bundle(project_dir, output=None, *, recorder=None, label="field-diagn
                 if identity in sample_ids:
                     continue
                 sample_ids.add(identity)
-                samples.append({**record.get("data", {}), **{k:record.get(k) for k in columns[:3]}})
+                data = dict(record.get("data", {}))
+                # Bench probes log the parsed protocol dataclass; the GUI logs
+                # unit-labelled aliases. Preserve both without inventing an
+                # output-axis mapping or replacing an explicitly unknown value.
+                for canonical, protocol_name in (
+                        ("motor_deg", "measured_position"),
+                        ("command_motor_deg", "command_position"),
+                        ("error_motor_deg", "position_error"),
+                        ("speed_motor_rpm", "speed")):
+                    if canonical not in data and protocol_name in data:
+                        data[canonical] = data[protocol_name]
+                samples.append({**data, **{k:record.get(k) for k in columns[:3]}})
     table = io.StringIO(newline="")
     writer = csv.DictWriter(table, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()

@@ -22,7 +22,7 @@ from .x42s_units import (
     motor_degrees_to_role, role_move_to_pulses, role_to_output_degrees,
     output_degrees_to_pulses,
 )
-from .x42s_motion import endpoint_tolerance
+from .x42s_motion import ArrivalEvidence, MoveExpectation, endpoint_tolerance
 
 X42S_DEBUG_JOG_DEG_S = 8.4
 
@@ -478,13 +478,12 @@ class X42sRuntimeMixin:
             move = pending.get(driver_id)
             # ACK != DONE. Reject the old reached=1 cached just after dispatch;
             # require a new measured endpoint (2 pulses incl. 0.1deg quantization).
-            if (move is not None and move.get("acknowledged") and move["target"] is not None
-                    and state.last_update_monotonic > move["sent_at"] + 0.45
-                    and state.telemetry_trusted and state.enabled
-                    and state.reached is True and state.fault is None
-                    and (state.speed is None or abs(state.speed) <= .01)
-                    and abs(state.measured_position - move["target"]) <= move.get("tolerance", 720 / X42S_PULSE_PER_REV)):
-                pending.pop(driver_id, None)
+            if move is not None and move.get("acknowledged") and move["target"] is not None:
+                expected = MoveExpectation(move, move["target"], move["sent_at"],
+                    tolerance_motor_deg=move.get("tolerance", 720 / X42S_PULSE_PER_REV))
+                evidence = move.setdefault("arrival_evidence", ArrivalEvidence())
+                if evidence.observe(expected, reply, time.monotonic()):
+                    pending.pop(driver_id, None)
         recorder = getattr(self, "diagnostics", None)
         if recorder is not None:
             position = motor_degrees_to_role(

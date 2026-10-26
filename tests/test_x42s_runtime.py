@@ -17,7 +17,7 @@ from motor_control.ui.scrollable import ScrollableFrame
 
 
 def status(*, online=1, enabled=1, reached=1, measured=215,
-           age=5, mask=7, fault="none"):
+           age=5, mask=63, fault="none"):
     return (f"X42S,2,S,{online},{enabled},{reached},{fault},"
             f"215,{measured},0,0,0,25,{age},0,{mask}")
 
@@ -65,7 +65,7 @@ class X42sRuntimeTests(unittest.TestCase):
         issue_move(app)
         app._send_and_read = lambda *_a, **_k: status(measured=215)
         with patch.object(desktop_app, "X42S_WAIT_BLIND_S", 0):
-            self.assertEqual(app._gait_wait_terminal(102, 0.2), "DONE")
+            self.assertEqual(app._gait_wait_terminal(102, 0.7), "DONE")
         self.assertAlmostEqual(app._x42s_role_output_units(LogicalRole.MR1), 10)
 
     def test_next_cumulative_segment_uses_confirmed_endpoint(self):
@@ -77,7 +77,7 @@ class X42sRuntimeTests(unittest.TestCase):
         controller = app._send_and_read
         app._send_and_read = lambda *_a, **_k: status(measured=215)
         with patch.object(desktop_app, "X42S_WAIT_BLIND_S", 0):
-            self.assertEqual(app._gait_wait_terminal(102, 0.2), "DONE")
+            self.assertEqual(app._gait_wait_terminal(102, 0.7), "DONE")
         app._send_and_read = controller
         self.assertEqual(app._gait_send_synchronized(
             [(102, 2, 1), (104, 0, 1)], 2, cumulative_targets=(12, 0)), "sent")

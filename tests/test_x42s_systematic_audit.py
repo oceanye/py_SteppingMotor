@@ -187,14 +187,26 @@ class PendingManualTests(unittest.TestCase):
 
     def test_old_reached_and_wrong_endpoint_cannot_clear_pending_but_arrival_can(self):
         app = self.app_with_move()
-        reply = lambda angle: parse_line(f'X42S,2,S,1,1,1,none,90,{angle},0,0,0,25,0,0,7')
+        reply = lambda angle: parse_line(f'X42S,2,S,1,1,1,none,90,{angle},0,0,0,25,0,0,63')
         app._apply_x42s_reply(LogicalRole.MR1,2,reply(90))
         self.assertIn(2,app._x42s_manual_pending)  # still in command-front blind window
         app._x42s_manual_pending[2]['sent_at'] -= 1
         app._apply_x42s_reply(LogicalRole.MR1,2,reply(0))
         self.assertIn(2,app._x42s_manual_pending)  # old endpoint despite reached=1
         app._apply_x42s_reply(LogicalRole.MR1,2,reply(90))
+        self.assertIn(2,app._x42s_manual_pending)  # one sample is insufficient
+        with patch('time.monotonic', return_value=time.monotonic()+.2):
+            app._apply_x42s_reply(LogicalRole.MR1,2,reply(90))
         self.assertFalse(app._x42s_manual_pending)
+
+    def test_position_only_reached_does_not_clear_pending(self):
+        app = self.app_with_move()
+        app._x42s_manual_pending[2]['sent_at'] -= 1
+        reply = parse_line('X42S,2,S,1,1,1,none,90,90,0,0,0,25,0,0,7')
+        for offset in (0, .2, .4):
+            with patch('time.monotonic', return_value=time.monotonic()+offset):
+                app._apply_x42s_reply(LogicalRole.MR1,2,reply)
+        self.assertIn(2, app._x42s_manual_pending)
 
     def test_timeout_cannot_clear_pending_from_old_telemetry_but_exact_stop_can(self):
         app = self.app_with_move()

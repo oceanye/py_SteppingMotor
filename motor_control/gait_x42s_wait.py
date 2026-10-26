@@ -2,7 +2,7 @@
 import time
 
 from .protocol import X42sStatusReply, build_x42s_status_command, parse_line
-from .x42s_motion import arrived
+from .x42s_motion import ArrivalEvidence
 from .x42s_units import X42S_AXIS_HANDLE_BASE
 
 
@@ -37,6 +37,7 @@ def wait_moves(app, axes, timeout_s, *, blind_s=.45, poll_s=.3):
     next_poll = max(now, max((e.acknowledged_at or now) + (0 if e.no_motion else blind_s)
                              for e in expected.values()) + .02)
     done, index = set(), 0
+    evidence = {axis: ArrivalEvidence() for axis in axes}
 
     def terminal(result, axis=None, reply=None):
         recorder = getattr(app, "diagnostics", None)
@@ -85,6 +86,7 @@ def wait_moves(app, axes, timeout_s, *, blind_s=.45, poll_s=.3):
         reply = parse_line(response) if response else None
         if not isinstance(reply, X42sStatusReply) or reply.driver_id != driver_id:
             done.discard(axis)
+            evidence[axis] = ArrivalEvidence()
             continue
         app._apply_x42s_reply(role, driver_id, reply)
         if not reply.online or not reply.enabled or reply.fault is not None:
@@ -95,7 +97,7 @@ def wait_moves(app, axes, timeout_s, *, blind_s=.45, poll_s=.3):
                 and e.outside_travel(reply.measured_position)):
             app.log(f"⛔ {role.value} 实测位置越出本段包络，联动中止")
             return terminal("ABORTED", axis, reply)
-        if arrived(e, reply, now, blind_s):
+        if evidence[axis].observe(e, reply, now, blind_s):
             done.add(axis)
         else:
             done.discard(axis)

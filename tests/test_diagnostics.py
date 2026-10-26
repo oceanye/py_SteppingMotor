@@ -51,6 +51,20 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertGreaterEqual(record["elapsed_ms"], 0)
         self.assertEqual(record["data"]["axis"], 2)
 
+    def test_bench_plan_waypoints_and_completion_are_in_action_journal(self):
+        self.recorder.close()
+        self.recorder = DiagnosticRecorder(self.root, max_bytes=3000, backups=1)
+        events = ('bench.lift_stage_plan', 'bench.lift_stage_waypoint', 'bench.lift_completed')
+        for event in events:
+            self.recorder.event('motor', event, target_mm=65)
+        for index in range(60):
+            self.recorder.event('motor', 'serial.rx', line='X42S,S,1', padding='x'*150)
+        journal = records(self.recorder, 'events')
+        self.assertEqual([r['event'] for r in journal if r['event'].startswith('bench.')], list(events))
+        self.assertFalse(any(r['event'] == 'serial.rx' for r in journal))
+        self.assertGreater(self.recorder.health()['rotations']['motor'], 0)
+        self.assertFalse(any(r['event'] in events for r in records(self.recorder, 'motor')))
+
     def test_cross_thread_producers_have_unique_sequence(self):
         threads = [threading.Thread(target=lambda: [self.recorder.event("motor", "sample")
                                                    for _ in range(40)]) for _ in range(4)]
@@ -236,6 +250,27 @@ class DiagnosticsTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 export_bundle(self.root, output, recorder=self.recorder)
         self.assertEqual(output.read_bytes(), b"preserve")
+
+    def test_bench_csv_preserves_measured_angle_and_unknown_speed_without_guessing_role_units(self):
+        import csv
+        import io
+        self.recorder.event('telemetry', 'x42s.telemetry', role='ID1', driver_id=1,
+                            measured_position=1800., command_position=1800.,
+                            position_error=0., speed=None)
+        self.recorder.event('telemetry', 'x42s.telemetry', role='Mr1', driver_id=2,
+                            motor_deg=None, measured_position=90., speed_motor_rpm=None, speed=0.)
+        with patch('motor_control.diagnostic_export.environment_summary', return_value={}):
+            output = export_bundle(self.root, recorder=self.recorder)
+        with zipfile.ZipFile(output) as archive:
+            rows = list(csv.DictReader(io.StringIO(archive.read('telemetry.csv').decode('utf-8-sig'))))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(float(rows[0]['motor_deg']), 1800)
+        self.assertEqual(float(rows[0]['command_motor_deg']), 1800)
+        self.assertEqual(float(rows[0]['error_motor_deg']), 0)
+        self.assertEqual(rows[0]['speed_motor_rpm'], '')
+        self.assertEqual(rows[0]['output_position'], '')  # no implicit lead/binding
+        self.assertEqual(rows[1]['motor_deg'], '')  # canonical unknown wins
+        self.assertEqual(rows[1]['speed_motor_rpm'], '')
 
     def test_close_drains_and_marks_manifest(self):
         self.recorder.event("motor", "final")
