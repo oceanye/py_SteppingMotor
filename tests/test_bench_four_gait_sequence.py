@@ -76,6 +76,29 @@ class FourGaitSequenceTests(unittest.TestCase):
                 patch('sys.stderr'), self.assertRaises(SystemExit):main()
         execute.assert_not_called()
 
+    def test_reviewed_restart_sequence_keeps_epoch_provenance_and_physical_bounds(self):
+        from scripts.x42s_20261027_epoch_return import TRANSFERRED_ZERO, provenance, REFERENCE_KIND
+        start = {1:0.,2:0.,3:0.,4:216.1}
+        context = dict(provenance(), rotary_alignment_visually_confirmed=True)
+        clock=FakeClock();rig=GaitRig(clock);rig.positions=dict(start)
+        recorder=Mock()
+        with patch('time.monotonic',clock.monotonic),patch('time.sleep',clock.sleep),patch('builtins.print'):
+            result=run_sequence(rig,recorder,None,self.plans,start,TRANSFERRED_ZERO,confirmed=True,
+                                reference_provenance=context)
+        self.assertEqual(result['completed_actions'],list(ACTIONS))
+        self.assertEqual(result['reference_kind'],REFERENCE_KIND)
+        self.assertFalse(result['reference_provenance']['absolute_position_independently_verified'])
+        for i,raw in result['raw_motor_deg'].items():
+            self.assertAlmostEqual(raw,TRANSFERRED_ZERO[i]+(1800 if i in (1,3) else 0),delta=TOL[i])
+        self.assertFalse(any('ZERO' in c or 'RAW' in c for c in rig.commands))
+        for wrong in (dict(context,rotary_alignment_visually_confirmed=False),
+                      dict(context,inferred_zero_raw_motor_deg=REFERENCE)):
+            session=Mock()
+            with self.assertRaises(ValueError):
+                run_sequence(session,Mock(),None,self.plans,start,TRANSFERRED_ZERO,confirmed=True,
+                             reference_provenance=wrong)
+            session.request.assert_not_called();session.request_line.assert_not_called()
+
     def test_pair_envelope_is_enforced_before_first_move(self):
         clock=FakeClock();rig=GaitRig(clock);rig.positions=dict(START)
         host=SuspendedHost(rig,Mock(),START,profile='interior',zero_reference=REFERENCE,
@@ -85,6 +108,19 @@ class FourGaitSequenceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'rectangle'):
                 host.dispatch({i:REFERENCE[i]+7*360 for i in (1,3)},{1:2.5,3:2.5})
         self.assertFalse(rig.moves)
+
+    def test_no_extra_dwell_keeps_four_actions_and_qualifies_each_stage_boundary(self):
+        clock=FakeClock();rig=GaitRig(clock);rig.positions=dict(START);recorder=Mock()
+        with patch('time.monotonic',clock.monotonic),patch('time.sleep',clock.sleep),patch('builtins.print'):
+            result=run_sequence(rig,recorder,None,self.plans,START,REFERENCE,confirmed=True,short_endpoint_checks=True)
+        self.assertEqual(result['completed_actions'],list(ACTIONS))
+        self.assertTrue(result['short_endpoint_checks'])
+        boundaries=[c.kwargs for c in recorder.event.call_args_list
+                    if len(c.args)>1 and c.args[1]=='bench.idle_qualified' and c.kwargs['reason']=='stage_boundary']
+        self.assertEqual(len(boundaries),sum(s.is_motion_stage for p in self.plans for s in p.stages))
+        self.assertTrue(all(r['duration_s']>=1 for r in boundaries))
+        for i,raw in result['raw_motor_deg'].items():
+            self.assertAlmostEqual(raw,REFERENCE[i]+(1800 if i in (1,3) else 0),delta=TOL[i])
 
 
 if __name__ == '__main__':

@@ -83,19 +83,29 @@ def validate_start(reviewed, reference):
             raise ValueError(f'ID{i} not at retained 5 mm / rotary zero start; no automatic parking')
 
 
-def run_sequence(session, recorder, _, plans, reviewed, reference, *, confirmed=False, stop_file=STOP_FILE):
+def run_sequence(session, recorder, _, plans, reviewed, reference, *, confirmed=False, stop_file=STOP_FILE, reference_provenance=None, short_endpoint_checks=False):
     validate_start(reviewed, reference)
     if not confirmed or stop_file.exists() or tuple(s.action for s in plans) != ACTIONS:
         raise ValueError('explicit reviewed four-action interior sequence required')
+    reference_kind = 'operator_confirmed_manual'
+    if reference_provenance is not None:
+        if (reference_provenance.get('reference_kind') != 'operator_reviewed_powercycle_transfer'
+                or reference_provenance.get('inferred_zero_raw_motor_deg') != reference
+                or reference_provenance.get('rotary_alignment_visually_confirmed') is not True
+                or reference_provenance.get('absolute_position_independently_verified') is not False):
+            raise ValueError('reviewed restart provenance and visual rotary alignment required')
+        reference_kind = reference_provenance['reference_kind']
+        recorder.event('motor', 'bench.sequence_reference_transfer', **reference_provenance)
     host = SuspendedHost(session, recorder, reviewed, profile='interior', zero_reference=reference,
-                         speed_scale=2, rotary_segment_deg=4, paired_progress_guard=True, stop_file=stop_file)
+                         speed_scale=2, rotary_segment_deg=4, paired_progress_guard=True, stop_file=stop_file,
+                         reference_kind=reference_kind, short_endpoint_checks=short_endpoint_checks)
     host.prepare()
     completed = []
     for index, step in enumerate(plans, 1):
         host.stage = f'{index}:{step.action}:preflight'
         if any(abs(host.heights[i]-5) > 1e-7 for i in (1, 3)):
             raise RuntimeError('previous gait did not return nominal lifts to 5 mm')
-        samples = host.snapshot()
+        samples = host.ready_snapshot()
         expected = {i: reference[i]+(1800 if i in (1, 3) else step.start_rotary[i]*SCALES[i]) for i in SCALES}
         if any(abs(samples[i][0].measured_position-expected[i]) > TOL[i] for i in SCALES):
             raise RuntimeError('retained cumulative start mismatch; no re-anchor or next step')
@@ -108,6 +118,7 @@ def run_sequence(session, recorder, _, plans, reviewed, reference, *, confirmed=
             modality=step.report.modality, route=step.report.route, supports_before=step.supports_before,
             supports_after=step.supports_after, start_rotary_output_deg=step.start_rotary,
             end_rotary_output_deg=step.end_rotary, mechanical_zero_raw_motor_deg=reference,
+            reference_kind=reference_kind,
             stages=[asdict(s) for s in step.stages], virtual_map_not_measured_world_pose=True,
             standard_70mm_acceptance=False)
         executor = GaitExecutor(host, step.params, step.stages, side=step.report.side)
@@ -121,9 +132,10 @@ def run_sequence(session, recorder, _, plans, reviewed, reference, *, confirmed=
                         host.log(f'SEQUENCE {index}/4 {step.action} {sid} {n}/{total}')
                         if n % 10 == 0 or n == total else None):
                     raise RuntimeError(executor.last_error)
+                host.verify_stage_boundary()
             elif not executor.advance_confirm():
                 raise RuntimeError('suspended-only checkpoint failed')
-        samples = host.snapshot()
+        samples = host.ready_snapshot()
         expected = {i: reference[i]+(1800 if i in (1, 3) else step.end_rotary[i]*SCALES[i]) for i in SCALES}
         if any(abs(samples[i][0].measured_position-expected[i]) > TOL[i] for i in SCALES):
             raise RuntimeError('nominal cumulative endpoint mismatch; no next gait')
@@ -133,6 +145,8 @@ def run_sequence(session, recorder, _, plans, reviewed, reference, *, confirmed=
             mechanical_zero_raw_motor_deg=reference, nominal_cumulative_rotary_output_deg=step.end_rotary)
         host.log(f'COMPLETE SUSPENDED GAIT {index}/4 {step.action} {step.report.modality}')
     return dict(completed_actions=completed, lift_range_mm=[5, 65], suspended_only=True,
+                reference_kind=reference_kind, reference_provenance=reference_provenance,
+                short_endpoint_checks=short_endpoint_checks,
                 standard_70mm_acceptance=False, field_contact_avoidance_verified=False,
                 mechanical_zero_raw_motor_deg=reference, groups_completed=host.groups_completed,
                 raw_motor_deg={i:r.measured_position for i,(r,_) in samples.items()})

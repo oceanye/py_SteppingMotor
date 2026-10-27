@@ -38,6 +38,12 @@ class RecoveryLeg:
     target: float  # estimated historical mm or output degrees
     zero_reference: dict | None = None
 
+    def rotary_start_limit(self):
+        return 5.
+
+    def reference_kind(self):
+        return 'operator_confirmed_manual' if self.zero_reference is not None else 'inferred_powercycle'
+
     def relative_motor_deg(self, driver, raw):
         if self.zero_reference is None:
             return estimated_motor_deg(driver, raw)
@@ -67,8 +73,8 @@ class RecoveryLeg:
             raise ValueError('rotary reference outside reviewed +/-30 output degrees')
         start = values[self.driver]
         if self.zero_reference is not None:
-            if any(abs(values[i]) > 5 for i in (2, 4)) or any(values[i] < 5-.002 for i in (1, 3)):
-                raise ValueError('manual parking requires lifts >=5 mm and small rotary offsets <=5 degrees')
+            if any(abs(values[i]) > self.rotary_start_limit() for i in (2, 4)) or any(values[i] < 5-.002 for i in (1, 3)):
+                raise ValueError('parking requires lifts >=5 mm and rotary offsets within reviewed bound')
             if self.target != (5. if self.driver in (1, 3) else 0.):
                 raise ValueError('manual-reference mode only parks lifts at 5 mm or rotary at zero')
         if self.driver in (1, 3):
@@ -138,6 +144,8 @@ def group_waypoints(legs):
         raise ValueError('all legs must share the same four-axis reviewed snapshot')
     if any(l.zero_reference != legs[0].zero_reference for l in legs):
         raise ValueError('all legs must share the same reviewed reference epoch')
+    if any(l.reference_kind() != legs[0].reference_kind() for l in legs):
+        raise ValueError('all legs must share the same reference provenance')
     if len(legs) == 1:
         return tuple({legs[0].driver: point} for point in legs[0].waypoints())
     starts = {l.driver: l.validate() for l in legs}
@@ -196,6 +204,9 @@ def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE, h
     held = dict(reviewed)
     bounds = {i: sorted((l.validate() * SCALES[i], l.target * SCALES[i])) for i, l in by_id.items()}
     manual = legs[0].zero_reference is not None
+    reference_kind = legs[0].reference_kind()
+    position_key = ('position_from_manual_zero' if reference_kind == 'operator_confirmed_manual'
+                    else 'inferred_epoch_position' if manual else 'inferred_historical_position')
     if hold_other_axes and (not manual or len(by_id) != 1 or not set(by_id) <= {2, 4}):
         raise ValueError('explicit holding mode only for a single manual-reference rotary trial')
     holding = sorted(set(SCALES)-set(by_id)) if hold_other_axes else []
@@ -222,7 +233,7 @@ def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE, h
         reviewed_raw_motor_deg=reviewed,
         historical_offset_motor_deg=None if manual else HISTORICAL,
         mechanical_zero_raw_motor_deg=legs[0].zero_reference,
-        reference_kind='operator_confirmed_manual' if manual else 'inferred_powercycle',
+        reference_kind=reference_kind,
         estimated_targets={i: l.target for i, l in by_id.items()}, waypoints=points,
         hardware_synchronized=False, independently_supported_clear_fixture=True,
         held_enabled_driver_ids=holding,
@@ -314,7 +325,7 @@ def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE, h
                     inferred[driver] = by_id[driver].relative_motor_deg(driver, pos) / SCALES[driver]
                     recorder.event('motor', 'bench.recovery_leg_arrived', driver_id=driver,
                         index=index, measured_raw_motor_deg=pos,
-                        **{('position_from_manual_zero' if manual else 'inferred_historical_position'): inferred[driver]})
+                        **{position_key: inferred[driver]})
                 moves.clear()
                 if index % 5 == 0 or index == len(points):
                     print(f'RECOVERY {list(by_id)} {index}/{len(points)} reference_positions={inferred}', flush=True)
@@ -322,7 +333,8 @@ def run_legs(session, recorder, legs, *, confirmed=False, stop_file=STOP_FILE, h
     samples = read_all(session, recorder, check_sample=check)
     raw = {i: r.measured_position for i, (r, _) in samples.items()}
     return dict(driver_ids=list(by_id), raw_motor_deg=raw,
-        **{('position_from_manual_zero' if manual else 'inferred_historical_position'):
+        reference_kind=reference_kind,
+        **{position_key:
            {i: legs[0].relative_motor_deg(i, v) / SCALES[i] for i, v in raw.items()}},
         mechanical_zero_raw_motor_deg=legs[0].zero_reference,
         held_enabled_driver_ids=holding,

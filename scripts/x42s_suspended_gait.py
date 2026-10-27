@@ -83,6 +83,10 @@ Travel/missing-feedback/deadline and post-arrival hold guards remain separate.
         return self.count >= 3 and at-self.first >= 1.
 
 
+class IdleSettlingNeeded(RuntimeError):
+    """One speed LSB at a held endpoint; no command may follow without requalification."""
+
+
 def validate_speed_scale(speed_scale):
     if isinstance(speed_scale, bool) or speed_scale not in (1., 2.):
         raise ValueError('bench speed scale must be explicitly 1 or 2')
@@ -195,7 +199,7 @@ def lift_pair_observation(samples, zero_reference):
 
 
 class SuspendedHost:
-    def __init__(self, session, recorder, reviewed, *, stop_file=STOP_FILE, profile='standard', zero_reference=None, speed_scale=1., rotary_segment_deg=1., paired_progress_guard=False):
+    def __init__(self, session, recorder, reviewed, *, stop_file=STOP_FILE, profile='standard', zero_reference=None, speed_scale=1., rotary_segment_deg=1., paired_progress_guard=False, reference_kind='operator_confirmed_manual', short_endpoint_checks=False):
         self.lift_floor, self.lift_ceiling = lift_bounds(profile)
         self.profile = profile
         self.speed_scale = validate_speed_scale(speed_scale)
@@ -203,6 +207,12 @@ class SuspendedHost:
             raise ValueError('unreviewed rotary subdivision')
         self.rotary_segment_deg = rotary_segment_deg
         self.paired_progress_guard = paired_progress_guard
+        if reference_kind not in ('operator_confirmed_manual', 'operator_reviewed_powercycle_transfer'):
+            raise ValueError('unknown reference provenance')
+        if reference_kind == 'operator_reviewed_powercycle_transfer' and zero_reference is None:
+            raise ValueError('restart transfer requires an explicit retained reference')
+        self.reference_kind = reference_kind
+        self.short_endpoint_checks = short_endpoint_checks
         if set(reviewed) != {1, 2, 3, 4} or any(not math.isfinite(v) for v in reviewed.values()):
             raise ValueError('four finite explicitly reviewed motor coordinates required')
         # An explicitly operator-confirmed mechanical zero may have NONZERO raw
@@ -223,6 +233,7 @@ class SuspendedHost:
         self.expected_enabled = set()
         self.stage, self.groups_completed, self.deadline = 'preflight', 0, 0.
         self.max_error = {i: 0. for i in reviewed}
+        self._ready_group_samples = None
 
     def cancelled(self):
         return self.stop_file.exists()
@@ -238,20 +249,92 @@ class SuspendedHost:
         # execute_test finally performs the full feedback-confirmed shutdown.
         self.session.request_line('ESTOP', timeout=1, soft_timeout=True)
 
-    def snapshot(self):
+    def snapshot(self, *, _allow_idle_settling=False):
+        self._ready_group_samples = None
         if self.cancelled():
             raise RuntimeError('operator stop file present')
         def check(i, r, now):
             enabling = i in self.pending and self.pending[i] is None
             if bool(r.enabled) != (i in self.expected_enabled) and not enabling:
                 raise RuntimeError(f'ID{i} unexpected enable state')
-            if i not in self.pending and (not r.reached or not stationary(r) or abs(r.measured_position-self.held[i]) > TOL[i]):
-                raise RuntimeError(f'held ID{i} moved/lost stationarity: {r.raw}')
+            if i not in self.pending:
+                if not r.reached or abs(r.measured_position-self.held[i]) > TOL[i]:
+                    raise RuntimeError(f'held ID{i} moved/lost stationarity: {r.raw}')
+                if not stationary(r):
+                    # ONLY an idle, fully enabled group with no outstanding MOVE
+                    # can wait at its ORIGINAL held positions. Never waive a
+                    # held-axis micro-speed while another axis is moving.
+                    can_wait = (self.short_endpoint_checks and not self.pending
+                                and self.expected_enabled == set(SCALES)
+                                and r.speed is not None and math.isfinite(r.speed)
+                                and abs(r.speed) <= .1)
+                    if not can_wait:
+                        raise RuntimeError(f'held ID{i} moved/lost stationarity: {r.raw}')
+                    if not _allow_idle_settling:
+                        raise IdleSettlingNeeded(f'idle ID{i} needs new stationary evidence: {r.raw}')
             move = self.pending.get(i)
             if move is not None and move.outside_travel(r.measured_position):
                 raise RuntimeError(f'ID{i} outside commanded travel: {r.raw}')
         # Fail on the first bad sample, not after querying the remaining axes.
         return read_all(self.session, self.recorder, pending=tuple(self.pending), check_sample=check)
+
+    def qualify_idle(self, reason):
+        """No MOVE/re-anchor/retry. Require a new 1s ZERO-speed window in <=3s.
+
+        Position, enabled/reached/fault/freshness limits remain unchanged. A
+        valid +/-0.1 RPM sample resets the window, not a completion or exemption.
+        Larger/nonfinite/missing speed or movement beyond tolerance aborts.
+        """
+        if not self.short_endpoint_checks or self.pending or self.expected_enabled != set(SCALES):
+            raise RuntimeError('idle qualification requires a fully held group')
+        started = time.monotonic()
+        # No-motion expectations are timestamp anchors, NOT synthetic MOVE ACKs.
+        anchors = {i:MoveExpectation(self, self.held[i], started, no_motion=True,
+                    origin_motor_deg=self.held[i], tolerance_motor_deg=TOL[i]) for i in SCALES}
+        evidence = {i:SettledArrivalEvidence() for i in SCALES}
+        self.recorder.event('motor', 'bench.idle_qualification_started', stage=self.stage,
+                            reason=reason, timeout_s=3, stationary_speed_limit_rpm=.01)
+        while True:
+            samples = self.snapshot(_allow_idle_settling=True)
+            if time.monotonic()-started > 3:
+                raise RuntimeError('idle stationary requalification timed out; no next MOVE')
+            complete = True
+            for i,(r,now) in samples.items():
+                complete = evidence[i].observe(anchors[i],r,now) and complete
+            if complete:
+                self.recorder.event('motor', 'bench.idle_qualified', stage=self.stage,
+                                    reason=reason, duration_s=time.monotonic()-started)
+                return samples
+
+    def ready_snapshot(self):
+        try:
+            return self.snapshot()
+        except IdleSettlingNeeded:
+            return self.qualify_idle('micro_speed_between_groups')
+
+    def dispatch_snapshot(self):
+        # Use the just-verified complete four-axis endpoint ONCE. No second
+        # serial round/delay is needed if every actual sample is still <=300ms
+        # old (stricter than the 500ms acquisition guard). Include host elapsed
+        # time, not just the original bridge age. Any intervening snapshot,
+        # stage qualification or time gap invalidates this one-shot handoff.
+        samples, self._ready_group_samples = self._ready_group_samples, None
+        now = time.monotonic()
+        if (self.short_endpoint_checks and not self.pending and samples is not None
+                and self.expected_enabled == set(SCALES)
+                and all(r.online and r.enabled and r.reached and not r.fault and stationary(r)
+                        and 0 <= now-(at-r.age_ms/1000) <= .3
+                        and abs(r.measured_position-self.held[i]) <= TOL[i]
+                        for i,(r,at) in samples.items())):
+            self.recorder.event('motor', 'bench.fresh_endpoint_handoff', stage=self.stage,
+                maximum_effective_age_ms=max((now-at)*1000+r.age_ms for r,at in samples.values()),
+                maximum_allowed_age_ms=300, reused_once=True)
+            return samples
+        return self.ready_snapshot()
+
+    def verify_stage_boundary(self):
+        if self.short_endpoint_checks:
+            self.qualify_idle('stage_boundary')
 
     def prepare(self):
         self.snapshot()
@@ -281,6 +364,8 @@ class SuspendedHost:
                             no_zero_written=True, nominal_lift_start_mm=self.lift_floor,
                             lift_profile=self.profile, lift_range_mm=[self.lift_floor, self.lift_ceiling],
                             mechanical_zero_raw_motor_deg=self.zero_reference,
+                            reference_kind=self.reference_kind,
+                            short_endpoint_checks=self.short_endpoint_checks,
                             raw_telemetry_preserved=True, speed_scale=self.speed_scale)
 
     def verify_hold(self, seconds=5.):
@@ -296,7 +381,7 @@ class SuspendedHost:
     def dispatch(self, targets, speeds):
         if set(targets) != set(speeds) or set(targets) & set(self.pending):
             raise RuntimeError('invalid/pending dispatch')
-        samples = self.snapshot()
+        samples = self.dispatch_snapshot()
         planned = []
         for i, target in targets.items():
             origin = samples[i][0].measured_position
@@ -339,7 +424,7 @@ class SuspendedHost:
             now = time.monotonic()
             self.pending[i] = MoveExpectation(object(), quantized_target(origin, steps), now,
                 no_motion=not steps, origin_motor_deg=origin, tolerance_motor_deg=TOL[i])
-            self.evidence[i] = (SettledArrivalEvidence() if self.profile == 'interior' or self.speed_scale == 2
+            self.evidence[i] = (SettledArrivalEvidence() if not self.short_endpoint_checks and (self.profile == 'interior' or self.speed_scale == 2)
                                 else ArrivalEvidence())
             self.progress[i] = (now, origin)
             self.deadline = max(self.deadline, now+abs(steps)/pps+5)
@@ -414,6 +499,8 @@ class SuspendedHost:
                     targets_motor_deg={i: m.target_motor_deg for i, m in self.pending.items()})
                 self.pending.clear()
                 self.deadline = 0.
+                if self.short_endpoint_checks:
+                    self._ready_group_samples = samples
                 return 'DONE'
             if time.monotonic() > self.deadline:
                 raise RuntimeError('fresh stable endpoint timeout; no retry')

@@ -12,8 +12,9 @@ from test_gait_realtime_fixes import FakeClock
 
 
 class GaitRig:
-    def __init__(self, clock, failure=None):
+    def __init__(self, clock, failure=None, *, failure_driver=3):
         self.clock, self.failure = clock, failure
+        self.failure_driver = failure_driver
         self.positions = {1: -.9, 2: 4.7, 3: 0., 4: .2}
         self.enabled = {i: False for i in self.positions}
         self.commands, self.moves, self.moving = [], [], {}
@@ -37,7 +38,7 @@ class GaitRig:
             self.moves.append(command)
             i, steps, pps = int(f[1]), int(f[3]), int(f[4])
             self.moving[i] = (self.clock.now, self.positions[i], quantized_target(self.positions[i], steps), pps)
-            if self.failure == 'wrong_ack' and i == 3:
+            if self.failure == 'wrong_ack' and i == self.failure_driver:
                 pps += 1
             return parse_line(f'ACK,X42S,{i},MOVE,{steps},{pps}')
         i = int(f[2])
@@ -51,7 +52,7 @@ class GaitRig:
             speed = 0 if reached else direction*pps*60/3200
             if dt < .4:
                 mask = 1
-            if i == 3:
+            if i == self.failure_driver:
                 if self.failure == 'stall':
                     self.positions[i], reached, speed = origin, 0, 0
                 elif self.failure == 'fault':
